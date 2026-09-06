@@ -58,6 +58,8 @@ println!("{} prints, impact {:+.5}", report.trades.len(), report.impact);
   tick-scaling formulas, the per-tick algorithm, and (§14) the trading layer
   and why it sits on top of the price process rather than replacing it.
 - **Tooling:** `just build | test | lint | bench | wasm | dump | serve`.
+- **Sample app:** [`webapp/`](webapp) is an axum server around four seeded
+  symbols, with a TypeScript UI in [`webapp/ui/`](webapp/ui).
 
 ## Sample web app
 
@@ -70,6 +72,11 @@ player's account live.
 ```text
 cargo run --release -p fehu-webapp     # then open http://localhost:3000
 ```
+
+The UI is TypeScript ([`webapp/ui/`](webapp/ui/README.md)) built with Vite.
+Its output is committed to `webapp/static/` and embedded into the binary, so
+the command above needs no Node toolchain; `just ui` rebuilds it after a
+change and `just ui-dev` serves it with hot reload against a running backend.
 
 | Method | Path | What |
 |---|---|---|

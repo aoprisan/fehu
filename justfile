@@ -42,5 +42,19 @@ dump OUT_DIR="out" SEED="42":
 serve BIND="0.0.0.0:3000" TIME_SCALE="1":
     FEHU_BIND={{BIND}} FEHU_TIME_SCALE={{TIME_SCALE}} cargo run --release -p fehu-webapp
 
-# Everything CI would run.
-ci: lint build test wasm
+# Build the TypeScript UI into webapp/static. That output is committed and
+# embedded in the binary, so `cargo run` needs no Node toolchain — only this.
+ui:
+    cd webapp/ui && npm ci && npm run build
+
+# Vite dev server with hot reload on :5173, proxying /api to `just serve`.
+ui-dev:
+    cd webapp/ui && npm install && npm run dev
+
+# Typecheck the UI and fail if the committed bundle is out of date.
+ui-check:
+    cd webapp/ui && npm ci && npm run build
+    git diff --exit-code -- webapp/static
+
+# Everything CI would run. `ui-check` needs Node; the Rust recipes do not.
+ci: lint build test wasm ui-check
