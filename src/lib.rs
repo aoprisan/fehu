@@ -35,5 +35,5 @@ mod time;
 pub use candles::{Candle, Candles, Interval};
 pub use config::{Config, ConfigError, GarchParams, JumpParams, VolumeParams};
 pub use event::{Event, EventError, EventKind};
-pub use sim::{STATE_VERSION, Simulator, Snapshot, Tick};
+pub use sim::{LoadError, STATE_VERSION, Simulator, SimulatorRepr, Snapshot, Tick};
 pub use time::{MarketHours, Timestamp};

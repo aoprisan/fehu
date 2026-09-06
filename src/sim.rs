@@ -58,7 +58,18 @@ pub struct Snapshot {
 }
 
 /// The price process. See `DESIGN.md` for the model.
+///
+/// With the `serde` feature the whole state (config, RNG, latent variables,
+/// pending events, in-progress candles) round-trips losslessly; loading a state
+/// saved with a different [`STATE_VERSION`] or an invalid config fails. Binary
+/// formats are always bit-exact; for JSON enable `serde_json`'s
+/// `float_roundtrip` feature, otherwise a parsed `f64` may be one ulp off.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "SimulatorRepr", into = "SimulatorRepr")
+)]
 pub struct Simulator {
     config: Config,
     derived: Derived,
@@ -369,6 +380,135 @@ impl Simulator {
         }
     }
 }
+
+/// Serialisable form of [`Simulator`]: everything except the derived
+/// quantities, which are rebuilt on load.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SimulatorRepr {
+    /// [`STATE_VERSION`] at save time.
+    pub version: u32,
+    config: Config,
+    rng: Xoshiro256PlusPlus,
+    clock: Timestamp,
+    next_ts: Timestamp,
+    last_ts: Option<Timestamp>,
+    log_price: f64,
+    log_fund: f64,
+    log_fund_target: f64,
+    variance: f64,
+    last_vol: f64,
+    drift_effects: Vec<Decaying>,
+    vol_effects: Vec<Decaying>,
+    pending: Vec<Queued>,
+    next_seq: u64,
+    candle_cursor: [CandleBuilder; 4],
+}
+
+impl From<Simulator> for SimulatorRepr {
+    fn from(s: Simulator) -> Self {
+        Self {
+            version: STATE_VERSION,
+            config: s.config,
+            rng: s.rng,
+            clock: s.clock,
+            next_ts: s.next_ts,
+            last_ts: s.last_ts,
+            log_price: s.log_price,
+            log_fund: s.log_fund,
+            log_fund_target: s.log_fund_target,
+            variance: s.variance,
+            last_vol: s.last_vol,
+            drift_effects: s.drift_effects,
+            vol_effects: s.vol_effects,
+            pending: s.pending.into_iter().map(|Reverse(q)| q).collect(),
+            next_seq: s.next_seq,
+            candle_cursor: s.candle_cursor,
+        }
+    }
+}
+
+impl TryFrom<SimulatorRepr> for Simulator {
+    type Error = LoadError;
+
+    fn try_from(r: SimulatorRepr) -> Result<Self, LoadError> {
+        if r.version != STATE_VERSION {
+            return Err(LoadError::VersionMismatch {
+                found: r.version,
+                expected: STATE_VERSION,
+            });
+        }
+        let derived = Derived::new(&r.config).map_err(LoadError::Config)?;
+        let finite = [
+            r.log_price,
+            r.log_fund,
+            r.log_fund_target,
+            r.variance,
+            r.last_vol,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            && r.variance >= 0.0
+            && r.drift_effects
+                .iter()
+                .chain(&r.vol_effects)
+                .all(|e| e.amplitude.is_finite() && e.lambda.is_finite() && e.lambda > 0.0)
+            && r.pending.iter().all(|q| q.kind.validate().is_ok());
+        if !finite {
+            return Err(LoadError::Corrupt);
+        }
+        Ok(Self {
+            config: r.config,
+            derived,
+            rng: r.rng,
+            clock: r.clock,
+            next_ts: r.next_ts,
+            last_ts: r.last_ts,
+            log_price: r.log_price.clamp(MIN_LOG_PRICE, MAX_LOG_PRICE),
+            log_fund: r.log_fund,
+            log_fund_target: r.log_fund_target,
+            variance: r.variance,
+            last_vol: r.last_vol,
+            drift_effects: r.drift_effects,
+            vol_effects: r.vol_effects,
+            pending: r.pending.into_iter().map(Reverse).collect(),
+            next_seq: r.next_seq,
+            candle_cursor: r.candle_cursor,
+        })
+    }
+}
+
+/// Why a saved [`Simulator`] state could not be loaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LoadError {
+    /// Saved with a different [`STATE_VERSION`].
+    VersionMismatch {
+        /// Version in the saved state.
+        found: u32,
+        /// Version this crate expects.
+        expected: u32,
+    },
+    /// The saved config does not validate.
+    Config(ConfigError),
+    /// A latent value is not finite or an effect/event is malformed.
+    Corrupt,
+}
+
+impl core::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::VersionMismatch { found, expected } => {
+                write!(f, "saved state version {found}, expected {expected}")
+            }
+            Self::Config(e) => write!(f, "saved config invalid: {e}"),
+            Self::Corrupt => f.write_str("saved state is corrupt"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for LoadError {}
 
 /// Round a log-dollar price to cents, clamped to `[1, 10^15]`.
 fn cents(log_price: f64) -> i64 {
