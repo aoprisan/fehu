@@ -15,12 +15,14 @@ build:
 test:
     cargo test --all-features
     cargo test --no-default-features --tests
+    cargo test -p fehu-webapp
 
 # clippy with -D warnings on all targets and feature sets, plus rustfmt check.
 lint:
     cargo fmt --all -- --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo clippy --all-targets --no-default-features -- -D warnings
+    cargo clippy -p fehu-webapp --all-targets -- -D warnings
 
 # criterion benchmark: ticks/sec for the default config and with market hours.
 bench:
@@ -35,6 +37,10 @@ wasm:
 # Write one year of 1 s ticks and daily candles to CSV in OUT_DIR.
 dump OUT_DIR="out" SEED="42":
     cargo run --release --example dump -- {{OUT_DIR}} {{SEED}}
+
+# Run the sample web app (four seeded symbols, OHLC UI, game-event endpoints).
+serve BIND="0.0.0.0:3000" TIME_SCALE="1":
+    FEHU_BIND={{BIND}} FEHU_TIME_SCALE={{TIME_SCALE}} cargo run --release -p fehu-webapp
 
 # Everything CI would run.
 ci: lint build test wasm
