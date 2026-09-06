@@ -25,10 +25,14 @@ sim.push_event(Event {
 for tick in sim.advance(Duration::from_secs(60)) {
     println!("{} {} {}", tick.ts.0, tick.price_cents, tick.volume);
 }
-// …or 5-minute candles directly.
+// …or 5-minute candles directly…
 for candle in sim.advance_candles(Duration::from_secs(3600), Interval::M5) {
     println!("{:?}", candle);
 }
+// …or ten years of daily bars in one step per day (coarse mode: high/low are
+// drawn from the Brownian-bridge extremum distribution instead of simulated).
+let history: Vec<_> = sim.coarse_candles(Interval::D1).take(10 * 365).collect();
+assert_eq!(history.len(), 3650);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 

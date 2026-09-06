@@ -533,9 +533,67 @@ is not lost on drop: the next call continues it, because the aggregator lives
 inside the iterator's borrowed `Simulator` state (`candle_cursor: Option<Candles>`
 in §7).
 
-Not designed here: a coarse mode that steps once per candle and synthesises
-high/low from the Brownian-bridge extremum distribution. It would make years of
-daily history almost free but is a second code path; add later if needed.
+### 8.5 Coarse mode
+
+```rust
+impl Simulator {
+    /// One latent step per candle; endless.
+    pub fn coarse_candles(&mut self, iv: Interval) -> impl Iterator<Item = Candle> + '_;
+    /// Coarse bars of `iv` that close within `dur`.
+    pub fn advance_coarse(&mut self, dur: Duration, iv: Interval) -> impl Iterator<Item = Candle> + '_;
+}
+```
+
+For long histories (years of daily bars) the tick path is wasteful. Coarse
+mode runs **steps 2–9 of §5 once per bar** over the whole bar's model time and
+synthesises the intra-bar extremes:
+
+- **Step geometry.** The bar covers the wall interval `[a, b)` from the current
+  position `a` to the end of its bucket, clipped to the session close under
+  market hours; `b` past the close parks the simulator at the next open, and
+  the first bar of a session also carries the gap (`g·S`). A first bar may be
+  partial if `a` is not on a bucket boundary. `Candle::ticks = 0` marks a
+  coarse bar.
+- **Same latent evolution.** Fundamental relaxation, exact OU step, drift/vol
+  effect integrals, Poisson jumps with `λΔ`, events with `at < b`: identical
+  code (`Simulator::evolve`), so events, reversion and vol shifts behave the
+  same way at any step length.
+- **GARCH at the step scale.** The per-tick `(α, β)` are meaningless for a
+  step longer than the variance half-life, so the coefficients are derived
+  per step from the same two invariants (persistence and dispersion):
+  `φ = e^{−ln2 · m / h_v}`, `α = min(sqrt(r (1 − φ²) / 2), φ)`, `β = φ − α`,
+  `ω = (1 − φ) σ² dt` (per-tick units, since `h` is stored per tick and
+  `σ_t = sqrt(h/dt)` is scale-free). For `m ≪ h_v` this reduces to the fine
+  formulas; for `m ≫ h_v` the regime averages out (`φ → 0`) and daily returns
+  are close to Gaussian, which is physically right. The `min(·, φ)` keeps
+  `β ≥ 0` and shrinks dispersion gracefully instead of rejecting the config.
+- **High/low: Brownian-bridge extremum.** Given the bar's log move
+  `x = ln(close/open)` and total variance `v = σ_t² Δ + λΔ(μ_J² + σ_J²)`, the
+  maximum `M` of a Brownian bridge from 0 to `x` has
+  `P(M ≥ m) = exp(−2 m (m − x) / v)`, so with a uniform `u`
+  `m = (x + sqrt(x² − 2 v ln u)) / 2`; the minimum is the mirror image
+  `(x − sqrt(x² − 2 v ln u')) / 2` with an independent `u'`. The two draws are
+  independent (the exact joint law is an infinite series), and reversion inside
+  the bar is ignored. `high ≥ max(open, close)` and `low ≤ min(open, close)`
+  hold by construction. With `v = 0` the extremes are the endpoints.
+- **Volume.** The tick formula at the bar scale:
+  `base_per_day · s/S_day · (σ_t/σ)^γ · (1 + c |x| / (σ√Δ))` with `s` the
+  session seconds in the bar, whose expectation equals the aggregate of the
+  ticks it replaces; the lognormal noise std is `η / sqrt(ticks in bar)`.
+- **Draw order per bar:** `z`, `u_poisson`, jump normals, `u_hi`, `u_lo`,
+  `z_v`. Coarse bars are therefore *not* the aggregate of the tick path for
+  the same seed — they are a separate, statistically equivalent path — but
+  they are just as deterministic. Mixing coarse and fine calls on one
+  simulator is allowed; the state continues from wherever the last call
+  stopped (switching coarse → fine overlaps the model time by at most one
+  tick).
+
+Validated in `tests/coarse.rs`: daily std and mean high–low range of coarse
+bars against both the analytic BM range `2 sqrt(2/π) σ √T` (within 5 %) and a
+1-minute fine simulation aggregated to daily bars (within 10 %); one bar per
+trading day / seven per session under market hours; events landing in the bar
+that contains them; regime clustering appearing only when the variance
+half-life exceeds the bar; 30 years of daily bars in ~11 k steps.
 
 ---
 
@@ -583,6 +641,7 @@ Integration tests under `tests/`, each fast enough for CI (< ~2 s each):
 | vol clustering | same series: autocorrelation of `|r_1m|` at lags 1..10 all `> 0` (expected ≈ 0.2–0.3, se ≈ 0.008). |
 | mean-reversion half-life | (a) deterministic: `σ = 0, λ = 0`, `Jump(0.10)` at start, tick = 1 min; time for the log-spread to halve equals `ln2/θ` ± 1 tick. (b) stochastic: tick = 1 h, `θ = 500`, 20 k ticks, AR(1) fit of the spread → `θ̂` within 25 %. |
 | events | with `σ = 0, λ = 0`: `Jump(p)` → next price `= P·(1+p)` within 1 cent, then reverts; `FundamentalShift(δ)` → after many half-lives price `= P e^δ` within 0.1 %; `DriftShift` → series matches the closed form §4.5 within 1e-9; `drift_for_total_move` integrates to `total`; `VolShift` (stochastic, same seed vs control) → realised-vol ratio within 5 % of `sqrt(mean σ_t²)/σ`; superposition and pruning; push order at equal timestamps; invalid events rejected. |
+| coarse mode | see §8.5: bar invariants for every interval, golden hash, statistical match with the fine path and the analytic BM range, market-hours bar counts, partial first bucket, event placement, GARCH scaling, mixing with fine steps. |
 | save/load | run under market hours with pending events, effects and a partial candle; JSON (`float_roundtrip`) and `postcard` round trips continue identically for 30 k ticks; `Candles` round-trips; wrong `STATE_VERSION` and invalid config are rejected. |
 | market hours | ticks only inside sessions; first tick of a day carries the gap; per-day tick count `= S / tick`; weekend skipped; realised annualised vol over 60 sessions within 15 % of `σ`. |
 | candles | hand-built ticks → OHLCV correct, bucket alignment, eviction at `max_per_interval`. |
@@ -643,3 +702,6 @@ core price process → GARCH → events → candles & volume → market hours �
 11. Added during implementation: `push_event` returns `Result<(), EventError>`;
     the drift-shift integral uses the exact forced-OU solution (§4.2); JSON
     saves need `serde_json/float_roundtrip` for bit-exactness (§7).
+12. Coarse mode (§8.5) added after the first review. While adding it, the
+    volume return of a tick was changed to include event jumps applied in
+    that tick (a news jump now prints volume); `STATE_VERSION` is 2.
