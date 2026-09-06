@@ -132,6 +132,14 @@ impl MarketHours {
             && tod < self.close_secs as i64 * 1000
     }
 
+    /// Close of the session on `ts`'s calendar day (whether or not it is a
+    /// trading day).
+    #[must_use]
+    pub const fn session_close(&self, ts: Timestamp) -> Timestamp {
+        let (day, _) = ts.day_and_time();
+        Timestamp(day * DAY_MS + self.close_secs as i64 * 1000)
+    }
+
     /// First session open at or after `ts`. If `ts` is inside a session this
     /// is the *next* session's open, not the current one's.
     #[must_use]

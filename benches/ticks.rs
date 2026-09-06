@@ -2,7 +2,7 @@
 
 use core::time::Duration;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use fehu::{Candles, Config, MarketHours, Simulator};
+use fehu::{Candles, Config, Interval, MarketHours, Simulator};
 use std::hint::black_box;
 
 const N: u64 = 100_000;
@@ -43,6 +43,19 @@ fn bench_ticks(c: &mut Criterion) {
         });
     });
 
+    g.finish();
+
+    let mut g = c.benchmark_group("coarse");
+    let days: u64 = 10 * 365;
+    g.throughput(Throughput::Elements(days));
+    g.bench_function("daily_10y", |b| {
+        let mut sim = Simulator::new(Config::default(), 1).unwrap();
+        b.iter(|| {
+            for c in sim.coarse_candles(Interval::D1).take(days as usize) {
+                black_box(c);
+            }
+        });
+    });
     g.finish();
 }
 
