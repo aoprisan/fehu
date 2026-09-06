@@ -43,7 +43,35 @@ assert_eq!(history.len(), 3650);
   every platform.
 - **Docs:** [`DESIGN.md`](DESIGN.md) has the model, parameter ranges,
   tick-scaling formulas and the per-tick algorithm.
-- **Tooling:** `just build | test | lint | bench | wasm | dump`.
+- **Tooling:** `just build | test | lint | bench | wasm | dump | serve`.
+
+## Sample web app
+
+[`webapp/`](webapp) is a small axum backend that shows the crate used the way
+a game server would: four hardcoded, seeded symbols tick in wall-clock time,
+the game pushes events over HTTP, and a browser UI draws the OHLC bars live.
+
+```text
+cargo run --release -p fehu-webapp     # then open http://localhost:3000
+```
+
+| Method | Path | What |
+|---|---|---|
+| `GET` | `/api/symbols` | Quotes for every symbol |
+| `GET` | `/api/symbols/{sym}` | Quote, latent snapshot and config |
+| `GET` | `/api/symbols/{sym}/bars?interval=M1\|M5\|H1\|D1&limit=500` | OHLCV bars, oldest first, in-progress bar last |
+| `POST` | `/api/symbols/{sym}/events` | Raw simulator event: `{"type":"jump","pct":-0.1}`, `drift_shift`, `drift_for_total_move`, `vol_shift`, `fundamental_shift`, `fundamental_target`; optional `at_ms` / `delay_secs`, `source`, `note` |
+| `POST` | `/api/game/events` | Semantic game event: `{"kind":"scandal","symbol":"ACME","magnitude":1.5}`; market-wide kinds (`market_crash`, `rate_hike`, …) need no symbol |
+| `GET` | `/api/game/catalog` | Every game-event kind and the simulator events it expands to |
+| `GET` | `/api/events` | Audit log of accepted events, newest first (`?symbol=`, `?limit=`) |
+| `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` and accepted `event` |
+| `GET` | `/api/health` | Uptime, simulated time, tick counters |
+
+At start-up each symbol generates a year of daily bars in coarse mode and then
+three days of 1 s ticks, so every interval has history before the first
+request. `FEHU_TIME_SCALE=60` runs the market at 60 simulated seconds per
+wall second; `FEHU_BIND`, `FEHU_HISTORY_DAYS` and `FEHU_WARMUP_HOURS` are the
+other knobs. Same seeds and same events give the same prices on every run.
 
 ## License
 
