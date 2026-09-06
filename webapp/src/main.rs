@@ -6,7 +6,7 @@
 //!
 //! Environment: `FEHU_BIND` (default `0.0.0.0:3000`), `FEHU_TIME_SCALE`,
 //! `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`, `FEHU_MAX_BARS`, `FEHU_EVENT_LOG`,
-//! `RUST_LOG`.
+//! `FEHU_TAPE`, `FEHU_FILL_LOG`, `FEHU_STARTING_CASH_CENTS`, `RUST_LOG`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,6 +37,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 daily_bars = s.bars(fehu::Interval::D1, usize::MAX).len(),
                 minute_bars = s.bars(fehu::Interval::M1, usize::MAX).len(),
                 ticks = s.ticks_total,
+                bid = q.bid_cents.map(|c| format!("{:.2}", c as f64 / 100.0)),
+                ask = q.ask_cents.map(|c| format!("{:.2}", c as f64 / 100.0)),
                 "ready"
             );
         }
