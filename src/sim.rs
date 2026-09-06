@@ -1,12 +1,16 @@
 //! The simulator: state, per-tick algorithm and the public stepping API.
 
+use alloc::collections::BinaryHeap;
+use alloc::vec::Vec;
+use core::cmp::Reverse;
 use core::time::Duration;
 
 use rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
 
 use crate::config::{Config, ConfigError, Derived};
-use crate::math::{self, exp, expm1, ln, round, sqrt};
+use crate::event::{Decaying, Event, EventError, EventKind, PRUNE_BELOW, Queued};
+use crate::math::{self, exp, expm1, ln, ln_1p, round, sqrt};
 use crate::time::Timestamp;
 
 /// Version of the state layout and RNG draw order. Bumped whenever either
@@ -44,6 +48,12 @@ pub struct Snapshot {
     pub log_spread: f64,
     /// Effective annualised volatility used for the last step.
     pub annual_vol: f64,
+    /// Sum of active drift-shift effects, annualised.
+    pub drift_effect: f64,
+    /// Sum of active vol-shift effects, annualised.
+    pub vol_effect: f64,
+    /// Events queued and not yet applied.
+    pub pending_events: usize,
 }
 
 /// The price process. See `DESIGN.md` for the model.
@@ -68,6 +78,14 @@ pub struct Simulator {
     variance: f64,
     /// Effective annualised vol used in the last step (for `Snapshot`).
     last_vol: f64,
+    /// Active drift-shift effects.
+    drift_effects: Vec<Decaying>,
+    /// Active vol-shift effects.
+    vol_effects: Vec<Decaying>,
+    /// Events not yet applied, earliest first.
+    pending: BinaryHeap<Reverse<Queued>>,
+    /// Sequence number for the next pushed event.
+    next_seq: u64,
 }
 
 impl Simulator {
@@ -91,6 +109,10 @@ impl Simulator {
             log_price,
             log_fund: log_price,
             log_fund_target: log_price,
+            drift_effects: Vec::new(),
+            vol_effects: Vec::new(),
+            pending: BinaryHeap::new(),
+            next_seq: 0,
         })
     }
 
@@ -121,6 +143,46 @@ impl Simulator {
             fundamental_cents: cents(self.log_fund),
             log_spread: self.log_price - self.log_fund,
             annual_vol: self.last_vol,
+            drift_effect: self.drift_effects.iter().map(|e| e.amplitude).sum(),
+            vol_effect: self.vol_effects.iter().map(|e| e.amplitude).sum(),
+            pending_events: self.pending.len(),
+        }
+    }
+
+    /// Queue an event. It is applied at the first tick with `ts ≥ event.at`;
+    /// events with equal timestamps apply in push order.
+    ///
+    /// # Errors
+    /// Rejects non-finite magnitudes, `Jump(pct)` with `pct ≤ -1`, and shifts
+    /// with a zero half-life.
+    pub fn push_event(&mut self, event: Event) -> Result<(), EventError> {
+        event.kind.validate()?;
+        self.pending.push(Reverse(Queued {
+            at: event.at,
+            seq: self.next_seq,
+            kind: event.kind,
+        }));
+        self.next_seq += 1;
+        Ok(())
+    }
+
+    /// Apply every queued event due at or before `ts`.
+    fn apply_due_events(&mut self, ts: Timestamp) {
+        while let Some(Reverse(q)) = self.pending.peek() {
+            if q.at > ts {
+                break;
+            }
+            let Reverse(q) = self.pending.pop().expect("peeked");
+            match q.kind {
+                EventKind::Jump(pct) => self.log_price += ln_1p(pct),
+                EventKind::DriftShift { delta, half_life } => {
+                    self.drift_effects.push(Decaying::new(delta, half_life));
+                }
+                EventKind::VolShift { delta, half_life } => {
+                    self.vol_effects.push(Decaying::new(delta, half_life));
+                }
+                EventKind::FundamentalShift(delta) => self.log_fund_target += delta,
+            }
         }
     }
 
@@ -145,21 +207,59 @@ impl Simulator {
         let model_secs = self.derived.tick_secs;
         let delta = model_secs / self.derived.year_secs;
 
+        // 2. Events due now.
+        self.apply_due_events(ts);
+
         // 3. Fundamental: target grows, value relaxes toward it.
         let spread = self.log_price - self.log_fund;
         self.log_fund_target += self.config.drift * delta;
         let relax = -expm1(-self.config.fundamental_speed * delta);
         self.log_fund += (self.log_fund_target - self.log_fund) * relax;
 
-        // 5. Effective vol from the GARCH variance.
-        let sigma_t = sqrt(self.variance / self.derived.dt);
+        // 4. Decaying effects. Drift shifts enter through the exact solution of
+        //    ds = −θ s dt + a e^{−λt} dt over the step:
+        //    a (e^{−λΔ} − e^{−θΔ}) / (θ − λ), or a Δ e^{−θΔ} when θ ≈ λ.
+        //    Vol shifts are taken at the start of the step. Then decay and prune.
+        let year_secs = self.derived.year_secs;
+        let theta = self.config.mean_reversion_speed;
+        let ou_decay = exp(-theta * delta);
+        let mut drift_int = 0.0;
+        for e in &mut self.drift_effects {
+            let lam_year = e.lambda * year_secs;
+            let lam_decay = exp(-lam_year * delta);
+            let diff = theta - lam_year;
+            drift_int += if diff.abs() > 1e-9 * theta {
+                e.amplitude * (lam_decay - ou_decay) / diff
+            } else {
+                e.amplitude * delta * ou_decay
+            };
+            e.amplitude *= lam_decay;
+        }
+        self.drift_effects
+            .retain(|e| e.amplitude.abs() >= PRUNE_BELOW);
+        let mut vol_add = 0.0;
+        for e in &mut self.vol_effects {
+            vol_add += e.amplitude;
+            e.amplitude *= exp(-e.lambda * model_secs);
+        }
+        self.vol_effects
+            .retain(|e| e.amplitude.abs() >= PRUNE_BELOW);
+
+        // 5. Effective vol from the GARCH variance plus vol shifts.
+        let sigma_t = (sqrt(self.variance / self.derived.dt) + vol_add).max(0.0);
         self.last_vol = sigma_t;
 
         // 6. Exact OU step on the spread.
-        let theta = self.config.mean_reversion_speed;
         let z = math::normal(&mut self.rng);
         let ou_std = sigma_t * sqrt(-expm1(-2.0 * theta * delta) / (2.0 * theta));
-        let spread = spread * exp(-theta * delta) + ou_std * z;
+        let mut spread = spread * ou_decay + drift_int + ou_std * z;
+
+        // 7. Poisson jumps.
+        let jumps = self.config.jumps;
+        let n_jumps = math::poisson(&mut self.rng, jumps.intensity * delta);
+        for _ in 0..n_jumps {
+            spread += jumps.mean + jumps.std * math::normal(&mut self.rng);
+        }
 
         // 8. GARCH update on the standardised diffusive shock.
         let d = &self.derived;

@@ -27,6 +27,12 @@ pub(crate) fn ln(x: f64) -> f64 {
     libm::log(x)
 }
 
+/// `ln(1 + x)`, accurate for small `x`.
+#[inline]
+pub(crate) fn ln_1p(x: f64) -> f64 {
+    libm::log1p(x)
+}
+
 #[inline]
 pub(crate) fn sqrt(x: f64) -> f64 {
     libm::sqrt(x)
@@ -56,6 +62,29 @@ pub(crate) fn normal(rng: &mut Xoshiro256PlusPlus) -> f64 {
     let u1 = uniform_open(rng);
     let u2 = uniform(rng);
     sqrt(-2.0 * ln(u1)) * libm::cos(TWO_PI * u2)
+}
+
+/// Poisson count by inversion. One uniform draw. Exact for `lambda` small enough
+/// that `e^{-lambda}` does not underflow (`lambda ≲ 700`); the config ranges keep
+/// `lambda` far below that. The count is capped at `u32::MAX`.
+pub(crate) fn poisson(rng: &mut Xoshiro256PlusPlus, lambda: f64) -> u32 {
+    let u = uniform(rng);
+    if lambda <= 0.0 {
+        return 0;
+    }
+    let mut p = exp(-lambda);
+    let mut cdf = p;
+    let mut k: u32 = 0;
+    while u > cdf && k < u32::MAX {
+        k += 1;
+        p *= lambda / f64::from(k);
+        cdf += p;
+        if p == 0.0 {
+            // Underflow: the tail carries no more mass we can represent.
+            break;
+        }
+    }
+    k
 }
 
 #[cfg(test)]
@@ -88,5 +117,15 @@ mod tests {
         let var = s2 / n as f64 - mean * mean;
         assert!(mean.abs() < 0.01, "mean {mean}");
         assert!((var - 1.0).abs() < 0.02, "var {var}");
+    }
+
+    #[test]
+    fn poisson_mean() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(3);
+        let n = 100_000;
+        let total: u64 = (0..n).map(|_| u64::from(poisson(&mut rng, 2.5))).sum();
+        let mean = total as f64 / n as f64;
+        assert!((mean - 2.5).abs() < 0.03, "mean {mean}");
+        assert_eq!(poisson(&mut rng, 0.0), 0);
     }
 }
