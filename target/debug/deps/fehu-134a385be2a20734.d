@@ -1,8 +1,8 @@
-/home/user/fehu/target/debug/deps/fehu-134a385be2a20734.d: src/lib.rs src/candles.rs src/config.rs src/event.rs src/math.rs src/sim.rs src/time.rs
+/home/user/fehu/target/debug/deps/fehu-134a385be2a20734.d: src/lib.rs src/candles.rs src/config.rs src/event.rs src/math.rs src/sim.rs src/time.rs src/../README.md
 
-/home/user/fehu/target/debug/deps/libfehu-134a385be2a20734.rlib: src/lib.rs src/candles.rs src/config.rs src/event.rs src/math.rs src/sim.rs src/time.rs
+/home/user/fehu/target/debug/deps/libfehu-134a385be2a20734.rlib: src/lib.rs src/candles.rs src/config.rs src/event.rs src/math.rs src/sim.rs src/time.rs src/../README.md
 
-/home/user/fehu/target/debug/deps/libfehu-134a385be2a20734.rmeta: src/lib.rs src/candles.rs src/config.rs src/event.rs src/math.rs src/sim.rs src/time.rs
+/home/user/fehu/target/debug/deps/libfehu-134a385be2a20734.rmeta: src/lib.rs src/candles.rs src/config.rs src/event.rs src/math.rs src/sim.rs src/time.rs src/../README.md
 
 src/lib.rs:
 src/candles.rs:
@@ -11,3 +11,4 @@ src/event.rs:
 src/math.rs:
 src/sim.rs:
 src/time.rs:
+src/../README.md:
