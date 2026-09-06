@@ -35,3 +35,7 @@ required-features = ["std"]
 
 [profile.bench]
 debug = false
+
+[workspace]
+members = ["webapp"]
+resolver = "3"
