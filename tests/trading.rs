@@ -1,0 +1,414 @@
+//! The exchange: synthetic liquidity, matching, price impact and the
+//! invariants that tie it to the bare simulator.
+
+use core::time::Duration;
+use fehu::{
+    Config, Exchange, ImpactParams, Order, OrderId, OrderStatus, Owner, Side, Simulator,
+    TimeInForce, Trade, TraderId, TradingParams,
+};
+
+const T: TraderId = TraderId(7);
+const OTHER: TraderId = TraderId(8);
+
+fn exchange(seed: u64) -> Exchange {
+    Exchange::new(Config::default(), TradingParams::default(), seed).unwrap()
+}
+
+#[test]
+fn without_traders_the_reference_is_the_bare_simulator() {
+    let mut ex = exchange(42);
+    let mut sim = Simulator::new(Config::default(), 42).unwrap();
+    for _ in 0..20_000 {
+        let r = ex.step();
+        let t = sim.step();
+        assert_eq!(r.tick, t, "price and volume must match the bare simulator");
+        assert_eq!(r.impact, 0.0);
+        let tape: u64 = r.trades.iter().map(|x| x.qty).sum();
+        assert_eq!(tape, t.volume, "every share of volume prints");
+        assert!(r.trades.iter().all(|x| x.taker.owner == Owner::Synthetic));
+    }
+    assert_eq!(ex.simulator().snapshot(), sim.snapshot());
+}
+
+#[test]
+fn ladder_is_quoted_around_the_reference_and_widens_with_vol() {
+    let mut ex = exchange(1);
+    let r = ex.reference_cents();
+    let book = ex.book();
+    let bids = book.depth(Side::Buy, 100);
+    let asks = book.depth(Side::Sell, 100);
+    assert_eq!(bids.len(), 10);
+    assert_eq!(asks.len(), 10);
+    assert!(bids[0].price_cents < r && r < asks[0].price_cents);
+    // 5 bp half spread on $100 is 5 cents.
+    assert_eq!(bids[0].price_cents, r - 5);
+    assert_eq!(asks[0].price_cents, r + 5);
+    assert_eq!(bids[1].price_cents, bids[0].price_cents - 5);
+    // Sizes grow away from the touch (in expectation; check the far end).
+    let near: u64 = bids[..3].iter().map(|l| l.qty).sum();
+    let far: u64 = bids[7..].iter().map(|l| l.qty).sum();
+    assert!(far > near, "near {near} far {far}");
+    for _ in 0..100 {
+        ex.step();
+    }
+    let calm_spread = {
+        let b = ex.book();
+        b.best_ask().unwrap() - b.best_bid().unwrap()
+    };
+    // A vol shock widens the spread.
+    ex.simulator_mut()
+        .push_event(fehu::Event {
+            at: fehu::Timestamp(0),
+            kind: fehu::EventKind::VolShift {
+                delta: 1.2,
+                half_life: Duration::from_secs(3600),
+            },
+        })
+        .unwrap();
+    ex.step();
+    let panic_spread = {
+        let b = ex.book();
+        b.best_ask().unwrap() - b.best_bid().unwrap()
+    };
+    assert!(
+        panic_spread >= 3 * calm_spread,
+        "calm {calm_spread} panic {panic_spread}"
+    );
+}
+
+#[test]
+fn market_buy_pays_the_spread_and_moves_the_reference() {
+    let mut ex = exchange(3);
+    for _ in 0..10 {
+        ex.step();
+    }
+    let r0 = ex.reference_cents();
+    let ask = ex.book().best_ask().unwrap();
+    // Roughly a tenth of a day's volume in one go.
+    let qty = 250_000;
+    let preview = ex.preview_market(Side::Buy, qty);
+    let p = ex
+        .submit(Order::market(Owner::Trader(T), Side::Buy, qty))
+        .unwrap();
+    assert_eq!(p.filled, preview.filled);
+    assert_eq!(p.notional_cents(), preview.notional_cents);
+    assert!(p.filled > 0);
+    assert!(
+        p.avg_price_cents().unwrap() >= ask as f64,
+        "paid the spread"
+    );
+    assert_eq!(ex.pending_flow(), i64::try_from(p.filled).unwrap());
+    let report = ex.step();
+    assert!(report.impact > 0.0);
+    let expected = 0.7 * 0.4 * (1.0f64 / 365.25).sqrt() * (p.filled as f64 / 2_595_769.0).sqrt();
+    assert!(
+        (report.impact - expected).abs() < 1e-6,
+        "impact {} vs {expected}",
+        report.impact
+    );
+    assert!(
+        report.tick.price_cents as f64 > r0 as f64 * (1.0 + expected * 0.5),
+        "reference did not move: {r0} -> {}",
+        report.tick.price_cents
+    );
+    assert_eq!(ex.pending_flow(), 0);
+}
+
+/// A large start price keeps cent rounding out of the log-price comparisons;
+/// one-minute ticks keep the long decay phases cheap.
+fn precise() -> Config {
+    Config {
+        start_price_cents: 1_000_000_000,
+        tick: Duration::from_secs(60),
+        ..Config::default()
+    }
+}
+
+#[test]
+fn impact_is_exactly_a_decaying_shock_on_the_spread() {
+    // Same seed with and without the trade: the simulator's RNG stream is
+    // untouched by trading, and the OU spread is linear, so the treated path
+    // differs from the control by J·e^{−θ(t−t0)} exactly.
+    let params = TradingParams::default();
+    let mut ex = Exchange::new(precise(), params, 5).unwrap();
+    let mut control = Exchange::new(precise(), params, 5).unwrap();
+    for _ in 0..10 {
+        ex.step();
+        control.step();
+    }
+    let buy = ex
+        .submit(Order::market(Owner::Trader(T), Side::Buy, 20_000))
+        .unwrap();
+    assert_eq!(buy.status, OrderStatus::Filled);
+    let rep = ex.step();
+    control.step();
+    let j = rep.impact;
+    assert!(j > 0.0);
+    let theta = 50.0;
+    let year_secs = 365.25 * 86_400.0;
+    for k in 0..5_000u64 {
+        let a = ex.step().tick.price_cents as f64;
+        let b = control.step().tick.price_cents as f64;
+        // The jump lands at the start of its own tick, so it has already
+        // decayed once by the time that tick prints.
+        let expected = j * (-theta * 60.0 * ((k + 2) as f64) / year_secs).exp();
+        let got = (a / b).ln();
+        assert!(
+            (got - expected).abs() < 1e-7,
+            "tick {k}: diff {got} vs {expected}"
+        );
+    }
+    // Selling it back costs the spread and undoes the impact.
+    let sell = ex
+        .submit(Order::market(Owner::Trader(T), Side::Sell, 20_000))
+        .unwrap();
+    assert_eq!(sell.status, OrderStatus::Filled);
+    assert!(
+        sell.notional_cents() < buy.notional_cents(),
+        "bought for {} sold for {}",
+        buy.notional_cents(),
+        sell.notional_cents()
+    );
+    let rep = ex.step();
+    control.step();
+    assert!((rep.impact + j).abs() < 1e-12, "{} vs {j}", rep.impact);
+    ex.advance(Duration::from_secs(60 * 86_400)).for_each(drop);
+    control
+        .advance(Duration::from_secs(60 * 86_400))
+        .for_each(drop);
+    let a = ex.simulator().snapshot();
+    let b = control.simulator().snapshot();
+    assert!((a.log_spread - b.log_spread).abs() < 1e-6);
+    assert_eq!(a.fundamental_cents, b.fundamental_cents);
+}
+
+#[test]
+fn permanent_impact_moves_the_fundamental() {
+    let params = TradingParams {
+        impact: ImpactParams {
+            permanent_fraction: 1.0,
+            ..ImpactParams::default()
+        },
+        ..TradingParams::default()
+    };
+    let mut ex = Exchange::new(precise(), params, 5).unwrap();
+    let mut control = Exchange::new(precise(), params, 5).unwrap();
+    ex.step();
+    control.step();
+    ex.submit(Order::market(Owner::Trader(T), Side::Buy, 20_000))
+        .unwrap();
+    let r = ex.step();
+    control.step();
+    assert!(r.impact > 0.0);
+    ex.advance(Duration::from_secs(120 * 86_400)).for_each(drop);
+    control
+        .advance(Duration::from_secs(120 * 86_400))
+        .for_each(drop);
+    let a = ex.simulator().snapshot();
+    let b = control.simulator().snapshot();
+    let got = (a.fundamental_cents as f64 / b.fundamental_cents as f64).ln();
+    assert!((got - r.impact).abs() < 1e-6, "{got} vs {}", r.impact);
+    assert!((a.log_spread - b.log_spread).abs() < 1e-9);
+}
+
+#[test]
+fn resting_orders_fill_when_the_market_comes_to_them() {
+    let mut ex = exchange(9);
+    ex.step();
+    let r = ex.reference_cents();
+    // A bid a little below the touch and an ask a little above.
+    let bid = ex
+        .submit(Order::limit(Owner::Trader(T), Side::Buy, r - 30, 500))
+        .unwrap();
+    let ask = ex
+        .submit(Order::limit(Owner::Trader(T), Side::Sell, r + 30, 500))
+        .unwrap();
+    assert_eq!(bid.status, OrderStatus::Resting);
+    assert_eq!(ask.status, OrderStatus::Resting);
+    assert_eq!(ex.book().orders_of(Owner::Trader(T)).count(), 2);
+    let mut fills: Vec<Trade> = Vec::new();
+    for _ in 0..20_000 {
+        let rep = ex.step();
+        fills.extend(
+            rep.trades
+                .iter()
+                .filter(|t| t.maker.owner == Owner::Trader(T)),
+        );
+        if ex.book().orders_of(Owner::Trader(T)).count() == 0 {
+            break;
+        }
+    }
+    let bought: u64 = fills
+        .iter()
+        .filter(|t| t.maker.order == bid.id)
+        .map(|t| t.qty)
+        .sum();
+    let sold: u64 = fills
+        .iter()
+        .filter(|t| t.maker.order == ask.id)
+        .map(|t| t.qty)
+        .sum();
+    assert_eq!(
+        bought, 500,
+        "bid should fill once the price falls through it"
+    );
+    assert_eq!(sold, 500, "ask should fill once the price rises through it");
+    assert!(
+        fills
+            .iter()
+            .all(|t| t.price_cents == r - 30 || t.price_cents == r + 30)
+    );
+    // Passive fills count as flow too: the exchange moved shares to the trader.
+    let net: i64 = fills.iter().map(Trade::trader_flow).sum();
+    assert_eq!(net, 0);
+}
+
+#[test]
+fn traders_trade_with_each_other_without_moving_the_reference() {
+    let mut ex = exchange(11);
+    ex.step();
+    let r = ex.reference_cents();
+    // An order inside the spread rests; the other trader hits it.
+    let rest = ex
+        .submit(Order::limit(Owner::Trader(T), Side::Sell, r, 100))
+        .unwrap();
+    assert_eq!(rest.status, OrderStatus::Resting);
+    let hit = ex
+        .submit(Order::limit(Owner::Trader(OTHER), Side::Buy, r, 100))
+        .unwrap();
+    assert_eq!(hit.status, OrderStatus::Filled);
+    assert_eq!(hit.trades[0].maker.order, rest.id);
+    assert_eq!(hit.trades[0].price_cents, r);
+    assert_eq!(hit.trades[0].signed_qty_for(T), -100);
+    assert_eq!(hit.trades[0].signed_qty_for(OTHER), 100);
+    assert_eq!(ex.pending_flow(), 0);
+    let rep = ex.step();
+    assert_eq!(rep.impact, 0.0);
+    // The interim trade is part of the next tick's volume.
+    let tape: u64 = rep.trades.iter().map(|t| t.qty).sum();
+    assert_eq!(rep.tick.volume, tape + 100);
+}
+
+#[test]
+fn cancel_and_ownership() {
+    let mut ex = exchange(2);
+    let r = ex.reference_cents();
+    let o = ex
+        .submit(Order::limit(Owner::Trader(T), Side::Buy, r - 100, 10))
+        .unwrap();
+    assert_eq!(ex.cancel(o.id, OTHER), Err(fehu::CancelError::NotOwner));
+    assert_eq!(ex.cancel(o.id, T).unwrap().remaining, 10);
+    assert_eq!(ex.cancel(o.id, T), Err(fehu::CancelError::Unknown));
+    assert_eq!(
+        ex.cancel(OrderId(1), T),
+        Err(fehu::CancelError::NotOwner),
+        "synthetic quotes are not cancellable"
+    );
+    assert_eq!(
+        ex.submit(Order::market(Owner::Synthetic, Side::Buy, 1)),
+        Err(fehu::OrderError::SyntheticOwner)
+    );
+    let ioc = ex
+        .submit(Order::limit(Owner::Trader(T), Side::Buy, r - 100, 10).with_tif(TimeInForce::Ioc))
+        .unwrap();
+    assert_eq!(ioc.status, OrderStatus::Cancelled);
+    assert!(ex.book().orders_of(Owner::Trader(T)).next().is_none());
+}
+
+#[test]
+fn market_orders_stop_at_the_collar() {
+    let mut ex = exchange(4);
+    ex.step();
+    let r = ex.reference_cents();
+    // A trader ask far above the collar must not be hit by a market buy.
+    ex.submit(Order::limit(
+        Owner::Trader(OTHER),
+        Side::Sell,
+        r * 2,
+        1_000_000,
+    ))
+    .unwrap();
+    let p = ex
+        .submit(Order::market(Owner::Trader(T), Side::Buy, 10_000_000))
+        .unwrap();
+    assert_eq!(p.status, OrderStatus::Cancelled);
+    assert!(p.remaining > 0);
+    assert!(p.trades.iter().all(|t| t.price_cents <= r * 105 / 100 + 1));
+    assert!(p.trades.iter().all(|t| t.maker.owner == Owner::Synthetic));
+}
+
+#[test]
+fn flow_direction_follows_the_return() {
+    let mut ex = exchange(6);
+    let mut agree = 0u64;
+    let mut total = 0u64;
+    let mut prev = ex.reference_cents();
+    for _ in 0..20_000 {
+        let rep = ex.step();
+        let up = rep.tick.price_cents > prev;
+        let down = rep.tick.price_cents < prev;
+        prev = rep.tick.price_cents;
+        for t in &rep.trades {
+            if up || down {
+                total += t.qty;
+                if (t.taker_side == Side::Buy) == up {
+                    agree += t.qty;
+                }
+            }
+        }
+    }
+    let share = agree as f64 / total as f64;
+    assert!(share > 0.7, "only {share:.2} of volume followed the return");
+}
+
+#[test]
+fn same_inputs_same_outputs() {
+    let run = || {
+        let mut ex = exchange(77);
+        let mut acc = Vec::new();
+        for i in 0..2_000 {
+            if i % 97 == 0 {
+                let r = ex.reference_cents();
+                let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+                ex.submit(Order::limit(Owner::Trader(T), side, r, 300))
+                    .unwrap();
+                ex.submit(Order::market(Owner::Trader(OTHER), side.opposite(), 5_000))
+                    .unwrap();
+            }
+            let rep = ex.step();
+            acc.push((rep.tick, rep.trades.len(), rep.impact.to_bits()));
+        }
+        acc
+    };
+    assert_eq!(run(), run());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn exchange_round_trips_through_serde() {
+    let mut ex = exchange(21);
+    for _ in 0..500 {
+        ex.step();
+    }
+    let r = ex.reference_cents();
+    ex.submit(Order::limit(Owner::Trader(T), Side::Buy, r - 50, 1_000))
+        .unwrap();
+    ex.submit(Order::market(Owner::Trader(T), Side::Buy, 3_000))
+        .unwrap();
+    let json = serde_json::to_string(&ex).unwrap();
+    let mut back: Exchange = serde_json::from_str(&json).unwrap();
+    let bytes = postcard::to_allocvec(&ex).unwrap();
+    let mut back2: Exchange = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(back.book(), ex.book());
+    assert_eq!(back.pending_flow(), ex.pending_flow());
+    for _ in 0..2_000 {
+        let a = ex.step();
+        let b = back.step();
+        let c = back2.step();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+    let mut bad: serde_json::Value = serde_json::from_str(&json).unwrap();
+    bad["version"] = serde_json::json!(99);
+    assert!(serde_json::from_value::<Exchange>(bad).is_err());
+}
