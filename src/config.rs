@@ -28,6 +28,8 @@ pub struct Config {
     pub fundamental_speed: f64,
     /// GARCH(1,1) volatility clustering.
     pub garch: GarchParams,
+    /// Random Merton-style jumps.
+    pub jumps: JumpParams,
     /// Wall time between ticks. Whole milliseconds, `[1 ms, 1 day]`.
     pub tick: Duration,
     /// Timestamp of the first tick.
@@ -43,6 +45,7 @@ impl Default for Config {
             mean_reversion_speed: 50.0,
             fundamental_speed: 36.0,
             garch: GarchParams::default(),
+            jumps: JumpParams::default(),
             tick: Duration::from_secs(1),
             start_ts: Timestamp(0),
         }
@@ -125,6 +128,43 @@ impl GarchParams {
             });
         }
         Ok(())
+    }
+}
+
+/// Poisson jumps on the log-spread. Like all shocks they revert toward the
+/// fundamental. No drift compensator is applied.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct JumpParams {
+    /// Expected jumps per year, `λ`. `[0, 10^4]`.
+    pub intensity: f64,
+    /// Mean log-jump size, `μ_J`. `[-1, 1]`.
+    pub mean: f64,
+    /// Std of the log-jump size, `σ_J`. `[0, 1]`.
+    pub std: f64,
+}
+
+impl Default for JumpParams {
+    fn default() -> Self {
+        Self {
+            intensity: 100.0,
+            mean: -0.005,
+            std: 0.03,
+        }
+    }
+}
+
+impl JumpParams {
+    fn validate(&self) -> Result<(), ConfigError> {
+        check_range(
+            "jumps.intensity",
+            self.intensity,
+            0.0,
+            1e4,
+            "must be in [0, 10^4] per year",
+        )?;
+        check_range("jumps.mean", self.mean, -1.0, 1.0, "must be in [-1, 1]")?;
+        check_range("jumps.std", self.std, 0.0, 1.0, "must be in [0, 1]")
     }
 }
 
@@ -223,6 +263,7 @@ impl Config {
             }
         }
         self.garch.validate(self.tick)?;
+        self.jumps.validate()?;
         Ok(())
     }
 }

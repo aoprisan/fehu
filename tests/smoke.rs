@@ -1,5 +1,5 @@
 use core::time::Duration;
-use fehu::{Config, GarchParams, Simulator, Timestamp};
+use fehu::{Config, GarchParams, JumpParams, Simulator, Timestamp};
 
 #[test]
 fn ticks_advance_time_and_stay_positive() {
@@ -28,6 +28,10 @@ fn same_seed_same_series() {
 fn price_tracks_fundamental_input() {
     let cfg = Config {
         volatility: 0.0,
+        jumps: JumpParams {
+            intensity: 0.0,
+            ..JumpParams::default()
+        },
         tick: Duration::from_secs(3600),
         garch: GarchParams {
             variance_half_life: Duration::from_secs(30 * 86_400),

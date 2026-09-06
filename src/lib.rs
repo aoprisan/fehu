@@ -26,10 +26,12 @@ extern crate alloc;
 extern crate std;
 
 mod config;
+mod event;
 mod math;
 mod sim;
 mod time;
 
-pub use config::{Config, ConfigError, GarchParams};
+pub use config::{Config, ConfigError, GarchParams, JumpParams};
+pub use event::{Event, EventError, EventKind};
 pub use sim::{STATE_VERSION, Simulator, Snapshot, Tick};
 pub use time::Timestamp;
