@@ -12,8 +12,9 @@ use fehu::{
 use serde::Serialize;
 use tokio::sync::broadcast;
 
+use crate::account::{Account, AccountId, MoneyError, User, UserId};
 use crate::events::EventRecord;
-use crate::trading::{BookDto, FillRecord, MAX_CASH_CENTS, TradeDto, Trader};
+use crate::trading::{BookDto, FillRecord, TradeDto, Trader};
 
 /// Milliseconds in one day.
 pub const DAY_MS: i64 = 86_400_000;
@@ -415,16 +416,22 @@ impl SymbolState {
     }
 }
 
-/// Everything behind the mutex: the symbols, the traders and the event log.
+/// Everything behind the mutex: the symbols, the users, their accounts and
+/// traders, and the event log.
 pub struct Market {
     pub symbols: Vec<SymbolState>,
     /// Most recent events, oldest first.
     pub events: VecDeque<EventRecord>,
     event_cap: usize,
     next_event_id: u64,
+    pub users: BTreeMap<UserId, User>,
+    next_user_id: u64,
+    pub accounts: BTreeMap<AccountId, Account>,
+    next_account_id: u64,
     pub traders: BTreeMap<TraderId, Trader>,
     next_trader_id: u64,
     fill_log: usize,
+    ledger_log: usize,
 }
 
 impl Market {
@@ -435,18 +442,106 @@ impl Market {
             .position(|s| s.info.symbol.eq_ignore_ascii_case(ticker))
     }
 
-    /// Create a trader with `cash_cents` (clamped to `[0, 10^15]`).
-    pub fn create_trader(&mut self, name: Option<String>, cash_cents: i64, now_ms: i64) -> &Trader {
+    /// Register a user. `name` and `email` are trimmed and truncated; an
+    /// empty name becomes `user-{id}`.
+    pub fn create_user(
+        &mut self,
+        name: Option<String>,
+        email: Option<String>,
+        now_ms: i64,
+    ) -> UserId {
+        let id = UserId(self.next_user_id);
+        self.next_user_id += 1;
+        let user = User {
+            id,
+            name: clean(name, 64).unwrap_or_else(|| format!("user-{}", id.0)),
+            email: clean(email, 254),
+            created_at_ms: now_ms,
+            accounts: Vec::new(),
+        };
+        self.users.insert(id, user);
+        id
+    }
+
+    /// Open an account for `user_id` with an opening balance of
+    /// `cash_cents`. The user must exist and the balance must be a
+    /// non-negative number of cents no larger than the balance cap.
+    pub fn open_account(
+        &mut self,
+        user_id: UserId,
+        name: Option<String>,
+        cash_cents: i64,
+        now_ms: i64,
+    ) -> Result<AccountId, MoneyError> {
+        debug_assert!(self.users.contains_key(&user_id), "unknown user");
+        let id = AccountId(self.next_account_id);
+        let account = Account::open(
+            id,
+            user_id,
+            clean(name, 64).unwrap_or_else(|| format!("account-{}", id.0)),
+            cash_cents,
+            self.ledger_log,
+            now_ms,
+        )?;
+        self.next_account_id += 1;
+        self.accounts.insert(id, account);
+        if let Some(user) = self.users.get_mut(&user_id) {
+            user.accounts.push(id);
+        }
+        Ok(id)
+    }
+
+    /// Create a trader for `user_id` that trades on `account_id`.
+    pub fn create_trader(
+        &mut self,
+        user_id: UserId,
+        account_id: AccountId,
+        name: Option<String>,
+        now_ms: i64,
+    ) -> TraderId {
         let id = TraderId(self.next_trader_id);
         self.next_trader_id += 1;
-        let name = name
-            .map(|n| n.trim().chars().take(64).collect::<String>())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| format!("trader-{}", id.0));
-        let cash = cash_cents.clamp(0, MAX_CASH_CENTS);
-        self.traders
-            .entry(id)
-            .or_insert_with(|| Trader::new(id, name, cash, self.fill_log, now_ms))
+        let name = clean(name, 64).unwrap_or_else(|| format!("trader-{}", id.0));
+        self.traders.insert(
+            id,
+            Trader::new(id, user_id, account_id, name, self.fill_log, now_ms),
+        );
+        id
+    }
+
+    /// The one-call sign-up behind `POST /api/traders`: a user, an account
+    /// funded with `cash_cents`, and a trader that trades on it.
+    pub fn sign_up(
+        &mut self,
+        name: Option<String>,
+        email: Option<String>,
+        cash_cents: i64,
+        now_ms: i64,
+    ) -> Result<TraderId, MoneyError> {
+        let user = self.create_user(name.clone(), email, now_ms);
+        let account = self.open_account(user, name.clone(), cash_cents, now_ms)?;
+        Ok(self.create_trader(user, account, name, now_ms))
+    }
+
+    /// The account a trader trades on.
+    pub fn account_of(&self, trader: TraderId) -> Option<&Account> {
+        let t = self.traders.get(&trader)?;
+        self.accounts.get(&t.account_id)
+    }
+
+    /// The trader that trades on `account`, if there is one.
+    pub fn trader_on(&self, account: AccountId) -> Option<&Trader> {
+        self.traders.values().find(|t| t.account_id == account)
+    }
+
+    /// A trader and its account, both mutable.
+    pub fn trader_and_account(&mut self, trader: TraderId) -> Option<(&mut Trader, &mut Account)> {
+        let Self {
+            traders, accounts, ..
+        } = self;
+        let t = traders.get_mut(&trader)?;
+        let a = accounts.get_mut(&t.account_id)?;
+        Some((t, a))
     }
 
     /// Book every trade in `trades` (for symbol `sym`) to the traders
@@ -459,8 +554,8 @@ impl Market {
                 parties[1] = None;
             }
             for id in parties.into_iter().flatten() {
-                if let Some(trader) = self.traders.get_mut(&id) {
-                    fills.extend(trader.apply_trade(sym, t));
+                if let Some((trader, account)) = self.trader_and_account(id) {
+                    fills.extend(trader.apply_trade(account, sym, t));
                 }
             }
         }
@@ -615,7 +710,10 @@ pub struct Options {
     pub tape_len: usize,
     /// Fills retained per trader. `FEHU_FILL_LOG`.
     pub fill_log: usize,
-    /// Cash a new trader starts with, in cents. `FEHU_STARTING_CASH_CENTS`.
+    /// Ledger entries retained per account. `FEHU_LEDGER_LOG`.
+    pub ledger_log: usize,
+    /// Cash a new account is opened with, in cents.
+    /// `FEHU_STARTING_CASH_CENTS`.
     pub starting_cash_cents: i64,
 }
 
@@ -630,6 +728,7 @@ impl Default for Options {
             event_log: 500,
             tape_len: 2_000,
             fill_log: 500,
+            ledger_log: 500,
             starting_cash_cents: 10_000_000,
         }
     }
@@ -650,6 +749,7 @@ impl Options {
             event_log: env_parse("FEHU_EVENT_LOG", d.event_log),
             tape_len: env_parse("FEHU_TAPE", d.tape_len),
             fill_log: env_parse("FEHU_FILL_LOG", d.fill_log),
+            ledger_log: env_parse("FEHU_LEDGER_LOG", d.ledger_log),
             starting_cash_cents: env_parse("FEHU_STARTING_CASH_CENTS", d.starting_cash_cents),
         }
     }
@@ -660,6 +760,14 @@ fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Trim a user-supplied name, cap it at `max` characters, and treat an
+/// empty result as absent.
+fn clean(value: Option<String>, max: usize) -> Option<String> {
+    value
+        .map(|v| v.trim().chars().take(max).collect::<String>())
+        .filter(|v| !v.is_empty())
 }
 
 /// Milliseconds since the Unix epoch on the wall clock.
@@ -709,9 +817,14 @@ impl App {
                 events: VecDeque::new(),
                 event_cap: options.event_log.max(1),
                 next_event_id: 1,
+                users: BTreeMap::new(),
+                next_user_id: 1,
+                accounts: BTreeMap::new(),
+                next_account_id: 1,
                 traders: BTreeMap::new(),
                 next_trader_id: 1,
                 fill_log: options.fill_log,
+                ledger_log: options.ledger_log,
             }),
             tx,
             options,

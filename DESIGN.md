@@ -919,16 +919,20 @@ pending flow. Cost: re-quoting is ~40 `BTreeMap` operations per tick, so
 simulator (hence the warm-up shortcut above). If that ever matters, the
 ladder could live in a fixed array merged into matching instead of the map.
 
-Accounts (cash, reservations for resting orders, no shorting) live in the
-web app (`webapp/src/trading.rs`), not the crate: they are game rules.
-`Position` is in the crate because every consumer needs the same
-average-cost arithmetic.
+Users, accounts (cash, reservations for resting orders, no shorting) and the
+cash ledger live in the web app (`webapp/src/account.rs` and
+`webapp/src/trading.rs`), not the crate: they are game rules. `Position` is
+in the crate because every consumer needs the same average-cost arithmetic.
 
 ### 14.7 Web app
 
 Per symbol the `SymbolState` now owns an `Exchange` and a bounded tape.
 New endpoints: `POST /api/traders`, `GET /api/traders[/{id}]`,
-`POST /api/traders/{id}/cancel_all`, `POST|GET /api/symbols/{s}/orders`,
+`POST /api/traders/{id}/cancel_all`, `POST /api/traders/{id}/deposit`,
+`POST|GET /api/users`, `GET /api/users/{id}`,
+`POST|GET /api/users/{id}/accounts`, `GET /api/accounts[/{id}]`,
+`POST /api/accounts/{id}/deposit|withdraw|status`,
+`GET /api/accounts/{id}/ledger|validate`, `POST|GET /api/symbols/{s}/orders`,
 `GET|DELETE /api/symbols/{s}/orders/{id}`, `GET /api/symbols/{s}/book`,
 `GET /api/symbols/{s}/trades`. The `tick` stream message carries the best
 bid/ask, the top of the book and the step's prints; `fill` messages report
@@ -936,7 +940,40 @@ a trader's executions. The UI gains a book ladder, an order ticket, the
 account and open orders, a tape, and fill markers on the chart. The four
 seeded symbols differ in liquidity: NBLA is thin and wide, PXCO deep.
 
-### 14.8 Tests
+### 14.8 Users, accounts and money
+
+Money is modelled in three pieces, in `webapp/src/account.rs`:
+
+* A **user** is the person: a name, an optional email, and the accounts
+  opened for them.
+* An **account** holds the money: a balance, the part of it reserved for
+  resting buy orders, a status (`active` / `frozen` / `closed`), and a
+  bounded ledger — one entry per movement (`open`, `deposit`, `withdrawal`,
+  `buy`, `sell`) carrying the signed amount and the balance after it.
+* A **trader** (`webapp/src/trading.rs`) is the market-facing identity. It
+  keeps positions, share reservations and fills, and trades on exactly one
+  account; several traders may share one, and one user may have several.
+
+Every amount is an `i64` count of cents. There is no floating point in the
+money path, formatting included (`account::money` divides by 100 and prints
+the remainder), and `notional_cents` does `price × qty` in `i128` before
+clamping back, so a game-sized order cannot overflow a balance. Amounts must
+be positive, a balance is capped at `MAX_BALANCE_CENTS` (10^15 cents) and
+`Account::issues` lists any invariant that is nonetheless broken — a
+negative balance, or more reserved than held — which
+`GET /api/accounts/{id}/validate` reports.
+
+An order is validated against its account *before* it reaches the exchange:
+`Account::authorise` refuses it unless the account is active and its
+available balance (`balance − reserved`) covers the worst case — `qty ×
+price` for a limit, the ladder-walk preview for a market order — and sells
+additionally need free shares. What rests reserves cash on the account; what
+fills settles through it, so every cent that moves is on the ledger and the
+sum of the entries is the balance. Cancels release the reservation, and
+reserved cash can be neither withdrawn nor closed out from under a resting
+order.
+
+### 14.9 Tests
 
 `tests/trading.rs`: book priority/partial fills/IOC/FOK/cancel/preview; the
 no-trader invariant against the bare simulator for 20 k ticks; ladder
@@ -948,4 +985,9 @@ trader-to-trader trades leave the reference alone; ownership on cancel;
 market-order collar; flow direction follows the return (> 70 % of volume);
 determinism with interleaved orders; serde round trip (JSON and postcard)
 continuing identically for 2 k ticks. `webapp/tests/api.rs` covers the HTTP
-surface end to end, including reservations and rejections.
+surface end to end, including reservations and rejections; users opening
+accounts and paying money in, the ledger adding up to the balance after a
+fill, refused amounts (zero, negative, over the cap, fractional JSON,
+overdrawn), a frozen account refusing orders and withdrawals while still
+taking deposits, and one user running several traders. `webapp/tests/contract.rs`
+pins the JSON key sets the TypeScript UI is typed against.

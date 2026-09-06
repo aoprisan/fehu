@@ -1,6 +1,8 @@
 /** Typed client for the server's JSON endpoints. */
 
 import type {
+  AccountCheck,
+  AccountDto,
   ApiErrorBody,
   BarsResponse,
   BookResponse,
@@ -10,6 +12,7 @@ import type {
   EventsResponse,
   GameEventRequest,
   Interval,
+  LedgerResponse,
   OpenOrderDto,
   OrderRequest,
   OrderResponse,
@@ -17,6 +20,7 @@ import type {
   PushEventRequest,
   SymbolsResponse,
   TradesResponse,
+  TransferRequest,
 } from './types.js';
 
 /** A non-2xx response, carrying the server's `error.code` when it sent one. */
@@ -87,7 +91,19 @@ export const api = {
 
   trader: (id: number): Promise<PortfolioDto> => request(`/api/traders/${id}`),
 
-  createTrader: (body: CreateTraderRequest): Promise<PortfolioDto> => send('POST', '/api/traders', body),
+  createTrader: (body: CreateTraderRequest): Promise<PortfolioDto> =>
+    send('POST', '/api/traders', body),
+
+  /** Add money to the account a trader trades on. */
+  deposit: (traderId: number, body: TransferRequest): Promise<PortfolioDto> =>
+    send('POST', `/api/traders/${traderId}/deposit`, body),
+
+  account: (id: number): Promise<AccountDto> => request(`/api/accounts/${id}`),
+
+  ledger: (id: number, limit: number): Promise<LedgerResponse> =>
+    request(`/api/accounts/${id}/ledger?limit=${limit}`),
+
+  validateAccount: (id: number): Promise<AccountCheck> => request(`/api/accounts/${id}/validate`),
 
   submitOrder: (symbol: string, body: OrderRequest): Promise<OrderResponse> =>
     send('POST', `/api/symbols/${enc(symbol)}/orders`, body),

@@ -1,11 +1,14 @@
 //! Sample backend for [`fehu`]: four hardcoded, seeded symbols ticking in
 //! wall-clock time, OHLC bars over HTTP, an SSE tick stream, endpoints
 //! through which a game pushes events into the simulation, and trading:
-//! traders with cash and positions send orders to each symbol's exchange.
+//! users open accounts, pay money into them in integer cents, and their
+//! traders send orders that each account is validated against and settled
+//! through.
 //!
 //! The crate is a library so the router can be exercised in tests; the binary
 //! in `main.rs` wires it to a TCP listener.
 
+pub mod account;
 pub mod api;
 pub mod engine;
 pub mod events;

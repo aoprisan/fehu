@@ -4,6 +4,7 @@
  */
 
 import { api, errorMessage } from './api.js';
+import { fmtPrice } from './format.js';
 import { bucketOf } from './intervals.js';
 import { setOrderStatus, setStatus } from './status.js';
 import { MAX_EVENTS, MAX_LIVE_FILLS, MAX_TAPE, type Store } from './store.js';
@@ -115,6 +116,27 @@ export class Actions {
     try {
       this.#state.trader = await api.trader(trader.id);
       this.#store.emit('trader', 'book');
+    } catch (e) {
+      setOrderStatus(errorMessage(e), true);
+    }
+  }
+
+  /**
+   * Add money to the player's account. The amount arrives here in cents —
+   * the API takes nothing else — and the account is validated server-side,
+   * so a refused deposit shows up as a status line, not as a wrong balance.
+   */
+  async deposit(amountCents: number): Promise<void> {
+    const trader = this.#state.trader;
+    if (trader === null) return;
+    if (!Number.isSafeInteger(amountCents) || amountCents <= 0) {
+      setOrderStatus('deposit: amount must be a positive number of cents', true);
+      return;
+    }
+    try {
+      this.#state.trader = await api.deposit(trader.id, { amount_cents: amountCents });
+      this.#store.emit('trader');
+      setOrderStatus(`deposited ${fmtPrice(amountCents)}`);
     } catch (e) {
       setOrderStatus(errorMessage(e), true);
     }

@@ -6,7 +6,8 @@
 //!
 //! Environment: `FEHU_BIND` (default `0.0.0.0:3000`), `FEHU_TIME_SCALE`,
 //! `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`, `FEHU_MAX_BARS`, `FEHU_EVENT_LOG`,
-//! `FEHU_TAPE`, `FEHU_FILL_LOG`, `FEHU_STARTING_CASH_CENTS`, `RUST_LOG`.
+//! `FEHU_TAPE`, `FEHU_FILL_LOG`, `FEHU_LEDGER_LOG`, `FEHU_STARTING_CASH_CENTS`,
+//! `RUST_LOG`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
