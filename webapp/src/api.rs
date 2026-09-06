@@ -8,7 +8,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -33,12 +33,20 @@ use crate::trading::{
 
 type AppState = Arc<App>;
 
+/// The UI is built from TypeScript sources in `webapp/ui/` (`just ui`) into
+/// `webapp/static/`, and embedded here so the server is a single binary with
+/// no runtime asset directory and no Node toolchain. Asset names are fixed
+/// rather than content-hashed so they can be named by `include_str!`.
 const INDEX_HTML: &str = include_str!("../static/index.html");
+const APP_JS: &str = include_str!("../static/assets/app.js");
+const APP_CSS: &str = include_str!("../static/assets/app.css");
 
 /// Build the router over a shared [`App`].
 pub fn router(app: AppState) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/assets/app.js", get(app_js))
+        .route("/assets/app.css", get(app_css))
         .route("/api/health", get(health))
         .route("/api/symbols", get(list_symbols))
         .route("/api/symbols/{symbol}", get(get_symbol))
@@ -142,6 +150,27 @@ impl IntoResponse for ApiError {
 
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+/// Embedded asset with its content type. The names are stable across builds,
+/// so revalidate rather than let a browser cache a stale bundle.
+fn asset(content_type: &'static str, body: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn app_js() -> Response {
+    asset("text/javascript; charset=utf-8", APP_JS)
+}
+
+async fn app_css() -> Response {
+    asset("text/css; charset=utf-8", APP_CSS)
 }
 
 #[derive(Serialize)]
