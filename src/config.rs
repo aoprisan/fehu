@@ -30,6 +30,8 @@ pub struct Config {
     pub garch: GarchParams,
     /// Random Merton-style jumps.
     pub jumps: JumpParams,
+    /// How tick volume is derived from returns and the vol regime.
+    pub volume: VolumeParams,
     /// Wall time between ticks. Whole milliseconds, `[1 ms, 1 day]`.
     pub tick: Duration,
     /// Timestamp of the first tick.
@@ -46,6 +48,7 @@ impl Default for Config {
             fundamental_speed: 36.0,
             garch: GarchParams::default(),
             jumps: JumpParams::default(),
+            volume: VolumeParams::default(),
             tick: Duration::from_secs(1),
             start_ts: Timestamp(0),
         }
@@ -168,6 +171,64 @@ impl JumpParams {
     }
 }
 
+/// Volume is derived from each tick's return and the current vol regime:
+///
+/// ```text
+/// E[v] = base_per_day · tick_s / S_day · (σ_t / σ)^vol_exponent
+///        · (1 + return_sensitivity · |r_t| / (σ √dt))
+/// v    = round(E[v] · exp(noise · z − noise² / 2))
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct VolumeParams {
+    /// Shares per trading day in a calm regime. `(0, 10^15]`.
+    pub base_per_day: f64,
+    /// Extra volume per unit of `|r| / tick_std`. `[0, 100]`.
+    pub return_sensitivity: f64,
+    /// Exponent on the vol regime ratio. `[0, 4]`.
+    pub vol_exponent: f64,
+    /// Lognormal noise std on the volume. `[0, 3]`.
+    pub noise: f64,
+}
+
+impl Default for VolumeParams {
+    fn default() -> Self {
+        Self {
+            base_per_day: 1_000_000.0,
+            return_sensitivity: 2.0,
+            vol_exponent: 1.0,
+            noise: 0.5,
+        }
+    }
+}
+
+impl VolumeParams {
+    fn validate(&self) -> Result<(), ConfigError> {
+        check_finite("volume.base_per_day", self.base_per_day)?;
+        if self.base_per_day <= 0.0 || self.base_per_day > 1e15 {
+            return Err(ConfigError::OutOfRange {
+                field: "volume.base_per_day",
+                reason: "must be in (0, 10^15]",
+            });
+        }
+        check_range(
+            "volume.return_sensitivity",
+            self.return_sensitivity,
+            0.0,
+            100.0,
+            "must be in [0, 100]",
+        )?;
+        check_range(
+            "volume.vol_exponent",
+            self.vol_exponent,
+            0.0,
+            4.0,
+            "must be in [0, 4]",
+        )?;
+        check_range("volume.noise", self.noise, 0.0, 3.0, "must be in [0, 3]")
+    }
+}
+
 /// Why a [`Config`] was rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -264,6 +325,7 @@ impl Config {
         }
         self.garch.validate(self.tick)?;
         self.jumps.validate()?;
+        self.volume.validate()?;
         Ok(())
     }
 }
@@ -290,6 +352,8 @@ pub(crate) struct Derived {
     pub omega: f64,
     /// Unconditional per-tick variance `σ² dt`.
     pub var_unc: f64,
+    /// Expected volume of a regular tick in a calm regime.
+    pub base_tick_volume: f64,
 }
 
 impl Derived {
@@ -312,6 +376,7 @@ impl Derived {
             beta,
             omega: q * var_unc,
             var_unc,
+            base_tick_volume: cfg.volume.base_per_day * tick_secs / 86_400.0,
         })
     }
 }

@@ -39,6 +39,11 @@ pub(crate) fn sqrt(x: f64) -> f64 {
 }
 
 #[inline]
+pub(crate) fn pow(x: f64, y: f64) -> f64 {
+    libm::pow(x, y)
+}
+
+#[inline]
 pub(crate) fn round(x: f64) -> f64 {
     libm::round(x)
 }

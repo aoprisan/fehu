@@ -1,1 +1,1 @@
-/home/user/fehu/target/release/examples/dump: /home/user/fehu/examples/dump.rs /home/user/fehu/src/config.rs /home/user/fehu/src/event.rs /home/user/fehu/src/lib.rs /home/user/fehu/src/math.rs /home/user/fehu/src/sim.rs /home/user/fehu/src/time.rs
+/home/user/fehu/target/release/examples/dump: /home/user/fehu/examples/dump.rs /home/user/fehu/src/candles.rs /home/user/fehu/src/config.rs /home/user/fehu/src/event.rs /home/user/fehu/src/lib.rs /home/user/fehu/src/math.rs /home/user/fehu/src/sim.rs /home/user/fehu/src/time.rs

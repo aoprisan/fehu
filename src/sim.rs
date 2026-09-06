@@ -8,9 +8,10 @@ use core::time::Duration;
 use rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
 
+use crate::candles::{Candle, CandleBuilder, Interval};
 use crate::config::{Config, ConfigError, Derived};
 use crate::event::{Decaying, Event, EventError, EventKind, PRUNE_BELOW, Queued};
-use crate::math::{self, exp, expm1, ln, ln_1p, round, sqrt};
+use crate::math::{self, exp, expm1, ln, ln_1p, pow, round, sqrt};
 use crate::time::Timestamp;
 
 /// Version of the state layout and RNG draw order. Bumped whenever either
@@ -86,6 +87,8 @@ pub struct Simulator {
     pending: BinaryHeap<Reverse<Queued>>,
     /// Sequence number for the next pushed event.
     next_seq: u64,
+    /// In-progress bars for the candle-stream API, one per `Interval`.
+    candle_cursor: [CandleBuilder; 4],
 }
 
 impl Simulator {
@@ -113,6 +116,7 @@ impl Simulator {
             vol_effects: Vec::new(),
             pending: BinaryHeap::new(),
             next_seq: 0,
+            candle_cursor: Interval::ALL.map(CandleBuilder::new),
         })
     }
 
@@ -201,6 +205,39 @@ impl Simulator {
         core::iter::from_fn(move || (self.next_ts <= self.clock).then(|| self.step()))
     }
 
+    /// Run ticks internally and yield each candle of `iv` as it closes. The
+    /// stream is endless; the in-progress bar is kept across calls, so it is
+    /// bit-identical to aggregating [`step`](Self::step) output by hand.
+    pub fn candles(&mut self, iv: Interval) -> impl Iterator<Item = Candle> + '_ {
+        core::iter::from_fn(move || {
+            loop {
+                let tick = self.step();
+                if let Some(c) = self.candle_cursor[iv as usize].push(&tick) {
+                    return Some(c);
+                }
+            }
+        })
+    }
+
+    /// Advance wall time by `dur` and yield the candles of `iv` that close
+    /// within it. The partially built last bar is kept for the next call.
+    pub fn advance_candles(
+        &mut self,
+        dur: Duration,
+        iv: Interval,
+    ) -> impl Iterator<Item = Candle> + '_ {
+        self.clock = self.clock + dur;
+        core::iter::from_fn(move || {
+            while self.next_ts <= self.clock {
+                let tick = self.step();
+                if let Some(c) = self.candle_cursor[iv as usize].push(&tick) {
+                    return Some(c);
+                }
+            }
+            None
+        })
+    }
+
     /// Emit exactly one tick and move the clock to it.
     pub fn step(&mut self) -> Tick {
         let ts = self.next_ts;
@@ -266,8 +303,12 @@ impl Simulator {
         self.variance = d.omega + d.alpha * self.variance * z * z + d.beta * self.variance;
 
         // 9. Recombine and clamp.
+        let p_old = self.log_price;
         self.log_price = (self.log_fund + spread).clamp(MIN_LOG_PRICE, MAX_LOG_PRICE);
         debug_assert!(self.log_price.is_finite());
+
+        // 10. Volume from |return| and the vol regime.
+        let volume = self.volume(self.log_price - p_old, sigma_t);
 
         // 11. Emit and schedule.
         self.last_ts = Some(ts);
@@ -278,7 +319,36 @@ impl Simulator {
         Tick {
             ts,
             price_cents: cents(self.log_price),
-            volume: 0,
+            volume,
+        }
+    }
+
+    /// Expected volume from the tick's return and vol regime, with lognormal
+    /// noise. Always draws one normal so the RNG stream is config-independent.
+    fn volume(&mut self, ret: f64, sigma_t: f64) -> u64 {
+        let v = self.config.volume;
+        let d = &self.derived;
+        let zv = math::normal(&mut self.rng);
+        let sigma = self.config.volatility;
+        let regime = if sigma > 0.0 {
+            pow(sigma_t / sigma, v.vol_exponent)
+        } else {
+            1.0
+        };
+        let activity = if d.tick_std > 0.0 {
+            1.0 + v.return_sensitivity * ret.abs() / d.tick_std
+        } else {
+            1.0
+        };
+        let expected = d.base_tick_volume * regime * activity;
+        let noisy = expected * exp(v.noise * zv - 0.5 * v.noise * v.noise);
+        let r = round(noisy);
+        if r.is_nan() || r <= 0.0 {
+            0
+        } else if r >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            r as u64
         }
     }
 }
