@@ -64,6 +64,8 @@ pub struct Simulator {
     log_fund: f64,
     /// `f*`, the fundamental's target.
     log_fund_target: f64,
+    /// GARCH per-tick variance `h`.
+    variance: f64,
     /// Effective annualised vol used in the last step (for `Snapshot`).
     last_vol: f64,
 }
@@ -79,6 +81,7 @@ impl Simulator {
         let start = config.start_ts;
         Ok(Self {
             last_vol: config.volatility,
+            variance: derived.var_unc,
             config,
             derived,
             rng: Xoshiro256PlusPlus::seed_from_u64(seed),
@@ -148,8 +151,8 @@ impl Simulator {
         let relax = -expm1(-self.config.fundamental_speed * delta);
         self.log_fund += (self.log_fund_target - self.log_fund) * relax;
 
-        // 5. Effective vol.
-        let sigma_t = self.config.volatility;
+        // 5. Effective vol from the GARCH variance.
+        let sigma_t = sqrt(self.variance / self.derived.dt);
         self.last_vol = sigma_t;
 
         // 6. Exact OU step on the spread.
@@ -157,6 +160,10 @@ impl Simulator {
         let z = math::normal(&mut self.rng);
         let ou_std = sigma_t * sqrt(-expm1(-2.0 * theta * delta) / (2.0 * theta));
         let spread = spread * exp(-theta * delta) + ou_std * z;
+
+        // 8. GARCH update on the standardised diffusive shock.
+        let d = &self.derived;
+        self.variance = d.omega + d.alpha * self.variance * z * z + d.beta * self.variance;
 
         // 9. Recombine and clamp.
         self.log_price = (self.log_fund + spread).clamp(MIN_LOG_PRICE, MAX_LOG_PRICE);

@@ -1,5 +1,5 @@
 use core::time::Duration;
-use fehu::{Config, Simulator, Timestamp};
+use fehu::{Config, GarchParams, Simulator, Timestamp};
 
 #[test]
 fn ticks_advance_time_and_stay_positive() {
@@ -29,6 +29,10 @@ fn price_tracks_fundamental_input() {
     let cfg = Config {
         volatility: 0.0,
         tick: Duration::from_secs(3600),
+        garch: GarchParams {
+            variance_half_life: Duration::from_secs(30 * 86_400),
+            ..GarchParams::default()
+        },
         ..Config::default()
     };
     let mut sim = Simulator::new(cfg, 0).unwrap();
@@ -46,4 +50,19 @@ fn price_tracks_fundamental_input() {
         "price {} expected {expected}",
         last.price_cents
     );
+}
+
+#[test]
+fn garch_variance_has_the_configured_mean() {
+    // Mean of the effective annualised variance over a long run ≈ σ².
+    let mut sim = Simulator::new(Config::default(), 5).unwrap();
+    let n = 2_000_000;
+    let mut acc = 0.0;
+    for _ in 0..n {
+        sim.step();
+        let v = sim.snapshot().annual_vol;
+        acc += v * v;
+    }
+    let mean_var = acc / n as f64;
+    assert!((mean_var - 0.16).abs() < 0.03, "mean variance {mean_var}");
 }
