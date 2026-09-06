@@ -165,9 +165,10 @@ Exact discretisation over a step `Δ` (stable for any `Δ`, including gaps):
 
 ```
 s' = s·e^{−θΔ}
-   + Σ_i a_i (1 − e^{−λ_i Δ}) / λ_i        exact integral of each decaying drift effect
-   + σ_t · sqrt((1 − e^{−2θΔ}) / (2θ)) · z  OU noise (→ σ_t·sqrtΔ as θΔ → 0)
-   + Σ_k J_k                                jumps in this step
+   + Σ_i a_i (e^{−λ_i Δ} − e^{−θΔ}) / (θ − λ_i)   exact solution of ds = −θs dt + a e^{−λt} dt
+                                                (a_i Δ e^{−θΔ} when θ ≈ λ_i)
+   + σ_t · sqrt((1 − e^{−2θΔ}) / (2θ)) · z       OU noise (→ σ_t·sqrtΔ as θΔ → 0)
+   + Σ_k J_k                                     jumps in this step
 p' = f' + s'
 ```
 
@@ -246,6 +247,10 @@ uniform is exceeded), then `N` draws `J_k ~ N(μ_J, σ_J²)` added to `s`. No
 compensator is applied: jumps sit on the spread and revert, so they do not bias
 long-run growth. `λ · Δ ≤ 30` is guaranteed by the validated ranges.
 
+`Config::volatility` is the *diffusive* vol. Total short-horizon variance is
+`σ² + λ (μ_J² + σ_J²)`; with defaults `0.16 + 0.0925`, i.e. realised annualised
+vol ≈ 0.50 rather than 0.40. Set `intensity = 0` to make them coincide.
+
 ### 4.5 Events and decay
 
 ```rust
@@ -271,13 +276,14 @@ pub enum EventKind {
   and are stored as a list `(amplitude, λ = ln2 / h_secs)`; each step multiplies
   every amplitude by `e^{−λ m}` (`m` = the step's model-seconds) and prunes
   `|a| < 1e-12`. Cost is O(active effects) per tick.
-- Drift shifts enter the spread through their exact integral over the step
-  (§4.2). A shift of `delta` with half-life `h` (years) moves `ln P` by a total
-  of `delta · h / ln2` if `θ` were zero; with reversion the closed form is
-  `s(t) = delta · (e^{−λt} − e^{−θt}) / (θ − λ)`, peaking at
-  `t* = ln(θ/λ) / (θ − λ)`. Helper `EventKind::drift_for_total_move(total, half_life)`
-  computes `delta = total · ln2 / h` so game code can think in "move 5 % over
-  about an hour".
+- Drift shifts enter the spread through the exact solution of the forced OU
+  equation over the step (§4.2), so the discrete series matches the closed
+  form `s(t) = delta · (e^{−λt} − e^{−θt}) / (θ − λ)` to floating-point
+  precision; it peaks at `t* = ln(θ/λ) / (θ − λ)`. A shift of `delta` with
+  half-life `h` (years) moves `ln P` by a total of `delta · h / ln2` if `θ`
+  were zero. Helper `EventKind::drift_for_total_move(total, half_life)`
+  computes `delta = total · ln2 / h` (calendar year) so game code can think in
+  "move 5 % over about an hour".
 - Vol shifts add to `σ_t` at the value at the start of the step.
 
 ### 4.6 Overnight gap
@@ -312,6 +318,10 @@ pub struct VolumeParams {
 At the open the gap return is compared with a *regular* tick's std, so the
 opening print naturally carries a few hundred ticks' worth of volume (≈ 1 % of
 the day with defaults for a 1 % gap).
+
+Because `E|r| / (σ√dt) = sqrt(2/π)` for Gaussian ticks, the mean daily volume
+is `base_per_day · (1 + c · sqrt(2/π))` ≈ `2.6 · base_per_day` with defaults
+(`base_per_day` is the volume of a day with no price movement).
 
 ### 4.8 Output and guards
 
@@ -396,29 +406,35 @@ e_theta_tick = e^{−θ dt}, ou_noise_tick = sqrt((1−e^{−2θ dt})/(2θ))   (
 ## 7. State layout (what gets serialised)
 
 ```rust
-pub struct Simulator {
-    version: u32,                  // STATE_VERSION; deserialising a different version is an error
+pub struct Simulator {                // serde(try_from = "SimulatorRepr", into = "SimulatorRepr")
     config: Config,
-    derived: Derived,              // #[serde(skip)], rebuilt on load
-    rng: Xoshiro256PlusPlus,       // 4 × u64
-    clock: Timestamp,              // wall time the simulator has been advanced to
-    next_ts: Timestamp,            // timestamp of the next tick to emit
-    last_ts: Option<Timestamp>,    // to detect a session boundary (gap) and to feed candles
-    log_price: f64,                // p
-    log_fund: f64,                 // f
-    log_fund_target: f64,          // f*
-    variance: f64,                 // h, per-tick GARCH variance
-    drift_effects: Vec<Decaying>,  // { amplitude: f64, lambda: f64 } lambda per model-second
+    derived: Derived,                 // not serialised, rebuilt on load
+    rng: Xoshiro256PlusPlus,          // 4 × u64
+    clock: Timestamp,                 // wall time the simulator has been advanced to
+    next_ts: Timestamp,               // timestamp of the next tick to emit
+    last_ts: Option<Timestamp>,       // detects a session boundary (gap)
+    log_price: f64,                   // p
+    log_fund: f64,                    // f
+    log_fund_target: f64,             // f*
+    variance: f64,                    // h, per-tick GARCH variance
+    last_vol: f64,                    // σ_t of the last step, for Snapshot
+    drift_effects: Vec<Decaying>,     // { amplitude, lambda } lambda per model-second
     vol_effects: Vec<Decaying>,
-    pending: BinaryHeap<Reverse<Queued>>, // Queued { at, seq, kind }
+    pending: BinaryHeap<Reverse<Queued>>, // Queued { at, seq, kind }; a Vec in the repr
     next_seq: u64,
-    candle_cursor: Option<Candles>, // in-progress bars for the candle-stream API (§8.4)
+    candle_cursor: [CandleBuilder; 4], // in-progress bars for the candle-stream API (§8.4)
 }
+
+pub struct SimulatorRepr { pub version: u32, /* the fields above minus `derived` */ }
 ```
 
+`TryFrom<SimulatorRepr>` checks `version == STATE_VERSION`, re-validates the
+config, rebuilds `Derived` and rejects non-finite latent values (`LoadError`).
+
 Everything is plain numbers, so `serde_json`, `postcard`, `bincode` etc. all
-work. Save/load is exact because `f64` serialises losslessly in every format we
-care about (JSON via `serde_json` round-trips `f64` exactly).
+work. Binary formats round-trip `f64` bit-exactly. **JSON needs `serde_json`'s
+`float_roundtrip` feature**; without it a parsed float can be one ulp off, which
+the determinism tests would catch.
 
 `Candles` state is separate (§8.3) and serialisable on its own; the save game
 stores both or rebuilds candles from stored ticks.
@@ -430,15 +446,19 @@ stores both or rebuilds candles from stored ticks.
 ### 8.1 Types
 
 ```rust
-pub struct Timestamp(pub i64);            // ms since epoch, UTC; + Duration → Timestamp
+pub struct Timestamp(pub i64);            // ms since epoch, UTC; ± Duration, Timestamp − Timestamp → ms
 pub struct Tick { pub ts: Timestamp, pub price_cents: i64, pub volume: u64 }
 pub struct Config { ... §6 ... }          // impl Default; fn validate(&self)
 pub struct Event { pub at: Timestamp, pub kind: EventKind }
 pub enum EventKind { Jump(f64), DriftShift{..}, VolShift{..}, FundamentalShift(f64) }
-pub enum ConfigError { .. }               // Display; std::error::Error under "std"
+pub enum ConfigError { NotFinite { field }, OutOfRange { field, reason } }  // #[non_exhaustive]
+pub enum EventError  { NotFinite, JumpBelowMinusOne, ZeroHalfLife }       // from push_event
+pub enum LoadError   { VersionMismatch { found, expected }, Config(ConfigError), Corrupt }
+// all implement Display, and std::error::Error under "std"
 pub struct Snapshot {                     // read-only view of latent state, for tests/UI
     pub ts: Timestamp, pub price_cents: i64, pub fundamental_cents: i64,
     pub log_spread: f64, pub annual_vol: f64, pub drift_effect: f64, pub vol_effect: f64,
+    pub pending_events: usize,
 }
 ```
 
@@ -450,9 +470,10 @@ impl Simulator {
     pub fn config(&self) -> &Config;
     pub fn step(&mut self) -> Tick;                                   // exactly one tick
     pub fn advance(&mut self, dur: Duration) -> impl Iterator<Item = Tick> + '_;
-    pub fn push_event(&mut self, event: Event);
+    pub fn push_event(&mut self, event: Event) -> Result<(), EventError>;
     pub fn set_fundamental_input(&mut self, target_cents: i64);        // f* ← ln(target/100)
     pub fn clock(&self) -> Timestamp;
+    pub fn next_tick_ts(&self) -> Timestamp;
     pub fn snapshot(&self) -> Snapshot;
 }
 ```
@@ -461,7 +482,10 @@ impl Simulator {
   `ts ≤ clock`. Dropping the iterator early is safe; the remaining ticks come
   out of the next `advance`/`step`. With market hours a `dur` spanning a closed
   period yields fewer ticks.
-- `step()` always emits the next tick and moves `clock` to it.
+- `advance` is inclusive: a tick at exactly `clock + dur` is emitted.
+- `step()` always emits the next tick and moves `clock` to it (never backwards).
+- `push_event` validates the event (finite magnitudes, `Jump > −1`, positive
+  half-life) and returns `Err` rather than poisoning the state with `NaN`.
 - `set_fundamental_input` takes cents rather than a log level so game code
   never touches logs. A second entry point `set_fundamental_growth(rate)`
   overriding `Config::drift` at runtime is cheap to add if wanted (§13).
@@ -478,9 +502,10 @@ pub struct Candles { .. }
 impl Candles {
     pub fn new(max_per_interval: usize) -> Self;       // ring buffers, oldest evicted
     pub fn push(&mut self, tick: &Tick) -> [Option<Candle>; 4]; // candles that just closed
-    pub fn completed(&self, iv: Interval) -> impl Iterator<Item = &Candle>;
+    pub fn completed(&self, iv: Interval) -> impl ExactSizeIterator<Item = &Candle>;
     pub fn current(&self, iv: Interval) -> Option<&Candle>;     // partial, in-progress
 }
+// also: Interval::ALL, Interval::millis(), Interval::bucket(ts)
 ```
 
 Buckets are aligned to epoch multiples of the interval (`open_ts = ts − ts mod
@@ -556,9 +581,9 @@ Integration tests under `tests/`, each fast enough for CI (< ~2 s each):
 | positivity | proptest configs × 5 k ticks: every `price_cents ≥ 1`, finite latent state. Includes adversarial configs (σ = 5, huge negative jumps, `Jump(−0.999)`). |
 | fat tails | 10 days of 1 s ticks → 1 m log returns → sample kurtosis `> 3.5`. |
 | vol clustering | same series: autocorrelation of `|r_1m|` at lags 1..10 all `> 0` (expected ≈ 0.2–0.3, se ≈ 0.008). |
-| mean-reversion half-life | (a) deterministic: `σ = 0, λ = 0`, `Jump(0.10)` at start, tick = 1 min; time for spread to fall below 0.05 equals `ln2/θ` ± 1 tick. (b) stochastic: tick = 1 h, `θ = 500`, 20 k ticks, AR(1) fit of the spread → `θ̂` within 25 %. |
-| events | with `σ = 0, λ = 0`: `Jump(p)` → next price `= P·(1+p)` within 1 cent, then decays; `FundamentalShift(δ)` → after 100 half-lives price `= P e^δ` within 0.1 %; `DriftShift` → series matches closed form §4.5 within 1e-6 relative; `VolShift` (stochastic) → realised vol in the first half-life window vs a control run ratio within 15 % of the analytic average `(σ + δ·(1−½)/ln2)/σ`. |
-| save/load | run 5 k ticks, serialise to JSON (and `postcard` if cheap), deserialise, run both 5 k more → identical. Also `Candles`. |
+| mean-reversion half-life | (a) deterministic: `σ = 0, λ = 0`, `Jump(0.10)` at start, tick = 1 min; time for the log-spread to halve equals `ln2/θ` ± 1 tick. (b) stochastic: tick = 1 h, `θ = 500`, 20 k ticks, AR(1) fit of the spread → `θ̂` within 25 %. |
+| events | with `σ = 0, λ = 0`: `Jump(p)` → next price `= P·(1+p)` within 1 cent, then reverts; `FundamentalShift(δ)` → after many half-lives price `= P e^δ` within 0.1 %; `DriftShift` → series matches the closed form §4.5 within 1e-9; `drift_for_total_move` integrates to `total`; `VolShift` (stochastic, same seed vs control) → realised-vol ratio within 5 % of `sqrt(mean σ_t²)/σ`; superposition and pruning; push order at equal timestamps; invalid events rejected. |
+| save/load | run under market hours with pending events, effects and a partial candle; JSON (`float_roundtrip`) and `postcard` round trips continue identically for 30 k ticks; `Candles` round-trips; wrong `STATE_VERSION` and invalid config are rejected. |
 | market hours | ticks only inside sessions; first tick of a day carries the gap; per-day tick count `= S / tick`; weekend skipped; realised annualised vol over 60 sessions within 15 % of `σ`. |
 | candles | hand-built ticks → OHLCV correct, bucket alignment, eviction at `max_per_interval`. |
 | config fuzzing | proptest: random fields in-range → `validate` Ok and 1 k ticks run; out-of-range → `Err` naming that field. |
@@ -572,12 +597,18 @@ Statistical tests use fixed seeds so they never flake.
 `justfile`
 
 ```
-build   cargo build --all-features && cargo build --no-default-features
+build   cargo build --all-features; --no-default-features; --no-default-features --features serde
 test    cargo test --all-features && cargo test --no-default-features --tests
-lint    cargo fmt --all -- --check && cargo clippy --all-targets --all-features -- -D warnings
-bench   cargo bench --bench ticks         (criterion: ticks/sec for default config, with and without market hours)
-wasm    rustup target add wasm32-unknown-unknown && cargo build --target wasm32-unknown-unknown --no-default-features --features serde
+lint    cargo fmt --all -- --check && cargo clippy --all-targets (all-features and no-default-features) -- -D warnings
+bench   cargo bench --bench ticks         (criterion: ticks/sec default, market hours, advance + candles)
+wasm    rustup target add wasm32-unknown-unknown && cargo build --release --target wasm32-unknown-unknown --no-default-features [--features serde]
+dump    cargo run --release --example dump -- OUT_DIR SEED
+ci      lint build test wasm
 ```
+
+Measured on the development container: ≈ 5 M ticks/s in the bench, and the
+example writes a year of 1 s ticks (31.5 M rows) plus daily candles in ≈ 13 s
+including CSV output.
 
 `examples/dump.rs` (requires `std`): default config, seed from argv, writes
 `ticks.csv` (`ts,price_cents,volume`, one year of 1 s ticks ≈ 31.5 M rows) and
@@ -589,7 +620,7 @@ core price process → GARCH → events → candles & volume → market hours �
 
 ---
 
-## 13. Decisions to confirm
+## 13. Decisions (confirmed at review)
 
 1. **Extra `Config` fields** beyond the request: `fundamental_speed`, `volume`,
    `start_ts`. All have defaults.
@@ -608,4 +639,7 @@ core price process → GARCH → events → candles & volume → market hours �
 9. **Overnight gap** is one OU step of `Δ_gap = g/(D(1+g))` years merged into the
    opening tick, with every gap weighted equally.
 10. `set_fundamental_input` takes a **target price in cents**; growth stays in
-    `Config::drift`. Say the word if you would rather feed a growth rate too.
+    `Config::drift`.
+11. Added during implementation: `push_event` returns `Result<(), EventError>`;
+    the drift-shift integral uses the exact forced-OU solution (§4.2); JSON
+    saves need `serde_json/float_roundtrip` for bit-exactness (§7).
