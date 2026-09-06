@@ -7,6 +7,7 @@
 use rand_core::Rng as _;
 use rand_xoshiro::Xoshiro256PlusPlus;
 
+pub(crate) const LN_2: f64 = core::f64::consts::LN_2;
 const TWO_PI: f64 = 2.0 * core::f64::consts::PI;
 const U53: f64 = 1.0 / ((1u64 << 53) as f64);
 

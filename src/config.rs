@@ -3,7 +3,7 @@
 use core::fmt;
 use core::time::Duration;
 
-use crate::math;
+use crate::math::{self, LN_2};
 use crate::time::{Timestamp, whole_millis};
 
 /// Seconds in a calendar year (365.25 days).
@@ -26,6 +26,8 @@ pub struct Config {
     /// Speed `κ_f` at which the fundamental relaxes toward its target, per year.
     /// `[0, 10^5]`; `0` means it only moves through `drift` and shifts.
     pub fundamental_speed: f64,
+    /// GARCH(1,1) volatility clustering.
+    pub garch: GarchParams,
     /// Wall time between ticks. Whole milliseconds, `[1 ms, 1 day]`.
     pub tick: Duration,
     /// Timestamp of the first tick.
@@ -40,9 +42,89 @@ impl Default for Config {
             volatility: 0.40,
             mean_reversion_speed: 50.0,
             fundamental_speed: 36.0,
+            garch: GarchParams::default(),
             tick: Duration::from_secs(1),
             start_ts: Timestamp(0),
         }
+    }
+}
+
+/// GARCH(1,1) variance dynamics in tick-invariant form.
+///
+/// The classic per-tick `(α, β)` are derived for the actual tick from these two
+/// numbers (Nelson's continuous-time limit), so changing `Config::tick` does not
+/// change the behaviour of the vol process. With Gaussian innovations:
+///
+/// - a variance shock decays with half-life `variance_half_life`;
+/// - `Var(h) / E[h]² = r / (1 − r)` where `r = variance_dispersion`;
+/// - returns shorter than the half-life have kurtosis `3 / (1 − r)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GarchParams {
+    /// Half-life of a variance shock, in model time. `[1 s, 1 year]`.
+    pub variance_half_life: Duration,
+    /// Dispersion of the variance regime, `r ∈ [0, 1)`. `0` disables clustering
+    /// (constant variance); `0.5` gives `std(h) = E[h]`.
+    pub variance_dispersion: f64,
+}
+
+impl Default for GarchParams {
+    fn default() -> Self {
+        Self {
+            variance_half_life: Duration::from_secs(3600),
+            variance_dispersion: 0.5,
+        }
+    }
+}
+
+impl GarchParams {
+    /// Classic per-tick coefficients `(α, β)` for a tick of `dt` years, given
+    /// the model-time year length used by the simulator.
+    ///
+    /// `q = ln2 · tick_secs / half_life_secs`, `α = sqrt(r·q)`, `β = 1 − q − α`.
+    #[must_use]
+    pub fn alpha_beta(&self, tick: Duration) -> (f64, f64) {
+        let q = LN_2 * tick.as_secs_f64() / self.variance_half_life.as_secs_f64();
+        let alpha = math::sqrt(self.variance_dispersion * q);
+        (alpha, 1.0 - q - alpha)
+    }
+
+    /// Build from classic per-tick coefficients measured at a given tick.
+    ///
+    /// Inverse of [`alpha_beta`](Self::alpha_beta): `q = 1 − α − β`,
+    /// `r = α² / q`, `half_life = ln2 · tick / q`. Requires `α + β < 1`.
+    #[must_use]
+    pub fn from_alpha_beta(alpha: f64, beta: f64, tick: Duration) -> Self {
+        let q = 1.0 - alpha - beta;
+        Self {
+            variance_half_life: Duration::from_secs_f64(LN_2 * tick.as_secs_f64() / q),
+            variance_dispersion: alpha * alpha / q,
+        }
+    }
+
+    fn validate(&self, tick: Duration) -> Result<(), ConfigError> {
+        let hl = self.variance_half_life.as_secs_f64();
+        if !(1.0..=CALENDAR_YEAR_SECS).contains(&hl) {
+            return Err(ConfigError::OutOfRange {
+                field: "garch.variance_half_life",
+                reason: "must be in [1 s, 1 year]",
+            });
+        }
+        check_finite("garch.variance_dispersion", self.variance_dispersion)?;
+        if self.variance_dispersion < 0.0 || self.variance_dispersion >= 1.0 {
+            return Err(ConfigError::OutOfRange {
+                field: "garch.variance_dispersion",
+                reason: "must be in [0, 1)",
+            });
+        }
+        let (_, beta) = self.alpha_beta(tick);
+        if beta < 0.0 {
+            return Err(ConfigError::OutOfRange {
+                field: "garch.variance_half_life",
+                reason: "tick too coarse for variance_half_life (β < 0)",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -140,6 +222,7 @@ impl Config {
                 });
             }
         }
+        self.garch.validate(self.tick)?;
         Ok(())
     }
 }
@@ -158,6 +241,14 @@ pub(crate) struct Derived {
     pub dt: f64,
     /// Unconditional per-tick return std, `σ √dt`.
     pub tick_std: f64,
+    /// GARCH `α` for the regular tick.
+    pub alpha: f64,
+    /// GARCH `β` for the regular tick.
+    pub beta: f64,
+    /// GARCH `ω` for the regular tick, so that `E[h] = σ² dt`.
+    pub omega: f64,
+    /// Unconditional per-tick variance `σ² dt`.
+    pub var_unc: f64,
 }
 
 impl Derived {
@@ -167,12 +258,19 @@ impl Derived {
         let tick_secs = tick_ms as f64 / 1000.0;
         let year_secs = CALENDAR_YEAR_SECS;
         let dt = tick_secs / year_secs;
+        let (alpha, beta) = cfg.garch.alpha_beta(cfg.tick);
+        let q = 1.0 - alpha - beta;
+        let var_unc = cfg.volatility * cfg.volatility * dt;
         Ok(Self {
             year_secs,
             tick_ms,
             tick_secs,
             dt,
             tick_std: cfg.volatility * math::sqrt(dt),
+            alpha,
+            beta,
+            omega: q * var_unc,
+            var_unc,
         })
     }
 }

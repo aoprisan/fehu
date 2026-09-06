@@ -30,6 +30,6 @@ mod math;
 mod sim;
 mod time;
 
-pub use config::{Config, ConfigError};
+pub use config::{Config, ConfigError, GarchParams};
 pub use sim::{STATE_VERSION, Simulator, Snapshot, Tick};
 pub use time::Timestamp;
