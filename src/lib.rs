@@ -36,4 +36,4 @@ pub use candles::{Candle, Candles, Interval};
 pub use config::{Config, ConfigError, GarchParams, JumpParams, VolumeParams};
 pub use event::{Event, EventError, EventKind};
 pub use sim::{STATE_VERSION, Simulator, Snapshot, Tick};
-pub use time::Timestamp;
+pub use time::{MarketHours, Timestamp};

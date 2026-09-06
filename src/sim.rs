@@ -99,7 +99,10 @@ impl Simulator {
     pub fn new(config: Config, seed: u64) -> Result<Self, ConfigError> {
         let derived = Derived::new(&config)?;
         let log_price = ln(config.start_price_cents as f64 / 100.0);
-        let start = config.start_ts;
+        let start = match &config.market_hours {
+            Some(mh) => mh.align(config.start_ts),
+            None => config.start_ts,
+        };
         Ok(Self {
             last_vol: config.volatility,
             variance: derived.var_unc,
@@ -240,8 +243,18 @@ impl Simulator {
 
     /// Emit exactly one tick and move the clock to it.
     pub fn step(&mut self) -> Tick {
+        // 1. Timestamp and model-time of this step. The first tick of a session
+        //    (after a previous one) also covers the closed period.
         let ts = self.next_ts;
-        let model_secs = self.derived.tick_secs;
+        let gap = self.config.market_hours.is_some()
+            && self
+                .last_ts
+                .is_some_and(|last| ts - last > self.derived.tick_ms);
+        let model_secs = if gap {
+            self.derived.gap_secs + self.derived.tick_secs
+        } else {
+            self.derived.tick_secs
+        };
         let delta = model_secs / self.derived.year_secs;
 
         // 2. Events due now.
@@ -315,7 +328,11 @@ impl Simulator {
         if self.clock < ts {
             self.clock = ts;
         }
-        self.next_ts = Timestamp(ts.0.saturating_add(self.derived.tick_ms));
+        let next = Timestamp(ts.0.saturating_add(self.derived.tick_ms));
+        self.next_ts = match &self.config.market_hours {
+            Some(mh) if !mh.contains(next) => mh.next_open(next),
+            _ => next,
+        };
         Tick {
             ts,
             price_cents: cents(self.log_price),
