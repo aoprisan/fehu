@@ -11,12 +11,12 @@ use rand_xoshiro::Xoshiro256PlusPlus;
 use crate::candles::{Candle, CandleBuilder, Interval};
 use crate::config::{Config, ConfigError, Derived};
 use crate::event::{Decaying, Event, EventError, EventKind, PRUNE_BELOW, Queued};
-use crate::math::{self, exp, expm1, ln, ln_1p, pow, round, sqrt};
+use crate::math::{self, LN_2, exp, expm1, ln, ln_1p, pow, round, sqrt};
 use crate::time::Timestamp;
 
 /// Version of the state layout and RNG draw order. Bumped whenever either
 /// changes; saved states with a different version are rejected on load.
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
 /// Lowest latent price the process can reach: half a cent.
 const MIN_LOG_PRICE: f64 = -5.298_317_366_548_036; // ln(0.005)
@@ -184,10 +184,10 @@ impl Simulator {
         Ok(())
     }
 
-    /// Apply every queued event due at or before `ts`.
-    fn apply_due_events(&mut self, ts: Timestamp) {
+    /// Apply every queued event with `at < before`.
+    fn apply_due_events(&mut self, before: Timestamp) {
         while let Some(Reverse(q)) = self.pending.peek() {
-            if q.at > ts {
+            if q.at >= before {
                 break;
             }
             let Reverse(q) = self.pending.pop().expect("peeked");
@@ -252,6 +252,43 @@ impl Simulator {
         })
     }
 
+    /// **Coarse mode.** Yield candles of `iv` endlessly, taking one latent
+    /// step per candle and synthesising high/low from the Brownian-bridge
+    /// extremum distribution instead of simulating every tick. Years of daily
+    /// history cost one step per day.
+    ///
+    /// The bars are *not* the aggregate of the tick path for the same seed:
+    /// they are a separate, statistically equivalent path (same fundamental,
+    /// mean reversion, jumps, events and vol regime; the intra-bar extremes
+    /// are drawn from the bridge given the endpoints, ignoring reversion
+    /// within the bar). `Candle::ticks` is `0` for coarse bars. The first bar
+    /// may cover only part of its bucket if the simulator is not on a
+    /// boundary; under market hours bars are clipped to the session. Coarse
+    /// and fine stepping may be mixed on one simulator; the state simply
+    /// continues from wherever the last call stopped.
+    pub fn coarse_candles(&mut self, iv: Interval) -> impl Iterator<Item = Candle> + '_ {
+        core::iter::from_fn(move || Some(self.coarse_step(iv)))
+    }
+
+    /// Coarse mode bounded by wall time: yield the coarse bars of `iv` that
+    /// close within `dur`. See [`coarse_candles`](Self::coarse_candles).
+    pub fn advance_coarse(
+        &mut self,
+        dur: Duration,
+        iv: Interval,
+    ) -> impl Iterator<Item = Candle> + '_ {
+        self.clock = self.clock + dur;
+        core::iter::from_fn(move || {
+            let a = self.next_ts;
+            let end = Timestamp(iv.bucket(a).0.saturating_add(iv.millis()));
+            let end = match &self.config.market_hours {
+                Some(mh) => end.min(mh.session_close(a)),
+                None => end,
+            };
+            (end <= self.clock).then(|| self.coarse_step(iv))
+        })
+    }
+
     /// Emit exactly one tick and move the clock to it.
     pub fn step(&mut self) -> Tick {
         // 1. Timestamp and model-time of this step. The first tick of a session
@@ -268,8 +305,64 @@ impl Simulator {
         };
         let delta = model_secs / self.derived.year_secs;
 
+        // 2–9. Events, fundamental, effects, OU, jumps, GARCH.
+        let d = &self.derived;
+        let garch = (d.omega, d.alpha, d.beta);
+        let out = self.evolve(Timestamp(ts.0.saturating_add(1)), delta, model_secs, garch);
+
+        // 10. Volume from |return| and the vol regime.
+        let (base, ret_std, noise) = (
+            self.derived.base_tick_volume,
+            self.derived.tick_std,
+            self.config.volume.noise,
+        );
+        let volume = self.volume(
+            self.log_price - out.p_old,
+            out.sigma_t,
+            base,
+            ret_std,
+            noise,
+        );
+
+        // 11. Emit and schedule.
+        self.last_ts = Some(ts);
+        if self.clock < ts {
+            self.clock = ts;
+        }
+        let next = Timestamp(ts.0.saturating_add(self.derived.tick_ms));
+        self.next_ts = self.align(next);
+        Tick {
+            ts,
+            price_cents: cents(self.log_price),
+            volume,
+        }
+    }
+
+    /// `ts` if it is inside a session (or there is no calendar), else the next
+    /// open.
+    fn align(&self, ts: Timestamp) -> Timestamp {
+        match &self.config.market_hours {
+            Some(mh) => mh.align(ts),
+            None => ts,
+        }
+    }
+
+    /// Steps 2–9 of the per-tick algorithm over a step of `delta` years
+    /// (`model_secs` model-seconds): apply events due before `before`, advance
+    /// the fundamental, integrate and decay the effects, draw the OU noise and
+    /// jumps, update the GARCH variance with the given per-tick `(ω, α, β)`,
+    /// and recombine into `log_price`. Shared by the fine and coarse paths.
+    fn evolve(
+        &mut self,
+        before: Timestamp,
+        delta: f64,
+        model_secs: f64,
+        garch: (f64, f64, f64),
+    ) -> Evolved {
+        let p_old = self.log_price;
+
         // 2. Events due now.
-        self.apply_due_events(ts);
+        self.apply_due_events(before);
 
         // 3. Fundamental: target grows, value relaxes toward it.
         let spread = self.log_price - self.log_fund;
@@ -323,39 +416,107 @@ impl Simulator {
         }
 
         // 8. GARCH update on the standardised diffusive shock.
-        let d = &self.derived;
-        self.variance = d.omega + d.alpha * self.variance * z * z + d.beta * self.variance;
+        let (omega, alpha, beta) = garch;
+        self.variance = omega + alpha * self.variance * z * z + beta * self.variance;
 
         // 9. Recombine and clamp.
-        let p_old = self.log_price;
         self.log_price = (self.log_fund + spread).clamp(MIN_LOG_PRICE, MAX_LOG_PRICE);
         debug_assert!(self.log_price.is_finite());
+        Evolved { p_old, sigma_t }
+    }
 
-        // 10. Volume from |return| and the vol regime.
-        let volume = self.volume(self.log_price - p_old, sigma_t);
+    /// Advance the latent state by one candle of `iv` in a single step and
+    /// synthesise the bar. See [`coarse_candles`](Self::coarse_candles).
+    fn coarse_step(&mut self, iv: Interval) -> Candle {
+        let d = &self.derived;
+        let cfg = &self.config;
 
-        // 11. Emit and schedule.
-        self.last_ts = Some(ts);
-        if self.clock < ts {
-            self.clock = ts;
-        }
-        let next = Timestamp(ts.0.saturating_add(self.derived.tick_ms));
-        self.next_ts = match &self.config.market_hours {
-            Some(mh) if !mh.contains(next) => mh.next_open(next),
-            _ => next,
+        // 1. Wall interval [a, b): from the current position to the end of its
+        //    bucket, clipped to the session close under market hours.
+        let a = self.next_ts;
+        let bucket = iv.bucket(a);
+        let b = Timestamp(bucket.0.saturating_add(iv.millis()));
+        let (end, session_ms) = match &cfg.market_hours {
+            Some(mh) => {
+                let end = b.min(mh.session_close(a));
+                (end, end - a)
+            }
+            None => (b, b - a),
         };
-        Tick {
-            ts,
-            price_cents: cents(self.log_price),
+        let gap =
+            cfg.market_hours.is_some() && self.last_ts.is_some_and(|last| a - last > d.tick_ms);
+        let session_secs = session_ms as f64 / 1000.0;
+        let model_secs = if gap {
+            d.gap_secs + session_secs
+        } else {
+            session_secs
+        };
+        let delta = model_secs / d.year_secs;
+
+        // GARCH coefficients for a step of this length (§8.5 of DESIGN.md):
+        // φ = e^{−κ_v Δ}, α = min(sqrt(r (1 − φ²) / 2), φ), β = φ − α,
+        // ω = (1 − φ) σ² dt in per-tick units.
+        let phi = exp(-LN_2 * model_secs / cfg.garch.variance_half_life.as_secs_f64());
+        let alpha = sqrt(cfg.garch.variance_dispersion * (1.0 - phi * phi) / 2.0).min(phi);
+        let garch = ((1.0 - phi) * d.var_unc, alpha, phi - alpha);
+
+        // 2–9. Same latent evolution as a tick, over the whole step.
+        let out = self.evolve(b, delta, model_secs, garch);
+        let d = &self.derived;
+        let cfg = &self.config;
+
+        // High/low from the Brownian-bridge extremum distribution given the
+        // endpoints: for a bridge from 0 to x with variance v,
+        // P(max ≥ m) = exp(−2 m (m − x) / v), so m = (x + sqrt(x² − 2 v ln u)) / 2;
+        // the minimum is the mirror image with an independent uniform.
+        let x = self.log_price - out.p_old;
+        let jump_var = cfg.jumps.intensity
+            * delta
+            * (cfg.jumps.mean * cfg.jumps.mean + cfg.jumps.std * cfg.jumps.std);
+        let v = out.sigma_t * out.sigma_t * delta + jump_var;
+        let u_hi = math::uniform(&mut self.rng);
+        let u_lo = math::uniform(&mut self.rng);
+        let (hi, lo) = if v > 0.0 {
+            let span_hi = sqrt(x * x - 2.0 * v * ln(1.0 - u_hi));
+            let span_lo = sqrt(x * x - 2.0 * v * ln(1.0 - u_lo));
+            ((x + span_hi) / 2.0, (x - span_lo) / 2.0)
+        } else {
+            (x.max(0.0), x.min(0.0))
+        };
+
+        // Volume: the tick formula at the step scale. Its expectation matches
+        // the fine aggregate; the lognormal noise shrinks as 1/sqrt(ticks).
+        let n_ticks = (session_secs / d.tick_secs).max(1.0);
+        let base = d.base_tick_volume * n_ticks;
+        let ret_std = cfg.volatility * sqrt(delta);
+        let noise = cfg.volume.noise / sqrt(n_ticks);
+        let volume = self.volume(x, out.sigma_t, base, ret_std, noise);
+
+        // Schedule.
+        self.last_ts = Some(end);
+        if self.clock < end {
+            self.clock = end;
+        }
+        self.next_ts = self.align(b);
+
+        let open = cents(out.p_old);
+        let close = cents(self.log_price);
+        Candle {
+            open_ts: bucket,
+            open,
+            high: cents(out.p_old + hi).max(open).max(close),
+            low: cents(out.p_old + lo).min(open).min(close),
+            close,
             volume,
+            ticks: 0,
         }
     }
 
-    /// Expected volume from the tick's return and vol regime, with lognormal
-    /// noise. Always draws one normal so the RNG stream is config-independent.
-    fn volume(&mut self, ret: f64, sigma_t: f64) -> u64 {
+    /// Expected volume `base · (σ_t/σ)^γ · (1 + c |ret| / ret_std)` with
+    /// lognormal noise of std `noise`. Always draws one normal so the RNG
+    /// stream is config-independent.
+    fn volume(&mut self, ret: f64, sigma_t: f64, base: f64, ret_std: f64, noise: f64) -> u64 {
         let v = self.config.volume;
-        let d = &self.derived;
         let zv = math::normal(&mut self.rng);
         let sigma = self.config.volatility;
         let regime = if sigma > 0.0 {
@@ -363,13 +524,13 @@ impl Simulator {
         } else {
             1.0
         };
-        let activity = if d.tick_std > 0.0 {
-            1.0 + v.return_sensitivity * ret.abs() / d.tick_std
+        let activity = if ret_std > 0.0 {
+            1.0 + v.return_sensitivity * ret.abs() / ret_std
         } else {
             1.0
         };
-        let expected = d.base_tick_volume * regime * activity;
-        let noisy = expected * exp(v.noise * zv - 0.5 * v.noise * v.noise);
+        let expected = base * regime * activity;
+        let noisy = expected * exp(noise * zv - 0.5 * noise * noise);
         let r = round(noisy);
         if r.is_nan() || r <= 0.0 {
             0
@@ -379,6 +540,14 @@ impl Simulator {
             r as u64
         }
     }
+}
+
+/// What [`Simulator::evolve`] hands back to the fine and coarse paths.
+struct Evolved {
+    /// `ln P` before the step, including before any events applied in it.
+    p_old: f64,
+    /// Effective annualised vol used for the step.
+    sigma_t: f64,
 }
 
 /// Serialisable form of [`Simulator`]: everything except the derived
