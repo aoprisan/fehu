@@ -675,3 +675,373 @@ async fn orders_are_checked_and_rejected() {
     assert_eq!(list.as_array().unwrap().len(), 1);
     assert_eq!(list[0]["equity_cents"], 10_000_000);
 }
+
+// ---------------------------------------------------------------------------
+// Users, accounts and money
+
+#[tokio::test]
+async fn users_open_accounts_and_add_money() {
+    let app = test_app();
+    let (status, user) = post(
+        &app,
+        "/api/users",
+        json!({ "name": "ada", "email": "ada@example.com" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{user}");
+    assert_eq!(user["id"], 1);
+    assert_eq!(user["name"], "ada");
+    assert_eq!(user["email"], "ada@example.com");
+    assert_eq!(user["balance_cents"], 0);
+    assert!(user["accounts"].as_array().unwrap().is_empty());
+
+    // An account with an opening balance, then two deposits.
+    let (status, account) = post(
+        &app,
+        "/api/users/1/accounts",
+        json!({ "name": "main", "cash_cents": 100_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{account}");
+    assert_eq!(account["balance_cents"], 100_000);
+    assert_eq!(account["available_cents"], 100_000);
+    assert_eq!(account["deposited_cents"], 100_000);
+    assert_eq!(account["status"], "active");
+    assert_eq!(account["valid"], true);
+    assert!(account["trader_id"].is_null(), "no trader on it yet");
+    let id = account["id"].as_u64().unwrap();
+
+    let (status, body) = post(
+        &app,
+        &format!("/api/accounts/{id}/deposit"),
+        json!({ "amount_cents": 25_000, "memo": "week 1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["account"]["balance_cents"], 125_000);
+    assert_eq!(body["entries"][0]["amount_cents"], 25_000);
+    assert_eq!(body["entries"][0]["balance_cents"], 125_000);
+    assert_eq!(body["entries"][0]["memo"], "week 1");
+
+    let (status, body) = post(
+        &app,
+        &format!("/api/accounts/{id}/withdraw"),
+        json!({ "amount_cents": 5_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["account"]["balance_cents"], 120_000);
+    assert_eq!(body["account"]["withdrawn_cents"], 5_000);
+    assert_eq!(body["entries"][0]["amount_cents"], -5_000);
+
+    // The ledger has all of it, newest first.
+    let (status, ledger) = get(&app, &format!("/api/accounts/{id}/ledger")).await;
+    assert_eq!(status, StatusCode::OK);
+    let kinds: Vec<&str> = ledger["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["withdrawal", "deposit", "open"]);
+
+    let (_, user) = get(&app, "/api/users/1").await;
+    assert_eq!(user["accounts"], json!([id]));
+    assert_eq!(user["balance_cents"], 120_000);
+    let (_, accounts) = get(&app, "/api/users/1/accounts").await;
+    assert_eq!(accounts.as_array().unwrap().len(), 1);
+    let (_, all) = get(&app, "/api/accounts").await;
+    assert_eq!(all.as_array().unwrap().len(), 1);
+    let (_, health) = get(&app, "/api/health").await;
+    assert_eq!(health["users"], 1);
+    assert_eq!(health["accounts"], 1);
+    assert_eq!(health["cash_cents"], 120_000);
+}
+
+#[tokio::test]
+async fn money_movements_are_validated() {
+    let app = test_app();
+    post(&app, "/api/users", json!({ "name": "bo" })).await;
+    let (_, account) = post(
+        &app,
+        "/api/users/1/accounts",
+        json!({ "cash_cents": 1_000 }),
+    )
+    .await;
+    let id = account["id"].as_u64().unwrap();
+    let cases = [
+        (
+            "deposit",
+            json!({ "amount_cents": 0 }),
+            StatusCode::BAD_REQUEST,
+            "invalid_amount",
+        ),
+        (
+            "deposit",
+            json!({ "amount_cents": -100 }),
+            StatusCode::BAD_REQUEST,
+            "invalid_amount",
+        ),
+        (
+            "deposit",
+            json!({ "amount_cents": 1_000_000_000_000_000_i64 + 1 }),
+            StatusCode::BAD_REQUEST,
+            "invalid_amount",
+        ),
+        (
+            "deposit",
+            json!({ "amount_cents": 12.5 }),
+            StatusCode::BAD_REQUEST,
+            "bad_json",
+        ),
+        (
+            "withdraw",
+            json!({ "amount_cents": 1_001 }),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "insufficient_funds",
+        ),
+    ];
+    for (path, body, want_status, want_code) in cases {
+        let (status, resp) = post(&app, &format!("/api/accounts/{id}/{path}"), body.clone()).await;
+        assert_eq!(status, want_status, "{path} {body}: {resp}");
+        assert_eq!(resp["error"]["code"], want_code, "{path} {body}: {resp}");
+    }
+    // Unknown ids, and an email that is not one.
+    for uri in ["/api/accounts/99", "/api/accounts/99/ledger"] {
+        let (status, body) = get(&app, uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "unknown_account");
+    }
+    let (status, body) = get(&app, "/api/users/99").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "unknown_user");
+    let (status, body) = post(&app, "/api/users", json!({ "email": "nope" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // The balance never moved.
+    let (_, account) = get(&app, &format!("/api/accounts/{id}")).await;
+    assert_eq!(account["balance_cents"], 1_000);
+    assert_eq!(account["valid"], true);
+}
+
+#[tokio::test]
+async fn orders_settle_through_the_account() {
+    let app = test_app();
+    let (status, trader) = post(
+        &app,
+        "/api/traders",
+        json!({ "name": "cleo", "email": "cleo@example.com", "cash_cents": 5_000_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{trader}");
+    assert_eq!(trader["user_id"], 1);
+    assert_eq!(trader["account_id"], 1);
+    assert_eq!(trader["account_status"], "active");
+    let id = trader["id"].as_u64().unwrap();
+
+    // A market buy debits the account and writes one ledger entry per print.
+    let (status, order) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "market" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{order}");
+    let notional = order["notional_cents"].as_i64().unwrap();
+    let prints = order["trades"].as_array().unwrap().len();
+    let (_, ledger) = get(&app, "/api/accounts/1/ledger").await;
+    assert_eq!(ledger["account"]["balance_cents"], 5_000_000 - notional);
+    assert_eq!(ledger["account"]["trader_id"], id);
+    let entries = ledger["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), prints + 1, "one per print, plus `open`");
+    assert_eq!(entries[0]["kind"], "buy");
+    assert_eq!(entries[0]["symbol"], "ACME");
+    assert!(entries[0]["amount_cents"].as_i64().unwrap() < 0);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["amount_cents"].as_i64().unwrap())
+            .sum::<i64>(),
+        5_000_000 - notional,
+        "the ledger adds up to the balance"
+    );
+
+    // Adding money through the trader lands on its account.
+    let (status, p) = post(
+        &app,
+        &format!("/api/traders/{id}/deposit"),
+        json!({ "amount_cents": 300_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{p}");
+    assert_eq!(p["cash_cents"], 5_300_000 - notional);
+    assert_eq!(p["free_cash_cents"], 5_300_000 - notional);
+
+    // A resting buy reserves cash on the account, not just in the portfolio.
+    let (_, book) = get(&app, "/api/symbols/PXCO/book").await;
+    let price = book["bid_cents"].as_i64().unwrap() - 20;
+    post(
+        &app,
+        "/api/symbols/PXCO/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "limit", "price_cents": price }),
+    )
+    .await;
+    let (_, account) = get(&app, "/api/accounts/1").await;
+    assert_eq!(account["reserved_cents"], 100 * price);
+    assert_eq!(
+        account["available_cents"].as_i64().unwrap(),
+        account["balance_cents"].as_i64().unwrap() - 100 * price
+    );
+    // Reserved cash cannot be withdrawn, and the account cannot be closed.
+    let (status, body) = post(
+        &app,
+        "/api/accounts/1/withdraw",
+        json!({ "amount_cents": account["balance_cents"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "insufficient_funds");
+    let (status, body) = post(
+        &app,
+        "/api/accounts/1/status",
+        json!({ "status": "closed" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "cash_reserved");
+
+    post(&app, &format!("/api/traders/{id}/cancel_all"), json!({})).await;
+    let (_, check) = get(&app, "/api/accounts/1/validate").await;
+    assert_eq!(check["valid"], true);
+    assert_eq!(check["reserved_cents"], 0);
+    assert_eq!(check["issues"], json!([]));
+    assert_eq!(check["can_trade"], true);
+}
+
+#[tokio::test]
+async fn a_frozen_account_cannot_trade() {
+    let app = test_app();
+    let id = new_trader(&app, "dee").await;
+    let (status, body) = post(
+        &app,
+        "/api/accounts/1/status",
+        json!({ "status": "frozen" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "frozen");
+
+    let (status, body) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "account_not_active");
+    // Deposits still land; withdrawals do not.
+    let (status, _) = post(
+        &app,
+        "/api/accounts/1/deposit",
+        json!({ "amount_cents": 1_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = post(
+        &app,
+        "/api/accounts/1/withdraw",
+        json!({ "amount_cents": 1_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // Unfrozen, it trades again.
+    post(
+        &app,
+        "/api/accounts/1/status",
+        json!({ "status": "active" }),
+    )
+    .await;
+    let (status, _) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A closed account is terminal.
+    post(
+        &app,
+        "/api/accounts/1/status",
+        json!({ "status": "closed" }),
+    )
+    .await;
+    let (status, body) = post(
+        &app,
+        "/api/accounts/1/status",
+        json!({ "status": "active" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, _) = post(
+        &app,
+        "/api/accounts/1/deposit",
+        json!({ "amount_cents": 1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn one_user_can_run_several_traders() {
+    let app = test_app();
+    post(&app, "/api/users", json!({ "name": "eve" })).await;
+    let (status, first) = post(
+        &app,
+        "/api/traders",
+        json!({ "name": "alpha", "user_id": 1, "cash_cents": 10_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let (status, second) = post(
+        &app,
+        "/api/traders",
+        json!({ "name": "beta", "user_id": 1, "cash_cents": 20_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    assert_eq!(first["user_id"], 1);
+    assert_eq!(second["user_id"], 1);
+    assert_ne!(first["account_id"], second["account_id"]);
+
+    let (_, user) = get(&app, "/api/users/1").await;
+    assert_eq!(user["traders"].as_array().unwrap().len(), 2);
+    assert_eq!(user["balance_cents"], 30_000);
+
+    // A trader may also join an account that already exists…
+    let (status, third) = post(
+        &app,
+        "/api/traders",
+        json!({ "name": "gamma", "user_id": 1, "account_id": first["account_id"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{third}");
+    assert_eq!(third["account_id"], first["account_id"]);
+    assert_eq!(third["cash_cents"], 10_000, "the same money, shared");
+
+    // …but not one that belongs to somebody else.
+    post(&app, "/api/users", json!({ "name": "mallory" })).await;
+    let (status, body) = post(
+        &app,
+        "/api/traders",
+        json!({ "user_id": 2, "account_id": first["account_id"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = post(&app, "/api/traders", json!({ "user_id": 99 })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "unknown_user");
+    let (status, body) = post(&app, "/api/traders", json!({ "account_id": 1 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}

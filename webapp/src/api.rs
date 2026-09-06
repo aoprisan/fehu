@@ -19,6 +19,10 @@ use tokio_stream::{Stream, StreamExt};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::account::{
+    Account, AccountCheck, AccountDto, AccountId, CreateUserRequest, LedgerResponse, MoneyError,
+    OpenAccountRequest, StatusRequest, TransferRequest, UserDto, UserId,
+};
 use crate::events::{
     CatalogEntry, EventRecord, GameEventKind, GameEventRequest, MAX_MAGNITUDE, Prepared,
     PushEventRequest, Scope, SimEvent,
@@ -28,7 +32,7 @@ use crate::market::{
 };
 use crate::trading::{
     BookDto, CreateTraderRequest, OpenOrderDto, OrderRequest, OrderResponse, PortfolioDto,
-    PositionDto, TradeDto, TraderSummary,
+    PositionDto, Refused, TradeDto, TraderSummary,
 };
 
 type AppState = Arc<App>;
@@ -68,6 +72,20 @@ pub fn router(app: AppState) -> Router {
         .route("/api/traders", get(list_traders).post(create_trader))
         .route("/api/traders/{trader_id}", get(get_trader))
         .route("/api/traders/{trader_id}/cancel_all", post(cancel_all))
+        .route("/api/traders/{trader_id}/deposit", post(trader_deposit))
+        .route("/api/users", get(list_users).post(create_user))
+        .route("/api/users/{user_id}", get(get_user))
+        .route(
+            "/api/users/{user_id}/accounts",
+            get(list_user_accounts).post(open_account),
+        )
+        .route("/api/accounts", get(list_accounts))
+        .route("/api/accounts/{account_id}", get(get_account))
+        .route("/api/accounts/{account_id}/deposit", post(deposit))
+        .route("/api/accounts/{account_id}/withdraw", post(withdraw))
+        .route("/api/accounts/{account_id}/status", post(set_status))
+        .route("/api/accounts/{account_id}/validate", get(validate_account))
+        .route("/api/accounts/{account_id}/ledger", get(get_ledger))
         .route("/api/game/catalog", get(catalog))
         .route("/api/game/events", get(list_events).post(push_game_event))
         .route("/api/events", get(list_events))
@@ -134,8 +152,51 @@ impl ApiError {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_order", message)
     }
 
-    fn refused(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::UNPROCESSABLE_ENTITY, "order_refused", message)
+    /// An order the trader's account would not fund.
+    fn refused(e: Refused) -> Self {
+        match e {
+            Refused::Account(MoneyError::Status { .. }) => {
+                Self::new(StatusCode::CONFLICT, "account_not_active", e.to_string())
+            }
+            _ => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "order_refused",
+                e.to_string(),
+            ),
+        }
+    }
+
+    fn unknown_user(id: u64) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "unknown_user",
+            format!("no such user: {id}"),
+        )
+    }
+
+    fn unknown_account(id: u64) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "unknown_account",
+            format!("no such account: {id}"),
+        )
+    }
+
+    /// A refused money movement: the amount, the balance or the account's
+    /// status made it impossible.
+    fn money(e: MoneyError) -> Self {
+        let (status, code) = match e {
+            MoneyError::NotPositive { .. } | MoneyError::TooLarge { .. } => {
+                (StatusCode::BAD_REQUEST, "invalid_amount")
+            }
+            MoneyError::BalanceCap { .. } => (StatusCode::UNPROCESSABLE_ENTITY, "balance_cap"),
+            MoneyError::Insufficient { .. } => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "insufficient_funds")
+            }
+            MoneyError::Status { .. } => (StatusCode::CONFLICT, "account_not_active"),
+            MoneyError::Reserved { .. } => (StatusCode::CONFLICT, "cash_reserved"),
+        };
+        Self::new(status, code, e.to_string())
     }
 }
 
@@ -183,7 +244,11 @@ struct Health {
     events_logged: usize,
     ticks_total: u64,
     trades_total: u64,
+    users: usize,
+    accounts: usize,
     traders: usize,
+    /// Every account's balance added up, in cents.
+    cash_cents: i64,
     /// Traders' orders resting across every book.
     resting_orders: usize,
 }
@@ -199,7 +264,14 @@ async fn health(State(app): State<AppState>) -> Json<Health> {
         events_logged: market.events.len(),
         ticks_total: market.symbols.iter().map(|s| s.ticks_total).sum(),
         trades_total: market.symbols.iter().map(|s| s.trades_total).sum(),
+        users: market.users.len(),
+        accounts: market.accounts.len(),
         traders: market.traders.len(),
+        cash_cents: market
+            .accounts
+            .values()
+            .map(Account::balance_cents)
+            .fold(0i64, i64::saturating_add),
         resting_orders: market
             .symbols
             .iter()
@@ -562,6 +634,9 @@ async fn get_trades(
     }))
 }
 
+/// Sign a player up: with no `user_id` this creates a user, opens an account
+/// funded with `cash_cents` and gives it a trader. With one, the trader joins
+/// that user, on an existing `account_id` or on a fresh account.
 async fn create_trader(
     State(app): State<AppState>,
     payload: Option<Json<CreateTraderRequest>>,
@@ -571,10 +646,74 @@ async fn create_trader(
     if cash < 0 {
         return Err(ApiError::bad_request("`cash_cents` must not be negative"));
     }
+    let email = check_email(req.email)?;
+    let now = wall_now_ms();
     let mut market = app.market();
-    let id = market.create_trader(req.name, cash, wall_now_ms()).id;
-    tracing::info!(trader = id.0, cash, "trader created");
-    Ok((StatusCode::CREATED, Json(portfolio(&market, id)?)))
+    let id = match (req.user_id, req.account_id) {
+        (None, None) => market
+            .sign_up(req.name, email, cash, now)
+            .map_err(ApiError::money)?,
+        (None, Some(_)) => {
+            return Err(ApiError::bad_request(
+                "`account_id` needs the `user_id` that owns it",
+            ));
+        }
+        (Some(user_id), account_id) => {
+            let user = UserId(user_id);
+            if !market.users.contains_key(&user) {
+                return Err(ApiError::unknown_user(user_id));
+            }
+            let account = match account_id {
+                Some(account_id) => {
+                    let account = AccountId(account_id);
+                    let held = market
+                        .accounts
+                        .get(&account)
+                        .ok_or_else(|| ApiError::unknown_account(account_id))?;
+                    if held.user_id != user {
+                        return Err(ApiError::bad_request(format!(
+                            "account {account_id} belongs to user {}",
+                            held.user_id.0
+                        )));
+                    }
+                    account
+                }
+                None => market
+                    .open_account(user, req.name.clone(), cash, now)
+                    .map_err(ApiError::money)?,
+            };
+            market.create_trader(user, account, req.name, now)
+        }
+    };
+    let dto = portfolio(&market, id)?;
+    tracing::info!(
+        trader = dto.id,
+        user = dto.user_id,
+        account = dto.account_id,
+        cash = dto.cash_cents,
+        "trader created"
+    );
+    Ok((StatusCode::CREATED, Json(dto)))
+}
+
+/// An email is optional, but if given it has to look like one.
+fn check_email(email: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(email) = email else { return Ok(None) };
+    let email = email.trim();
+    if email.is_empty() {
+        return Ok(None);
+    }
+    let local_and_domain = email.split_once('@');
+    match local_and_domain {
+        Some((local, domain))
+            if !local.is_empty() && domain.contains('.') && !domain.starts_with('.') =>
+        {
+            Ok(Some(email.to_owned()))
+        }
+        _ => Err(ApiError::bad_request(format!(
+            "`email` does not look like an address: {email}"
+        ))),
+    }
 }
 
 async fn list_traders(State(app): State<AppState>) -> Json<Vec<TraderSummary>> {
@@ -584,7 +723,9 @@ async fn list_traders(State(app): State<AppState>) -> Json<Vec<TraderSummary>> {
             .traders
             .values()
             .map(|t| {
-                let equity = t.cash_cents.saturating_add(
+                let account = market.accounts.get(&t.account_id);
+                let cash = account.map_or(0, Account::balance_cents);
+                let equity = cash.saturating_add(
                     t.positions
                         .iter()
                         .map(|(sym, p)| {
@@ -597,8 +738,11 @@ async fn list_traders(State(app): State<AppState>) -> Json<Vec<TraderSummary>> {
                 );
                 TraderSummary {
                     id: t.id.0,
+                    user_id: t.user_id.0,
+                    account_id: t.account_id.0,
                     name: t.name.clone(),
-                    cash_cents: t.cash_cents,
+                    account_status: account.map(|a| a.status).unwrap_or_default(),
+                    cash_cents: cash,
                     equity_cents: equity,
                     positions: t.positions.len(),
                     open_orders: market
@@ -625,6 +769,10 @@ fn portfolio(market: &Market, id: TraderId) -> Result<PortfolioDto, ApiError> {
         .traders
         .get(&id)
         .ok_or_else(|| ApiError::unknown_trader(id.0))?;
+    let account = market
+        .accounts
+        .get(&t.account_id)
+        .ok_or_else(|| ApiError::unknown_account(t.account_id.0))?;
     let mut positions = Vec::new();
     let mut value = 0i64;
     let mut unrealised = 0i64;
@@ -661,12 +809,15 @@ fn portfolio(market: &Market, id: TraderId) -> Result<PortfolioDto, ApiError> {
         .collect();
     Ok(PortfolioDto {
         id: t.id.0,
+        user_id: t.user_id.0,
+        account_id: t.account_id.0,
         name: t.name.clone(),
         created_at_ms: t.created_at_ms,
-        cash_cents: t.cash_cents,
-        reserved_cents: t.reserved_cents,
-        free_cash_cents: t.free_cash_cents(),
-        equity_cents: t.cash_cents.saturating_add(value),
+        account_status: account.status,
+        cash_cents: account.balance_cents(),
+        reserved_cents: account.reserved_cents(),
+        free_cash_cents: account.available_cents(),
+        equity_cents: account.balance_cents().saturating_add(value),
         realised_pnl_cents: realised,
         unrealised_pnl_cents: unrealised,
         positions,
@@ -712,9 +863,14 @@ async fn submit_order(
                     .notional_cents
             }
         };
+        // Validate the order against the account that would fund it: it must
+        // be active, and a buy must have the cash available.
+        let account = market
+            .account_of(trader)
+            .ok_or_else(|| ApiError::unknown_trader(trader.0))?;
         market.traders[&trader]
-            .check(sym, order.side, order.qty, cost)
-            .map_err(|e| ApiError::refused(e.to_string()))?;
+            .check(account, sym, order.side, order.qty, cost)
+            .map_err(ApiError::refused)?;
         let placement = market.symbols[idx]
             .exchange
             .submit(order)
@@ -723,9 +879,9 @@ async fn submit_order(
         let fills = market.apply_trades(sym, &placement.trades);
         if placement.status == fehu::OrderStatus::Resting
             && let OrderKind::Limit { price_cents } = order.kind
-            && let Some(t) = market.traders.get_mut(&trader)
+            && let Some((t, account)) = market.trader_and_account(trader)
         {
-            t.reserve(sym, order.side, placement.remaining, price_cents);
+            t.reserve(account, sym, order.side, placement.remaining, price_cents);
         }
         (
             OrderResponse::new(sym, trader, order.side, order.qty, &placement),
@@ -812,8 +968,9 @@ async fn cancel_order(
             }
             _ => ApiError::bad_request(e.to_string()),
         })?;
-    if let Some(t) = market.traders.get_mut(&trader) {
+    if let Some((t, account)) = market.trader_and_account(trader) {
         t.release(
+            account,
             sym,
             cancelled.side,
             cancelled.remaining,
@@ -842,14 +999,288 @@ async fn cancel_all(
     for i in 0..market.symbols.len() {
         let sym = market.symbols[i].info.symbol;
         let cancelled = market.symbols[i].exchange.cancel_all(trader);
-        if let Some(t) = market.traders.get_mut(&trader) {
+        if let Some((t, account)) = market.trader_and_account(trader) {
             for o in &cancelled {
-                t.release(sym, o.side, o.remaining, o.price_cents);
+                t.release(account, sym, o.side, o.remaining, o.price_cents);
                 out.push(OpenOrderDto::from_resting(sym, o));
             }
         }
     }
     Ok(Json(out))
+}
+
+// ---------------------------------------------------------------------------
+// Users and accounts
+//
+// A user is the person, an account holds their money, and a trader trades on
+// exactly one account. Every amount here is an integer number of cents.
+
+async fn create_user(
+    State(app): State<AppState>,
+    payload: Option<Json<CreateUserRequest>>,
+) -> Result<(StatusCode, Json<UserDto>), ApiError> {
+    let req = payload.map(|Json(r)| r).unwrap_or_default();
+    let email = check_email(req.email)?;
+    let mut market = app.market();
+    let id = market.create_user(req.name, email, wall_now_ms());
+    tracing::info!(user = id.0, "user created");
+    Ok((StatusCode::CREATED, Json(user_dto(&market, id)?)))
+}
+
+async fn list_users(State(app): State<AppState>) -> Json<Vec<UserDto>> {
+    let market = app.market();
+    Json(
+        market
+            .users
+            .keys()
+            .filter_map(|&id| user_dto(&market, id).ok())
+            .collect(),
+    )
+}
+
+async fn get_user(
+    State(app): State<AppState>,
+    Path(user_id): Path<u64>,
+) -> Result<Json<UserDto>, ApiError> {
+    let market = app.market();
+    Ok(Json(user_dto(&market, UserId(user_id))?))
+}
+
+/// Open another account for a user, with `cash_cents` paid in.
+async fn open_account(
+    State(app): State<AppState>,
+    Path(user_id): Path<u64>,
+    payload: Option<Json<OpenAccountRequest>>,
+) -> Result<(StatusCode, Json<AccountDto>), ApiError> {
+    let req = payload.map(|Json(r)| r).unwrap_or_default();
+    let cash = req.cash_cents.unwrap_or(app.options.starting_cash_cents);
+    let user = UserId(user_id);
+    let mut market = app.market();
+    if !market.users.contains_key(&user) {
+        return Err(ApiError::unknown_user(user_id));
+    }
+    let id = market
+        .open_account(user, req.name, cash, wall_now_ms())
+        .map_err(ApiError::money)?;
+    tracing::info!(user = user_id, account = id.0, cash, "account opened");
+    Ok((StatusCode::CREATED, Json(account_dto(&market, id)?)))
+}
+
+async fn list_user_accounts(
+    State(app): State<AppState>,
+    Path(user_id): Path<u64>,
+) -> Result<Json<Vec<AccountDto>>, ApiError> {
+    let user = UserId(user_id);
+    let market = app.market();
+    if !market.users.contains_key(&user) {
+        return Err(ApiError::unknown_user(user_id));
+    }
+    Ok(Json(
+        market
+            .accounts
+            .values()
+            .filter(|a| a.user_id == user)
+            .map(|a| account_view(&market, a))
+            .collect(),
+    ))
+}
+
+async fn list_accounts(State(app): State<AppState>) -> Json<Vec<AccountDto>> {
+    let market = app.market();
+    Json(
+        market
+            .accounts
+            .values()
+            .map(|a| account_view(&market, a))
+            .collect(),
+    )
+}
+
+async fn get_account(
+    State(app): State<AppState>,
+    Path(account_id): Path<u64>,
+) -> Result<Json<AccountDto>, ApiError> {
+    let market = app.market();
+    Ok(Json(account_dto(&market, AccountId(account_id))?))
+}
+
+/// Add money: `{"amount_cents": 500000}`. The amount is a positive integer
+/// number of cents.
+async fn deposit(
+    State(app): State<AppState>,
+    Path(account_id): Path<u64>,
+    payload: Result<Json<TransferRequest>, JsonRejection>,
+) -> Result<Json<LedgerResponse>, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let mut market = app.market();
+    let id = AccountId(account_id);
+    let entry = market
+        .accounts
+        .get_mut(&id)
+        .ok_or_else(|| ApiError::unknown_account(account_id))?
+        .deposit(req.amount_cents, req.memo, wall_now_ms())
+        .map_err(ApiError::money)?;
+    tracing::info!(
+        account = account_id,
+        amount_cents = req.amount_cents,
+        balance_cents = entry.balance_cents,
+        "deposit"
+    );
+    Ok(Json(LedgerResponse {
+        account: account_dto(&market, id)?,
+        entries: vec![entry],
+    }))
+}
+
+/// Take money out. Only the available balance can leave: cash reserved for
+/// resting orders has to be freed by cancelling them first.
+async fn withdraw(
+    State(app): State<AppState>,
+    Path(account_id): Path<u64>,
+    payload: Result<Json<TransferRequest>, JsonRejection>,
+) -> Result<Json<LedgerResponse>, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let mut market = app.market();
+    let id = AccountId(account_id);
+    let entry = market
+        .accounts
+        .get_mut(&id)
+        .ok_or_else(|| ApiError::unknown_account(account_id))?
+        .withdraw(req.amount_cents, req.memo, wall_now_ms())
+        .map_err(ApiError::money)?;
+    tracing::info!(
+        account = account_id,
+        amount_cents = req.amount_cents,
+        balance_cents = entry.balance_cents,
+        "withdrawal"
+    );
+    Ok(Json(LedgerResponse {
+        account: account_dto(&market, id)?,
+        entries: vec![entry],
+    }))
+}
+
+/// Freeze, reopen or close an account: `{"status": "frozen"}`.
+async fn set_status(
+    State(app): State<AppState>,
+    Path(account_id): Path<u64>,
+    payload: Result<Json<StatusRequest>, JsonRejection>,
+) -> Result<Json<AccountDto>, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let mut market = app.market();
+    let id = AccountId(account_id);
+    market
+        .accounts
+        .get_mut(&id)
+        .ok_or_else(|| ApiError::unknown_account(account_id))?
+        .set_status(req.status)
+        .map_err(ApiError::money)?;
+    tracing::info!(account = account_id, status = ?req.status, "account status");
+    Ok(Json(account_dto(&market, id)?))
+}
+
+/// Check an account: its status, what it can do, and any broken invariant.
+async fn validate_account(
+    State(app): State<AppState>,
+    Path(account_id): Path<u64>,
+) -> Result<Json<AccountCheck>, ApiError> {
+    let market = app.market();
+    let account = market
+        .accounts
+        .get(&AccountId(account_id))
+        .ok_or_else(|| ApiError::unknown_account(account_id))?;
+    Ok(Json(AccountCheck::new(account)))
+}
+
+/// Every movement of money through an account, newest first.
+async fn get_ledger(
+    State(app): State<AppState>,
+    Path(account_id): Path<u64>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<LedgerResponse>, ApiError> {
+    let limit = q
+        .limit
+        .unwrap_or(100)
+        .clamp(1, app.options.ledger_log.max(1));
+    let market = app.market();
+    let id = AccountId(account_id);
+    let account = market
+        .accounts
+        .get(&id)
+        .ok_or_else(|| ApiError::unknown_account(account_id))?;
+    Ok(Json(LedgerResponse {
+        account: account_view(&market, account),
+        entries: account.ledger(limit),
+    }))
+}
+
+/// Add money to the account a trader trades on, without having to look its
+/// account up first.
+async fn trader_deposit(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    payload: Result<Json<TransferRequest>, JsonRejection>,
+) -> Result<Json<PortfolioDto>, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let trader = TraderId(trader_id);
+    let mut market = app.market();
+    let account_id = market
+        .traders
+        .get(&trader)
+        .ok_or_else(|| ApiError::unknown_trader(trader_id))?
+        .account_id;
+    let entry = market
+        .accounts
+        .get_mut(&account_id)
+        .ok_or_else(|| ApiError::unknown_account(account_id.0))?
+        .deposit(req.amount_cents, req.memo, wall_now_ms())
+        .map_err(ApiError::money)?;
+    tracing::info!(
+        trader = trader_id,
+        account = account_id.0,
+        amount_cents = req.amount_cents,
+        balance_cents = entry.balance_cents,
+        "deposit"
+    );
+    Ok(Json(portfolio(&market, trader)?))
+}
+
+fn user_dto(market: &Market, id: UserId) -> Result<UserDto, ApiError> {
+    let user = market
+        .users
+        .get(&id)
+        .ok_or_else(|| ApiError::unknown_user(id.0))?;
+    Ok(UserDto {
+        id: user.id.0,
+        name: user.name.clone(),
+        email: user.email.clone(),
+        created_at_ms: user.created_at_ms,
+        accounts: user.accounts.iter().map(|a| a.0).collect(),
+        traders: market
+            .traders
+            .values()
+            .filter(|t| t.user_id == id)
+            .map(|t| t.id.0)
+            .collect(),
+        balance_cents: user
+            .accounts
+            .iter()
+            .filter_map(|a| market.accounts.get(a))
+            .map(Account::balance_cents)
+            .fold(0i64, i64::saturating_add),
+    })
+}
+
+fn account_dto(market: &Market, id: AccountId) -> Result<AccountDto, ApiError> {
+    let account = market
+        .accounts
+        .get(&id)
+        .ok_or_else(|| ApiError::unknown_account(id.0))?;
+    Ok(account_view(market, account))
+}
+
+fn account_view(market: &Market, account: &Account) -> AccountDto {
+    AccountDto::new(account, market.trader_on(account.id).map(|t| t.id.0))
 }
 
 async fn catalog() -> Json<Vec<CatalogEntry>> {
