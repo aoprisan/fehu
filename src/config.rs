@@ -4,7 +4,7 @@ use core::fmt;
 use core::time::Duration;
 
 use crate::math::{self, LN_2};
-use crate::time::{Timestamp, whole_millis};
+use crate::time::{MarketHours, Timestamp, whole_millis};
 
 /// Seconds in a calendar year (365.25 days).
 const CALENDAR_YEAR_SECS: f64 = 365.25 * 86_400.0;
@@ -34,8 +34,10 @@ pub struct Config {
     pub volume: VolumeParams,
     /// Wall time between ticks. Whole milliseconds, `[1 ms, 1 day]`.
     pub tick: Duration,
-    /// Timestamp of the first tick.
+    /// Timestamp of the first tick (aligned to the next open under market hours).
     pub start_ts: Timestamp,
+    /// Optional trading calendar. `None` trades around the clock.
+    pub market_hours: Option<MarketHours>,
 }
 
 impl Default for Config {
@@ -51,6 +53,7 @@ impl Default for Config {
             volume: VolumeParams::default(),
             tick: Duration::from_secs(1),
             start_ts: Timestamp(0),
+            market_hours: None,
         }
     }
 }
@@ -326,6 +329,9 @@ impl Config {
         self.garch.validate(self.tick)?;
         self.jumps.validate()?;
         self.volume.validate()?;
+        if let Some(mh) = &self.market_hours {
+            mh.validate(self.tick)?;
+        }
         Ok(())
     }
 }
@@ -336,6 +342,8 @@ impl Config {
 pub(crate) struct Derived {
     /// Model-seconds in one year (`Y`).
     pub year_secs: f64,
+    /// Model-seconds covered by one closed period (`g·S`), 0 without market hours.
+    pub gap_secs: f64,
     /// Wall milliseconds per tick.
     pub tick_ms: i64,
     /// Model-seconds per regular tick.
@@ -361,13 +369,21 @@ impl Derived {
         cfg.validate()?;
         let tick_ms = whole_millis(cfg.tick).expect("validated");
         let tick_secs = tick_ms as f64 / 1000.0;
-        let year_secs = CALENDAR_YEAR_SECS;
+        let (year_secs, gap_secs, day_secs) = match &cfg.market_hours {
+            None => (CALENDAR_YEAR_SECS, 0.0, 86_400.0),
+            Some(mh) => {
+                let session = f64::from(mh.session_secs());
+                let gap = mh.gap_weight * session;
+                (mh.trading_days_per_year() * (session + gap), gap, session)
+            }
+        };
         let dt = tick_secs / year_secs;
         let (alpha, beta) = cfg.garch.alpha_beta(cfg.tick);
         let q = 1.0 - alpha - beta;
         let var_unc = cfg.volatility * cfg.volatility * dt;
         Ok(Self {
             year_secs,
+            gap_secs,
             tick_ms,
             tick_secs,
             dt,
@@ -376,7 +392,7 @@ impl Derived {
             beta,
             omega: q * var_unc,
             var_unc,
-            base_tick_volume: cfg.volume.base_per_day * tick_secs / 86_400.0,
+            base_tick_volume: cfg.volume.base_per_day * tick_secs / day_secs,
         })
     }
 }
