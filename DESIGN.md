@@ -412,6 +412,7 @@ pub struct Simulator {
     vol_effects: Vec<Decaying>,
     pending: BinaryHeap<Reverse<Queued>>, // Queued { at, seq, kind }
     next_seq: u64,
+    candle_cursor: Option<Candles>, // in-progress bars for the candle-stream API (§8.4)
 }
 ```
 
@@ -485,6 +486,31 @@ impl Candles {
 Buckets are aligned to epoch multiples of the interval (`open_ts = ts − ts mod
 interval`). With market hours a 1 d candle spans the session (ticks only exist
 inside it); no empty candles are emitted for closed periods.
+
+### 8.4 Candle streams
+
+For callers that only want bars, the simulator can drive the tick loop itself:
+
+```rust
+impl Simulator {
+    /// Runs ticks internally and yields each candle of `iv` as it closes.
+    pub fn candles(&mut self, iv: Interval) -> impl Iterator<Item = Candle> + '_;
+    /// Same, bounded by wall time: yields the candles that close within `dur`.
+    pub fn advance_candles(&mut self, dur: Duration, iv: Interval)
+        -> impl Iterator<Item = Candle> + '_;
+}
+```
+
+Both are thin adapters over `step`/`advance` and `Candles`, so the candles are
+bit-identical to aggregating the same ticks by hand, and the simulator's clock
+and RNG advance exactly as they would through `step`. A partially built candle
+is not lost on drop: the next call continues it, because the aggregator lives
+inside the iterator's borrowed `Simulator` state (`candle_cursor: Option<Candles>`
+in §7).
+
+Not designed here: a coarse mode that steps once per candle and synthesises
+high/low from the Brownian-bridge extremum distribution. It would make years of
+daily history almost free but is a second code path; add later if needed.
 
 ---
 
