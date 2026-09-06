@@ -27,8 +27,9 @@ Goals
 Non-goals
 
 - Mapping game actions to events (the game does that; the crate only consumes `Event`).
-- Order books, multiple assets, real calendars with holidays/time zones (a simple
-  UTC weekday calendar is provided; holidays can be added later).
+- Multiple assets, real calendars with holidays/time zones (a simple UTC
+  weekday calendar is provided; holidays can be added later). An order book
+  *is* provided, layered on top of the price process (§14).
 - Statistical realism beyond "looks and feels like a stock": fat tails, vol
   clustering, gaps, reversion after shocks.
 
@@ -47,6 +48,8 @@ fehu/
     time.rs           Timestamp, MarketHours calendar arithmetic
     config.rs         Config, GarchParams, JumpParams, VolumeParams, validation, Derived
     event.rs          Event, EventKind, decaying effect bookkeeping
+    book.rs           OrderBook: price–time priority matching (§14)
+    exchange.rs       Exchange: simulator + synthetic liquidity + trader impact (§14)
     sim.rs            Simulator, Tick, step / advance
     candles.rs        Candles, Candle, Interval
   tests/              integration tests (see §11)
@@ -705,3 +708,244 @@ core price process → GARCH → events → candles & volume → market hours �
 12. Coarse mode (§8.5) added after the first review. While adding it, the
     volume return of a tick was changed to include event jumps applied in
     that tick (a news jump now prints volume); `STATE_VERSION` is 2.
+13. Trading (§14) is a liquidity layer around the unchanged price process,
+    not an order-driven price: game events keep their promised size, the
+    tape still shows them as flow, and traders move the price through a
+    square-root impact that reverts with the spread.
+
+---
+
+## 14. Trading layer
+
+Added after the price simulator was in use. The request: let players open
+orders, match them, have their trades influence the price, and populate the
+market with synthetic orders so it looks alive; and decide how all of that
+relates to the price simulation.
+
+### 14.1 How trading relates to the price simulation
+
+Three architectures were considered.
+
+**A. Order-driven price.** Retire the latent process; the price is whatever
+the last trade printed, and *everything* (players, game events, background
+noise) is an order. Game events become synthetic order flow, e.g. a scandal
+is a wave of market sells. Rejected:
+
+- The size of an event's move becomes a function of book depth at that
+  moment, so "scandal = −10 %" is no longer a promise the game can make; it
+  has to be tuned per symbol and re-tuned whenever liquidity changes.
+- Mean reversion, GARCH clustering, jumps and overnight gaps have no natural
+  home; they would all have to be re-invented as agent behaviour, which is
+  more code, more parameters and much harder to validate statistically than
+  the current tests (§11).
+- Coarse mode (years of daily history in thousands of steps) is impossible:
+  an agent-based market has to be simulated tick by tick.
+- Cost: every tick becomes many order-book operations instead of ~7 libm
+  calls.
+
+**B. Reference price plus liquidity layer** (chosen). The simulator remains
+the *reference price* `R_t`: the fundamental, the reverting spread, GARCH,
+jumps, game events and coarse history all stay exactly as they are. The
+order book is a liquidity layer around it:
+
+- Synthetic **makers** quote a ladder of limit orders around `R_t`, re-quoted
+  every tick (§14.3). Their quotes are what a player's market order hits.
+- Synthetic **takers** realise the simulator's tick volume as prints against
+  the book (§14.4), with a direction biased by the tick's return. A game
+  event therefore *does* show up on the tape as a burst of one-sided flow,
+  as the user suggested, but the flow is a rendering of the move the
+  simulator already made rather than its cause. The move's size is still the
+  event's.
+- **Traders** (players, or NPCs the game runs under a `TraderId`) send orders
+  that match against both. Their net flow feeds back into the simulator as
+  price impact (§14.5), so trading moves the price, and the move decays
+  through the same mean reversion as every other shock.
+
+Invariant: **with no trader orders the exchange's ticks are bit-identical to
+the bare simulator's** (price *and* volume). The synthetic flow draws from a
+separate RNG stream (`long_jump` of the seeded generator), so adding the
+book cannot perturb the reference path, and existing golden hashes still
+hold. `tests/trading.rs` pins this.
+
+**C. Simulate the past, order-drive the present** (the option raised in the
+request). History from the simulator, live trading purely order-driven.
+This inherits every drawback of A for the live part and adds a seam: the
+statistical character of the series changes at the moment the game starts.
+B gives the same visible outcome (events manifest as flow on the tape,
+players see their orders in a book) without the seam, and the game can still
+choose to express an event as an NPC trader's orders when it wants the move
+to *emerge* from matching rather than be dictated.
+
+So a game has two ways to act on the market, and can mix them:
+
+| route | what happens | move size |
+|---|---|---|
+| `Simulator::push_event` (existing) | jump / drift / vol / fundamental on the reference; the tape shows the corresponding flow | exactly as specified, reverts per §4 |
+| `Exchange::submit` under an NPC `TraderId` | orders match against the book and other traders; net flow moves the reference through impact | emerges from book depth and the impact law |
+
+### 14.2 Order book (`book.rs`)
+
+Plain price–time priority, `no_std`, deterministic:
+
+- `BTreeMap<price, VecDeque<Resting>>` per side plus an id index; no hashing
+  anywhere, so iteration order is fixed (§9 rule 4).
+- `Order { owner, side, kind: Market | Limit { price_cents }, tif: Gtc | Ioc | Fok, qty }`.
+  The taker pays the maker's price. `Placement` reports fills, remainder and
+  where it went (`Filled | Resting | Cancelled`).
+- `Trade { ts, price_cents, qty, taker_side, taker: Party, maker: Party }`;
+  `Party { order: OrderId, owner: Synthetic | Trader(id) }`. `OrderId::HIDDEN`
+  (zero) marks hidden liquidity (§14.4).
+- `preview(side, qty, limit)` walks the book without mutating it, so a game
+  can check affordability before submitting.
+- Self-trades are allowed (a trader's buy may hit their own ask); they net to
+  zero flow.
+
+### 14.3 Synthetic makers
+
+Every tick, after the reference moves, all synthetic quotes are cancelled and
+re-placed (`LiquidityParams`):
+
+```
+regime  = max(1, σ_t / σ)                          spread widens in panic
+hs      = half_spread · regime
+bid_1   = min(R − 1, ⌊R (1 − hs)⌋)                  never inside one cent
+ask_1   = max(R + 1, ⌈R (1 + hs)⌉)
+step    = max(1, round(R · level_step))
+bid_k   = bid_1 − k·step,  ask_k = ask_1 + k·step,  k = 0 … levels−1
+size_k  = touch_depth · base_per_day · depth_growth^k · exp(η z − η²/2)
+```
+
+Defaults: 5 bp half spread, 10 levels 5 bp apart, 0.1 % of a day's base
+volume at the touch growing 1.3× per level (≈ 42 k shares per side for the
+default config), lognormal size noise 0.3. Re-quoting is one normal draw per
+level and side from the flow RNG.
+
+A new quote that crosses a trader's resting order executes against it at the
+trader's price: a bid wall below the market gets eaten level by level as the
+reference falls through it, exactly as a resting limit should. Those fills
+count as trader flow (§14.5), so a wall does hold the price up — at the cost
+of the shares it absorbs.
+
+Market orders from traders are converted to immediate-or-cancel limits
+`market_collar` (default 5 %) from the reference, so a fat-fingered order
+cannot sweep a stray trader ask at ten times the price.
+
+### 14.4 Synthetic takers
+
+The simulator's `Tick::volume` is spent as prints against the book
+(`FlowParams`), before the ladder is re-quoted, so the prints walk the
+*previous* ladder toward the new price and the tape reads "buyers swept the
+asks, market re-quoted higher":
+
+```
+r       = ln(R_new / R_old)
+P(buy)  = ½ + ½ · imbalance · tanh(r / σ_tick)      default imbalance 0.8
+n       = 1 + Poisson(max(1, V / mean_print) − 1), capped at max_prints
+weights w_i ~ U[0.5, 1.5);  print_i = V · w_i / Σw  (last print takes the remainder)
+```
+
+Each print is a synthetic market order. Whatever the visible book cannot
+absorb prints against **hidden liquidity** at the new reference price
+(`maker.order = OrderId::HIDDEN`), so the tape volume always equals the
+simulator's volume and no share of a game event's volume spike is lost.
+Synthetic prints also fill traders' resting orders that stand at or inside
+the touch, which is how a limit order inside the spread gets filled without
+the reference ever crossing its price.
+
+Draw order per tick (flow RNG): one uniform for the print count, one per
+print for its weight, one per print for its side; then the ladder's normals.
+Frozen by `EXCHANGE_VERSION`.
+
+`StepReport.tick.volume` is the tape volume of the step: synthetic prints
+plus every trader execution since the previous tick (orders submitted
+between ticks are added to the next tick).
+
+### 14.5 Price impact
+
+Net signed shares that traders took from synthetic liquidity since the last
+tick, `Q` (trader-to-trader trades net to zero, and a trader's passive fills
+count the same as aggressive ones: the rest of the market had to be induced
+to supply those shares), become an event on the simulator at the next tick
+(`ImpactParams`):
+
+```
+Δ ln P = sign(Q) · min(1, coefficient · σ_day · (|Q| / ADV)^exponent)
+σ_day  = σ / sqrt(trading days per year)
+ADV    = base_per_day · (1 + return_sensitivity · sqrt(2/π))     (§4.7)
+```
+
+The square-root law (`coefficient` ≈ 0.7, `exponent` 0.5) is the standard
+empirical shape. The move is pushed as `Jump(e^{Δ} − 1)` on the spread, so
+it is **transient**: it decays with the spread half-life `ln2/θ` like any
+other shock, which is also the empirically right shape for impact. An
+optional `permanent_fraction` routes part of it to `FundamentalShift`
+instead. Because the OU spread is linear and the simulator's RNG is
+untouched, the treated path differs from a seed-matched control by exactly
+`Δ·e^{−θt}`; `tests/trading.rs` checks this to 1e-7.
+
+Consequences a game gets for free: buying then selling loses the spread
+plus the impact you paid on the way in; a pump reverts unless the fundamental
+follows; a big wall supports the price only while it lasts.
+
+### 14.6 API and state
+
+```rust
+pub struct Exchange { .. }   // serde(try_from = "ExchangeRepr") with its own EXCHANGE_VERSION
+impl Exchange {
+    pub fn new(config: Config, params: TradingParams, seed: u64) -> Result<Self, ConfigError>;
+    pub fn step(&mut self) -> StepReport;                                    // one tick
+    pub fn advance(&mut self, dur: Duration) -> impl Iterator<Item = StepReport> + '_;
+    pub fn submit(&mut self, order: Order) -> Result<Placement, OrderError>;  // matches now
+    pub fn cancel(&mut self, id: OrderId, trader: TraderId) -> Result<Resting, CancelError>;
+    pub fn cancel_all(&mut self, trader: TraderId) -> Vec<Resting>;
+    pub fn preview_market(&self, side: Side, qty: u64) -> Preview;
+    pub fn book(&self) -> &OrderBook;
+    pub fn simulator(&self) -> &Simulator;
+    pub fn simulator_mut(&mut self) -> &mut Simulator;   // events, coarse history
+    pub fn reference_cents(&self) -> i64;
+    pub fn pending_flow(&self) -> i64;
+}
+pub struct StepReport { pub tick: Tick, pub trades: Vec<Trade>, pub impact: f64 }
+pub struct Position { qty, cash_cents, cost_cents, realised_pnl_cents }   // average-cost ledger helper
+```
+
+`Exchange` wraps a `Simulator`; the game generates history through
+`simulator_mut()` (coarse bars, or fine ticks, which with no traders are
+the ticks the exchange would have produced), calls `resync()` to quote the
+ladder, and then steps the exchange. Serialisation nests `SimulatorRepr`
+inside `ExchangeRepr`, so save games carry the book, the flow RNG and the
+pending flow. Cost: re-quoting is ~40 `BTreeMap` operations per tick, so
+`bench ticks/exchange` runs at ≈ 150 k ticks/s against ≈ 5 M for the bare
+simulator (hence the warm-up shortcut above). If that ever matters, the
+ladder could live in a fixed array merged into matching instead of the map.
+
+Accounts (cash, reservations for resting orders, no shorting) live in the
+web app (`webapp/src/trading.rs`), not the crate: they are game rules.
+`Position` is in the crate because every consumer needs the same
+average-cost arithmetic.
+
+### 14.7 Web app
+
+Per symbol the `SymbolState` now owns an `Exchange` and a bounded tape.
+New endpoints: `POST /api/traders`, `GET /api/traders[/{id}]`,
+`POST /api/traders/{id}/cancel_all`, `POST|GET /api/symbols/{s}/orders`,
+`GET|DELETE /api/symbols/{s}/orders/{id}`, `GET /api/symbols/{s}/book`,
+`GET /api/symbols/{s}/trades`. The `tick` stream message carries the best
+bid/ask, the top of the book and the step's prints; `fill` messages report
+a trader's executions. The UI gains a book ladder, an order ticket, the
+account and open orders, a tape, and fill markers on the chart. The four
+seeded symbols differ in liquidity: NBLA is thin and wide, PXCO deep.
+
+### 14.8 Tests
+
+`tests/trading.rs`: book priority/partial fills/IOC/FOK/cancel/preview; the
+no-trader invariant against the bare simulator for 20 k ticks; ladder
+geometry and spread widening under a vol shift; market buy pays the spread
+and moves the reference by the analytic amount; exact impact decay and
+round-trip cost against a seed-matched control; permanent fraction lands on
+the fundamental; resting bids/asks fill when the market trades through them;
+trader-to-trader trades leave the reference alone; ownership on cancel;
+market-order collar; flow direction follows the return (> 70 % of volume);
+determinism with interleaved orders; serde round trip (JSON and postcard)
+continuing identically for 2 k ticks. `webapp/tests/api.rs` covers the HTTP
+surface end to end, including reservations and rejections.
