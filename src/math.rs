@@ -1,7 +1,7 @@
 //! Every transcendental operation and every RNG-to-float conversion in the crate
 //! lives here, so results are bit-identical across native and `wasm32`.
 //!
-//! Rules: only `libm` for `exp`/`ln`/`sqrt`/`pow`/`cos`/`round`, only
+//! Rules: only `libm` for `exp`/`ln`/`sqrt`/`pow`/`cos`/`tanh`/`round`, only
 //! `next_u64` from the RNG, and no `mul_add`/`powi` (LLVM intrinsics).
 
 use rand_core::Rng as _;
@@ -46,6 +46,11 @@ pub(crate) fn pow(x: f64, y: f64) -> f64 {
 #[inline]
 pub(crate) fn round(x: f64) -> f64 {
     libm::round(x)
+}
+
+#[inline]
+pub(crate) fn tanh(x: f64) -> f64 {
+    libm::tanh(x)
 }
 
 /// Uniform in `[0, 1)` from the top 53 bits of one `u64`.

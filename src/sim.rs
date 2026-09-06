@@ -152,6 +152,21 @@ impl Simulator {
         self.next_ts
     }
 
+    /// Unconditional standard deviation of one regular tick's log return,
+    /// `σ √dt`.
+    #[must_use]
+    pub fn tick_std(&self) -> f64 {
+        self.derived.tick_std
+    }
+
+    /// Move the wall clock forward to `ts` without emitting ticks (no-op if
+    /// `ts` is not in the future).
+    pub(crate) fn set_clock(&mut self, ts: Timestamp) {
+        if ts > self.clock {
+            self.clock = ts;
+        }
+    }
+
     /// Latent-state view.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
