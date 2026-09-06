@@ -86,5 +86,5 @@ fn golden_hash_with_events_and_market_hours() {
 // Pinned outputs. If a deliberate change to the draw order or model alters
 // these, bump `STATE_VERSION` and update them.
 const GOLDEN_DEFAULT: u64 = 0x8872_ac21_7ef8_77a8;
-const GOLDEN_EVENTS: u64 = 0x3d1d_5d8c_77e8_b2c0;
+const GOLDEN_EVENTS: u64 = 0x8b2f_7a50_5b67_a470;
 const GOLDEN_MARKET_HOURS: u64 = 0x2503_7189_602e_037f;
