@@ -11,8 +11,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
-use fehu::{Candle, Config, Interval};
+use axum::routing::{get, post};
+use fehu::{Candle, Config, Interval, Order, OrderKind, Owner, TraderId};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
@@ -23,7 +23,13 @@ use crate::events::{
     CatalogEntry, EventRecord, GameEventKind, GameEventRequest, MAX_MAGNITUDE, Prepared,
     PushEventRequest, Scope, SimEvent,
 };
-use crate::market::{App, Quote, SnapshotDto, StreamMessage, SymbolInfo, SymbolState, wall_now_ms};
+use crate::market::{
+    App, Market, Quote, SnapshotDto, StreamMessage, SymbolInfo, SymbolState, wall_now_ms,
+};
+use crate::trading::{
+    BookDto, CreateTraderRequest, OpenOrderDto, OrderRequest, OrderResponse, PortfolioDto,
+    PositionDto, TradeDto, TraderSummary,
+};
 
 type AppState = Arc<App>;
 
@@ -41,6 +47,19 @@ pub fn router(app: AppState) -> Router {
             "/api/symbols/{symbol}/events",
             get(list_symbol_events).post(push_sim_event),
         )
+        .route("/api/symbols/{symbol}/book", get(get_book))
+        .route("/api/symbols/{symbol}/trades", get(get_trades))
+        .route(
+            "/api/symbols/{symbol}/orders",
+            get(list_orders).post(submit_order),
+        )
+        .route(
+            "/api/symbols/{symbol}/orders/{order_id}",
+            get(get_order).delete(cancel_order),
+        )
+        .route("/api/traders", get(list_traders).post(create_trader))
+        .route("/api/traders/{trader_id}", get(get_trader))
+        .route("/api/traders/{trader_id}/cancel_all", post(cancel_all))
         .route("/api/game/catalog", get(catalog))
         .route("/api/game/events", get(list_events).post(push_game_event))
         .route("/api/events", get(list_events))
@@ -86,6 +105,30 @@ impl ApiError {
     fn bad_json(rej: JsonRejection) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_json", rej.body_text())
     }
+
+    fn unknown_trader(id: u64) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "unknown_trader",
+            format!("no such trader: {id}"),
+        )
+    }
+
+    fn unknown_order(id: u64) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "unknown_order",
+            format!("no resting order {id} (it may have filled or been cancelled)"),
+        )
+    }
+
+    fn invalid_order(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_order", message)
+    }
+
+    fn refused(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNPROCESSABLE_ENTITY, "order_refused", message)
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -110,6 +153,10 @@ struct Health {
     symbols: usize,
     events_logged: usize,
     ticks_total: u64,
+    trades_total: u64,
+    traders: usize,
+    /// Traders' orders resting across every book.
+    resting_orders: usize,
 }
 
 async fn health(State(app): State<AppState>) -> Json<Health> {
@@ -122,6 +169,19 @@ async fn health(State(app): State<AppState>) -> Json<Health> {
         symbols: market.symbols.len(),
         events_logged: market.events.len(),
         ticks_total: market.symbols.iter().map(|s| s.ticks_total).sum(),
+        trades_total: market.symbols.iter().map(|s| s.trades_total).sum(),
+        traders: market.traders.len(),
+        resting_orders: market
+            .symbols
+            .iter()
+            .map(|s| {
+                s.exchange
+                    .book()
+                    .orders()
+                    .filter(|o| o.owner != Owner::Synthetic)
+                    .count()
+            })
+            .sum(),
     })
 }
 
@@ -159,8 +219,8 @@ async fn get_symbol(
     Ok(Json(SymbolDetail {
         info: s.info,
         quote: s.quote(),
-        snapshot: s.sim.snapshot().into(),
-        config: s.sim.config().clone(),
+        snapshot: s.sim().snapshot().into(),
+        config: s.sim().config().clone(),
         ticks_total: s.ticks_total,
     }))
 }
@@ -288,7 +348,7 @@ async fn push_sim_event(
             .symbol_mut(&symbol)
             .ok_or_else(|| ApiError::not_found(&symbol))?;
         prepared
-            .apply(&mut s.sim, at)
+            .apply(s.exchange.simulator_mut(), at)
             .map_err(|e| ApiError::invalid_event(e.to_string()))?;
         let ticker = s.info.symbol;
         market.record(EventRecord {
@@ -359,7 +419,7 @@ async fn push_game_event(
             }
         };
         for &i in &targets {
-            let sim = &mut market.symbols[i].sim;
+            let sim = market.symbols[i].exchange.simulator_mut();
             for p in &prepared {
                 p.apply(sim, at)
                     .map_err(|e| ApiError::invalid_event(e.to_string()))?;
@@ -392,6 +452,375 @@ fn game_kind_name(kind: GameEventKind) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Trading
+
+#[derive(Deserialize)]
+struct DepthQuery {
+    depth: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct BookResponse {
+    symbol: &'static str,
+    ts_ms: i64,
+    reference_cents: i64,
+    bid_cents: Option<i64>,
+    ask_cents: Option<i64>,
+    /// Traders' net flow the next tick will price in.
+    pending_flow: i64,
+    #[serde(flatten)]
+    book: BookDto,
+}
+
+async fn get_book(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    Query(q): Query<DepthQuery>,
+) -> Result<Json<BookResponse>, ApiError> {
+    let depth = q.depth.unwrap_or(10).clamp(1, 200);
+    let market = app.market();
+    let s = market
+        .symbol(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    let b = s.exchange.book();
+    Ok(Json(BookResponse {
+        symbol: s.info.symbol,
+        ts_ms: s.exchange.clock().0,
+        reference_cents: s.exchange.reference_cents(),
+        bid_cents: b.best_bid(),
+        ask_cents: b.best_ask(),
+        pending_flow: s.exchange.pending_flow(),
+        book: s.book(depth),
+    }))
+}
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct TradesResponse {
+    symbol: &'static str,
+    sim_now_ms: i64,
+    /// Newest first.
+    trades: Vec<TradeDto>,
+}
+
+async fn get_trades(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<TradesResponse>, ApiError> {
+    let limit = q.limit.unwrap_or(50).clamp(1, app.options.tape_len.max(1));
+    let market = app.market();
+    let s = market
+        .symbol(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    Ok(Json(TradesResponse {
+        symbol: s.info.symbol,
+        sim_now_ms: app.clock.now().0,
+        trades: s
+            .tape
+            .iter()
+            .rev()
+            .take(limit)
+            .map(TradeDto::from)
+            .collect(),
+    }))
+}
+
+async fn create_trader(
+    State(app): State<AppState>,
+    payload: Option<Json<CreateTraderRequest>>,
+) -> Result<(StatusCode, Json<PortfolioDto>), ApiError> {
+    let req = payload.map(|Json(r)| r).unwrap_or_default();
+    let cash = req.cash_cents.unwrap_or(app.options.starting_cash_cents);
+    if cash < 0 {
+        return Err(ApiError::bad_request("`cash_cents` must not be negative"));
+    }
+    let mut market = app.market();
+    let id = market.create_trader(req.name, cash, wall_now_ms()).id;
+    tracing::info!(trader = id.0, cash, "trader created");
+    Ok((StatusCode::CREATED, Json(portfolio(&market, id)?)))
+}
+
+async fn list_traders(State(app): State<AppState>) -> Json<Vec<TraderSummary>> {
+    let market = app.market();
+    Json(
+        market
+            .traders
+            .values()
+            .map(|t| {
+                let equity = t.cash_cents.saturating_add(
+                    t.positions
+                        .iter()
+                        .map(|(sym, p)| {
+                            let mark = market
+                                .symbol(sym)
+                                .map_or(0, |s| s.exchange.reference_cents());
+                            p.market_value_cents(mark)
+                        })
+                        .fold(0i64, i64::saturating_add),
+                );
+                TraderSummary {
+                    id: t.id.0,
+                    name: t.name.clone(),
+                    cash_cents: t.cash_cents,
+                    equity_cents: equity,
+                    positions: t.positions.len(),
+                    open_orders: market
+                        .symbols
+                        .iter()
+                        .map(|s| s.exchange.book().orders_of(t.owner()).count())
+                        .sum(),
+                }
+            })
+            .collect(),
+    )
+}
+
+async fn get_trader(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+) -> Result<Json<PortfolioDto>, ApiError> {
+    let market = app.market();
+    Ok(Json(portfolio(&market, TraderId(trader_id))?))
+}
+
+fn portfolio(market: &Market, id: TraderId) -> Result<PortfolioDto, ApiError> {
+    let t = market
+        .traders
+        .get(&id)
+        .ok_or_else(|| ApiError::unknown_trader(id.0))?;
+    let mut positions = Vec::new();
+    let mut value = 0i64;
+    let mut unrealised = 0i64;
+    let mut realised = 0i64;
+    for (sym, p) in &t.positions {
+        let mark = market
+            .symbol(sym)
+            .map_or(0, |s| s.exchange.reference_cents());
+        let mv = p.market_value_cents(mark);
+        let u = p.unrealised_pnl_cents(mark);
+        value = value.saturating_add(mv);
+        unrealised = unrealised.saturating_add(u);
+        realised = realised.saturating_add(p.realised_pnl_cents);
+        positions.push(PositionDto {
+            symbol: sym,
+            qty: p.qty,
+            avg_cost_cents: p.avg_cost_cents(),
+            mark_cents: mark,
+            market_value_cents: mv,
+            unrealised_pnl_cents: u,
+            realised_pnl_cents: p.realised_pnl_cents,
+            reserved_shares: t.reserved_shares.get(sym).copied().unwrap_or(0),
+        });
+    }
+    let open_orders = market
+        .symbols
+        .iter()
+        .flat_map(|s| {
+            s.exchange
+                .book()
+                .orders_of(t.owner())
+                .map(|o| OpenOrderDto::from_resting(s.info.symbol, o))
+        })
+        .collect();
+    Ok(PortfolioDto {
+        id: t.id.0,
+        name: t.name.clone(),
+        created_at_ms: t.created_at_ms,
+        cash_cents: t.cash_cents,
+        reserved_cents: t.reserved_cents,
+        free_cash_cents: t.free_cash_cents(),
+        equity_cents: t.cash_cents.saturating_add(value),
+        realised_pnl_cents: realised,
+        unrealised_pnl_cents: unrealised,
+        positions,
+        open_orders,
+        fills: t.fills.iter().rev().cloned().collect(),
+    })
+}
+
+async fn submit_order(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    payload: Result<Json<OrderRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<OrderResponse>), ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let trader = TraderId(req.trader_id);
+    let order = Order {
+        owner: Owner::Trader(trader),
+        side: req.side,
+        kind: req.kind,
+        tif: req.tif,
+        qty: req.qty,
+    };
+    fehu::OrderBook::validate(&order).map_err(|e| ApiError::invalid_order(e.to_string()))?;
+
+    let (response, fills) = {
+        let mut market = app.market();
+        let idx = market
+            .symbol_index(&symbol)
+            .ok_or_else(|| ApiError::not_found(&symbol))?;
+        if !market.traders.contains_key(&trader) {
+            return Err(ApiError::unknown_trader(trader.0));
+        }
+        let sym = market.symbols[idx].info.symbol;
+        // Worst-case cash a buy can consume.
+        let cost = match order.kind {
+            OrderKind::Limit { price_cents } => {
+                i64::try_from(i128::from(price_cents) * i128::from(order.qty)).unwrap_or(i64::MAX)
+            }
+            OrderKind::Market => {
+                market.symbols[idx]
+                    .exchange
+                    .preview_market(order.side, order.qty)
+                    .notional_cents
+            }
+        };
+        market.traders[&trader]
+            .check(sym, order.side, order.qty, cost)
+            .map_err(|e| ApiError::refused(e.to_string()))?;
+        let placement = market.symbols[idx]
+            .exchange
+            .submit(order)
+            .map_err(|e| ApiError::invalid_order(e.to_string()))?;
+        market.symbols[idx].record_trades(&placement.trades);
+        let fills = market.apply_trades(sym, &placement.trades);
+        if placement.status == fehu::OrderStatus::Resting
+            && let OrderKind::Limit { price_cents } = order.kind
+            && let Some(t) = market.traders.get_mut(&trader)
+        {
+            t.reserve(sym, order.side, placement.remaining, price_cents);
+        }
+        (
+            OrderResponse::new(sym, trader, order.side, order.qty, &placement),
+            fills,
+        )
+    };
+    tracing::info!(
+        trader = trader.0,
+        symbol = response.symbol,
+        order = response.order_id,
+        side = ?response.side,
+        qty = response.qty,
+        filled = response.filled,
+        status = ?response.status,
+        "order"
+    );
+    for fill in fills {
+        let _ = app.tx.send(StreamMessage::Fill {
+            trader_id: fill.trader_id,
+            fill,
+        });
+    }
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+#[derive(Deserialize)]
+struct TraderQuery {
+    trader_id: u64,
+}
+
+async fn list_orders(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    Query(q): Query<TraderQuery>,
+) -> Result<Json<Vec<OpenOrderDto>>, ApiError> {
+    let market = app.market();
+    let s = market
+        .symbol(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    Ok(Json(
+        s.exchange
+            .book()
+            .orders_of(Owner::Trader(TraderId(q.trader_id)))
+            .map(|o| OpenOrderDto::from_resting(s.info.symbol, o))
+            .collect(),
+    ))
+}
+
+async fn get_order(
+    State(app): State<AppState>,
+    Path((symbol, order_id)): Path<(String, u64)>,
+) -> Result<Json<OpenOrderDto>, ApiError> {
+    let market = app.market();
+    let s = market
+        .symbol(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    let o = s
+        .exchange
+        .book()
+        .get(fehu::OrderId(order_id))
+        .filter(|o| o.owner != Owner::Synthetic)
+        .ok_or_else(|| ApiError::unknown_order(order_id))?;
+    Ok(Json(OpenOrderDto::from_resting(s.info.symbol, o)))
+}
+
+async fn cancel_order(
+    State(app): State<AppState>,
+    Path((symbol, order_id)): Path<(String, u64)>,
+    Query(q): Query<TraderQuery>,
+) -> Result<Json<OpenOrderDto>, ApiError> {
+    let trader = TraderId(q.trader_id);
+    let mut market = app.market();
+    let idx = market
+        .symbol_index(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    let sym = market.symbols[idx].info.symbol;
+    let cancelled = market.symbols[idx]
+        .exchange
+        .cancel(fehu::OrderId(order_id), trader)
+        .map_err(|e| match e {
+            fehu::CancelError::Unknown => ApiError::unknown_order(order_id),
+            fehu::CancelError::NotOwner => {
+                ApiError::new(StatusCode::FORBIDDEN, "not_owner", e.to_string())
+            }
+            _ => ApiError::bad_request(e.to_string()),
+        })?;
+    if let Some(t) = market.traders.get_mut(&trader) {
+        t.release(
+            sym,
+            cancelled.side,
+            cancelled.remaining,
+            cancelled.price_cents,
+        );
+    }
+    tracing::info!(
+        trader = trader.0,
+        symbol = sym,
+        order = order_id,
+        "order cancelled"
+    );
+    Ok(Json(OpenOrderDto::from_resting(sym, &cancelled)))
+}
+
+async fn cancel_all(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+) -> Result<Json<Vec<OpenOrderDto>>, ApiError> {
+    let trader = TraderId(trader_id);
+    let mut market = app.market();
+    if !market.traders.contains_key(&trader) {
+        return Err(ApiError::unknown_trader(trader_id));
+    }
+    let mut out = Vec::new();
+    for i in 0..market.symbols.len() {
+        let sym = market.symbols[i].info.symbol;
+        let cancelled = market.symbols[i].exchange.cancel_all(trader);
+        if let Some(t) = market.traders.get_mut(&trader) {
+            for o in &cancelled {
+                t.release(sym, o.side, o.remaining, o.price_cents);
+                out.push(OpenOrderDto::from_resting(sym, o));
+            }
+        }
+    }
+    Ok(Json(out))
 }
 
 async fn catalog() -> Json<Vec<CatalogEntry>> {

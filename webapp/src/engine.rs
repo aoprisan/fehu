@@ -8,28 +8,11 @@ use tokio::time::MissedTickBehavior;
 
 use crate::market::{App, StreamMessage};
 
-/// Advance every symbol to `target` and publish the resulting ticks. Returns
-/// the number of ticks emitted across all symbols.
+/// Advance every symbol to `target`, book the traders' fills, and publish
+/// the resulting ticks and fills. Returns the number of ticks emitted across
+/// all symbols.
 pub fn advance_to(app: &App, target: Timestamp) -> u64 {
-    let mut total = 0;
-    let messages: Vec<StreamMessage> = {
-        let mut market = app.market();
-        market
-            .symbols
-            .iter_mut()
-            .filter_map(|s| {
-                let advanced = s.advance_to(target);
-                total += advanced.ticks;
-                advanced.last.map(|t| StreamMessage::Tick {
-                    symbol: s.info.symbol,
-                    ts_ms: t.ts.0,
-                    price_cents: t.price_cents,
-                    volume: t.volume,
-                    closed: advanced.closed_intervals(),
-                })
-            })
-            .collect()
-    };
+    let (total, messages): (u64, Vec<StreamMessage>) = app.market().advance_to(target);
     for m in messages {
         // `Err` only means nobody is listening right now.
         let _ = app.tx.send(m);

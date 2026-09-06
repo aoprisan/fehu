@@ -1,18 +1,19 @@
 //! The seeded symbols, their simulators and bar history, and the shared
 //! application state.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fehu::{
-    Candle, Candles, Config, Interval, JumpParams, Simulator, Snapshot, Tick, Timestamp,
-    VolumeParams,
+    Candle, Candles, Config, Exchange, Interval, JumpParams, LiquidityParams, Snapshot, Tick,
+    Timestamp, Trade, TraderId, TradingParams, VolumeParams,
 };
 use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::events::EventRecord;
+use crate::trading::{BookDto, FillRecord, MAX_CASH_CENTS, TradeDto, Trader};
 
 /// Milliseconds in one day.
 pub const DAY_MS: i64 = 86_400_000;
@@ -32,10 +33,12 @@ pub struct SymbolInfo {
     pub seed: u64,
 }
 
-/// A symbol's metadata plus the simulator config it is created with.
+/// A symbol's metadata plus the simulator config and trading parameters it
+/// is created with.
 pub struct SymbolSpec {
     pub info: SymbolInfo,
     pub config: Config,
+    pub trading: TradingParams,
 }
 
 /// The four hardcoded symbols. `start_ts` is the first tick's timestamp; the
@@ -70,6 +73,7 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
                 },
                 ..base(8_420, 0.04, 0.22)
             },
+            trading: TradingParams::default(),
         },
         SymbolSpec {
             info: SymbolInfo {
@@ -92,6 +96,16 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
                 },
                 ..base(31_255, 0.15, 0.60)
             },
+            // Thin book, wide spread: a market order moves it.
+            trading: TradingParams {
+                liquidity: LiquidityParams {
+                    half_spread: 0.0010,
+                    level_step: 0.0010,
+                    touch_depth: 0.0005,
+                    ..LiquidityParams::default()
+                },
+                ..TradingParams::default()
+            },
         },
         SymbolSpec {
             info: SymbolInfo {
@@ -113,6 +127,7 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
                 },
                 ..base(2_310, 0.02, 0.42)
             },
+            trading: TradingParams::default(),
         },
         SymbolSpec {
             info: SymbolInfo {
@@ -135,12 +150,21 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
                 },
                 ..base(5_780, 0.05, 0.16)
             },
+            // Deep book: hard to move.
+            trading: TradingParams {
+                liquidity: LiquidityParams {
+                    touch_depth: 0.003,
+                    depth_growth: 1.5,
+                    ..LiquidityParams::default()
+                },
+                ..TradingParams::default()
+            },
         },
     ]
 }
 
 /// What one call to [`SymbolState::advance_to`] produced.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Advanced {
     /// Last tick emitted, if any.
     pub last: Option<Tick>,
@@ -148,6 +172,10 @@ pub struct Advanced {
     pub ticks: u64,
     /// Per interval in [`Interval::ALL`] order: did at least one bar close?
     pub closed: [bool; 4],
+    /// Trades of the last tick, for the stream.
+    pub last_trades: Vec<Trade>,
+    /// Every trade a trader took part in, in order.
+    pub trader_trades: Vec<Trade>,
 }
 
 impl Advanced {
@@ -182,6 +210,8 @@ pub struct Quote {
     pub fundamental_cents: i64,
     pub annual_vol: f64,
     pub pending_events: usize,
+    pub bid_cents: Option<i64>,
+    pub ask_cents: Option<i64>,
 }
 
 /// Serialisable view of [`fehu::Snapshot`].
@@ -212,11 +242,12 @@ impl From<Snapshot> for SnapshotDto {
     }
 }
 
-/// One symbol: its simulator, the bars aggregated from its ticks, and the
-/// coarse daily bars generated as pre-history at start-up.
+/// One symbol: its exchange (simulator plus order book), the bars
+/// aggregated from its ticks, the coarse daily bars generated as
+/// pre-history at start-up, and the tape.
 pub struct SymbolState {
     pub info: SymbolInfo,
-    pub sim: Simulator,
+    pub exchange: Exchange,
     /// 1 m / 5 m / 1 h / 1 d bars aggregated from fine ticks.
     pub candles: Candles,
     /// Daily bars from coarse mode, before the fine-tick history starts.
@@ -224,54 +255,115 @@ pub struct SymbolState {
     pub last_tick: Option<Tick>,
     /// Fine ticks emitted since start-up (warm-up included).
     pub ticks_total: u64,
+    /// Most recent trades, oldest first.
+    pub tape: VecDeque<Trade>,
+    tape_cap: usize,
+    /// Trades since start-up (warm-up included).
+    pub trades_total: u64,
 }
 
 impl SymbolState {
-    fn new(spec: SymbolSpec, max_bars: usize) -> Self {
-        let sim = Simulator::new(spec.config, spec.info.seed).expect("seeded configs are valid");
+    fn new(spec: SymbolSpec, max_bars: usize, tape_cap: usize) -> Self {
+        let exchange = Exchange::new(spec.config, spec.trading, spec.info.seed)
+            .expect("seeded configs are valid");
         Self {
             info: spec.info,
-            sim,
+            exchange,
             candles: Candles::new(max_bars),
             coarse_daily: Vec::new(),
             last_tick: None,
             ticks_total: 0,
+            tape: VecDeque::new(),
+            tape_cap: tape_cap.max(1),
+            trades_total: 0,
         }
+    }
+
+    /// The reference price process.
+    pub fn sim(&self) -> &fehu::Simulator {
+        self.exchange.simulator()
     }
 
     /// Generate `coarse_days` daily bars in coarse mode, then tick finely up
-    /// to `until` so the intraday intervals have history too.
+    /// to `until` so the intraday intervals have history too. Both run on
+    /// the bare simulator (no traders exist yet, so the ticks are the ones
+    /// the exchange would have produced) and the book is synced at the end.
     fn warm_up(&mut self, coarse_days: usize, until: Timestamp) {
-        self.coarse_daily = self
-            .sim
-            .coarse_candles(Interval::D1)
-            .take(coarse_days)
-            .collect();
-        self.advance_to(until);
+        let sim = self.exchange.simulator_mut();
+        self.coarse_daily = sim.coarse_candles(Interval::D1).take(coarse_days).collect();
+        let dur = until - sim.clock();
+        if dur > 0 {
+            for tick in sim.advance(Duration::from_millis(dur as u64)) {
+                self.candles.push(&tick);
+                self.last_tick = Some(tick);
+                self.ticks_total += 1;
+            }
+        }
+        self.exchange.resync();
     }
 
-    /// Advance the simulator's wall clock to `target` (no-op if it is not in
-    /// the future), aggregating every tick into the bars.
+    /// Advance the exchange's wall clock to `target` (no-op if it is not in
+    /// the future), aggregating every tick into the bars and every trade
+    /// into the tape.
     pub fn advance_to(&mut self, target: Timestamp) -> Advanced {
         let mut out = Advanced::default();
-        let dur = target - self.sim.clock();
+        let dur = target - self.exchange.clock();
         if dur <= 0 {
             return out;
         }
-        let Self { sim, candles, .. } = self;
-        for tick in sim.advance(Duration::from_millis(dur as u64)) {
-            let closed = candles.push(&tick);
+        let Self {
+            exchange,
+            candles,
+            tape,
+            tape_cap,
+            ..
+        } = self;
+        for report in exchange.advance(Duration::from_millis(dur as u64)) {
+            let closed = candles.push(&report.tick);
             for (flag, c) in out.closed.iter_mut().zip(closed) {
                 *flag |= c.is_some();
             }
-            out.last = Some(tick);
+            out.last = Some(report.tick);
             out.ticks += 1;
+            out.trader_trades.extend(
+                report.trades.iter().filter(|t| {
+                    t.taker.owner.trader().is_some() || t.maker.owner.trader().is_some()
+                }),
+            );
+            self.trades_total += report.trades.len() as u64;
+            for t in &report.trades {
+                if tape.len() >= *tape_cap {
+                    tape.pop_front();
+                }
+                tape.push_back(*t);
+            }
+            out.last_trades = report.trades;
         }
         if out.last.is_some() {
             self.last_tick = out.last;
             self.ticks_total += out.ticks;
         }
         out
+    }
+
+    /// Record trades executed between ticks (a trader's order) on the tape.
+    pub fn record_trades(&mut self, trades: &[Trade]) {
+        self.trades_total += trades.len() as u64;
+        for t in trades {
+            if self.tape.len() >= self.tape_cap {
+                self.tape.pop_front();
+            }
+            self.tape.push_back(*t);
+        }
+    }
+
+    /// Top `depth` levels of each side.
+    pub fn book(&self, depth: usize) -> BookDto {
+        let b = self.exchange.book();
+        BookDto {
+            bids: b.depth(fehu::Side::Buy, depth),
+            asks: b.depth(fehu::Side::Sell, depth),
+        }
     }
 
     /// The most recent `limit` bars of `iv`, oldest first, including the
@@ -291,7 +383,7 @@ impl SymbolState {
 
     /// Current quote.
     pub fn quote(&self) -> Quote {
-        let snap = self.sim.snapshot();
+        let snap = self.sim().snapshot();
         let daily = self.bars(Interval::D1, 2);
         let today = self.candles.current(Interval::D1);
         let prev_close = match (today, daily.len()) {
@@ -317,20 +409,106 @@ impl SymbolState {
             fundamental_cents: snap.fundamental_cents,
             annual_vol: snap.annual_vol,
             pending_events: snap.pending_events,
+            bid_cents: self.exchange.book().best_bid(),
+            ask_cents: self.exchange.book().best_ask(),
         }
     }
 }
 
-/// Everything behind the mutex: the symbols and the event log.
+/// Everything behind the mutex: the symbols, the traders and the event log.
 pub struct Market {
     pub symbols: Vec<SymbolState>,
     /// Most recent events, oldest first.
     pub events: VecDeque<EventRecord>,
     event_cap: usize,
     next_event_id: u64,
+    pub traders: BTreeMap<TraderId, Trader>,
+    next_trader_id: u64,
+    fill_log: usize,
 }
 
 impl Market {
+    /// Index of a symbol by ticker, case-insensitively.
+    pub fn symbol_index(&self, ticker: &str) -> Option<usize> {
+        self.symbols
+            .iter()
+            .position(|s| s.info.symbol.eq_ignore_ascii_case(ticker))
+    }
+
+    /// Create a trader with `cash_cents` (clamped to `[0, 10^15]`).
+    pub fn create_trader(&mut self, name: Option<String>, cash_cents: i64, now_ms: i64) -> &Trader {
+        let id = TraderId(self.next_trader_id);
+        self.next_trader_id += 1;
+        let name = name
+            .map(|n| n.trim().chars().take(64).collect::<String>())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("trader-{}", id.0));
+        let cash = cash_cents.clamp(0, MAX_CASH_CENTS);
+        self.traders
+            .entry(id)
+            .or_insert_with(|| Trader::new(id, name, cash, self.fill_log, now_ms))
+    }
+
+    /// Book every trade in `trades` (for symbol `sym`) to the traders
+    /// involved. Returns the fills created, in order.
+    pub fn apply_trades(&mut self, sym: &'static str, trades: &[Trade]) -> Vec<FillRecord> {
+        let mut fills = Vec::new();
+        for t in trades {
+            let mut parties = [t.taker.owner.trader(), t.maker.owner.trader()];
+            if parties[0] == parties[1] {
+                parties[1] = None;
+            }
+            for id in parties.into_iter().flatten() {
+                if let Some(trader) = self.traders.get_mut(&id) {
+                    fills.extend(trader.apply_trade(sym, t));
+                }
+            }
+        }
+        fills
+    }
+
+    /// Advance every symbol to `target`, book the resulting fills, and
+    /// return the stream messages describing what happened.
+    pub fn advance_to(&mut self, target: Timestamp) -> (u64, Vec<StreamMessage>) {
+        let mut total = 0;
+        let mut messages = Vec::new();
+        let mut fills = Vec::new();
+        for i in 0..self.symbols.len() {
+            let advanced = self.symbols[i].advance_to(target);
+            total += advanced.ticks;
+            let sym = self.symbols[i].info.symbol;
+            if !advanced.trader_trades.is_empty() {
+                fills.extend(self.apply_trades(sym, &advanced.trader_trades));
+            }
+            if let Some(t) = advanced.last {
+                let s = &self.symbols[i];
+                let trades = advanced
+                    .last_trades
+                    .iter()
+                    .rev()
+                    .take(MAX_STREAM_TRADES)
+                    .map(TradeDto::from)
+                    .collect();
+                messages.push(StreamMessage::Tick {
+                    symbol: sym,
+                    ts_ms: t.ts.0,
+                    price_cents: t.price_cents,
+                    volume: t.volume,
+                    closed: advanced.closed_intervals(),
+                    bid_cents: s.exchange.book().best_bid(),
+                    ask_cents: s.exchange.book().best_ask(),
+                    book: s.book(STREAM_BOOK_DEPTH),
+                    trades,
+                });
+            }
+        }
+        messages.extend(fills.into_iter().map(|fill| StreamMessage::Fill {
+            trader_id: fill_trader(&fill),
+            fill,
+        }));
+        (total, messages)
+    }
+
     /// Look a symbol up by ticker, case-insensitively.
     pub fn symbol(&self, ticker: &str) -> Option<&SymbolState> {
         self.symbols
@@ -373,6 +551,16 @@ impl SimClock {
     }
 }
 
+/// Most recent prints carried in one `tick` stream message.
+pub const MAX_STREAM_TRADES: usize = 20;
+/// Book levels per side carried in one `tick` stream message.
+pub const STREAM_BOOK_DEPTH: usize = 8;
+
+/// Trader id of a fill (fills are always attributed; see `Trader::record`).
+fn fill_trader(f: &FillRecord) -> u64 {
+    f.trader_id
+}
+
 /// What goes out over the SSE stream.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -392,9 +580,18 @@ pub enum StreamMessage {
         /// Intervals for which at least one bar closed during the step, so a
         /// client can refetch instead of extending its last bar.
         closed: Vec<Interval>,
+        bid_cents: Option<i64>,
+        ask_cents: Option<i64>,
+        /// Top of the book after the step.
+        book: BookDto,
+        /// Newest prints of the step, newest first, at most
+        /// [`MAX_STREAM_TRADES`].
+        trades: Vec<TradeDto>,
     },
     /// An event was accepted.
     Event(EventRecord),
+    /// A trader's order executed (in whole or part).
+    Fill { trader_id: u64, fill: FillRecord },
 }
 
 /// Start-up options, all overridable through `FEHU_*` environment variables.
@@ -414,6 +611,12 @@ pub struct Options {
     pub max_bars: usize,
     /// Events retained in the log. `FEHU_EVENT_LOG`.
     pub event_log: usize,
+    /// Trades retained on each symbol's tape. `FEHU_TAPE`.
+    pub tape_len: usize,
+    /// Fills retained per trader. `FEHU_FILL_LOG`.
+    pub fill_log: usize,
+    /// Cash a new trader starts with, in cents. `FEHU_STARTING_CASH_CENTS`.
+    pub starting_cash_cents: i64,
 }
 
 impl Default for Options {
@@ -425,6 +628,9 @@ impl Default for Options {
             now_ms: None,
             max_bars: 5_000,
             event_log: 500,
+            tape_len: 2_000,
+            fill_log: 500,
+            starting_cash_cents: 10_000_000,
         }
     }
 }
@@ -442,6 +648,9 @@ impl Options {
                 .and_then(|v| v.parse().ok()),
             max_bars: env_parse("FEHU_MAX_BARS", d.max_bars),
             event_log: env_parse("FEHU_EVENT_LOG", d.event_log),
+            tape_len: env_parse("FEHU_TAPE", d.tape_len),
+            fill_log: env_parse("FEHU_FILL_LOG", d.fill_log),
+            starting_cash_cents: env_parse("FEHU_STARTING_CASH_CENTS", d.starting_cash_cents),
         }
     }
 }
@@ -482,7 +691,7 @@ impl App {
         let symbols = seeded_symbols(start_ts)
             .into_iter()
             .map(|spec| {
-                let mut s = SymbolState::new(spec, options.max_bars);
+                let mut s = SymbolState::new(spec, options.max_bars, options.tape_len);
                 s.warm_up(options.history_days, now);
                 s
             })
@@ -500,6 +709,9 @@ impl App {
                 events: VecDeque::new(),
                 event_cap: options.event_log.max(1),
                 next_event_id: 1,
+                traders: BTreeMap::new(),
+                next_trader_id: 1,
+                fill_log: options.fill_log,
             }),
             tx,
             options,

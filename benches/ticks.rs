@@ -1,8 +1,9 @@
-//! Ticks per second for the default config, with and without market hours.
+//! Ticks per second for the default config, with and without market hours,
+//! and for the exchange (simulator plus synthetic book).
 
 use core::time::Duration;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use fehu::{Candles, Config, Interval, MarketHours, Simulator};
+use fehu::{Candles, Config, Exchange, Interval, MarketHours, Simulator, TradingParams};
 use std::hint::black_box;
 
 const N: u64 = 100_000;
@@ -39,6 +40,15 @@ fn bench_ticks(c: &mut Criterion) {
         b.iter(|| {
             for t in sim.advance(Duration::from_secs(N - 1)) {
                 black_box(candles.push(&t));
+            }
+        });
+    });
+
+    g.bench_function("exchange", |b| {
+        let mut ex = Exchange::new(Config::default(), TradingParams::default(), 1).unwrap();
+        b.iter(|| {
+            for _ in 0..N {
+                black_box(ex.step());
             }
         });
     });

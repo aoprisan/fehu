@@ -44,6 +44,38 @@
   .sym .c { font-variant-numeric: tabular-nums; text-align: right; font-size: 11px; }
   .up { color: var(--up); } .down { color: var(--down); }
   #chart-area { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  #trading {
+    display: grid; grid-template-columns: 200px 1fr 220px; gap: 0; border-top: 1px solid var(--line);
+    background: var(--panel); height: 250px; min-height: 0;
+  }
+  #trading > div { padding: 8px 10px; overflow: auto; min-width: 0; }
+  #trading > div + div { border-left: 1px solid var(--line); }
+  table.ladder, table.tape, table.pos { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 12px; }
+  table.ladder td, table.tape td, table.pos td { padding: 1px 4px; white-space: nowrap; }
+  table.ladder td.q, table.tape td.q, table.pos td.r { text-align: right; color: var(--muted); }
+  table.ladder tr.ask td.p { color: var(--down); } table.ladder tr.bid td.p { color: var(--up); }
+  table.ladder tr.mid td { text-align: center; color: var(--muted); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  table.ladder td.bar { position: relative; width: 40%; }
+  table.ladder td.bar i { position: absolute; top: 2px; bottom: 2px; right: 0; opacity: .25; }
+  table.ladder tr.ask td.bar i { background: var(--down); } table.ladder tr.bid td.bar i { background: var(--up); }
+  table.ladder tr.mine td.p::after { content: ' •'; color: var(--accent); }
+  table.tape tr.buy td.p { color: var(--up); } table.tape tr.sell td.p { color: var(--down); }
+  table.tape tr.mine td { background: #1f2a3d; }
+  .ticket { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; align-items: center; }
+  .ticket .full { grid-column: 1 / span 2; }
+  .ticket .side { display: flex; gap: 4px; }
+  .ticket .side button { flex: 1; }
+  .ticket button.buy.active { background: var(--up); border-color: var(--up); color: #0b0f16; }
+  .ticket button.sell.active { background: var(--down); border-color: var(--down); color: #0b0f16; }
+  .ticket button.submit { font-weight: 600; }
+  .acct { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 6px 0; }
+  .acct b { color: var(--text); font-variant-numeric: tabular-nums; }
+  #orders li { display: flex; gap: 6px; align-items: center; font-size: 12px; padding: 2px 0; }
+  #orders li span { flex: 1; font-variant-numeric: tabular-nums; }
+  #orders button { padding: 1px 6px; font-size: 11px; }
+  .twocol { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  #acct-hdr { color: var(--muted); font-variant-numeric: tabular-nums; }
+  #acct-hdr b { color: var(--text); }
   .toolbar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
   .toolbar .title { font-weight: 600; font-size: 14px; }
   .toolbar .sub { color: var(--muted); }
@@ -84,6 +116,8 @@
     #symbols { display: flex; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); }
     .sym { min-width: 160px; border-right: 1px solid var(--line); }
     #events { max-height: 45vh; }
+    #trading { grid-template-columns: 1fr 1fr; height: auto; }
+    #trading > div:last-child { display: none; }
   }
 </style>
 </head>
@@ -92,6 +126,7 @@
   <h1>fehu market</h1>
   <span class="clock" id="clock">—</span>
   <span class="spacer"></span>
+  <span id="acct-hdr">—</span>
   <span id="conn"><span class="dot"></span>connecting</span>
 </header>
 <main>
@@ -106,6 +141,42 @@
       <span id="ohlc"></span>
     </div>
     <div id="chart-wrap"><canvas id="chart"></canvas><div id="tip"></div></div>
+    <div id="trading">
+      <div>
+        <h2>Book <span id="book-sym"></span></h2>
+        <table class="ladder"><tbody id="ladder"></tbody></table>
+      </div>
+      <div>
+        <div class="twocol">
+          <div>
+            <h2>Order <span id="ticket-sym"></span></h2>
+            <form class="ticket" id="ticket">
+              <div class="side full">
+                <button type="button" class="buy active" data-side="buy">Buy</button>
+                <button type="button" class="sell" data-side="sell">Sell</button>
+              </div>
+              <input type="number" name="qty" min="1" step="1" value="100" placeholder="qty" required>
+              <select name="type"><option value="market">market</option><option value="limit">limit</option></select>
+              <input type="number" name="price" step="0.01" placeholder="limit price" class="full" disabled>
+              <select name="tif" class="full"><option value="gtc">good till cancelled</option><option value="ioc">immediate or cancel</option><option value="fok">fill or kill</option></select>
+              <button type="submit" class="submit full">Buy 100 at market</button>
+            </form>
+            <div id="order-status" class="m"></div>
+          </div>
+          <div>
+            <h2>Account</h2>
+            <div class="acct" id="acct">—</div>
+            <table class="pos"><tbody id="positions"></tbody></table>
+            <h2>Open orders</h2>
+            <ul id="orders" style="list-style:none;margin:0;padding:0"></ul>
+          </div>
+        </div>
+      </div>
+      <div>
+        <h2>Tape</h2>
+        <table class="tape"><tbody id="tape"></tbody></table>
+      </div>
+    </div>
   </section>
   <aside id="events">
     <h2>Game events → <span id="target">—</span></h2>
@@ -140,6 +211,7 @@ const $ = id => document.getElementById(id);
 const state = {
   symbol: null, interval: 'M1', bars: [], quotes: new Map(), catalog: [], events: [],
   pitch: 9, hover: null, simNow: null, scale: 1, loading: false,
+  trader: null, book: { bids: [], asks: [] }, tape: [], side: 'buy', myOrders: new Set(), fills: [],
 };
 
 // ---------- helpers ----------
@@ -182,6 +254,33 @@ async function loadEvents() {
 }
 async function loadCatalog() {
   state.catalog = await api('/api/game/catalog'); renderCatalog();
+}
+async function loadTrader() {
+  let id = null;
+  try { id = localStorage.getItem('fehu.trader_id'); } catch (e) {}
+  if (id) {
+    try { state.trader = await api(`/api/traders/${id}`); }
+    catch (e) { state.trader = null; }
+  }
+  if (!state.trader) {
+    state.trader = await api('/api/traders', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'player' }) });
+    try { localStorage.setItem('fehu.trader_id', String(state.trader.id)); } catch (e) {}
+  }
+  renderAccount();
+}
+async function refreshTrader() {
+  if (!state.trader) return;
+  try { state.trader = await api(`/api/traders/${state.trader.id}`); renderAccount(); }
+  catch (e) { setOrderStatus(e.message, true); }
+}
+async function loadBookAndTape() {
+  const [b, t] = await Promise.all([
+    api(`/api/symbols/${state.symbol}/book?depth=8`),
+    api(`/api/symbols/${state.symbol}/trades?limit=40`),
+  ]);
+  if (b.symbol !== state.symbol) return;
+  state.book = { bids: b.bids, asks: b.asks }; state.tape = t.trades;
+  renderBook(); renderTape();
 }
 
 // ---------- rendering: sidebar, catalogue, log ----------
@@ -234,11 +333,93 @@ function logItem(e) {
   return li;
 }
 
+// ---------- rendering: trading ----------
+function setOrderStatus(msg, err) { const s = $('order-status'); s.textContent = msg; s.className = err ? 'err' : 'm'; s.style.color = err ? 'var(--down)' : 'var(--muted)'; }
+function myOrderIds() {
+  const t = state.trader; if (!t) return new Set();
+  return new Set(t.open_orders.filter(o => o.symbol === state.symbol).map(o => o.order_id));
+}
+function renderBook() {
+  const tb = $('ladder'); tb.innerHTML = '';
+  $('book-sym').textContent = state.symbol || '';
+  const { bids, asks } = state.book;
+  const vmax = Math.max(1, ...bids.map(l => l.qty), ...asks.map(l => l.qty));
+  const t = state.trader;
+  const mine = new Set();
+  if (t) for (const o of t.open_orders) if (o.symbol === state.symbol) mine.add(`${o.side}:${o.price_cents}`);
+  const row = (l, cls) => {
+    const tr = document.createElement('tr'); tr.className = cls + (mine.has(`${cls === 'ask' ? 'sell' : 'buy'}:${l.price_cents}`) ? ' mine' : '');
+    tr.innerHTML = `<td class="p">${fmtPrice(l.price_cents)}</td><td class="q">${fmtVol(l.qty)}</td><td class="bar"><i style="width:${(l.qty / vmax * 100).toFixed(0)}%"></i></td>`;
+    tr.onclick = () => { const f = $('ticket'); f.type.value = 'limit'; f.price.disabled = false; f.price.value = (l.price_cents / 100).toFixed(2); updateSubmitLabel(); };
+    return tr;
+  };
+  for (const l of asks.slice().reverse()) tb.appendChild(row(l, 'ask'));
+  const mid = document.createElement('tr'); mid.className = 'mid';
+  const spread = bids.length && asks.length ? asks[0].price_cents - bids[0].price_cents : null;
+  mid.innerHTML = `<td colspan="3">${spread == null ? '—' : 'spread ' + fmtPrice(spread) + (bids[0] ? ` (${(spread / bids[0].price_cents * 1e4).toFixed(1)} bp)` : '')}</td>`;
+  tb.appendChild(mid);
+  for (const l of bids) tb.appendChild(row(l, 'bid'));
+}
+function renderTape() {
+  const tb = $('tape'); tb.innerHTML = '';
+  const me = state.trader ? state.trader.id : null;
+  for (const t of state.tape.slice(0, 40)) {
+    const tr = document.createElement('tr');
+    const mine = me != null && (t.taker_trader === me || t.maker_trader === me);
+    tr.className = (t.taker_side === 'buy' ? 'buy' : 'sell') + (mine ? ' mine' : '');
+    const who = t.taker_trader != null || t.maker_trader != null ? (mine ? 'you' : 'trader') : (t.hidden ? 'hidden' : '');
+    tr.innerHTML = `<td class="q">${fmtTs(t.ts_ms)}</td><td class="p">${fmtPrice(t.price_cents)}</td><td class="q">${fmtVol(t.qty)}</td><td class="q">${who}</td>`;
+    tb.appendChild(tr);
+  }
+}
+function renderAccount() {
+  const t = state.trader; if (!t) return;
+  const pnl = t.realised_pnl_cents + t.unrealised_pnl_cents;
+  const cls = pnl >= 0 ? 'up' : 'down';
+  $('acct-hdr').innerHTML = `${t.name} #${t.id} · equity <b>${fmtPrice(t.equity_cents)}</b> · P&amp;L <b class="${cls}">${pnl >= 0 ? '+' : ''}${fmtPrice(pnl)}</b>`;
+  $('acct').innerHTML = `<span>cash <b>${fmtPrice(t.cash_cents)}</b></span><span>free <b>${fmtPrice(t.free_cash_cents)}</b></span>
+    <span>realised <b class="${t.realised_pnl_cents >= 0 ? 'up' : 'down'}">${fmtPrice(t.realised_pnl_cents)}</b></span>
+    <span>unrealised <b class="${t.unrealised_pnl_cents >= 0 ? 'up' : 'down'}">${fmtPrice(t.unrealised_pnl_cents)}</b></span>`;
+  const pb = $('positions'); pb.innerHTML = '';
+  for (const p of t.positions) {
+    const tr = document.createElement('tr');
+    const u = p.unrealised_pnl_cents;
+    tr.innerHTML = `<td><b>${p.symbol}</b></td><td class="r">${p.qty}</td><td class="r">@ ${p.avg_cost_cents != null ? fmtPrice(p.avg_cost_cents) : '—'}</td><td class="r ${u >= 0 ? 'up' : 'down'}">${u >= 0 ? '+' : ''}${fmtPrice(u)}</td>`;
+    tr.style.cursor = 'pointer'; tr.onclick = () => selectSymbol(p.symbol);
+    pb.appendChild(tr);
+  }
+  const ol = $('orders'); ol.innerHTML = '';
+  for (const o of t.open_orders) {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="${o.side === 'buy' ? 'up' : 'down'}">${o.side}</span><span>${o.symbol}</span><span>${o.remaining}/${o.qty}</span><span>@ ${fmtPrice(o.price_cents)}</span>`;
+    const b = document.createElement('button'); b.textContent = '✕'; b.title = 'cancel';
+    b.onclick = () => cancelOrder(o);
+    li.appendChild(b); ol.appendChild(li);
+  }
+  renderBook();
+}
+function updateSubmitLabel() {
+  const f = $('ticket');
+  const qty = f.qty.value || '?';
+  const limit = f.type.value === 'limit';
+  f.price.disabled = !limit;
+  f.querySelector('.submit').textContent = `${state.side === 'buy' ? 'Buy' : 'Sell'} ${qty} ${limit ? (f.price.value ? '@ ' + f.price.value : 'limit') : 'at market'}`;
+  f.querySelector('.submit').className = 'submit full ' + state.side;
+}
+async function cancelOrder(o) {
+  try {
+    await api(`/api/symbols/${o.symbol}/orders/${o.order_id}?trader_id=${state.trader.id}`, { method: 'DELETE' });
+    setOrderStatus(`cancelled #${o.order_id}`);
+    await refreshTrader();
+  } catch (e) { setOrderStatus(e.message, true); }
+}
+
 // ---------- actions ----------
 function selectSymbol(sym) {
   if (sym === state.symbol) return;
-  state.symbol = sym; state.bars = []; state.hover = null;
-  renderSymbols(); draw(); loadBars();
+  state.symbol = sym; state.bars = []; state.hover = null; state.tape = []; state.book = { bids: [], asks: [] };
+  renderSymbols(); draw(); loadBars(); loadBookAndTape().catch(e => setStatus(e.message, true));
+  $('ticket-sym').textContent = sym; $('ticket').price.value = ''; updateSubmitLabel(); renderBook();
 }
 function selectInterval(iv) {
   state.interval = iv; state.bars = []; state.hover = null;
@@ -271,6 +452,26 @@ $('raw').onsubmit = async ev => {
   } catch (e) { setStatus(e.message, true); }
 };
 $('mag').oninput = () => { $('magv').textContent = parseFloat($('mag').value).toFixed(2); };
+for (const b of document.querySelectorAll('#ticket .side button')) b.onclick = () => {
+  state.side = b.dataset.side;
+  for (const x of document.querySelectorAll('#ticket .side button')) x.classList.toggle('active', x === b);
+  updateSubmitLabel();
+};
+for (const name of ['qty', 'type', 'price']) $('ticket')[name].oninput = updateSubmitLabel;
+$('ticket').onsubmit = async ev => {
+  ev.preventDefault();
+  if (!state.trader) return;
+  const f = ev.target;
+  const body = { trader_id: state.trader.id, side: state.side, qty: parseInt(f.qty.value, 10), type: f.type.value, tif: f.tif.value };
+  if (f.type.value === 'limit') body.price_cents = Math.round(parseFloat(f.price.value) * 100);
+  try {
+    const r = await api(`/api/symbols/${state.symbol}/orders`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const avg = r.avg_price_cents != null ? ` avg ${fmtPrice(r.avg_price_cents)}` : '';
+    setOrderStatus(`#${r.order_id} ${r.status}: ${r.filled}/${r.qty} filled${avg}`);
+    await refreshTrader();
+    loadBookAndTape().catch(() => {});
+  } catch (e) { setOrderStatus(e.message, true); }
+};
 for (const b of document.querySelectorAll('#intervals button')) b.onclick = () => selectInterval(b.dataset.iv);
 
 // ---------- live stream ----------
@@ -287,11 +488,22 @@ function connect() {
       renderSymbols();
     } else if (m.type === 'tick') {
       const q = state.quotes.get(m.symbol);
-      if (q) { q.price_cents = m.price_cents; q.ts_ms = m.ts_ms; updateSymbolRow(q); }
+      if (q) { q.price_cents = m.price_cents; q.ts_ms = m.ts_ms; q.bid_cents = m.bid_cents; q.ask_cents = m.ask_cents; updateSymbolRow(q); }
       if (m.ts_ms > (state.simNow || 0)) state.simNow = m.ts_ms;
       if (m.symbol === state.symbol) {
         if (m.closed.includes(state.interval)) loadBars(); else applyTick(m);
+        state.book = m.book; renderBook();
+        if (m.trades.length) { state.tape = m.trades.concat(state.tape).slice(0, 60); renderTape(); }
         draw();
+      }
+      if (state.trader && state.trader.positions.some(p => p.symbol === m.symbol) && (m.ts_ms / 1000 | 0) % 5 === 0) refreshTrader();
+    } else if (m.type === 'fill') {
+      if (state.trader && m.trader_id === state.trader.id) {
+        const f = m.fill;
+        state.fills.unshift(f); if (state.fills.length > 200) state.fills.pop();
+        setOrderStatus(`fill: ${f.side} ${f.qty} ${f.symbol} @ ${fmtPrice(f.price_cents)} (${f.liquidity})`);
+        refreshTrader();
+        if (f.symbol === state.symbol) draw();
       }
     } else if (m.type === 'event') {
       state.events.unshift(m); if (state.events.length > 200) state.events.pop();
@@ -411,6 +623,23 @@ function draw() {
     ctx.fillStyle = e.kind.startsWith('game:') ? '#f5b942' : '#6ea8fe';
     ctx.beginPath(); ctx.moveTo(xx, padT + 2); ctx.lineTo(xx - 5, padT - 6); ctx.lineTo(xx + 5, padT - 6); ctx.closePath(); ctx.fill();
   }
+  // own fills
+  const fills = (state.trader ? state.trader.fills : []).concat(state.fills);
+  const seen = new Set();
+  for (const f of fills) {
+    if (f.symbol !== state.symbol) continue;
+    const key = `${f.id}:${f.ts_ms}`; if (seen.has(key)) continue; seen.add(key);
+    const bucket = f.ts_ms - (((f.ts_ms % ivms) + ivms) % ivms);
+    if (bucket < first || bucket > lastTs) continue;
+    const i = Math.round((bucket - first) / ivms);
+    if (i < 0 || i >= bars.length || bars[i].open_ts !== bucket) continue;
+    const xx = x(i), yy = y(f.price_cents), up = f.side === 'buy';
+    ctx.fillStyle = up ? '#3ddc97' : '#ff6b6b'; ctx.strokeStyle = '#0b0f16'; ctx.lineWidth = 1;
+    ctx.beginPath();
+    if (up) { ctx.moveTo(xx, yy - 4); ctx.lineTo(xx - 4, yy + 3); ctx.lineTo(xx + 4, yy + 3); }
+    else { ctx.moveTo(xx, yy + 4); ctx.lineTo(xx - 4, yy - 3); ctx.lineTo(xx + 4, yy - 3); }
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+  }
   // last price
   const last = bars[bars.length - 1]; const ly = Math.round(y(last.close)) + 0.5;
   ctx.setLineDash([3, 3]); ctx.strokeStyle = last.close >= last.open ? '#3ddc97' : '#ff6b6b';
@@ -457,7 +686,9 @@ new ResizeObserver(draw).observe(wrap);
   try {
     await loadSymbols();
     selectInterval('M1');
-    await Promise.all([loadCatalog(), loadEvents()]);
+    $('ticket-sym').textContent = state.symbol;
+    updateSubmitLabel();
+    await Promise.all([loadCatalog(), loadEvents(), loadTrader(), loadBookAndTape()]);
     connect();
   } catch (e) { setStatus(e.message, true); }
 })();
