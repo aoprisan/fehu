@@ -224,8 +224,9 @@ impl Trader {
 
     /// Validate an order against the trader's account before it reaches the
     /// exchange. `cost_cents` is the worst-case cash a buy could consume
-    /// (limit: `qty × price`; market: the preview). A sell needs no cash but
-    /// needs an account that is allowed to trade and, above all, the shares:
+    /// (limit: `qty × price`; market: executable liquidity including hidden
+    /// slices). A sell needs no cash but needs an account that is allowed to
+    /// trade and, above all, the shares:
     /// there is no shorting, so `qty` may never exceed [`Trader::free_shares`]
     /// — the position less whatever earlier resting sells already promised.
     pub fn check(
@@ -601,6 +602,20 @@ pub struct StopRequest {
     pub client_order_id: Option<String>,
 }
 
+/// Submission options that affect execution and must agree on a retry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderOptions {
+    /// Show only this many shares at a time while resting.
+    #[serde(default)]
+    pub display_qty: Option<u64>,
+    /// Refuse an order that would take liquidity on arrival.
+    #[serde(default)]
+    pub post_only: bool,
+    /// Expire at the close of the original submission's session.
+    #[serde(default)]
+    pub day: bool,
+}
+
 /// One submitted order for as long as the log keeps it: what was asked for,
 /// what has happened to it since, and the id the caller gave it.
 ///
@@ -635,9 +650,12 @@ pub struct OrderRecord {
     pub submitted_at_ms: i64,
     pub updated_at_ms: i64,
     /// Simulated time this order is withdrawn at if it is still resting.
-    /// The engine sweeps for these at the end of every step.
+    /// The engine cancels these before matching at or after the deadline.
     #[serde(default)]
     pub expires_at_ms: Option<i64>,
+    /// Original execution options, retained for idempotent retries.
+    #[serde(flatten)]
+    pub options: OrderOptions,
     /// The response the submission returned, replayed verbatim if the same
     /// `client_order_id` arrives again. Not part of the record's own JSON,
     /// but it is saved, so a retry across a restart still replays.
@@ -675,6 +693,7 @@ impl OrderRecord {
             submitted_at_ms: ts_ms,
             updated_at_ms: ts_ms,
             expires_at_ms: None,
+            options: OrderOptions::default(),
             accepted: Some(response),
         }
     }
@@ -683,6 +702,13 @@ impl OrderRecord {
     #[must_use]
     pub fn expiring_at(mut self, at_ms: Option<i64>) -> Self {
         self.expires_at_ms = at_ms;
+        self
+    }
+
+    /// Retain the original execution options for retries and persistence.
+    #[must_use]
+    pub fn with_options(mut self, options: OrderOptions) -> Self {
+        self.options = options;
         self
     }
 
@@ -726,9 +752,16 @@ impl OrderRecord {
         self.updated_at_ms = ts_ms;
     }
 
-    /// The submission this order was accepted with matches `other` — the same
-    /// order, sent twice.
-    pub fn matches(&self, order: &Order, symbol: &str) -> bool {
+    /// Whether the order and its original submission options match a retry.
+    /// A day order keeps the first submission's close rather than resolving
+    /// a new deadline in the retry's session.
+    pub fn matches(
+        &self,
+        order: &Order,
+        symbol: &str,
+        options: OrderOptions,
+        expires_at_ms: Option<i64>,
+    ) -> bool {
         let (kind, price_cents) = OrderStyle::of(order);
         self.symbol == symbol
             && self.trader_id == order.owner.trader().map_or(0, |t| t.0)
@@ -737,6 +770,12 @@ impl OrderRecord {
             && self.price_cents == price_cents
             && self.tif == order.tif
             && self.qty == order.qty
+            && self.options == options
+            && if options.day {
+                expires_at_ms.is_none()
+            } else {
+                self.expires_at_ms == expires_at_ms
+            }
     }
 }
 

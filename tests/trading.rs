@@ -709,3 +709,27 @@ fn advancing_without_matching_preserves_resting_orders_until_resync() {
     assert!(ex.book().get(placement.id).is_none());
     assert_eq!(ex.book().validate_state(), Ok(()));
 }
+
+#[test]
+fn market_funding_counts_hidden_slices_without_exposing_them() {
+    for side in [Side::Buy, Side::Sell] {
+        let mut ex = exchange(42);
+        let price = match side {
+            Side::Buy => ex.book().best_bid().unwrap() + 1,
+            Side::Sell => ex.book().best_ask().unwrap() - 1,
+        };
+        ex.submit_iceberg(
+            Order::limit(Owner::Trader(T), side.opposite(), price, 1_000_000),
+            1_000,
+        )
+        .unwrap();
+        let visible = ex.preview_market(side, 1_000_000);
+        let cost = ex.market_cost_cents(side, 1_000_000);
+        assert!(visible.notional_cents < cost);
+        let placement = ex
+            .submit(Order::market(Owner::Trader(OTHER), side, 1_000_000))
+            .unwrap();
+        assert_eq!(placement.notional_cents(), cost);
+        assert_eq!(placement.filled, 1_000_000);
+    }
+}

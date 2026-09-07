@@ -511,17 +511,32 @@ impl Exchange {
         self.book.cancel_all(Owner::Trader(trader))
     }
 
-    /// What a market order would execute right now, within the collar.
+    /// Visible liquidity a market order can reach within the collar.
+    /// Hidden iceberg slices are excluded; use
+    /// [`market_cost_cents`](Self::market_cost_cents) for funding checks.
     #[must_use]
     pub fn preview_market(&self, side: Side, qty: u64) -> Preview {
+        self.book.preview(side, qty, Some(self.market_limit(side)))
+    }
+
+    /// Cost of all executable market liquidity, including hidden iceberg
+    /// slices. Intended for internal funding checks, not public market data.
+    #[must_use]
+    pub fn market_cost_cents(&self, side: Side, qty: u64) -> i64 {
+        self.book
+            .execution_preview(side, qty, Some(self.market_limit(side)))
+            .notional_cents
+    }
+
+    fn market_limit(&self, side: Side) -> i64 {
         let collar = self.params.liquidity.market_collar;
         let r = self.reference_cents as f64;
         let rules = self.params.rules;
-        let limit = match side {
+        match side {
             Side::Buy => rules.floor_price(libm::ceil(r * (1.0 + collar)) as i64),
             Side::Sell => rules.ceil_price(libm::floor(r * (1.0 - collar)) as i64),
-        };
-        self.book.preview(side, qty, Some(limit))
+        }
+        .clamp(1, crate::book::MAX_PRICE_CENTS)
     }
 
     /// Advance wall time by `dur` and yield every tick within it.

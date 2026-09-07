@@ -534,6 +534,9 @@ async fn trading_shapes() {
             "submitted_at_ms",
             "updated_at_ms",
             "expires_at_ms",
+            "display_qty",
+            "post_only",
+            "day",
         ],
     );
     assert_eq!(records[0]["status"], "resting", "OrderStatus is lower-case");

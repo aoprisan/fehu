@@ -795,8 +795,9 @@ Plain price–time priority, `no_std`, deterministic:
 - `Trade { ts, price_cents, qty, taker_side, taker: Party, maker: Party }`;
   `Party { order: OrderId, owner: Synthetic | Trader(id) }`. `OrderId::HIDDEN`
   (zero) marks hidden liquidity (§14.4).
-- `preview(side, qty, limit)` walks the book without mutating it, so a game
-  can check affordability before submitting.
+- `preview(side, qty, limit)` walks visible depth without mutating it.
+  `execution_preview` also counts replenishable iceberg slices; the exchange's
+  `market_cost_cents` uses it within the collar for internal funding checks.
 - Self-trades are allowed (a trader's buy may hit their own ask); they net to
   zero flow.
 
@@ -967,7 +968,8 @@ negative balance, or more reserved than held — which
 An order is validated against its account *before* it reaches the exchange:
 `Account::authorise` refuses it unless the account is active and its
 available balance (`balance − reserved`) covers the worst case — `qty ×
-price` for a limit, the ladder-walk preview for a market order. What rests
+price` for a limit, executable liquidity including hidden iceberg slices
+for a market order. What rests
 reserves cash on the account; what fills settles through it, so every cent
 that moves is on the ledger and the sum of the entries is the balance.
 Cancels release the reservation, and reserved cash can be neither withdrawn
@@ -1317,9 +1319,11 @@ outcomes to the owner, and save format 4 carries the untriggered stops.
 Either way the deadline lands on the `OrderRecord` — which is saved, and
 which the log never evicts while an order is live — so by the time the engine
 sees them a day order and a good-till-date order are the same thing: a
-resting order with a time on it. `Market::sweep_expired` runs at the end of
-every step, cancels what is due, releases what it reserved and tells the
-owner with an `order_expired` message. It runs on halted symbols too: a halt
+resting order with a time on it. Catch-up advances split at each expiry
+boundary: fills strictly before the deadline settle, then
+`Market::sweep_expired` cancels the remainder before matching at or after it.
+The cancellation releases reservations and tells the owner with an
+`order_expired` message. Reopening also sweeps before resynchronizing the book. It runs on halted symbols too: a halt
 stops trading, not the clock, and an order whose date has passed should not
 come back when the market does. A `day` order without a trading calendar is
 refused rather than left to live forever, because there is no close for it to
@@ -1348,6 +1352,16 @@ the order is gone. Everything that asks "what is still owed" —
 reservations, cancels, amends, reconciliation, the order log — uses
 `Resting::outstanding()`, so hiding size never makes it free: a buy iceberg
 reserves cash for all of it, and cancelling gives all of it back.
+Market-buy funding uses `execution_preview` through `market_cost_cents`, so
+hidden shares that can execute must also be funded. Public depth and the
+visible preview continue to show only the current slices.
+
+Order records retain `display_qty`, `post_only` and `day` alongside the
+resolved expiry. Retries compare these options too, before current-market
+validation, so an identical retry still replays after expiry or a halt.
+Older saves default missing options to an ordinary non-day, non-post-only
+order without a display slice; options absent from old records cannot be
+recovered for historical retries.
 
 **Tick and lot size (implemented).** `MarketRules { tick_cents, lot }` lives
 in `TradingParams`, and the exchange copies it into the book whenever one is

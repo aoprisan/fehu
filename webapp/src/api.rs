@@ -36,8 +36,8 @@ use crate::market::{
 };
 use crate::trading::{
     AmendRequest, AmendResponse, BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID,
-    OpenOrderDto, OrderRecord, OrderRequest, OrderResponse, PortfolioDto, PositionDto, Refused,
-    StopOrder, StopRequest, TradeDto, TraderSummary, UserHoldingsResponse,
+    OpenOrderDto, OrderOptions, OrderRecord, OrderRequest, OrderResponse, PortfolioDto,
+    PositionDto, Refused, StopOrder, StopRequest, TradeDto, TraderSummary, UserHoldingsResponse,
 };
 
 type AppState = Arc<App>;
@@ -766,9 +766,13 @@ async fn resume_symbol(
     let idx = market
         .symbol_index(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
+    let mut expired = Vec::new();
     let (status, fills) = market
-        .resume(idx, now)
+        .resume(idx, now, &mut expired)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
+    for message in expired {
+        app.publish(message);
+    }
     tracing::info!(symbol = status.symbol, "trading resumed");
     app.publish(StreamMessage::Status(status));
     for fill in fills {
@@ -1326,7 +1330,12 @@ async fn submit_order(
         qty: req.qty,
     };
     let client_order_id = clean_client_order_id(req.client_order_id)?;
-    let (day, expires_at_ms, display_qty) = (req.day, req.expires_at_ms, req.display_qty);
+    let expires_at_ms = req.expires_at_ms;
+    let options = OrderOptions {
+        day: req.day,
+        post_only: req.post_only,
+        display_qty: req.display_qty,
+    };
 
     let (response, fills, replayed) = {
         let mut market = app.market();
@@ -1334,33 +1343,14 @@ async fn submit_order(
             .symbol_index(&symbol)
             .ok_or_else(|| ApiError::not_found(&symbol))?;
         owned_trader(&market, caller, trader)?;
-        // Validated against this symbol's own book: the tick and lot are a
-        // property of the listing, not of orders in general.
-        market.symbols[idx]
-            .exchange
-            .book()
-            .validate(&order)
-            .map_err(|e| ApiError::invalid_order(e.to_string()))?;
         let sym = market.symbols[idx].info.symbol;
-        // A closed session or a halt takes no new orders at all.
-        if let Some(closed) = market.symbols[idx].closed(app.clock.now()) {
-            return Err(ApiError::closed(sym, closed));
-        }
-        if req.post_only {
-            check_post_only(&market.symbols[idx], &order)?;
-        }
-        let crossing = self_crossing(&market.symbols[idx], &order);
-        if !crossing.is_empty() {
-            return Err(ApiError::self_trade(&crossing));
-        }
-        let expires_at_ms = expiry_of(&market.symbols[idx], day, expires_at_ms, app.clock.now())?;
         // The same order sent twice — a retry after a timeout, say — is
         // placed once: the first response is replayed, and a re-used id that
         // asks for something else is refused rather than quietly obeyed.
         if let Some(id) = client_order_id.as_deref()
             && let Some(record) = market.order_by_client_id(trader, id)
         {
-            if !record.matches(&order, sym) {
+            if !record.matches(&order, sym, options, expires_at_ms) {
                 return Err(ApiError::duplicate_client_order_id(id, record.order_id));
             }
             let Some(accepted) = record.accepted.clone() else {
@@ -1368,15 +1358,32 @@ async fn submit_order(
             };
             (accepted, Vec::new(), true)
         } else {
+            // Validated against this symbol's own book: the tick and lot are a
+            // property of the listing, not of orders in general.
+            market.symbols[idx]
+                .exchange
+                .book()
+                .validate(&order)
+                .map_err(|e| ApiError::invalid_order(e.to_string()))?;
+            // A closed session or a halt takes no new orders at all.
+            if let Some(closed) = market.symbols[idx].closed(app.clock.now()) {
+                return Err(ApiError::closed(sym, closed));
+            }
+            if req.post_only {
+                check_post_only(&market.symbols[idx], &order)?;
+            }
+            let crossing = self_crossing(&market.symbols[idx], &order);
+            if !crossing.is_empty() {
+                return Err(ApiError::self_trade(&crossing));
+            }
+            let expires_at_ms = expiry_of(
+                &market.symbols[idx],
+                options.day,
+                expires_at_ms,
+                app.clock.now(),
+            )?;
             let (response, fills) = market
-                .place_full(
-                    idx,
-                    trader,
-                    order,
-                    client_order_id,
-                    expires_at_ms,
-                    display_qty,
-                )
+                .place_full(idx, trader, order, client_order_id, expires_at_ms, options)
                 .map_err(ApiError::place)?;
             (response, fills, false)
         }

@@ -357,6 +357,9 @@ export interface OrderRecord {
    * leaves it resting until it fills or is cancelled.
    */
   expires_at_ms: number | null;
+  display_qty: number | null;
+  post_only: boolean;
+  day: boolean;
 }
 
 /** `trading::FillRecord`. */

@@ -19,8 +19,8 @@ use crate::limit::{Decision, Limiter, Rate};
 use crate::metrics::Metrics;
 use crate::save::{MarketSave, STATE_VERSION, Save, SymbolSave};
 use crate::trading::{
-    BookDto, Fees, FillRecord, HoldingDto, MAX_STOPS_PER_TRADER, OrderRecord, OrderResponse,
-    Refused, StopOrder, StopRequest, TradeDto, Trader,
+    BookDto, Fees, FillRecord, HoldingDto, MAX_STOPS_PER_TRADER, OrderOptions, OrderRecord,
+    OrderResponse, Refused, StopOrder, StopRequest, TradeDto, Trader,
 };
 
 /// Milliseconds in one day.
@@ -1281,12 +1281,10 @@ impl Market {
     /// A day order and a good-till-date order differ only in where the
     /// deadline came from; by the time the engine sees them they are both
     /// just a resting order with an `expires_at_ms`. The sweep runs at the
-    /// end of every step, on every symbol — a halted one included, because a
-    /// halt stops trading, not the clock, and an order whose date has passed
-    /// should not come back when the market does.
-    fn sweep_expired(&mut self, index: usize) -> Vec<StreamMessage> {
+    /// expiry boundary before matching, including on halted symbols: a halt
+    /// stops trading, not the clock. Reopening sweeps before resynchronizing.
+    fn sweep_expired(&mut self, index: usize, now_ms: i64) -> Vec<StreamMessage> {
         let sym = self.symbols[index].info.symbol;
-        let now_ms = self.symbols[index].exchange.clock().0;
         let due: Vec<u64> = self
             .orders
             .values()
@@ -1329,7 +1327,10 @@ impl Market {
         &mut self,
         index: usize,
         now: Timestamp,
+        messages: &mut Vec<StreamMessage>,
     ) -> Option<(SymbolStatus, Vec<FillRecord>)> {
+        self.symbols.get(index)?;
+        messages.extend(self.sweep_expired(index, now.0));
         let symbol = self.symbols.get_mut(index)?;
         let was_halted = symbol.resume().is_some();
         let trades = if was_halted && symbol.is_open(now) {
@@ -1351,13 +1352,14 @@ impl Market {
         index: usize,
         now: Timestamp,
         fills: &mut Vec<FillRecord>,
+        messages: &mut Vec<StreamMessage>,
     ) -> Option<SymbolStatus> {
         let (limit_pct, halt_ms) = (self.price_limit_pct, self.halt_secs as i64 * 1000);
         let s = self.symbols.get_mut(index)?;
         if let Some(halt) = s.halt {
             // A manual halt has no end: only a resume lifts it.
             if halt.until_ms.is_some_and(|until| until <= now.0) {
-                let (status, resumed_fills) = self.resume(index, now)?;
+                let (status, resumed_fills) = self.resume(index, now, messages)?;
                 fills.extend(resumed_fills);
                 return Some(status);
             }
@@ -1373,6 +1375,46 @@ impl Market {
         self.status(index, now)
     }
 
+    // Split matching at expiry boundaries. Settle each prefix before its
+    // cancellations so partial fills release only the remaining reservation.
+    fn advance_symbol_to(
+        &mut self,
+        index: usize,
+        target: Timestamp,
+        fills: &mut Vec<FillRecord>,
+        messages: &mut Vec<StreamMessage>,
+    ) -> Advanced {
+        let sym = self.symbols[index].info.symbol;
+        let deadlines: std::collections::BTreeSet<i64> = self
+            .orders
+            .values()
+            .filter(|o| o.symbol == sym && o.is_live())
+            .filter_map(|o| o.expires_at_ms)
+            .filter(|at| *at <= target.0)
+            .collect();
+        let mut out = Advanced::default();
+        for (until, expiry) in deadlines
+            .into_iter()
+            .map(|at| (Timestamp(at.saturating_sub(1)), Some(at)))
+            .chain(std::iter::once((target, None)))
+        {
+            let part = self.symbols[index].advance_to(until);
+            fills.extend(self.apply_trades(sym, &part.trader_trades));
+            out.ticks += part.ticks;
+            for (flag, closed) in out.closed.iter_mut().zip(part.closed) {
+                *flag |= closed;
+            }
+            if part.last.is_some() {
+                out.last = part.last;
+                out.last_trades = part.last_trades;
+            }
+            if let Some(at) = expiry {
+                messages.extend(self.sweep_expired(index, at));
+            }
+        }
+        out
+    }
+
     /// Advance every symbol to `target`, book the resulting fills, and
     /// return the stream messages describing what happened.
     pub fn advance_to(&mut self, target: Timestamp) -> (u64, Vec<StreamMessage>) {
@@ -1380,16 +1422,13 @@ impl Market {
         let mut messages = Vec::new();
         let mut fills = Vec::new();
         for i in 0..self.symbols.len() {
-            let advanced = self.symbols[i].advance_to(target);
+            let advanced = self.advance_symbol_to(i, target, &mut fills, &mut messages);
             total += advanced.ticks;
             // A new day is a new band to measure the limit move from.
             if advanced.closed_intervals().contains(&Interval::D1) {
                 self.symbols[i].reband();
             }
             let sym = self.symbols[i].info.symbol;
-            if !advanced.trader_trades.is_empty() {
-                fills.extend(self.apply_trades(sym, &advanced.trader_trades));
-            }
             if let Some(t) = advanced.last {
                 let s = &self.symbols[i];
                 let trades = advanced
@@ -1413,16 +1452,9 @@ impl Market {
             }
         }
         for i in 0..self.symbols.len() {
-            if let Some(status) = self.review_halt(i, target, &mut fills) {
+            if let Some(status) = self.review_halt(i, target, &mut fills, &mut messages) {
                 messages.push(StreamMessage::Status(status));
             }
-        }
-        // Before the stops, so a trigger cannot fire an order that would
-        // immediately be swept, and after the halts for the same reason a
-        // resume settles first.
-        for i in 0..self.symbols.len() {
-            let expired = self.sweep_expired(i);
-            messages.extend(expired);
         }
         // After the halts, so a symbol that just resumed fires the triggers
         // the price reached while it was stopped.
@@ -1611,7 +1643,14 @@ impl Market {
         client_order_id: Option<String>,
         expires_at_ms: Option<i64>,
     ) -> Result<(OrderResponse, Vec<FillRecord>), PlaceError> {
-        self.place_full(idx, trader, order, client_order_id, expires_at_ms, None)
+        self.place_full(
+            idx,
+            trader,
+            order,
+            client_order_id,
+            expires_at_ms,
+            OrderOptions::default(),
+        )
     }
 
     /// [`place`](Self::place), for an order that may also hide most of its
@@ -1623,7 +1662,7 @@ impl Market {
         order: fehu::Order,
         client_order_id: Option<String>,
         expires_at_ms: Option<i64>,
-        display_qty: Option<u64>,
+        options: OrderOptions,
     ) -> Result<(OrderResponse, Vec<FillRecord>), PlaceError> {
         let sym = self.symbols[idx].info.symbol;
         // Worst-case cash a buy can consume.
@@ -1631,12 +1670,9 @@ impl Market {
             fehu::OrderKind::Limit { price_cents } => {
                 i64::try_from(i128::from(price_cents) * i128::from(order.qty)).unwrap_or(i64::MAX)
             }
-            fehu::OrderKind::Market => {
-                self.symbols[idx]
-                    .exchange
-                    .preview_market(order.side, order.qty)
-                    .notional_cents
-            }
+            fehu::OrderKind::Market => self.symbols[idx]
+                .exchange
+                .market_cost_cents(order.side, order.qty),
         };
         // A symbol has a fixed number of shares: a buy can only be filled from
         // the ones no trader holds or is already bidding for.
@@ -1675,7 +1711,7 @@ impl Market {
             .max()
             .unwrap_or(fehu::OrderId(1));
         self.symbols[idx].exchange.advance_order_id(next_id);
-        let submitted = match display_qty {
+        let submitted = match options.display_qty {
             None => self.symbols[idx].exchange.submit(order),
             Some(display) => self.symbols[idx].exchange.submit_iceberg(order, display),
         };
@@ -1707,7 +1743,8 @@ impl Market {
                 response.clone(),
                 now,
             )
-            .expiring_at(expires_at_ms),
+            .expiring_at(expires_at_ms)
+            .with_options(options),
         );
         Ok((response, fills))
     }

@@ -339,12 +339,14 @@ async fn an_iceberg_comes_back_with_what_it_was_hiding() {
     };
     let price = bid + 1;
     assert!(price < ask, "the spread has room");
+    let request = json!({ "trader_id": id, "side": "buy", "qty": 200, "type": "limit",
+        "price_cents": price, "display_qty": 25, "post_only": true,
+        "expires_at_ms": NOW_MS + 300_000, "client_order_id": "saved-iceberg" });
     let (status, body) = post(
         &before,
         Some(&key),
         "/api/symbols/ACME/orders",
-        json!({ "trader_id": id, "side": "buy", "qty": 200, "type": "limit",
-                "price_cents": price, "display_qty": 25 }),
+        request.clone(),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -359,6 +361,26 @@ async fn an_iceberg_comes_back_with_what_it_was_hiding() {
     // A file whose books do not add up is refused, so getting this far is
     // already most of the check.
     let after = App::restore(options(Some(path.clone())), save::read(&path).unwrap());
+    let (status, replay) = post(
+        &after,
+        Some(&key),
+        "/api/symbols/ACME/orders",
+        request.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay, body);
+    for (field, value) in [
+        ("display_qty", json!(50)),
+        ("post_only", json!(false)),
+        ("day", json!(true)),
+        ("expires_at_ms", json!(NOW_MS + 600_000)),
+    ] {
+        let mut changed = request.clone();
+        changed[field] = value;
+        let (status, body) = post(&after, Some(&key), "/api/symbols/ACME/orders", changed).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{field}: {body}");
+    }
     let (_, p) = get(&after, Some(&key), &format!("/api/traders/{id}")).await;
     let open = p["open_orders"]
         .as_array()

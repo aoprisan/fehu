@@ -3810,3 +3810,222 @@ async fn a_replay_keeps_other_traders_fills_to_themselves() {
     let anonymous = stream_frames(&app, "/api/stream?since=0", 8).await;
     assert!(!anonymous.iter().any(|m| m["type"] == "fill"));
 }
+
+#[tokio::test]
+async fn iceberg_market_buys_must_fund_hidden_executions() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let (code, body) = post(
+        &app,
+        "/api/traders",
+        json!({"cash_cents":1_000_000_000_000i64}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let seller = player_from(&app, &body);
+    let mut held = 0;
+    for step in 1..=100 {
+        let (code, body) = post(
+            &seller,
+            "/api/symbols/ACME/orders",
+            json!({
+                "trader_id":seller.trader,"side":"buy","type":"market","qty":1_000_000-held
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        held += body["filled"].as_u64().unwrap();
+        if held == 1_000_000 {
+            break;
+        }
+        engine::advance_to(&app, Timestamp(NOW_MS + step * 1000));
+    }
+    assert_eq!(held, 1_000_000);
+    let price = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap()
+        + 1;
+    let (code, body) = post(
+        &seller,
+        "/api/symbols/ACME/orders",
+        json!({
+            "trader_id":seller.trader,"side":"sell","type":"limit","qty":held,
+            "price_cents":price,"display_qty":1000
+        }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["status"], "resting");
+    let visible_cost = app
+        .market()
+        .symbol("ACME")
+        .unwrap()
+        .exchange
+        .preview_market(fehu::Side::Buy, held)
+        .notional_cents;
+    assert!(visible_cost < price * held as i64);
+    let (code, body) = post(&app, "/api/traders", json!({"cash_cents":visible_cost})).await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let buyer = player_from(&app, &body);
+    let request = json!({"trader_id":buyer.trader,"side":"buy","type":"market","qty":held});
+    let (code, body) = post(&buyer, "/api/symbols/ACME/orders", request.clone()).await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (_, portfolio) = get(&buyer, &format!("/api/traders/{}", buyer.trader)).await;
+    assert_eq!(portfolio["cash_cents"], visible_cost);
+    assert!(portfolio["positions"].as_array().unwrap().is_empty());
+    let (code, body) = post(
+        &buyer,
+        &format!("/api/traders/{}/deposit", buyer.trader),
+        json!({"amount_cents":price * held as i64-visible_cost}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let (code, body) = post(&buyer, "/api/symbols/ACME/orders", request).await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["filled"], held);
+    let (_, portfolio) = get(&buyer, &format!("/api/traders/{}", buyer.trader)).await;
+    assert_eq!(portfolio["cash_cents"], 0);
+    assert_eq!(get(&app, "/api/reconcile").await.1["valid"], true);
+}
+
+#[tokio::test]
+async fn expiry_boundaries_precede_matching_during_catchup() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "expiry").await;
+    let bid = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+    let mut orders = Vec::new();
+    for delay in [1000, 2000, 3000] {
+        let (code, body) = post(
+            &player,
+            "/api/symbols/ACME/orders",
+            json!({
+                "trader_id":player.trader,"side":"buy","type":"limit","qty":10,
+                "price_cents":bid/2,"expires_at_ms":NOW_MS+delay
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        orders.push(body["order_id"].as_u64().unwrap());
+    }
+    let (code, body) = post(
+        &app,
+        "/api/symbols/ACME/events",
+        json!({
+            "type":"jump","pct":-0.6,"at_ms":NOW_MS+2000
+        }),
+    )
+    .await;
+    assert!(code.is_success(), "{body}");
+    engine::advance_to(&app, Timestamp(NOW_MS + 4000));
+    for (id, expected) in orders.into_iter().zip(["cancelled", "cancelled", "filled"]) {
+        let (_, record) = get(&player, &format!("/api/orders/{id}")).await;
+        assert_eq!(record["status"], expected, "{record}");
+    }
+    let (_, portfolio) = get(&player, &format!("/api/traders/{}", player.trader)).await;
+    assert_eq!(portfolio["reserved_cents"], 0);
+    assert_eq!(get(&app, "/api/reconcile").await.1["valid"], true);
+}
+
+#[tokio::test]
+async fn order_retries_compare_options_and_replay_after_halts() {
+    let app = test_app();
+    let player = sign_up(&app, "retry-options").await;
+    let bid = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+    let request = json!({"trader_id":player.trader,"side":"buy","type":"limit","qty":100,
+        "price_cents":bid/2,"display_qty":20,"post_only":true,
+        "expires_at_ms":NOW_MS+30_000,"client_order_id":"options"});
+    let (code, accepted) = post(&player, "/api/symbols/ACME/orders", request.clone()).await;
+    assert_eq!(code, StatusCode::CREATED, "{accepted}");
+    for (field, value) in [
+        ("display_qty", json!(50)),
+        ("post_only", json!(false)),
+        ("day", json!(true)),
+        ("expires_at_ms", json!(NOW_MS + 60_000)),
+    ] {
+        let mut changed = request.clone();
+        changed[field] = value;
+        let (code, body) = post(&player, "/api/symbols/ACME/orders", changed).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{field}: {body}");
+    }
+    assert!(
+        post(&app, "/api/symbols/ACME/halt", json!({}))
+            .await
+            .0
+            .is_success()
+    );
+    engine::advance_to(&app, Timestamp(NOW_MS + 40_000));
+    let (code, replay) = post(&player, "/api/symbols/ACME/orders", request).await;
+    assert_eq!(code, StatusCode::OK, "{replay}");
+    assert_eq!(replay, accepted);
+}
+
+#[tokio::test]
+async fn reopening_cancels_expired_orders_before_resync() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "reopen-expiry").await;
+    let bid = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({
+            "trader_id":player.trader,"side":"buy","type":"limit","qty":10,
+            "price_cents":bid/2,"expires_at_ms":NOW_MS+1000
+        }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let id = body["order_id"].as_u64().unwrap();
+    let (code, body) = post(
+        &app,
+        "/api/symbols/ACME/events",
+        json!({
+            "type":"jump","pct":-0.6,"at_ms":NOW_MS+2000
+        }),
+    )
+    .await;
+    assert!(code.is_success(), "{body}");
+    // Move a halted reference across the order, leaving its book frozen.
+    // Resume must expire it even without an intervening engine sweep.
+    let mut messages = Vec::new();
+    {
+        let mut market = app.market();
+        let idx = market.symbol_index("ACME").unwrap();
+        market.halt(idx, Timestamp(NOW_MS)).unwrap();
+        market.symbols[idx].advance_to(Timestamp(NOW_MS + 3000));
+        let (_, fills) = market
+            .resume(idx, Timestamp(NOW_MS + 3000), &mut messages)
+            .unwrap();
+        assert!(fills.is_empty());
+    }
+    assert!(messages.iter().any(|m| matches!(m, fehu_webapp::market::StreamMessage::OrderExpired { order, .. } if order.order_id == id)));
+    let (_, record) = get(&player, &format!("/api/orders/{id}")).await;
+    assert_eq!(record["status"], "cancelled");
+    assert_eq!(record["filled"], 0);
+    assert_eq!(get(&app, "/api/reconcile").await.1["valid"], true);
+}

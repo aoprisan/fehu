@@ -892,13 +892,31 @@ impl OrderBook {
         self.index.is_empty()
     }
 
-    /// What a `side` order for `qty` shares with an optional limit would
-    /// execute right now, without changing anything.
+    /// Visible liquidity a `side` order for `qty` shares with an optional
+    /// limit can reach. Hidden iceberg slices are excluded; use
+    /// [`execution_preview`](Self::execution_preview) for funding checks.
     #[must_use]
     pub fn preview(&self, side: Side, qty: u64, limit: Option<i64>) -> Preview {
+        self.preview_with_hidden(side, qty, limit, false)
+    }
+
+    /// Execution estimate including every replenishable iceberg slice.
+    /// Use this for funding checks, not public depth or FOK availability.
+    #[must_use]
+    pub fn execution_preview(&self, side: Side, qty: u64, limit: Option<i64>) -> Preview {
+        self.preview_with_hidden(side, qty, limit, true)
+    }
+
+    fn preview_with_hidden(
+        &self,
+        side: Side,
+        qty: u64,
+        limit: Option<i64>,
+        hidden: bool,
+    ) -> Preview {
         let mut p = Preview::default();
         let mut left = qty;
-        self.walk(side, limit, |price, level_qty| {
+        self.walk(side, limit, hidden, |price, level_qty| {
             let q = left.min(level_qty);
             left -= q;
             p.filled += q;
@@ -912,7 +930,7 @@ impl OrderBook {
     /// Shares available to a `side` order within `limit`, capped at `cap`.
     fn available(&self, side: Side, limit: Option<i64>, cap: u64) -> u64 {
         let mut total = 0u64;
-        self.walk(side, limit, |_, level_qty| {
+        self.walk(side, limit, false, |_, level_qty| {
             total = total.saturating_add(level_qty);
             total < cap
         });
@@ -921,7 +939,13 @@ impl OrderBook {
 
     /// Visit the opposite side's levels that a `side` order with `limit`
     /// crosses, best first, until `f` returns `false`.
-    fn walk(&self, side: Side, limit: Option<i64>, mut f: impl FnMut(i64, u64) -> bool) {
+    fn walk(
+        &self,
+        side: Side,
+        limit: Option<i64>,
+        hidden: bool,
+        mut f: impl FnMut(i64, u64) -> bool,
+    ) {
         let levels: Box<dyn Iterator<Item = (&i64, &VecDeque<Resting>)>> = match side {
             Side::Buy => Box::new(self.asks.iter()),
             Side::Sell => Box::new(self.bids.iter().rev()),
@@ -930,7 +954,9 @@ impl OrderBook {
             if !crosses(side, price, limit) {
                 break;
             }
-            let qty = level.iter().map(|o| o.remaining).sum();
+            let qty = level.iter().fold(0u64, |total, o| {
+                total.saturating_add(if hidden { o.outstanding() } else { o.remaining })
+            });
             if !f(price, qty) {
                 break;
             }
