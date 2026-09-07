@@ -2414,17 +2414,30 @@ async fn set_status(
     let Json(req) = payload.ok_or_else(|| ApiError::bad_request("a `status` is required"))?;
     let id = AccountId(account_id);
     let status = req.status;
-    if status != AccountStatus::Closed && admin.is_none() {
-        return Err(ApiError::forbidden(
-            "freezing and unfreezing an account is the operator's to do",
-        ));
-    }
-    let caller = caller.ok_or_else(ApiError::unauthenticated)?;
+    // Who has to be who depends on which transition this is. An operator
+    // freezes an account that is not theirs — that is the whole point of a
+    // freeze — so they are not asked to own it; an owner closes theirs, and
+    // is not asked to be an operator.
+    let owner = match status {
+        AccountStatus::Frozen | AccountStatus::Active => {
+            if admin.is_none() {
+                return Err(ApiError::forbidden(
+                    "freezing and unfreezing an account is the operator's to do",
+                ));
+            }
+            None
+        }
+        AccountStatus::Closed => Some(caller.ok_or_else(ApiError::unauthenticated)?),
+    };
     let dto = app
         .market
         .call_async(move |m| {
             Box::pin(async move {
-                owned_account(m, caller, id)?;
+                if let Some(owner) = owner {
+                    owned_account(m, owner, id)?;
+                } else if !m.accounts.contains_key(&id) {
+                    return Err(ApiError::unknown_account(account_id));
+                }
                 match status {
                     AccountStatus::Frozen => m.freeze_account(id).await,
                     AccountStatus::Active => m.unfreeze_account(id),

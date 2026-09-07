@@ -122,16 +122,16 @@ read that portfolio, cancel those orders or move that money. The key is shown
 | `POST` | `/api/users` | Create a user: `{"name":"ada","email":"ada@example.com"}` (both optional). The response carries their `api_key`, once |
 | `GET` | `/api/users`, `/api/users/{id}` | The caller themselves: accounts, traders, cash and shares owned |
 | `GET` | `/api/users/{id}/holdings` | Shares the user owns per symbol, added up over their traders, with what is reserved and what is still sellable |
-| `POST` | `/api/users/{id}/accounts` | Open another account: `{"name":"main","cash_cents":10000000}` |
-| `GET` | `/api/users/{id}/accounts`, `/api/accounts`, `/api/accounts/{id}` | Accounts: balance, reserved, available, status |
-| `POST` | `/api/accounts/{id}/deposit` | Add money: `{"amount_cents":250000,"memo":"week 1"}` |
-| `POST` | `/api/accounts/{id}/withdraw` | Take money out; only the available balance can leave |
-| `POST` | `/api/accounts/{id}/status` | `{"status":"active\|frozen\|closed"}` |
+| `POST` | `/api/users/{id}/accounts` | Open another account: `{"name":"main","cash_cents":10000000}` — the cash is paid out of treasury, not created |
+| `GET` | `/api/users/{id}/accounts`, `/api/accounts`, `/api/accounts/{id}` | Accounts: balance, reserved, available, status, and the `wallet_id` holding the money |
+| `POST` | `/api/accounts/{id}/deposit` | Game master: **mint** money into an account, `{"amount_cents":250000,"memo":"week 1"}` |
+| `POST` | `/api/accounts/{id}/withdraw` | Game master: **burn** money out of one; only the available balance can leave |
+| `POST` | `/api/accounts/{id}/status` | `{"status":"active\|frozen\|closed"}` — freezing and unfreezing are the game master's, closing is the owner's and needs an empty account |
 | `GET` | `/api/accounts/{id}/ledger?limit=100` | Every movement of money, newest first |
 | `GET` | `/api/accounts/{id}/validate` | Status, what the account may do, and any broken invariant |
 | `POST` | `/api/traders` | Create a trader, with a user and a funded account: `{"name":"alice","cash_cents":10000000}` (both optional), and hand over the new user's `api_key`; `user_id` and `account_id` join existing ones, which needs that user's key |
 | `GET` | `/api/traders`, `/api/traders/{id}` | Traders; a portfolio with cash, positions marked to the reference price, open orders and fills |
-| `POST` | `/api/traders/{id}/deposit` | Add money to the trader's account: `{"amount_cents":250000}` |
+| `POST` | `/api/traders/{id}/deposit` | Game master: mint into the trader's account, `{"amount_cents":250000}` |
 | `POST` | `/api/traders/{id}/cancel_all` | Cancel every resting order of a trader |
 | `POST` | `/api/symbols/{sym}/orders` | `{"trader_id":1,"side":"buy","qty":100,"type":"market"}` or `"type":"limit","price_cents":8400`, optional `"tif":"gtc\|ioc\|fok"`, `"client_order_id":"abc-1"`, `"post_only":true`, `"display_qty":20` to show only a slice of a resting order at a time, and `"expires_at_ms"` or `"day":true` to have the resting remainder withdrawn later; responds with fills and status |
 | `GET` | `/api/symbols/{sym}/orders?trader_id=` | A trader's resting orders on that symbol |
@@ -145,7 +145,8 @@ read that portfolio, cancel those orders or move that money. The key is shown
 | `GET` | `/api/symbols/{sym}/book?depth=10` | Aggregated bids and asks, reference price, pending trader flow |
 | `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first |
 | `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and — for `?api_key=`, since `EventSource` cannot set headers — that player's `fill`s |
-| `GET` | `/api/reconcile` | Game master: check ownership, reservations, share supply and retained cash ledgers; returns `valid` and `issues` |
+| `GET` | `/api/supply` | How much currency exists and where it sits: minted, burned, outstanding, what the wallets actually hold, and whether the two agree |
+| `GET` | `/api/reconcile` | Game master: check ownership, reservations, share supply, retained cash ledgers **and that the currency adds up**; returns `valid` and `issues` |
 | `GET` | `/api/health` | Uptime, simulated time, tick/trade counters, orders placed and refused, stream and rate-limit state, and how long requests and engine steps are taking |
 
 At start-up each symbol generates a year of daily bars in coarse mode and then
@@ -153,7 +154,14 @@ three days of 1 s ticks, so every interval has history before the first
 request. `FEHU_TIME_SCALE=60` runs the market at 60 simulated seconds per
 wall second; `FEHU_BIND`, `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`,
 `FEHU_STARTING_CASH_CENTS`, `FEHU_TAPE`, `FEHU_FILL_LOG`, `FEHU_ORDER_LOG`
-and `FEHU_LEDGER_LOG` are the other knobs. `FEHU_MARKET_HOURS=09:30-16:00`
+and `FEHU_LEDGER_LOG` are the other knobs. `FEHU_GENESIS_CENTS` (10^14, i.e.
+$1 trillion) is the world's whole opening supply, minted into treasury at
+start-up; `FEHU_STARTING_CASH_CENTS` is paid to each new account *out of*
+that, so a treasury that runs dry refuses to open more rather than printing
+the difference. `FEHU_ISSUER_FLOAT_CENTS` (10^11) is what each symbol's
+issuer wallet is given to pay dividends and buyouts from, and
+`FEHU_SYNTHETIC_FLOAT_CENTS` (5×10^13) is what the stand-in for the
+simulator's unfunded liquidity starts with — see **The currency** below. `FEHU_MARKET_HOURS=09:30-16:00`
 gives the market a UTC weekday session (unset, it never closes);
 `FEHU_PRICE_LIMIT_PCT` (0.10) and `FEHU_HALT_SECS` (300) set the limit move
 that halts a symbol and how long the halt lasts. `FEHU_RATE_PER_SEC` (20) and
@@ -171,23 +179,58 @@ to be able to afford the fee as well as the shares.
 `FEHU_STATE_FILE` keeps the market
 across restarts (`FEHU_SAVE_SECS`, 30 by default, sets how often it is
 written). `FEHU_ADMIN_KEY` locks the
-game-master endpoints (`POST /api/game/events` and
-`POST /api/symbols/{sym}/events`, which move prices) behind a key of your
-choosing; unset, they stay open, which is what a single-player game on
-localhost wants and a shared server does not. Same seeds and same events give the
+game-master endpoints behind a key of your choosing: the ones that move
+prices (`POST /api/game/events`, `POST /api/symbols/{sym}/events`), the ones
+that list, halt and delist symbols, and — since currency became conserved —
+the only two that change how much of it there is, `POST
+/api/accounts/{id}/deposit` and `.../withdraw`. Unset, they stay open, which
+is what a single-player game on localhost wants and a shared server does
+not. Same seeds and same events give the
 same prices on every run; trading adds impact on top, so a market with no
 orders replays the bare simulation.
 
 A **user** is the player, an **account** holds their money, and a **trader**
 is the market-facing identity that trades on one account (several traders may
 share one). All money is an integer count of cents — never a float — and
-every amount is checked: deposits and withdrawals must be positive, a
-withdrawal cannot touch the cash a resting buy order has reserved, and an
-order is validated against its account before it reaches the exchange (the
-account must be active and its available balance must cover the worst-case
-cost). Fills settle through the account, so every cent that moves is on its
-ledger. New accounts start with cash, no shares, no margin and no shorting.
-Persistence is optional, as described below.
+every amount is checked: amounts must be positive, a withdrawal cannot touch
+the cash a resting buy order has reserved, and an order is validated against
+its account before it reaches the exchange (the account must be active and
+its available balance must cover the worst-case cost). Fills settle through
+the account, so every cent that moves is on its ledger. New accounts start
+with cash, no shares, no margin and no shorting. Persistence is optional, as
+described below.
+
+### The currency
+
+An account's money is a **wallet** in one world-wide ledger, and every
+movement through it is a set of signed postings that **sums to zero**. So the
+currency is conserved by construction rather than by care, and the audit is a
+sum anyone can do:
+
+```text
+Σ balances (every wallet but issuance) = minted − burned
+```
+
+`GET /api/supply` reports both sides of it and whether they agree;
+`GET /api/reconcile` fails if they do not. Only two operations move those
+numbers — minting and burning — and both are the game master's. **No route a
+player can reach changes the supply.** Opening an account with `cash_cents`
+pays it out of treasury; a fee goes to a venue wallet instead of leaving the
+world; a dividend or a delisting buyout is funded from that symbol's issuer
+wallet, and one it cannot fund is refused with the shortfall rather than
+paid to some holders and not others, or clipped at a balance cap.
+
+Freezing an account is the game master's and withdraws its resting orders in
+the same job, since an order that outlived a freeze would fill against a
+wallet that could no longer pay for it. Closing one is the owner's, and needs
+the wallet empty, so closing can never strand currency where nothing can
+reach it again.
+
+One wallet is allowed to owe: the stand-in for the liquidity the simulator
+quotes, which nobody funds. Currency it hands a player is real currency, so
+its debt is carried inside the sum above and reported as
+`synthetic_debt_cents` rather than quietly minted. Funding both sides of
+every fill is what retires it.
 
 The market can stop. Give it `FEHU_MARKET_HOURS` and orders outside the
 session are refused with `409 market_closed`; leave it unset and it trades
@@ -204,15 +247,20 @@ to pull an order out of a market that has stopped. `GET
 
 Set `FEHU_STATE_FILE` and the market survives a restart. The whole thing is
 written there — every symbol's simulator, book, bars and held stops, and
-every user, account, ledger, position, resting order and API key — every `FEHU_SAVE_SECS`
+every user, account, wallet, position, resting order and API key, with the
+currency ledger and the supply behind it — every `FEHU_SAVE_SECS`
 seconds and once more on a clean shutdown, and read back at start-up in place
 of the warm-up, continuing from the simulated time it had reached. The write
 goes through a temporary file and a rename, so an interrupted save cannot
-destroy the last good one; a file from an unsupported format version, or one listing
-different symbols, stops the server rather than starting a market without its
-accounts. The reader also refuses inconsistent account balances, retained
-ledgers, reservations, ownership links, identity counters and key ownership,
-and malformed book indexes, price queues or quantities.
+destroy the last good one; a file from an unsupported format version, or one
+listing different symbols, stops the server rather than starting a market
+without its accounts. Files written before the currency ledger are among
+them: they carry a balance on each account and no supply behind it, so there
+is no way to carry one forward without inventing where its money came from.
+The reader also refuses inconsistent account balances, retained ledgers,
+reservations, ownership links, identity counters and key ownership, malformed
+book indexes, price queues or quantities, and a ledger whose wallets do not
+add up to what has been minted less what has been burned.
 Without the variable nothing is kept and every start warms up a
 fresh market.
 

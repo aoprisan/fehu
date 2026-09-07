@@ -739,7 +739,6 @@ mod tests {
     /// `balance_cents` paid to it out of that treasury.
     fn world(balance_cents: i64) -> (Ledger, Account, WalletId) {
         let mut ledger = Ledger::new();
-        ledger.issuance_wallet();
         let treasury = ledger.open(WalletKind::Treasury);
         ledger
             .mint(treasury, MAX_BALANCE_CENTS / 2, Reason::Genesis)
@@ -813,7 +812,6 @@ mod tests {
     #[test]
     fn a_settlement_draft_balances_whichever_way_the_fee_points() {
         let mut ledger = Ledger::new();
-        ledger.issuance_wallet();
         let treasury = ledger.open(WalletKind::Treasury);
         ledger.mint(treasury, 1_000_000, Reason::Genesis).unwrap();
         let buyer = ledger.open(WalletKind::Player);

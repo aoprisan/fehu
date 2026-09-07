@@ -648,7 +648,7 @@ impl std::error::Error for LedgerError {}
 ///
 /// Cloneable and serialisable whole, private fields included: a save file has
 /// to carry the balances, not a view of them.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Ledger {
     wallets: BTreeMap<WalletId, Wallet>,
@@ -657,15 +657,28 @@ pub struct Ledger {
     next_tx: u64,
 }
 
+impl Default for Ledger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Ledger {
-    /// An empty ledger: no wallets, no supply.
+    /// A new ledger holding nothing, with its issuance wallet open.
+    ///
+    /// Issuance is opened here rather than on demand because every ledger has
+    /// exactly one and cannot mint without it — a ledger that had to be told
+    /// to open its own control account would just be one that fails
+    /// confusingly until somebody does.
     pub fn new() -> Self {
-        Self {
+        let mut ledger = Self {
             wallets: BTreeMap::new(),
             supply: Supply::default(),
             next_wallet: 1,
             next_tx: 1,
-        }
+        };
+        ledger.open(WalletKind::Issuance);
+        ledger
     }
 
     /// Open a wallet of `kind` in the only currency there is.
@@ -960,12 +973,14 @@ impl Ledger {
         )
     }
 
-    /// The issuance wallet, opening one if this ledger has none.
-    ///
-    /// There is exactly one: the first wallet of that kind, by id.
+    /// The mint and burn control account. Every ledger has exactly one, and
+    /// [`Ledger::new`] opened it.
     pub fn issuance_wallet(&mut self) -> WalletId {
         match self.issuance() {
             Ok(id) => id,
+            // Only reachable through a deserialised ledger that never had
+            // one; opening it here keeps that world usable rather than
+            // permanently unable to mint.
             Err(_) => self.open(WalletKind::Issuance),
         }
     }

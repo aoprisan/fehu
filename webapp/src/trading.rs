@@ -1126,7 +1126,6 @@ mod tests {
     /// `cash_cents` out of treasury.
     fn trader(cash_cents: i64) -> (World, Trader, Account) {
         let mut ledger = Ledger::new();
-        ledger.issuance_wallet();
         let treasury = ledger.open(WalletKind::Treasury);
         let venue = ledger.open(WalletKind::Venue);
         let synthetic = ledger.open(WalletKind::Synthetic);
