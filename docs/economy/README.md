@@ -1,6 +1,6 @@
 # Economy implementation tasks
 
-These eight Markdown briefs split the [economy implementation plan](../../ECONOMY_PLAN.md) into ordered tasks. They are repository documents, not new hird task numbers; the existing hird implementation brief is #12. No queue split is performed by adding these files.
+These eight briefs split the [economy implementation plan](../../ECONOMY_PLAN.md) into ordered tasks. The plan holds the assessment, rationale, defaults, invariants, HTTP contract and deferred options; each brief holds the implementation text for one task and is the canonical version of it.
 
 All tasks are planned. The target is one server-authoritative game world using a centrally issued GAME token with two decimals, durable accounting, funded markets, goods, production and consumption. A token ledger alone does not complete the economy.
 
@@ -27,4 +27,10 @@ The dependencies form a sequential implementation path; some rows list earlier d
 - Keep credentials and player financial data out of public events.
 - Use the final task to prove the complete reward -> purchase -> production -> consume/sell -> transfer -> trade loop, including restart and retry scenarios.
 
-Read the parent plan for the source assessment, rationale, defaults and deferred options. These briefs add implementation boundaries and handoff requirements without replacing that design.
+## How to use a brief
+
+Every brief is planned work: it describes what to build and does not claim the feature exists. Read the parent plan and this index before starting one; the plan's invariants and completion criteria apply to every task.
+
+- **Expected file scope** lists likely locations. Inspect the current tree and the results of the dependency tasks before choosing exact files.
+- **Acceptance** is the behavior the task must demonstrate. Run focused integration and property tests for changed behavior and record the exact commands and results. Retain Rust feature compatibility and seeded determinism. Update server DTO contracts and TypeScript types together, and rebuild committed static assets if UI source changes. The final task runs the full release gate.
+- **Handoff.** On finishing, report the implemented interfaces, migrations and configuration, the tests run and any remaining limitations for dependent tasks. Do not mark a task complete on the basis of its brief alone. Keep the parent plan and the API documentation consistent with the implemented behavior.
