@@ -1192,14 +1192,18 @@ at start-up in place of the warm-up.
 The file is versioned JSON (`STATE_VERSION`), with the crate's own `Exchange`
 and `Candles` representations nested inside the web app's users, accounts,
 traders, order log, event log and keyring — `serde_json`'s `float_roundtrip`
-is on, so a restored simulator continues bit-exactly. Symbols are the one
-thing not saved: their metadata comes from the build and only the ticker is
-written, so a file listing symbols this build does not have is refused, as is
-one from an unsupported format version. Version 2 is migrated to version 3
-by hashing the saved API keys; the next write contains only hashes, while
-existing backups remain unchanged. Refusing unknown formats is the point — a
-market that comes back without its accounts is worse than one that does not
-come back.
+is on, so a restored simulator continues bit-exactly. Since version 5 the
+file is also the symbol table: symbols are listed and delisted while the
+server runs (§14.15), so each entry carries its own `SymbolInfo` and the
+market comes back listing what was saved rather than what this build seeds. A
+file from an unsupported format version is refused. Version 2 is migrated to
+version 3 by hashing the saved API keys; the next write contains only hashes,
+while existing backups remain unchanged. Version 4 predates runtime listings,
+so its symbols take their metadata from the build that wrote them, which is
+where it lived — and a version-4 file naming a symbol this build does not
+seed cannot be migrated, because there is nowhere left to find it. Refusing
+unknown formats is the point — a market that comes back without its accounts
+is worse than one that does not come back.
 
 Two details make the restart seamless. `sim_now_ms` is the furthest the
 market reached — the clock, or a symbol's own clock if an engine step left it
@@ -1216,10 +1220,72 @@ server down.
 
 Tickers are `&'static str` throughout the server (`save::Symbol`), which
 `serde` would otherwise treat as data borrowed from the input; the alias hides
-that from the derive, and the `symbol*` modules turn a ticker on disk back
-into one of the build's four, refusing anything else.
+that from the derive, and the `symbol*` modules register a ticker on disk as
+it is read (§14.15), refusing only one that is not a ticker at all.
 
-### 14.15 Tests
+### 14.15 Listing and delisting (`symbols.rs`)
+
+The symbol set used to be `TICKERS`, a build-time array. It is now whatever
+the market lists, and `POST /api/symbols` and `POST /api/symbols/{s}/delist`
+change it while the server runs. Both are game-master endpoints, like halts
+and dividends.
+
+The obstacle was never the endpoints; it was the representation. Positions,
+share reservations, order records, fills, ledger entries, stops and the event
+log are all keyed on `save::Symbol`, which is `&'static str` — cheap to copy
+and compare, ordered by ticker in every `BTreeMap`, a plain string in JSON —
+and the only `&'static str`s in a program are the ones its author wrote. So
+rather than replace that representation everywhere, `webapp/src/symbols.rs`
+supplies the missing half: a process-wide registry that validates a ticker,
+upper-cases it, and leaks it with `Box::leak`, so every later mention of it —
+from a request path or from a save file — resolves to the same pointer.
+Registering is idempotent; looking up is not registering, so a typo in a URL
+stays a typo. Nothing is ever freed, which is exactly what is wanted (a
+delisted company's fills still name it, and re-listing the ticker must land on
+the same string) and is why the registry is capped at 1024 tickers of at most
+8 characters each: a corrupt or hostile save can waste a few kilobytes, not
+the heap.
+
+A listing is a `SymbolSpec` like a seeded one. Warming its simulator up is the
+slow half and needs nothing from the market, so `App::prepare_listing` does it
+before the lock is taken and `Market::list` only checks the ticker is still
+free and that the market is under `FEHU_MAX_SYMBOLS`. `history_days` days of
+coarse daily bars can be generated so the chart is not empty; `0`, the
+default, lists a company with no past, which is what a flotation is. The
+calendar, tick and lot are the venue's rather than the caller's. A listing
+without a seed takes one derived from its ticker, so the same ticker listed on
+two servers is the same company.
+
+Delisting is the part with a decision in it, because a symbol is holding
+things when it goes: reserved cash behind resting buys, promised shares behind
+resting sells, stops nobody triggered, and the shares themselves. Dropping the
+symbol alone would strand every one of them. So `Market::delist`, in order:
+cancels every resting order, which releases exactly what it reserved and marks
+the record cancelled as an expiry does; drops the untriggered stops, which
+reserved nothing; and buys every holder out at `cents_per_share` — the last
+traded price by default — crediting each account with its own
+`LedgerKind::Delisting` entry and removing the position. Zero is a real price:
+a bankruptcy is a delisting that pays nothing, and it takes the shares just
+the same. The money comes from outside the market, exactly as a dividend's
+does — somebody bought the company — and `shares_outstanding` leaves with the
+listing.
+
+What stays is history. The fills, ledger entries and order records of a
+delisted symbol still name it and are still served; only the position goes,
+because a flat position in a symbol with no price is a row nothing can mark,
+and the ledger has the money either way. Reconciliation enforces the other
+half: a position or a share reservation in a symbol that is not listed is an
+inconsistency, so a delisting that left one behind would fail
+`GET /api/reconcile` rather than pass quietly.
+
+One thing had to move with the book. Order ids are allocated above every
+book's counter, which is the whole story only while every book that ever
+existed is still there; a delisted symbol's book leaves with its counter while
+its orders stay in the log. `Market` therefore keeps an `order_id_floor`,
+raised to the departing book's next id and saved with the market, so an id is
+never handed out twice.
+
+### 14.16 Tests
 
 `tests/trading.rs`: book priority/partial fills/IOC/FOK/cancel/preview; the
 no-trader invariant against the bare simulator for 20 k ticks; ladder
@@ -1262,8 +1328,11 @@ endpoints while leaving the event log readable. `webapp/tests/save.rs`: a
 saved market comes back whole — the same portfolio, ledger, order log, book,
 bars, events and holders, with keys that still work, ids that carry on and a
 `client_order_id` that still replays — a new player can still sign up
-afterwards, a file from another version or with unknown symbols is refused,
-and a failed write leaves the previous save intact, a halt included. Sessions
+afterwards, the symbols a market comes back with are the ones it was saved
+with (a runtime listing included, a delisted one still gone) while a
+version-4 file takes its symbols from the build, a file from another version
+or whose symbol table does not agree with itself is refused, and a failed
+write leaves the previous save intact, a halt included. Sessions
 and halts: a limit move halts a symbol and refuses its orders while the others
 carry on, the halt lifts itself and re-bands, a manual halt outlasts any amount
 of time and only the game master can place or lift one, a resting order
@@ -1286,6 +1355,15 @@ when it is armed; it is private property that only its owner may see or
 withdraw; a halted symbol holds its triggers and fires them on the resume;
 one whose money has left in the meantime is refused when it fires rather than
 half-placed; and held stops come back from a save and still fire.
+`webapp/tests/listing.rs`: a listed symbol is quoted, stepped, traded and
+reconciled like a seeded one; a ticker that is taken, malformed, shareless or
+priced at nothing is refused and lists nothing; a market fills up at
+`max_symbols`; a delisting gives back the reserved cash, the promised shares,
+the stops and the money the shares were worth, in one ledger entry of its
+own, leaving the history readable and the market reconciling; a buy-out at
+nothing takes the shares and credits nobody while a negative one is refused;
+an order id from a delisted book is never handed out again; and only the game
+master may do any of it.
 The stream: a client that falls behind is disconnected rather than skipped,
 a reconnect with `?since=` replays exactly what it missed once each and in
 order, asking for more than the buffer holds is answered with `gap: true`
@@ -1440,22 +1518,35 @@ it owns its shares. Nothing is created or destroyed, so `shares_outstanding`
 is untouched, and the whole thing is recorded in the event log as
 `corporate:dividend`.
 
-**Splits and buybacks that retire stock.** Still unbuilt, and each is blocked
-on something specific rather than merely unwritten. A split rewrites every
+**Splits and buybacks that retire stock.** A split is still unbuilt, and
+blocked on something specific rather than merely unwritten: it rewrites every
 position's quantity and average cost, every resting order's price and size,
 the reservations behind them, the simulator's price and fundamental, and the
 whole bar history and tape — or the chart lies. Most of that is inside the
 crate (`Simulator`, `Candles`, `OrderBook` all lack any way to rescale) and
 the rounding is not free: two book levels can collide when prices are divided,
-and a resting buy's reservation no longer matches `price × qty` afterwards. A
-buyback that retires stock needs `shares_outstanding` to change, and that is
-build metadata which the save file deliberately does not carry — the same
-question as listing, below, and it should be answered once for both.
+and a resting buy's reservation no longer matches `price × qty` afterwards.
 
-**Listing and delisting.** The symbol set is fixed at build time
-(`TICKERS`), which the save format depends on: a file listing other symbols is
-refused (§14.14). Adding symbols at runtime means a symbol table in the save
-file and a story for what happens to a delisted symbol's positions.
+A buyback that retires stock is no longer blocked. It needed
+`shares_outstanding` to be something other than build metadata, and since
+§14.15 it is: `SymbolInfo` is the listing's own, carried in the save file and
+changed while the server runs. What is left is the buyback itself — paying
+the holders it buys from, and lowering the count by exactly what it retired,
+under the same lock.
+
+**Listing and delisting (implemented, §14.15).** `POST /api/symbols` lists a
+symbol and `POST /api/symbols/{s}/delist` takes one away, both as game-master
+endpoints. Tickers are registered in a process-wide table
+(`webapp/src/symbols.rs`) rather than written into the build, so they stay
+`&'static str` everywhere without the symbol set being fixed; the save file
+carries each listing's own metadata and is the symbol table a restore comes
+back with. Delisting answers the question that was open here: a symbol holding
+reserved cash, promised shares, stops and the shares themselves gives all four
+back — the orders are cancelled, the stops dropped, and every holder bought
+out at `cents_per_share` (the last price by default, and zero for a company
+that turned out to be worth nothing) as its own `LedgerKind::Delisting` entry.
+The history stays and names the ticker; the position goes, because nothing can
+mark it.
 
 ### 15.4 Running it for more than a game
 

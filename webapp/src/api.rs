@@ -31,8 +31,8 @@ use crate::events::{
 };
 use crate::limit::Decision;
 use crate::market::{
-    App, Closed, Market, PlaceError, Quote, Sequenced, SnapshotDto, StreamMessage, Subscription,
-    SymbolInfo, SymbolState, SymbolStatus, wall_now_ms,
+    App, Closed, Delisting, Market, PlaceError, Quote, Sequenced, SnapshotDto, StreamMessage,
+    Subscription, SymbolInfo, SymbolSpec, SymbolState, SymbolStatus, wall_now_ms,
 };
 use crate::trading::{
     AmendRequest, AmendResponse, BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID,
@@ -58,7 +58,7 @@ pub fn router(app: AppState) -> Router {
         .route("/assets/app.css", get(app_css))
         .route("/api/health", get(health))
         .route("/api/reconcile", get(reconcile))
-        .route("/api/symbols", get(list_symbols))
+        .route("/api/symbols", get(list_symbols).post(list_symbol))
         .route("/api/symbols/{symbol}", get(get_symbol))
         .route("/api/symbols/{symbol}/bars", get(get_bars))
         .route(
@@ -67,6 +67,7 @@ pub fn router(app: AppState) -> Router {
         )
         .route("/api/symbols/{symbol}/shares", get(get_shares))
         .route("/api/symbols/{symbol}/dividend", post(pay_dividend))
+        .route("/api/symbols/{symbol}/delist", post(delist_symbol))
         .route("/api/symbols/{symbol}/status", get(get_status))
         .route("/api/symbols/{symbol}/halt", post(halt_symbol))
         .route("/api/symbols/{symbol}/resume", post(resume_symbol))
@@ -205,6 +206,12 @@ impl ApiError {
 
     fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message)
+    }
+
+    /// The request is well formed but the market is not in a state to take
+    /// it: a ticker already listed, a market with no room for another.
+    fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "conflict", message)
     }
 
     fn invalid_event(message: impl Into<String>) -> Self {
@@ -709,7 +716,7 @@ async fn get_symbol(
         .ok_or_else(|| ApiError::not_found(&symbol))?;
     let s = &market.symbols[idx];
     Ok(Json(SymbolDetail {
-        info: s.info,
+        info: s.info.clone(),
         quote: s.quote(),
         snapshot: s.sim().snapshot().into(),
         config: s.sim().config().clone(),
@@ -734,6 +741,235 @@ async fn get_status(
         .status(idx, app.clock.now())
         .map(Json)
         .ok_or_else(|| ApiError::not_found(&symbol))
+}
+
+/// Body of `POST /api/symbols`.
+#[derive(Deserialize)]
+struct ListingRequest {
+    /// Ticker. Registered as it is read, upper-cased, and refused if another
+    /// listing already has it.
+    symbol: String,
+    name: Option<String>,
+    sector: Option<String>,
+    description: Option<String>,
+    /// Shares in existence. The market never creates or destroys them, so
+    /// this is the ceiling on what every trader can hold between them.
+    shares_outstanding: u64,
+    /// Where the price starts, in cents.
+    start_price_cents: i64,
+    /// Annual log drift and annualised volatility; the simulator's defaults
+    /// if they are not given.
+    drift: Option<f64>,
+    volatility: Option<f64>,
+    /// The RNG seed. Same seed, same prices — so a listing without one takes
+    /// a seed derived from its ticker rather than from a clock: listing
+    /// `WDGT` twice on two servers gives the same company.
+    seed: Option<u64>,
+    /// Days of coarse daily bars to generate before now. `0`, the default,
+    /// lists a company with no past, which is what a flotation is.
+    history_days: Option<usize>,
+    note: Option<String>,
+    source: Option<String>,
+}
+
+/// A new listing, and the event it was recorded as.
+#[derive(Serialize)]
+struct ListingResponse {
+    quote: Quote,
+    event: EventRecord,
+}
+
+/// List a symbol: from this call on it is quoted, it ticks, and orders in it
+/// are accepted like any other.
+///
+/// The work is done in two halves. Warming the simulator up is the expensive
+/// part and needs nothing from the market, so it happens before the lock is
+/// taken; the lock is held only long enough to check the ticker is still free
+/// and push the listing in.
+async fn list_symbol(
+    State(app): State<AppState>,
+    _admin: Admin,
+    payload: Result<Json<ListingRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ListingResponse>), ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let symbol =
+        crate::symbols::register(&req.symbol).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if req.shares_outstanding == 0 {
+        return Err(ApiError::bad_request(
+            "a listing needs shares: shares_outstanding must be positive",
+        ));
+    }
+    let now = app.clock.now();
+    // Cheap answer first: warming a year of history up only to find the
+    // ticker taken would be a waste of the caller's time and this server's.
+    if app.market().symbol_index(symbol).is_some() {
+        return Err(ApiError::conflict(format!("{symbol} is already listed")));
+    }
+    let info = SymbolInfo {
+        symbol,
+        name: clean_text(req.name, 64).unwrap_or_else(|| symbol.to_string()),
+        sector: clean_text(req.sector, 64).unwrap_or_else(|| "Uncategorised".into()),
+        description: clean_text(req.description, 280).unwrap_or_default(),
+        shares_outstanding: req.shares_outstanding,
+        seed: req.seed.unwrap_or_else(|| seed_from_ticker(symbol)),
+    };
+    let spec = SymbolSpec {
+        info,
+        config: Config {
+            start_price_cents: req.start_price_cents,
+            drift: req.drift.unwrap_or(Config::default().drift),
+            volatility: req.volatility.unwrap_or(Config::default().volatility),
+            ..Config::default()
+        },
+        trading: fehu::TradingParams::default(),
+    };
+    let state = app
+        .prepare_listing(spec, req.history_days.unwrap_or(0), now)
+        .map_err(|e| ApiError::invalid_event(e.to_string()))?;
+    let (quote, record) = {
+        let mut market = app.market();
+        let index = market
+            .list(state, app.options.max_symbols)
+            .map_err(|e| ApiError::conflict(e.to_string()))?;
+        let quote = market.symbols[index].quote();
+        let record = market.record(EventRecord {
+            id: 0,
+            received_at_ms: wall_now_ms(),
+            at_ms: now.0,
+            symbols: vec![symbol],
+            kind: "corporate:listing".into(),
+            source: req.source.unwrap_or_else(|| "api".into()),
+            note: req.note,
+            magnitude: None,
+            effects: Vec::new(),
+            summary: vec![format!(
+                "{symbol} listed at {} cents, {} shares outstanding",
+                quote.price_cents, quote.shares_outstanding
+            )],
+        });
+        (quote, record)
+    };
+    tracing::info!(
+        symbol,
+        price_cents = quote.price_cents,
+        shares_outstanding = quote.shares_outstanding,
+        "symbol listed"
+    );
+    app.publish(StreamMessage::Listed {
+        quote: quote.clone(),
+    });
+    app.publish(StreamMessage::Event(record.clone()));
+    Ok((
+        StatusCode::CREATED,
+        Json(ListingResponse {
+            quote,
+            event: record,
+        }),
+    ))
+}
+
+/// Body of `POST /api/symbols/{symbol}/delist`.
+#[derive(Deserialize)]
+struct DelistRequest {
+    /// Paid on every share held, in cents; the last traded price if it is not
+    /// given, and `0` for a company that turned out to be worth nothing.
+    cents_per_share: Option<i64>,
+    note: Option<String>,
+    source: Option<String>,
+}
+
+/// What a delisting undid, and the event it was recorded as.
+#[derive(Serialize)]
+struct DelistResponse {
+    delisting: Delisting,
+    event: EventRecord,
+}
+
+/// Delist a symbol: withdraw its book, drop its stops, buy every holder out,
+/// and take it off the market.
+///
+/// This is the counterpart of listing and it is not a cancellation of it:
+/// what the symbol did is still on the record — the fills, the ledger
+/// entries and the order records all still name it — and the money the shares
+/// were worth is credited before the listing goes.
+async fn delist_symbol(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    _admin: Admin,
+    payload: Result<Json<DelistRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<DelistResponse>), ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let now = app.clock.now();
+    let (delisting, messages, record) = {
+        let mut market = app.market();
+        let idx = market
+            .symbol_index(&symbol)
+            .ok_or_else(|| ApiError::not_found(&symbol))?;
+        let (delisting, messages) = market
+            .delist(idx, req.cents_per_share, req.note.clone(), now.0)
+            .map_err(|e| ApiError::invalid_event(e.to_string()))?;
+        let record = market.record(EventRecord {
+            id: 0,
+            received_at_ms: wall_now_ms(),
+            at_ms: now.0,
+            symbols: vec![delisting.symbol],
+            kind: "corporate:delisting".into(),
+            source: req.source.unwrap_or_else(|| "api".into()),
+            note: req.note,
+            magnitude: None,
+            effects: Vec::new(),
+            summary: vec![format!(
+                "{} delisted at {} cents a share: {} shares bought out for {} cents across {} \
+                 account(s), {} resting order(s) and {} stop(s) withdrawn",
+                delisting.symbol,
+                delisting.cents_per_share,
+                delisting.shares_bought_out,
+                delisting.total_cents,
+                delisting.accounts_paid,
+                delisting.orders_cancelled,
+                delisting.stops_cancelled,
+            )],
+        });
+        (delisting, messages, record)
+    };
+    tracing::info!(
+        symbol = delisting.symbol,
+        cents_per_share = delisting.cents_per_share,
+        shares = delisting.shares_bought_out,
+        total_cents = delisting.total_cents,
+        "symbol delisted"
+    );
+    for message in messages {
+        app.publish(message);
+    }
+    app.publish(StreamMessage::Event(record.clone()));
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(DelistResponse {
+            delisting,
+            event: record,
+        }),
+    ))
+}
+
+/// A seed from a ticker, so a listing without one is still reproducible: the
+/// same ticker on two servers gives the same company. FNV-1a, which is
+/// nothing but a spread of the letters — it is a seed, not a digest.
+fn seed_from_ticker(ticker: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in ticker.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Trim a caller's text, cap it at `max` characters, and treat an empty
+/// result as absent.
+fn clean_text(value: Option<String>, max: usize) -> Option<String> {
+    value
+        .map(|v| v.trim().chars().take(max).collect::<String>())
+        .filter(|v| !v.is_empty())
 }
 
 /// Stop trading in a symbol. It stays stopped until it is resumed.

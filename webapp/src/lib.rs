@@ -1,4 +1,4 @@
-//! Sample backend for [`fehu`]: four hardcoded, seeded symbols ticking in
+//! Sample backend for [`fehu`]: seeded symbols ticking in
 //! wall-clock time, OHLC bars over HTTP, an SSE tick stream, endpoints
 //! through which a game pushes events into the simulation, and trading:
 //! users open accounts, pay money into them in integer cents, and their
@@ -18,6 +18,7 @@ pub mod market;
 pub mod metrics;
 pub mod reconcile;
 pub mod save;
+pub mod symbols;
 pub mod trading;
 
 pub use api::router;

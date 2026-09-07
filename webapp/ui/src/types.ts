@@ -702,7 +702,10 @@ export interface FillMessage {
 /** A symbol stopped trading, or started again. */
 export type StatusMessage = { type: 'status' } & SymbolStatus;
 
-/** A resting order reached its expiry and was withdrawn. */
+/**
+ * A resting order was withdrawn by the venue rather than by its owner: it
+ * reached its expiry, or its symbol was delisted.
+ */
 export interface OrderExpiredMessage {
   type: 'order_expired';
   trader_id: number;
@@ -723,6 +726,33 @@ export interface StopTriggeredMessage {
   refused: string | null;
 }
 
+/** A symbol was listed: it is quoted and tradable from this message on. */
+export interface ListedMessage {
+  type: 'listed';
+  quote: Quote;
+}
+
+/** What a delisting undid, and what it paid for the shares. */
+export interface Delisting {
+  symbol: string;
+  /** Paid on every share held. Zero is a real answer. */
+  cents_per_share: number;
+  /** What the symbol last traded at, for comparison. */
+  last_price_cents: number;
+  orders_cancelled: number;
+  stops_cancelled: number;
+  shares_bought_out: number;
+  accounts_paid: number;
+  total_cents: number;
+}
+
+/**
+ * A symbol was delisted. Its book and stops are gone, every holder has been
+ * bought out, and orders in it are refused from here on. `Delisting` is
+ * flattened alongside the tag.
+ */
+export type DelistedMessage = { type: 'delisted' } & Delisting;
+
 /**
  * Every message carries the sequence number it was published under, so a
  * client can tell a quiet market from a gap and resume with `?since=`.
@@ -737,6 +767,8 @@ export type StreamMessage = Sequenced<
   | StatusMessage
   | StopTriggeredMessage
   | OrderExpiredMessage
+  | ListedMessage
+  | DelistedMessage
 >;
 
 /** The server's error body: `{"error": {"code", "message"}}`. */

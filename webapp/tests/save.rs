@@ -423,6 +423,105 @@ async fn an_iceberg_comes_back_with_what_it_was_hiding() {
 }
 
 #[tokio::test]
+async fn the_symbols_a_market_comes_back_with_are_the_ones_it_was_saved_with() {
+    let dir = TempDir::new("fehu-save-listings");
+    let path = dir.path().join("state.json");
+    let before = App::new(options(Some(path.clone())));
+
+    // A symbol the build has never heard of, and one of the build's own
+    // taken away. Neither is what `seeded_symbols` says the market is.
+    let (status, listed) = post(
+        &before,
+        None,
+        "/api/symbols",
+        json!({
+            "symbol": "WDGT",
+            "name": "Widget Corp",
+            "sector": "Industrials",
+            "shares_outstanding": 1_000_000,
+            "start_price_cents": 5_000,
+            "seed": 99,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{listed}");
+    let (status, _) = post(&before, None, "/api/symbols/HLIO/delist", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    engine::advance_to(
+        &before,
+        before.clock.now() + std::time::Duration::from_secs(5),
+    );
+
+    let (_, symbols) = get(&before, None, "/api/symbols").await;
+    let (_, detail) = get(&before, None, "/api/symbols/WDGT").await;
+    save::write(&before, &path).expect("state written");
+
+    let after = App::restore(options(Some(path.clone())), save::read(&path).unwrap());
+    let (_, restored) = get(&after, None, "/api/symbols").await;
+    let tickers: Vec<&str> = restored["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["symbol"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tickers,
+        ["ACME", "NBLA", "PXCO", "WDGT"],
+        "the file is the symbol table, not the build"
+    );
+    assert_eq!(restored["symbols"], symbols["symbols"], "the same quotes");
+    let (status, restored_detail) = get(&after, None, "/api/symbols/WDGT").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        restored_detail["info"], detail["info"],
+        "name, sector, share count and seed all came back"
+    );
+    let (status, _) = get(&after, None, "/api/symbols/HLIO").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a delisting stays done");
+    assert!(after.market().reconcile().valid);
+
+    // And the restored market goes on listing and delisting.
+    let (status, body) = post(&after, None, "/api/symbols/WDGT/delist", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+#[tokio::test]
+async fn a_version_4_save_takes_its_symbols_from_the_build() {
+    let dir = TempDir::new("fehu-save-v4");
+    let path = dir.path().join("state.json");
+    let app = App::new(options(Some(path.clone())));
+    busy_market(&app).await;
+    save::write(&app, &path).unwrap();
+
+    // Version 4 knew nothing of listings: it named its symbols and left the
+    // metadata to the build, which is where the migration has to find it.
+    let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    value["version"] = json!(4);
+    for symbol in value["symbols"].as_array_mut().unwrap() {
+        symbol.as_object_mut().unwrap().remove("info");
+    }
+    value["market"]
+        .as_object_mut()
+        .unwrap()
+        .remove("next_order_id");
+    std::fs::write(&path, value.to_string()).unwrap();
+
+    let restored = save::read(&path).expect("a version-4 file still loads");
+    assert_eq!(restored.version, save::STATE_VERSION);
+    let after = App::restore(options(None), restored);
+    let (_, symbols) = get(&after, None, "/api/symbols").await;
+    let tickers: Vec<&str> = symbols["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["symbol"].as_str().unwrap())
+        .collect();
+    assert_eq!(tickers, ["ACME", "NBLA", "HLIO", "PXCO"]);
+    assert_eq!(symbols["symbols"][0]["name"], "Acme Industrial");
+    assert!(after.market().reconcile().valid);
+}
+
+#[tokio::test]
 async fn a_save_this_build_cannot_use_is_refused() {
     let dir = TempDir::new("fehu-save-bad");
     let path = dir.path().join("state.json");
@@ -441,13 +540,40 @@ async fn a_save_this_build_cannot_use_is_refused() {
         "a version this build does not read is refused"
     );
 
-    // A file listing symbols this build does not have.
+    // A file whose symbol table does not agree with itself: the entry is
+    // filed under one ticker and carries the listing of another. Which of the
+    // two the market would have is not a question worth guessing at.
     let mut value: Value = serde_json::from_str(&good).unwrap();
     value["symbols"][0]["symbol"] = json!("WHAT");
     std::fs::write(&path, value.to_string()).unwrap();
     assert!(
+        matches!(save::read(&path), Err(save::SaveError::Invalid(_))),
+        "a symbol filed under the wrong listing is refused"
+    );
+
+    // The same ticker listed twice: the second book would be unreachable
+    // behind the first.
+    let mut value: Value = serde_json::from_str(&good).unwrap();
+    let duplicate = value["symbols"][0].clone();
+    value["symbols"].as_array_mut().unwrap().push(duplicate);
+    std::fs::write(&path, value.to_string()).unwrap();
+    assert!(
+        matches!(save::read(&path), Err(save::SaveError::Invalid(_))),
+        "a ticker listed twice is refused"
+    );
+
+    // A version-4 file naming a symbol this build does not seed. Its
+    // metadata lived in the build, and this build does not have it.
+    let mut value: Value = serde_json::from_str(&good).unwrap();
+    value["version"] = json!(4);
+    for symbol in value["symbols"].as_array_mut().unwrap() {
+        symbol.as_object_mut().unwrap().remove("info");
+    }
+    value["symbols"][0]["symbol"] = json!("WHAT");
+    std::fs::write(&path, value.to_string()).unwrap();
+    assert!(
         matches!(save::read(&path), Err(save::SaveError::Symbols { .. })),
-        "an unknown symbol list is refused"
+        "a version-4 file with no metadata for a symbol is refused"
     );
 
     // Not JSON at all.

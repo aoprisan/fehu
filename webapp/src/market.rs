@@ -17,7 +17,7 @@ use crate::auth::Keyring;
 use crate::events::EventRecord;
 use crate::limit::{Decision, Limiter, Rate};
 use crate::metrics::Metrics;
-use crate::save::{MarketSave, STATE_VERSION, Save, SymbolSave};
+use crate::save::{MarketSave, STATE_VERSION, Save, Symbol, SymbolSave};
 use crate::trading::{
     BookDto, Fees, FillRecord, HoldingDto, MAX_STOPS_PER_TRADER, OrderRecord, OrderResponse,
     Refused, StopOrder, StopRequest, TradeDto, Trader,
@@ -26,17 +26,28 @@ use crate::trading::{
 /// Milliseconds in one day.
 pub const DAY_MS: i64 = 86_400_000;
 
-/// Static metadata for a listed symbol.
-#[derive(Clone, Copy, Debug, Serialize)]
+/// What a listing is, apart from its price process: who it claims to be and
+/// how many shares of it exist.
+///
+/// This travels in the save file. It used to come from the build — the four
+/// literals below — but a symbol listed while the server runs has no build to
+/// come from, so the file carries the listing itself and the build only
+/// supplies the ones a fresh market starts with.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+// `symbol` is registered on the way in rather than borrowed from the input,
+// so the derive needs no `'de: 'static`.
+#[serde(bound(deserialize = ""))]
 pub struct SymbolInfo {
-    /// Ticker, e.g. `ACME`.
-    pub symbol: &'static str,
+    /// Ticker, e.g. `ACME`. Spelled as [`Symbol`] rather than `&'static str`
+    /// so `serde` does not read it as data borrowed from the input.
+    #[serde(with = "crate::save::symbol")]
+    pub symbol: Symbol,
     /// Company name.
-    pub name: &'static str,
+    pub name: String,
     /// Sector label.
-    pub sector: &'static str,
+    pub sector: String,
     /// One-line flavour text.
-    pub description: &'static str,
+    pub description: String,
     /// Shares in existence. Nothing creates or destroys them: what the
     /// traders hold plus what is still out in the market adds up to this, so
     /// a buy cannot ask for more than is left (see
@@ -47,30 +58,40 @@ pub struct SymbolInfo {
 }
 
 /// A symbol's metadata plus the simulator config and trading parameters it
-/// is created with.
+/// is created with. This is what both a seeded symbol and one listed at
+/// runtime are built from.
 pub struct SymbolSpec {
     pub info: SymbolInfo,
     pub config: Config,
     pub trading: TradingParams,
 }
 
-/// The listed tickers, in listing order. The symbol set is fixed at build
-/// time: it names the `&'static str`s the rest of the server uses, and a save
-/// file listing anything else is refused rather than guessed at.
+/// The tickers a fresh market starts with, in listing order.
+///
+/// These are the *seeded* symbols, not the symbol set: listings are added and
+/// removed while the server runs (`POST /api/symbols`,
+/// `DELETE /api/symbols/{symbol}`), and a restored market lists whatever its
+/// save file lists rather than whatever this array says.
 pub const TICKERS: [&str; 4] = ["ACME", "NBLA", "HLIO", "PXCO"];
 
 /// `ticker` as the `&'static str` the server uses for it, matched
-/// case-insensitively.
+/// case-insensitively, or `None` if this process has never registered it.
+///
+/// A lookup, never a registration: see [`crate::symbols`].
 pub fn intern(ticker: &str) -> Option<&'static str> {
-    TICKERS
-        .iter()
-        .find(|s| s.eq_ignore_ascii_case(ticker))
-        .copied()
+    crate::symbols::lookup(ticker)
 }
 
-/// The four hardcoded symbols. `start_ts` is the first tick's timestamp; the
-/// rest of the config is per symbol and deliberately varied so the charts
-/// look different from one another.
+/// Register `ticker` and give back the one string the whole server will use
+/// for it. Panics only if the ticker is malformed, which the literals below
+/// are not.
+fn seeded(ticker: &str) -> &'static str {
+    crate::symbols::register(ticker).expect("seeded tickers are well formed")
+}
+
+/// The four symbols a fresh market is seeded with. `start_ts` is the first
+/// tick's timestamp; the rest of the config is per symbol and deliberately
+/// varied so the charts look different from one another.
 pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
     let base = |start_price_cents: i64, drift: f64, volatility: f64| Config {
         start_price_cents,
@@ -82,10 +103,11 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
     vec![
         SymbolSpec {
             info: SymbolInfo {
-                symbol: "ACME",
-                name: "Acme Industrial",
-                sector: "Industrials",
-                description: "Century-old conglomerate. Low volatility, steady drift, rare jumps.",
+                symbol: seeded("ACME"),
+                name: "Acme Industrial".into(),
+                sector: "Industrials".into(),
+                description: "Century-old conglomerate. Low volatility, steady drift, rare jumps."
+                    .into(),
                 shares_outstanding: 240_000_000,
                 seed: 0xACE,
             },
@@ -105,10 +127,12 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
         },
         SymbolSpec {
             info: SymbolInfo {
-                symbol: "NBLA",
-                name: "Nebula Robotics",
-                sector: "Technology",
-                description: "Pre-profit robotics darling. High volatility, big drift, frequent jumps.",
+                symbol: seeded("NBLA"),
+                name: "Nebula Robotics".into(),
+                sector: "Technology".into(),
+                description:
+                    "Pre-profit robotics darling. High volatility, big drift, frequent jumps."
+                        .into(),
                 shares_outstanding: 85_000_000,
                 seed: 0x4E42,
             },
@@ -138,10 +162,11 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
         },
         SymbolSpec {
             info: SymbolInfo {
-                symbol: "HLIO",
-                name: "Helio Energy",
-                sector: "Energy",
-                description: "Solar and storage utility. Commodity-driven, moderate volatility.",
+                symbol: seeded("HLIO"),
+                name: "Helio Energy".into(),
+                sector: "Energy".into(),
+                description: "Solar and storage utility. Commodity-driven, moderate volatility."
+                    .into(),
                 shares_outstanding: 610_000_000,
                 seed: 0x4845,
             },
@@ -161,10 +186,11 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
         },
         SymbolSpec {
             info: SymbolInfo {
-                symbol: "PXCO",
-                name: "Pax Consumer Co",
-                sector: "Consumer Staples",
-                description: "Household brands. Defensive: low volatility, shocks fade slowly.",
+                symbol: seeded("PXCO"),
+                name: "Pax Consumer Co".into(),
+                sector: "Consumer Staples".into(),
+                description: "Household brands. Defensive: low volatility, shocks fade slowly."
+                    .into(),
                 shares_outstanding: 150_000_000,
                 seed: 0x5058,
             },
@@ -314,8 +340,8 @@ impl Advanced {
 #[derive(Clone, Debug, Serialize)]
 pub struct Quote {
     pub symbol: &'static str,
-    pub name: &'static str,
-    pub sector: &'static str,
+    pub name: String,
+    pub sector: String,
     /// Timestamp of the last tick.
     pub ts_ms: i64,
     pub price_cents: i64,
@@ -401,9 +427,24 @@ pub struct SymbolState {
 
 impl SymbolState {
     fn new(spec: SymbolSpec, max_bars: usize, tape_cap: usize) -> Self {
-        let exchange = Exchange::new(spec.config, spec.trading, spec.info.seed)
-            .expect("seeded configs are valid");
-        Self {
+        Self::create(spec, max_bars, tape_cap).expect("seeded configs are valid")
+    }
+
+    /// Build a symbol from a spec that has not been vetted. The seeded ones
+    /// have been, and go through [`SymbolState::new`]; a listing asked for
+    /// over HTTP has not, and its config is checked here rather than
+    /// panicking on the request thread.
+    ///
+    /// # Errors
+    /// The first [`fehu::ConfigError`] in the simulator config or the trading
+    /// parameters.
+    fn create(
+        spec: SymbolSpec,
+        max_bars: usize,
+        tape_cap: usize,
+    ) -> Result<Self, fehu::ConfigError> {
+        let exchange = Exchange::new(spec.config, spec.trading, spec.info.seed)?;
+        Ok(Self {
             info: spec.info,
             exchange,
             candles: Candles::new(max_bars),
@@ -416,7 +457,7 @@ impl SymbolState {
             halt: None,
             band_cents: 0,
             stops: Vec::new(),
-        }
+        })
     }
 
     /// The reference price process.
@@ -612,6 +653,7 @@ impl SymbolState {
     pub fn to_save(&self) -> SymbolSave {
         SymbolSave {
             symbol: self.info.symbol.to_string(),
+            info: Some(self.info.clone()),
             exchange: self.exchange.clone(),
             candles: self.candles.clone(),
             coarse_daily: self.coarse_daily.clone(),
@@ -625,9 +667,9 @@ impl SymbolState {
         }
     }
 
-    /// Rebuild a symbol from a save. Its metadata (name, sector, share count,
-    /// seed) comes from the build rather than the file: the save carries only
-    /// what changed while the server ran.
+    /// Rebuild a symbol from a save. Its listing comes out of the file with
+    /// it: which symbols a restored market has, and what they are, is what
+    /// was saved rather than what this build seeds.
     fn from_save(info: SymbolInfo, save: SymbolSave, tape_cap: usize) -> Self {
         let tape_cap = tape_cap.max(1);
         let mut tape: VecDeque<Trade> = save.tape.into_iter().collect();
@@ -675,8 +717,8 @@ impl SymbolState {
         let price = self.last_tick.map_or(snap.price_cents, |t| t.price_cents);
         Quote {
             symbol: self.info.symbol,
-            name: self.info.name,
-            sector: self.info.sector,
+            name: self.info.name.clone(),
+            sector: self.info.sector.clone(),
             ts_ms: self.last_tick.map_or(snap.ts.0, |t| t.ts.0),
             price_cents: price,
             prev_close_cents: prev_close,
@@ -719,6 +761,14 @@ pub struct Market {
     /// Ids for the stops held on the symbols. Separate from order ids: a
     /// stop only becomes an order when it fires.
     next_stop_id: u64,
+    /// The lowest order id a new order may take, whatever the books say.
+    ///
+    /// Order ids are allocated above every book's counter, which is only the
+    /// whole story while every book that ever existed is still here. A
+    /// delisted symbol's book leaves with its counter, and its orders stay in
+    /// the log: without this floor the next order could take an id one of
+    /// them already has.
+    order_id_floor: fehu::OrderId,
     /// Every order the log still holds, by order id.
     orders: BTreeMap<u64, OrderRecord>,
     /// Order ids in the order they were accepted, for eviction.
@@ -1116,6 +1166,156 @@ impl Market {
         Some(paid)
     }
 
+    /// List a new symbol.
+    ///
+    /// `state` is built outside the market lock — warming a simulator up is
+    /// the slow part and none of it needs the market — so the checks that
+    /// have to be made against the market are made here, at the moment the
+    /// listing goes in.
+    ///
+    /// # Errors
+    /// [`ListingError`] if the ticker is already listed, or the market
+    /// already has `max_symbols` of them.
+    pub fn list(&mut self, state: SymbolState, max_symbols: usize) -> Result<usize, ListingError> {
+        let ticker = state.info.symbol;
+        if self.symbol(ticker).is_some() {
+            return Err(ListingError::AlreadyListed(ticker));
+        }
+        if self.symbols.len() >= max_symbols {
+            return Err(ListingError::Full { max: max_symbols });
+        }
+        self.symbols.push(state);
+        Ok(self.symbols.len() - 1)
+    }
+
+    /// Delist the symbol at `index`: withdraw its book, drop its stops, buy
+    /// every holder out at `cents_per_share`, and take it off the market.
+    ///
+    /// The order matters, and so does doing all of it. A delisting that
+    /// only removed the symbol would strand cash in buy reservations that no
+    /// order can ever fill, and leave traders holding shares in a company
+    /// with no price. So:
+    ///
+    /// * every resting order is cancelled, which releases exactly what it
+    ///   reserved — cash for a buy, shares for a sell — and marks its record
+    ///   cancelled, as an expiry does;
+    /// * every untriggered stop is dropped. A stop reserves nothing, so
+    ///   there is nothing to give back;
+    /// * every holder is bought out at `cents_per_share`, credited as its own
+    ///   [`LedgerKind::Delisting`](crate::account::LedgerKind::Delisting)
+    ///   entry, and their position is removed.
+    ///
+    /// `cents_per_share` defaults to the last price and may be zero: a
+    /// company can be worth nothing, and a bankruptcy is a delisting that
+    /// pays its holders nothing. It is money from outside the market, exactly
+    /// as a dividend is — somebody bought the company — and
+    /// `shares_outstanding` leaves with the listing.
+    ///
+    /// What stays behind is history: the fills, the ledger entries and the
+    /// order records of a delisted symbol still name it, and its ticker is
+    /// still registered, so re-listing it later reuses the same name. What
+    /// does not stay is the position: a flat position in a symbol that no
+    /// longer exists is a row nothing can price, so the ledger keeps the
+    /// money and the position goes.
+    ///
+    /// # Errors
+    /// [`DelistError`] if there is no symbol at `index` or the price is not a
+    /// price.
+    pub fn delist(
+        &mut self,
+        index: usize,
+        cents_per_share: Option<i64>,
+        note: Option<String>,
+        now_ms: i64,
+    ) -> Result<(Delisting, Vec<StreamMessage>), DelistError> {
+        let symbol = self.symbols.get(index).ok_or(DelistError::Unknown)?;
+        let sym = symbol.info.symbol;
+        let last_price_cents = symbol.price_cents();
+        let cents_per_share = cents_per_share.unwrap_or(last_price_cents);
+        if cents_per_share < 0 {
+            return Err(DelistError::Price);
+        }
+        let resting: Vec<(u64, TraderId)> = symbol
+            .exchange
+            .book()
+            .orders()
+            .filter_map(|o| o.owner.trader().map(|t| (o.id.0, t)))
+            .collect();
+        let mut messages = Vec::new();
+        let mut orders_cancelled = 0;
+        for (order_id, trader) in resting {
+            let Ok(cancelled) = self.symbols[index]
+                .exchange
+                .cancel(fehu::OrderId(order_id), trader)
+            else {
+                continue; // Filled or gone between the book and here.
+            };
+            if let Some((t, account)) = self.trader_and_account(trader) {
+                t.release(
+                    account,
+                    sym,
+                    cancelled.side,
+                    cancelled.outstanding(),
+                    cancelled.price_cents,
+                );
+            }
+            self.cancel_order_record(sym, order_id, cancelled.outstanding(), now_ms);
+            orders_cancelled += 1;
+            if let Some(record) = self.orders.get(&order_id) {
+                messages.push(StreamMessage::OrderExpired {
+                    trader_id: trader.0,
+                    order: record.clone(),
+                });
+            }
+        }
+        let stops_cancelled = std::mem::take(&mut self.symbols[index].stops).len();
+        let mut paid = Delisting {
+            symbol: sym,
+            cents_per_share,
+            last_price_cents,
+            orders_cancelled,
+            stops_cancelled,
+            shares_bought_out: 0,
+            accounts_paid: 0,
+            total_cents: 0,
+        };
+        let holders: Vec<TraderId> = self.traders.keys().copied().collect();
+        for id in holders {
+            let Some((trader, account)) = self.trader_and_account(id) else {
+                continue;
+            };
+            // Every resting sell in this symbol was cancelled above, so
+            // nothing is still promised to one.
+            trader.reserved_shares.remove(sym);
+            let Some(position) = trader.positions.remove(sym) else {
+                continue;
+            };
+            let Ok(qty) = u64::try_from(position.qty) else {
+                continue;
+            };
+            if qty == 0 {
+                continue;
+            }
+            let amount = notional_cents(cents_per_share, qty);
+            paid.shares_bought_out = paid.shares_bought_out.saturating_add(qty);
+            // The shares are gone either way; what was actually credited is
+            // what the ledger says, which is what gets reported.
+            if let Some(entry) = account.pay_delisting(amount, sym, note.clone(), now_ms) {
+                paid.accounts_paid += 1;
+                paid.total_cents = paid.total_cents.saturating_add(entry.amount_cents);
+            }
+        }
+        // The book goes, and its order-id counter with it. The ids it handed
+        // out are still in the log, so the floor keeps the next order from
+        // reaching back into them.
+        let removed = self.symbols.remove(index);
+        self.order_id_floor = self
+            .order_id_floor
+            .max(removed.exchange.book().next_order_id());
+        messages.push(StreamMessage::Delisted(paid.clone()));
+        Ok((paid, messages))
+    }
+
     /// Hold a stop until the price reaches it.
     ///
     /// The account is checked here so an obviously unfundable trigger is
@@ -1478,7 +1678,19 @@ impl Market {
             next_trader_id: self.next_trader_id,
             next_event_id: self.next_event_id,
             next_stop_id: self.next_stop_id,
+            next_order_id: self.next_order_id().0,
         }
+    }
+
+    /// The id the next order would take. Above every book's counter and above
+    /// the floor left behind by any book that has been delisted.
+    pub fn next_order_id(&self) -> fehu::OrderId {
+        self.symbols
+            .iter()
+            .map(|s| s.exchange.book().next_order_id())
+            .chain(std::iter::once(self.order_id_floor))
+            .max()
+            .unwrap_or(fehu::OrderId(1))
     }
 
     /// Put a saved market back: users, money, traders and every log, with the
@@ -1496,6 +1708,7 @@ impl Market {
             next_account_id: save.next_account_id.max(1),
             traders: save.traders.into_iter().map(|t| (t.id, t)).collect(),
             next_trader_id: save.next_trader_id.max(1),
+            order_id_floor: fehu::OrderId(save.next_order_id.max(1)),
             next_stop_id: save.next_stop_id.max(1),
             orders: BTreeMap::new(),
             order_ids: VecDeque::new(),
@@ -1672,6 +1885,7 @@ impl Market {
             .symbols
             .iter()
             .map(|s| s.exchange.book().next_order_id())
+            .chain(std::iter::once(self.order_id_floor))
             .max()
             .unwrap_or(fehu::OrderId(1));
         self.symbols[idx].exchange.advance_order_id(next_id);
@@ -1753,8 +1967,15 @@ pub enum StreamMessage {
     Fill { trader_id: u64, fill: FillRecord },
     /// A symbol stopped trading, or started again.
     Status(SymbolStatus),
-    /// A resting order reached its expiry and was withdrawn.
+    /// A resting order was withdrawn by the venue rather than by its owner:
+    /// it reached its expiry, or its symbol was delisted. Either way the
+    /// record is cancelled and whatever it reserved has been released.
     OrderExpired { trader_id: u64, order: OrderRecord },
+    /// A symbol was listed. It is tradable from this message on.
+    Listed { quote: Quote },
+    /// A symbol was delisted. Its book and stops are gone, every holder has
+    /// been bought out, and orders in it will be refused from here on.
+    Delisted(Delisting),
     /// A stop fired. It is held no longer: it either became the order in
     /// `order`, or was `refused` when the account was checked again.
     StopTriggered {
@@ -1765,6 +1986,66 @@ pub enum StreamMessage {
         order: Option<OrderResponse>,
         refused: Option<String>,
     },
+}
+
+/// Why a symbol could not be listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListingError {
+    /// A symbol with this ticker is already listed. Delist it first.
+    AlreadyListed(&'static str),
+    /// The market already lists as many symbols as it will.
+    Full { max: usize },
+}
+
+impl std::fmt::Display for ListingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyListed(t) => write!(f, "{t} is already listed"),
+            Self::Full { max } => write!(f, "this market lists at most {max} symbols"),
+        }
+    }
+}
+
+impl std::error::Error for ListingError {}
+
+/// Why a symbol could not be delisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DelistError {
+    /// No symbol at that index.
+    Unknown,
+    /// The buy-out price is not a price.
+    Price,
+}
+
+impl std::fmt::Display for DelistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown => write!(f, "no such symbol"),
+            Self::Price => write!(f, "a buy-out price cannot be negative"),
+        }
+    }
+}
+
+impl std::error::Error for DelistError {}
+
+/// What a delisting undid, and what it paid for the shares.
+#[derive(Clone, Debug, Serialize)]
+pub struct Delisting {
+    pub symbol: &'static str,
+    /// Paid on every share held. Zero is a real answer: a company can be
+    /// worth nothing.
+    pub cents_per_share: i64,
+    /// What the symbol last traded at, for comparison.
+    pub last_price_cents: i64,
+    /// Resting orders withdrawn, releasing what they reserved.
+    pub orders_cancelled: usize,
+    /// Untriggered stops dropped. They reserved nothing.
+    pub stops_cancelled: usize,
+    pub shares_bought_out: u64,
+    /// Accounts credited. A holder paid nothing — a buy-out at zero — is
+    /// bought out but not credited.
+    pub accounts_paid: usize,
+    pub total_cents: i64,
 }
 
 /// What a dividend paid, and the price it went ex at.
@@ -1899,6 +2180,10 @@ pub struct Options {
     /// The share lot every symbol trades in. `FEHU_LOT`; `1` allows every
     /// share, which is the default.
     pub lot: u64,
+    /// Symbols the market may list at once. `FEHU_MAX_SYMBOLS`. Every one of
+    /// them is a simulator stepped on every engine tick, so this is a bound
+    /// on how much work a step is, not just on how long a list is.
+    pub max_symbols: usize,
     /// What a taker pays, in basis points of the fill's notional.
     /// `FEHU_TAKER_FEE_BPS`; `0`, the default, charges nothing. Negative
     /// values are refused: the venue does not pay takers.
@@ -1934,6 +2219,7 @@ impl Default for Options {
             rate_burst: 40.0,
             tick_cents: 1,
             lot: 1,
+            max_symbols: 32,
             taker_fee_bps: 0,
             maker_fee_bps: 0,
         }
@@ -1988,6 +2274,8 @@ impl Options {
             rate_burst: env_parse("FEHU_RATE_BURST", d.rate_burst).max(0.0),
             tick_cents: env_parse("FEHU_TICK_CENTS", d.tick_cents).clamp(1, 1_000_000),
             lot: env_parse("FEHU_LOT", d.lot).clamp(1, 1_000_000),
+            max_symbols: env_parse("FEHU_MAX_SYMBOLS", d.max_symbols)
+                .clamp(1, crate::symbols::MAX_TICKERS),
             taker_fee_bps: env_parse("FEHU_TAKER_FEE_BPS", d.taker_fee_bps),
             maker_fee_bps: env_parse("FEHU_MAKER_FEE_BPS", d.maker_fee_bps),
         }
@@ -2117,6 +2405,7 @@ impl App {
                 traders: BTreeMap::new(),
                 next_trader_id: 1,
                 next_stop_id: 1,
+                order_id_floor: fehu::OrderId(1),
                 orders: BTreeMap::new(),
                 order_ids: VecDeque::new(),
                 client_order_ids: BTreeMap::new(),
@@ -2133,6 +2422,38 @@ impl App {
             tx,
             options,
         })
+    }
+
+    /// Build a listing from `spec` without touching the market.
+    ///
+    /// Warming a simulator up is the slow part of listing a symbol and none
+    /// of it needs the market lock, so it happens here and the finished
+    /// symbol is handed to [`Market::list`] afterwards. `history_days` days of
+    /// coarse daily bars are generated so the chart is not empty on the first
+    /// morning; `0` lists a company with no past, which is what an IPO is.
+    ///
+    /// The calendar, tick and lot are the market's rather than the caller's:
+    /// they are properties of this venue, and a symbol that traded on a
+    /// different grid to everything beside it would not be one of its
+    /// listings.
+    ///
+    /// # Errors
+    /// The first [`fehu::ConfigError`] in the requested config.
+    pub fn prepare_listing(
+        &self,
+        mut spec: SymbolSpec,
+        history_days: usize,
+        now: Timestamp,
+    ) -> Result<SymbolState, fehu::ConfigError> {
+        spec.config.start_ts = Timestamp(now.0 - history_days as i64 * DAY_MS);
+        spec.config.market_hours = self.options.market_hours;
+        spec.trading.rules = fehu::MarketRules {
+            tick_cents: self.options.tick_cents,
+            lot: self.options.lot,
+        };
+        let mut state = SymbolState::create(spec, self.options.max_bars, self.options.tape_len)?;
+        state.warm_up(history_days, now);
+        Ok(state)
     }
 
     /// Everything the server would need to carry on after a restart.
@@ -2163,15 +2484,14 @@ impl App {
     /// checks that — and each symbol's metadata comes from the build.
     pub fn restore(options: Options, save: Save) -> Arc<Self> {
         let now = Timestamp(save.sim_now_ms);
-        let specs: BTreeMap<&'static str, SymbolInfo> = seeded_symbols(now)
-            .into_iter()
-            .map(|spec| (spec.info.symbol, spec.info))
-            .collect();
         let symbols = save
             .symbols
             .into_iter()
-            .filter_map(|s| {
-                let info = *specs.get(intern(&s.symbol)?)?;
+            .filter_map(|mut s| {
+                // Every symbol in a save that `save::read` accepted carries
+                // its listing; one that does not cannot be rebuilt, and there
+                // is no build metadata left to guess it from.
+                let info = s.info.take()?;
                 Some(SymbolState::from_save(info, s, options.tape_len))
             })
             .collect();

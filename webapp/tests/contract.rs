@@ -885,6 +885,65 @@ async fn stream_message_shapes() {
         }
     }
     assert!(saw_event, "the accepted event was not published");
+
+    // `listed` carries the new symbol's first quote; `delisted` flattens what
+    // the delisting undid next to the tag.
+    let listed = serde_json::to_value(StreamMessage::Listed {
+        quote: app.market().symbols[0].quote(),
+    })
+    .unwrap();
+    assert_keys("ListedMessage", &listed, &["type", "quote"]);
+    assert_eq!(listed["type"], "listed");
+
+    let (_, delisted) = call_as(
+        &app,
+        None,
+        Request::post("/api/symbols/PXCO/delist")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({}).to_string()))
+            .unwrap(),
+    )
+    .await;
+    let mut saw_delisted = false;
+    while let Ok(message) = rx.try_recv() {
+        let value = serde_json::to_value(&message).unwrap();
+        if value["type"] == "delisted" {
+            assert_keys(
+                "DelistedMessage",
+                &value,
+                &[
+                    "seq",
+                    "type",
+                    "symbol",
+                    "cents_per_share",
+                    "last_price_cents",
+                    "orders_cancelled",
+                    "stops_cancelled",
+                    "shares_bought_out",
+                    "accounts_paid",
+                    "total_cents",
+                ],
+            );
+            assert_eq!(value["symbol"], "PXCO");
+            saw_delisted = true;
+        }
+    }
+    assert!(saw_delisted, "the delisting was not published: {delisted}");
+    assert_keys("DelistResponse", &delisted, &["delisting", "event"]);
+    assert_keys(
+        "Delisting",
+        &delisted["delisting"],
+        &[
+            "symbol",
+            "cents_per_share",
+            "last_price_cents",
+            "orders_cancelled",
+            "stops_cancelled",
+            "shares_bought_out",
+            "accounts_paid",
+            "total_cents",
+        ],
+    );
 }
 
 #[tokio::test]

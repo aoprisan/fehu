@@ -59,15 +59,16 @@ println!("{} prints, impact {:+.5}", report.trades.len(), report.impact);
   and why it sits on top of the price process rather than replacing it.
 - **Tooling:** `just build | test | lint | bench | wasm | dump | serve`.
 - **Sample app:** [`webapp/`](webapp) is an axum server around four seeded
-  symbols, with a TypeScript UI in [`webapp/ui/`](webapp/ui).
+  symbols — listed and delisted at runtime — with a TypeScript UI in
+  [`webapp/ui/`](webapp/ui).
 
 ## Sample web app
 
 [`webapp/`](webapp) is a small axum backend that shows the crate used the way
-a game server would: four hardcoded, seeded symbols tick in wall-clock time,
-the game pushes events over HTTP, traders send orders into each symbol's
-book, and a browser UI draws the OHLC bars, the book, the tape and the
-player's account live.
+a game server would: four seeded symbols tick in wall-clock time — and the
+game master lists and delists more of them as it goes — the game pushes
+events over HTTP, traders send orders into each symbol's book, and a browser
+UI draws the OHLC bars, the book, the tape and the player's account live.
 
 ```text
 cargo run --release -p fehu-webapp     # then open http://localhost:3000
@@ -88,12 +89,14 @@ read that portfolio, cancel those orders or move that money. The key is shown
 
 | Method | Path | What |
 |---|---|---|
-| `GET` | `/api/symbols` | Quotes for every symbol |
+| `GET` | `/api/symbols` | Quotes for every listed symbol |
+| `POST` | `/api/symbols` | Game master: list a new symbol — `{"symbol":"WDGT","name":"Widget Corp","shares_outstanding":1000000,"start_price_cents":5000}`, optional `sector`, `description`, `drift`, `volatility`, `seed`, `history_days` |
 | `GET` | `/api/symbols/{sym}` | Quote, latent snapshot, config and share count |
 | `GET` | `/api/symbols/{sym}/shares` | The symbol's shares: outstanding, held by traders, bid for, still available, and who holds them |
 | `GET` | `/api/symbols/{sym}/status` | Whether the symbol can be traded: session open, halted, the limit band and the next open/close |
 | `POST` | `/api/symbols/{sym}/halt`, `/resume` | Game master: stop and start trading in one symbol |
 | `POST` | `/api/symbols/{sym}/dividend` | Game master: `{"cents_per_share":50}` — pays every holder and takes the price ex |
+| `POST` | `/api/symbols/{sym}/delist` | Game master: take the symbol away — cancels its resting orders and stops, buys every holder out at `{"cents_per_share":60}` (the last price if omitted, `0` for a company worth nothing) |
 | `GET` | `/api/symbols/{sym}/bars?interval=M1\|M5\|H1\|D1&limit=500` | OHLCV bars, oldest first, in-progress bar last |
 | `POST` | `/api/symbols/{sym}/events` | Raw simulator event: `{"type":"jump","pct":-0.1}`, `drift_shift`, `drift_for_total_move`, `vol_shift`, `fundamental_shift`, `fundamental_target`; optional `at_ms` / `delay_secs`, `source`, `note` |
 | `POST` | `/api/game/events` | Semantic game event: `{"kind":"scandal","symbol":"ACME","magnitude":1.5}`; market-wide kinds (`market_crash`, `rate_hike`, …) need no symbol |
@@ -139,6 +142,8 @@ gives the market a UTC weekday session (unset, it never closes);
 that halts a symbol and how long the halt lasts. `FEHU_RATE_PER_SEC` (20) and
 `FEHU_RATE_BURST` (40) set how fast one client may change things, and
 `FEHU_STREAM_REPLAY` (1024) how many stream messages are kept for `?since=`.
+`FEHU_MAX_SYMBOLS` (32) caps how many symbols may be listed at once — every
+one of them is a simulator stepped on every engine tick.
 `FEHU_TICK_CENTS` (1) and `FEHU_LOT` (1) make every symbol quote in a coarser
 price step and trade in lots: the synthetic ladder and its prints obey them
 too, and an order off the grid is refused by the book rather than by the
