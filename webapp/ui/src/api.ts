@@ -2,6 +2,8 @@
 
 import type {
   AccountCheck,
+  AmendRequest,
+  AmendResponse,
   AccountDto,
   ApiErrorBody,
   BarsResponse,
@@ -87,7 +89,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
-function send<T>(method: 'POST' | 'DELETE', path: string, body?: unknown): Promise<T> {
+function send<T>(method: 'POST' | 'PATCH' | 'DELETE', path: string, body?: unknown): Promise<T> {
   const init: RequestInit = { method };
   if (body !== undefined) {
     init.headers = { 'content-type': 'application/json' };
@@ -151,6 +153,10 @@ export const api = {
   /** A trader's orders, newest first. */
   traderOrders: (traderId: number, limit: number): Promise<OrderRecord[]> =>
     request(`/api/traders/${traderId}/orders?limit=${limit}`),
+
+  /** Replace a resting order with another at a new price or quantity. */
+  amendOrder: (symbol: string, orderId: number, body: AmendRequest): Promise<AmendResponse> =>
+    send('PATCH', `/api/symbols/${enc(symbol)}/orders/${orderId}`, body),
 
   cancelOrder: (symbol: string, orderId: number, traderId: number): Promise<OpenOrderDto> =>
     send('DELETE', `/api/symbols/${enc(symbol)}/orders/${orderId}?trader_id=${traderId}`),

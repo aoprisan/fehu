@@ -33,9 +33,9 @@ use crate::market::{
     wall_now_ms,
 };
 use crate::trading::{
-    BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID, OpenOrderDto, OrderRecord,
-    OrderRequest, OrderResponse, PortfolioDto, PositionDto, Refused, TradeDto, TraderSummary,
-    UserHoldingsResponse,
+    AmendRequest, AmendResponse, BookDto, CreateTraderRequest, FillRecord, HolderDto,
+    MAX_CLIENT_ORDER_ID, OpenOrderDto, OrderRecord, OrderRequest, OrderResponse, PortfolioDto,
+    PositionDto, Refused, TradeDto, TraderSummary, UserHoldingsResponse,
 };
 
 type AppState = Arc<App>;
@@ -74,7 +74,7 @@ pub fn router(app: AppState) -> Router {
         )
         .route(
             "/api/symbols/{symbol}/orders/{order_id}",
-            get(get_order).delete(cancel_order),
+            get(get_order).patch(amend_order).delete(cancel_order),
         )
         .route("/api/traders", get(list_traders).post(create_trader))
         .route("/api/traders/{trader_id}", get(get_trader))
@@ -160,6 +160,30 @@ impl ApiError {
 
     fn invalid_order(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_order", message)
+    }
+
+    /// The order would have traded with the trader's own resting order.
+    fn self_trade(crossing: &[u64]) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "self_trade",
+            format!(
+                "this would trade with your own resting order(s) {crossing:?}: \
+                 cancel or reprice them first"
+            ),
+        )
+    }
+
+    /// A post-only order that would have taken liquidity instead of adding it.
+    fn would_cross(price_cents: i64, best_cents: i64) -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "post_only_would_cross",
+            format!(
+                "a post-only order at {price_cents} would trade against {best_cents} \
+                 instead of resting"
+            ),
+        )
     }
 
     /// The `client_order_id` was used before, for a different order.
@@ -1176,6 +1200,13 @@ async fn submit_order(
         if let Some(closed) = market.symbols[idx].closed(app.clock.now()) {
             return Err(ApiError::closed(sym, closed));
         }
+        if req.post_only {
+            check_post_only(&market.symbols[idx], &order)?;
+        }
+        let crossing = self_crossing(&market.symbols[idx], &order);
+        if !crossing.is_empty() {
+            return Err(ApiError::self_trade(&crossing));
+        }
         // The same order sent twice — a retry after a timeout, say — is
         // placed once: the first response is replayed, and a re-used id that
         // asks for something else is refused rather than quietly obeyed.
@@ -1190,62 +1221,7 @@ async fn submit_order(
             };
             (accepted, Vec::new(), true)
         } else {
-            // Worst-case cash a buy can consume.
-            let cost = match order.kind {
-                OrderKind::Limit { price_cents } => {
-                    i64::try_from(i128::from(price_cents) * i128::from(order.qty))
-                        .unwrap_or(i64::MAX)
-                }
-                OrderKind::Market => {
-                    market.symbols[idx]
-                        .exchange
-                        .preview_market(order.side, order.qty)
-                        .notional_cents
-                }
-            };
-            // A symbol has a fixed number of shares: a buy can only be filled
-            // from the ones no trader holds or is already bidding for.
-            if order.side == fehu::Side::Buy {
-                let available = market.available_shares(sym);
-                if order.qty > available {
-                    return Err(ApiError::refused(Refused::SupplyExhausted {
-                        needed: order.qty,
-                        available,
-                    }));
-                }
-            }
-            // Validate the order against the account that would fund it: it must
-            // be active, a buy must have the cash available, and a sell the
-            // shares — nothing may be sold that the trader does not hold.
-            let account = market
-                .account_of(trader)
-                .ok_or_else(|| ApiError::unknown_trader(trader.0))?;
-            market.traders[&trader]
-                .check(account, sym, order.side, order.qty, cost)
-                .map_err(ApiError::refused)?;
-            let placement = market.symbols[idx]
-                .exchange
-                .submit(order)
-                .map_err(|e| ApiError::invalid_order(e.to_string()))?;
-            market.symbols[idx].record_trades(&placement.trades);
-            let fills = market.apply_trades(sym, &placement.trades);
-            if placement.status == fehu::OrderStatus::Resting
-                && let OrderKind::Limit { price_cents } = order.kind
-                && let Some((t, account)) = market.trader_and_account(trader)
-            {
-                t.reserve(account, sym, order.side, placement.remaining, price_cents);
-            }
-            let response = OrderResponse::new(sym, trader, order.side, order.qty, &placement);
-            let now = market.symbols[idx].exchange.clock().0;
-            market.record_order(OrderRecord::new(
-                client_order_id,
-                trader,
-                sym,
-                &order,
-                &placement,
-                response.clone(),
-                now,
-            ));
+            let (response, fills) = place_order(&mut market, idx, trader, order, client_order_id)?;
             (response, fills, false)
         }
     };
@@ -1275,6 +1251,143 @@ async fn submit_order(
 #[derive(Deserialize)]
 struct TraderQuery {
     trader_id: u64,
+}
+
+/// Send a validated order to the exchange and book everything that follows:
+/// the money check, the share checks, the fills, the reservation of what
+/// rests, and the order log. The caller holds the market lock and has already
+/// established who the trader is and that the symbol is open to them.
+fn place_order(
+    market: &mut Market,
+    idx: usize,
+    trader: TraderId,
+    order: Order,
+    client_order_id: Option<String>,
+) -> Result<(OrderResponse, Vec<FillRecord>), ApiError> {
+    let sym = market.symbols[idx].info.symbol;
+    // Worst-case cash a buy can consume.
+    let cost = match order.kind {
+        OrderKind::Limit { price_cents } => {
+            i64::try_from(i128::from(price_cents) * i128::from(order.qty)).unwrap_or(i64::MAX)
+        }
+        OrderKind::Market => {
+            market.symbols[idx]
+                .exchange
+                .preview_market(order.side, order.qty)
+                .notional_cents
+        }
+    };
+    // A symbol has a fixed number of shares: a buy can only be filled from the
+    // ones no trader holds or is already bidding for.
+    if order.side == fehu::Side::Buy {
+        let available = market.available_shares(sym);
+        if order.qty > available {
+            return Err(ApiError::refused(Refused::SupplyExhausted {
+                needed: order.qty,
+                available,
+            }));
+        }
+    }
+    // Validate the order against the account that would fund it: it must be
+    // active, a buy must have the cash available, and a sell the shares —
+    // nothing may be sold that the trader does not hold.
+    let account = market
+        .account_of(trader)
+        .ok_or_else(|| ApiError::unknown_trader(trader.0))?;
+    market.traders[&trader]
+        .check(account, sym, order.side, order.qty, cost)
+        .map_err(ApiError::refused)?;
+    let placement = market.symbols[idx]
+        .exchange
+        .submit(order)
+        .map_err(|e| ApiError::invalid_order(e.to_string()))?;
+    market.symbols[idx].record_trades(&placement.trades);
+    let fills = market.apply_trades(sym, &placement.trades);
+    if placement.status == fehu::OrderStatus::Resting
+        && let OrderKind::Limit { price_cents } = order.kind
+        && let Some((t, account)) = market.trader_and_account(trader)
+    {
+        t.reserve(account, sym, order.side, placement.remaining, price_cents);
+    }
+    let response = OrderResponse::new(sym, trader, order.side, order.qty, &placement);
+    let now = market.symbols[idx].exchange.clock().0;
+    market.record_order(OrderRecord::new(
+        client_order_id,
+        trader,
+        sym,
+        &order,
+        &placement,
+        response.clone(),
+        now,
+    ));
+    Ok((response, fills))
+}
+
+/// The price an order can reach: its limit, or for a market order the collar
+/// the exchange turns it into.
+fn reachable_price_cents(s: &SymbolState, order: &Order) -> i64 {
+    match order.kind {
+        OrderKind::Limit { price_cents } => price_cents,
+        OrderKind::Market => {
+            let collar = s.exchange.params().liquidity.market_collar;
+            let reference = s.exchange.reference_cents() as f64;
+            let price = match order.side {
+                fehu::Side::Buy => (reference * (1.0 + collar)).ceil(),
+                fehu::Side::Sell => (reference * (1.0 - collar)).floor(),
+            };
+            (price as i64).max(1)
+        }
+    }
+}
+
+/// The trader's own resting orders this one would trade with. Trading with
+/// yourself moves no shares and no money but does print on the tape and move
+/// the price, so it is refused rather than matched.
+///
+/// Only orders the incoming one would actually reach count: the book's own
+/// preview says how far down the other side it would walk, and anything
+/// past that is none of its business.
+fn self_crossing(s: &SymbolState, order: &Order) -> Vec<u64> {
+    let book = s.exchange.book();
+    let limit = reachable_price_cents(s, order);
+    let Some(worst) = book
+        .preview(order.side, order.qty, Some(limit))
+        .worst_price_cents
+    else {
+        return Vec::new(); // Nothing would trade at all.
+    };
+    book.orders_of(order.owner)
+        .filter(|resting| resting.side != order.side)
+        .filter(|resting| match order.side {
+            fehu::Side::Buy => resting.price_cents <= worst,
+            fehu::Side::Sell => resting.price_cents >= worst,
+        })
+        .map(|resting| resting.id.0)
+        .collect()
+}
+
+/// A post-only order must rest. It cannot if it is a market order, if it is
+/// not good-till-cancelled, or if its price is already tradable.
+fn check_post_only(s: &SymbolState, order: &Order) -> Result<(), ApiError> {
+    let OrderKind::Limit { price_cents } = order.kind else {
+        return Err(ApiError::invalid_order(
+            "a market order cannot be post-only: it exists to take liquidity",
+        ));
+    };
+    if order.tif != fehu::TimeInForce::Gtc {
+        return Err(ApiError::invalid_order(
+            "a post-only order must be `gtc`: the others are there to trade at once",
+        ));
+    }
+    let book = s.exchange.book();
+    let best = match order.side {
+        fehu::Side::Buy => book.best_ask().filter(|ask| *ask <= price_cents),
+        fehu::Side::Sell => book.best_bid().filter(|bid| *bid >= price_cents),
+    };
+    match best {
+        Some(best) => Err(ApiError::would_cross(price_cents, best)),
+        None => Ok(()),
+    }
 }
 
 /// Trim a caller-supplied `client_order_id`; an empty one counts as absent.
@@ -1384,6 +1497,101 @@ async fn get_order(
     let dto = OpenOrderDto::from_resting(s.info.symbol, o);
     owned_trader(&market, caller, TraderId(dto.trader_id))?;
     Ok(Json(dto))
+}
+
+/// Replace a resting order with another at a new price or quantity.
+///
+/// This is a cancel and a fresh order, in that order and under one lock: the
+/// replacement goes to the back of the queue at its price, and if it cannot
+/// be placed — no cash, no shares, a halt — the old order is already gone.
+/// The response says which order was withdrawn and how much of it had filled.
+async fn amend_order(
+    State(app): State<AppState>,
+    Path((symbol, order_id)): Path<(String, u64)>,
+    caller: Caller,
+    payload: Result<Json<AmendRequest>, JsonRejection>,
+) -> Result<Json<AmendResponse>, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let trader = TraderId(req.trader_id);
+    let client_order_id = clean_client_order_id(req.client_order_id)?;
+    let (response, fills, replaced_filled) = {
+        let mut market = app.market();
+        owned_trader(&market, caller, trader)?;
+        let idx = market
+            .symbol_index(&symbol)
+            .ok_or_else(|| ApiError::not_found(&symbol))?;
+        let sym = market.symbols[idx].info.symbol;
+        if let Some(closed) = market.symbols[idx].closed(app.clock.now()) {
+            return Err(ApiError::closed(sym, closed));
+        }
+        let resting = *market.symbols[idx]
+            .exchange
+            .book()
+            .get(fehu::OrderId(order_id))
+            .filter(|o| o.owner == Owner::Trader(trader))
+            .ok_or_else(|| ApiError::unknown_order(order_id))?;
+        let order = Order {
+            owner: Owner::Trader(trader),
+            side: resting.side,
+            kind: OrderKind::Limit {
+                price_cents: req.price_cents.unwrap_or(resting.price_cents),
+            },
+            tif: fehu::TimeInForce::Gtc,
+            qty: req.qty.unwrap_or(resting.remaining),
+        };
+        fehu::OrderBook::validate(&order).map_err(|e| ApiError::invalid_order(e.to_string()))?;
+
+        // Withdraw the old one first: it would otherwise be in the way of its
+        // own replacement, both as liquidity and as a reservation.
+        let cancelled = market.symbols[idx]
+            .exchange
+            .cancel(fehu::OrderId(order_id), trader)
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        let now = market.symbols[idx].exchange.clock().0;
+        if let Some((t, account)) = market.trader_and_account(trader) {
+            t.release(
+                account,
+                sym,
+                cancelled.side,
+                cancelled.remaining,
+                cancelled.price_cents,
+            );
+        }
+        market.cancel_order_record(order_id, cancelled.remaining, now);
+
+        if req.post_only {
+            check_post_only(&market.symbols[idx], &order)?;
+        }
+        let crossing = self_crossing(&market.symbols[idx], &order);
+        if !crossing.is_empty() {
+            return Err(ApiError::self_trade(&crossing));
+        }
+        let (response, fills) = place_order(&mut market, idx, trader, order, client_order_id)?;
+        (
+            response,
+            fills,
+            cancelled.qty.saturating_sub(cancelled.remaining),
+        )
+    };
+    tracing::info!(
+        trader = trader.0,
+        symbol = response.symbol,
+        replaced = order_id,
+        order = response.order_id,
+        qty = response.qty,
+        "order amended"
+    );
+    for fill in fills {
+        let _ = app.tx.send(StreamMessage::Fill {
+            trader_id: fill.trader_id,
+            fill,
+        });
+    }
+    Ok(Json(AmendResponse {
+        replaced_order_id: order_id,
+        replaced_filled,
+        order: response,
+    }))
 }
 
 async fn cancel_order(

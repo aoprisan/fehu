@@ -367,6 +367,42 @@ pub struct OrderRequest {
     /// idempotent: sending the same order twice — a retry after a timeout,
     /// say — places it once. See [`OrderRecord`].
     pub client_order_id: Option<String>,
+    /// The order must rest: if it would trade on arrival it is refused
+    /// instead. Only meaningful for a `gtc` limit order.
+    #[serde(default)]
+    pub post_only: bool,
+}
+
+/// Body of `PATCH /api/symbols/{symbol}/orders/{order_id}`: a new price, a
+/// new quantity, or both.
+///
+/// An amendment is a cancel and a fresh order, so the amended order goes to
+/// the back of the queue at its price — the same as anywhere else that does
+/// not have a true in-place amend.
+#[derive(Clone, Debug, Deserialize)]
+pub struct AmendRequest {
+    pub trader_id: u64,
+    /// New limit price; unchanged if absent.
+    pub price_cents: Option<i64>,
+    /// New quantity; what is still resting if absent.
+    pub qty: Option<u64>,
+    /// A `client_order_id` for the replacement order.
+    pub client_order_id: Option<String>,
+    /// The replacement must rest.
+    #[serde(default)]
+    pub post_only: bool,
+}
+
+/// Response to an amendment: the order that was withdrawn, and the one that
+/// took its place.
+#[derive(Clone, Debug, Serialize)]
+pub struct AmendResponse {
+    /// The order that was cancelled to make way.
+    pub replaced_order_id: u64,
+    /// Shares of the replaced order that had already filled.
+    pub replaced_filled: u64,
+    #[serde(flatten)]
+    pub order: OrderResponse,
 }
 
 impl OrderStyle {

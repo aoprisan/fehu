@@ -1012,6 +1012,25 @@ resting order's record follows it whether it is hit by another trader's order
 or by the engine's synthetic flow; cancels mark it from the two cancel paths.
 Eviction drops the oldest *finished* records first and never a live one.
 
+Three checks stand between a submission and the book, all in `api.rs` because
+they are exchange rules rather than book mechanics. **Post-only**
+(`"post_only": true`) refuses a limit order whose price is already tradable —
+`best_ask ≤ price` for a buy — so a maker never becomes a taker by accident; it
+is meaningless for a market order or a non-`gtc` one, and both are refused as
+invalid. **Self-trade prevention** refuses an order that would reach one of the
+same trader's resting orders: `self_crossing` asks the book's own preview how
+far down the other side the order would walk and flags only the trader's orders
+inside that reach, so a resting bid far from the market does not block a market
+sell. A self-trade moves neither shares nor money, but it prints on the tape and
+drags the reference with it, which is exactly what an exchange stops. **Amend**
+(`PATCH /api/symbols/{s}/orders/{id}`) is a cancel and a fresh order under one
+lock — the crate's book has no in-place amend, and a price change would lose
+priority anyway — so the replacement goes to the back of its price queue, and
+the response names the withdrawn order and how much of it had filled. Both
+handlers place the order through one `place_order`, which is where the cash,
+share-supply and ownership checks, the fills, the reservation and the order log
+all live.
+
 A submission may carry a `client_order_id` (≤ 64 characters, unique per
 trader), which makes it idempotent: a repeat with the same parameters is not
 sent to the book at all — the response the first one produced is stored on the
@@ -1137,7 +1156,11 @@ while one trader still cannot sell another's shares. Orders: a
 `client_order_id` replays the first response and refuses a mismatched reuse
 while staying per-trader, a filled or cancelled order is still readable from
 the log once the book has dropped it, the history filters by status, and a
-resting order's record follows its partial fills to `filled`. Keys: every
+resting order's record follows its partial fills to `filled`; a post-only order
+that would cross is refused while one that rests is taken, a trader cannot
+reach its own resting order but another trader can, and an amendment replaces a
+partly-filled order with one for the remainder, releasing what the old one
+reserved. Keys: every
 private endpoint answers 401 without one and 403 with somebody else's, having
 moved nothing; a forged key is refused; listings show the caller their own
 only; market data stays open; and `FEHU_ADMIN_KEY` locks the game-master
