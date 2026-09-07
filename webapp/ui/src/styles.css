@@ -84,6 +84,10 @@ table.tape tr.mine td { background: var(--selected); }
 .ticket button.buy.active { background: var(--up); border-color: var(--up); color: var(--backdrop); }
 .ticket button.sell.active { background: var(--down); border-color: var(--down); color: var(--backdrop); }
 .ticket button.submit { font-weight: 600; }
+.ticket button.submit:disabled { cursor: not-allowed; opacity: 0.7; }
+.ticket button.submit.stopped { background: var(--panel); color: var(--muted); }
+/* A symbol nobody can trade, in the rail and on the ticket. */
+b.stopped { color: var(--down); text-transform: uppercase; font-size: 10px; letter-spacing: 0.04em; }
 .acct { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 6px 0; }
 .acct b { color: var(--text); font-variant-numeric: tabular-nums; }
 .deposit { display: flex; gap: 6px; margin: 6px 0; }

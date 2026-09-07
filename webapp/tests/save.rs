@@ -223,6 +223,31 @@ async fn a_second_player_can_still_sign_up_after_a_restore() {
 }
 
 #[tokio::test]
+async fn a_halt_survives_a_restart() {
+    let dir = TempDir::new("fehu-save-halt");
+    let path = dir.path().join("state.json");
+    let before = App::new(options(Some(path.clone())));
+    busy_market(&before).await;
+
+    let (status, halted) = post(&before, None, "/api/symbols/ACME/halt", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{halted}");
+    save::write(&before, &path).unwrap();
+
+    let after = App::restore(options(Some(path.clone())), save::read(&path).unwrap());
+    let (_, status) = get(&after, None, "/api/symbols/ACME/status").await;
+    assert_eq!(status["halted"], true, "still stopped: {status}");
+    assert_eq!(status["halt"]["reason"], "manual");
+    assert_eq!(
+        status["halt"], halted["halt"],
+        "the same halt, not a new one"
+    );
+    assert_eq!(status["band_cents"], halted["band_cents"]);
+    // The other symbols came back tradable.
+    let (_, other) = get(&after, None, "/api/symbols/HLIO/status").await;
+    assert_eq!(other["tradable"], true, "{other}");
+}
+
+#[tokio::test]
 async fn a_save_this_build_cannot_use_is_refused() {
     let dir = TempDir::new("fehu-save-bad");
     let path = dir.path().join("state.json");

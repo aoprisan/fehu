@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fehu::{
-    Candle, Candles, Config, Exchange, Interval, JumpParams, LiquidityParams, Side, Snapshot, Tick,
-    Timestamp, Trade, TraderId, TradingParams, VolumeParams,
+    Candle, Candles, Config, Exchange, Interval, JumpParams, LiquidityParams, MarketHours, Side,
+    Snapshot, Tick, Timestamp, Trade, TraderId, TradingParams, VolumeParams,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::account::{Account, AccountId, MoneyError, User, UserId, notional_cents};
@@ -189,6 +189,95 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
     ]
 }
 
+/// Why trading in a symbol stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HaltReason {
+    /// The price left the band the day opened with: a limit move.
+    LimitMove,
+    /// The game master stopped it, and only they can start it again.
+    Manual,
+}
+
+impl HaltReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LimitMove => "limit move",
+            Self::Manual => "halted by the game master",
+        }
+    }
+}
+
+/// Trading in one symbol, stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Halt {
+    pub reason: HaltReason,
+    /// Simulated time trading stopped.
+    pub since_ms: i64,
+    /// When an automatic halt lifts by itself. A manual one has no end: it
+    /// stands until the game master resumes the symbol.
+    pub until_ms: Option<i64>,
+    /// The band the price left, and the price that left it.
+    pub band_cents: i64,
+    pub price_cents: i64,
+    /// How far the price had moved from the band, as a fraction.
+    pub move_pct: f64,
+}
+
+/// Why an order cannot be sent for a symbol right now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Closed {
+    /// Outside the trading session.
+    Session {
+        /// When the next session opens.
+        next_open_ms: i64,
+    },
+    /// Trading is halted.
+    Halted(Halt),
+}
+
+impl std::fmt::Display for Closed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Session { next_open_ms } => write!(
+                f,
+                "the market is closed; the next session opens at {next_open_ms}                  (milliseconds since the Unix epoch, simulated time)"
+            ),
+            Self::Halted(halt) => {
+                write!(f, "trading is halted ({})", halt.reason.label())?;
+                if let Some(until) = halt.until_ms {
+                    write!(f, " until {until}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Whether a symbol can be traded right now, and if not, why not.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct SymbolStatus {
+    pub symbol: &'static str,
+    /// Simulated time this was asked.
+    pub ts_ms: i64,
+    /// A session is running (always, with no trading calendar).
+    pub market_open: bool,
+    pub halted: bool,
+    /// Orders are accepted: open, and not halted.
+    pub tradable: bool,
+    pub halt: Option<Halt>,
+    /// When the next session opens; `null` with no trading calendar.
+    pub next_open_ms: Option<i64>,
+    /// When the running session closes; `null` if none is running.
+    pub next_close_ms: Option<i64>,
+    /// The price the limit band is measured from, and how far the price has
+    /// moved from it.
+    pub band_cents: i64,
+    pub move_pct: f64,
+    /// The move that stops trading; `0` when automatic halts are off.
+    pub limit_pct: f64,
+}
+
 /// What one call to [`SymbolState::advance_to`] produced.
 #[derive(Clone, Debug, Default)]
 pub struct Advanced {
@@ -242,6 +331,10 @@ pub struct Quote {
     pub shares_outstanding: u64,
     /// `price × shares_outstanding`.
     pub market_cap_cents: i64,
+    /// A session is running.
+    pub market_open: bool,
+    /// Trading is stopped.
+    pub halted: bool,
 }
 
 /// Serialisable view of [`fehu::Snapshot`].
@@ -290,6 +383,12 @@ pub struct SymbolState {
     tape_cap: usize,
     /// Trades since start-up (warm-up included).
     pub trades_total: u64,
+    /// Set while trading is stopped.
+    pub halt: Option<Halt>,
+    /// The price the current band is measured from: where the day opened, or
+    /// where trading resumed. A move of more than `price_limit_pct` away from
+    /// it halts the symbol.
+    pub band_cents: i64,
 }
 
 impl SymbolState {
@@ -306,6 +405,8 @@ impl SymbolState {
             tape: VecDeque::new(),
             tape_cap: tape_cap.max(1),
             trades_total: 0,
+            halt: None,
+            band_cents: 0,
         }
     }
 
@@ -330,6 +431,7 @@ impl SymbolState {
             }
         }
         self.exchange.resync();
+        self.band_cents = self.price_cents();
     }
 
     /// Advance the exchange's wall clock to `target` (no-op if it is not in
@@ -374,6 +476,85 @@ impl SymbolState {
             self.ticks_total += out.ticks;
         }
         out
+    }
+
+    /// The symbol's trading calendar, if it has one.
+    pub fn market_hours(&self) -> Option<&MarketHours> {
+        self.sim().config().market_hours.as_ref()
+    }
+
+    /// A session is running at `now` (always, with no calendar).
+    pub fn is_open(&self, now: Timestamp) -> bool {
+        self.market_hours().is_none_or(|mh| mh.contains(now))
+    }
+
+    /// When the next session opens, with a calendar.
+    pub fn next_open_ms(&self, now: Timestamp) -> Option<i64> {
+        self.market_hours().map(|mh| {
+            if mh.contains(now) {
+                mh.next_open(now).0
+            } else {
+                mh.align(now).0
+            }
+        })
+    }
+
+    /// When the running session closes, if one is running.
+    pub fn next_close_ms(&self, now: Timestamp) -> Option<i64> {
+        self.market_hours()
+            .filter(|mh| mh.contains(now))
+            .map(|mh| mh.session_close(now).0)
+    }
+
+    /// Why an order cannot be sent right now, if it cannot: outside the
+    /// session, or halted. Cancelling is always allowed — a player must be
+    /// able to pull an order out of a market that has stopped.
+    pub fn closed(&self, now: Timestamp) -> Option<Closed> {
+        if let Some(halt) = self.halt {
+            return Some(Closed::Halted(halt));
+        }
+        if self.is_open(now) {
+            return None;
+        }
+        Some(Closed::Session {
+            next_open_ms: self.next_open_ms(now).unwrap_or(now.0),
+        })
+    }
+
+    /// Measure the band from where the price is now: a new day, or trading
+    /// starting again after a halt.
+    pub fn reband(&mut self) {
+        self.band_cents = self.price_cents();
+    }
+
+    /// Stop trading in this symbol.
+    pub fn halt(&mut self, reason: HaltReason, until_ms: Option<i64>, now_ms: i64) -> Halt {
+        let price_cents = self.price_cents();
+        let band_cents = if self.band_cents > 0 {
+            self.band_cents
+        } else {
+            price_cents
+        };
+        let halt = Halt {
+            reason,
+            since_ms: now_ms,
+            until_ms,
+            band_cents,
+            price_cents,
+            move_pct: band_move(band_cents, price_cents),
+        };
+        self.halt = Some(halt);
+        halt
+    }
+
+    /// Start trading again, measuring a fresh band from where the price got
+    /// to while it was stopped.
+    pub fn resume(&mut self) -> Option<Halt> {
+        let was = self.halt.take();
+        if was.is_some() {
+            self.reband();
+        }
+        was
     }
 
     /// Record trades executed between ticks (a trader's order) on the tape.
@@ -423,6 +604,8 @@ impl SymbolState {
             ticks_total: self.ticks_total,
             tape: self.tape.iter().copied().collect(),
             trades_total: self.trades_total,
+            halt: self.halt,
+            band_cents: self.band_cents,
         }
     }
 
@@ -445,6 +628,8 @@ impl SymbolState {
             tape,
             tape_cap,
             trades_total: save.trades_total,
+            halt: save.halt,
+            band_cents: save.band_cents,
         }
     }
 
@@ -492,6 +677,8 @@ impl SymbolState {
             ask_cents: self.exchange.book().best_ask(),
             shares_outstanding: self.info.shares_outstanding,
             market_cap_cents: notional_cents(price, self.info.shares_outstanding),
+            market_open: self.is_open(Timestamp(self.last_tick.map_or(snap.ts.0, |t| t.ts.0))),
+            halted: self.halt.is_some(),
         }
     }
 }
@@ -521,6 +708,10 @@ pub struct Market {
     fill_log: usize,
     ledger_log: usize,
     order_log: usize,
+    /// A move this far from the band halts a symbol; `0` turns that off.
+    price_limit_pct: f64,
+    /// How long an automatic halt lasts, in simulated seconds.
+    halt_secs: u64,
 }
 
 impl Market {
@@ -802,6 +993,70 @@ impl Market {
         fills
     }
 
+    /// What a symbol's trading state is at `now`.
+    pub fn status(&self, index: usize, now: Timestamp) -> Option<SymbolStatus> {
+        let s = self.symbols.get(index)?;
+        let halted = s.halt.is_some();
+        let market_open = s.is_open(now);
+        Some(SymbolStatus {
+            symbol: s.info.symbol,
+            ts_ms: now.0,
+            market_open,
+            halted,
+            tradable: market_open && !halted,
+            halt: s.halt,
+            next_open_ms: s.next_open_ms(now),
+            next_close_ms: s.next_close_ms(now),
+            band_cents: s.band_cents,
+            move_pct: band_move(s.band_cents, s.price_cents()),
+            limit_pct: self.price_limit_pct,
+        })
+    }
+
+    /// The move that halts a symbol; `0` when automatic halts are off.
+    pub fn price_limit_pct(&self) -> f64 {
+        self.price_limit_pct
+    }
+
+    /// Stop trading in the symbol at `index` by hand. It stays stopped until
+    /// somebody resumes it.
+    pub fn halt(&mut self, index: usize, now: Timestamp) -> Option<SymbolStatus> {
+        self.symbols
+            .get_mut(index)?
+            .halt(HaltReason::Manual, None, now.0);
+        self.status(index, now)
+    }
+
+    /// Start trading again, whatever stopped it.
+    pub fn resume(&mut self, index: usize, now: Timestamp) -> Option<SymbolStatus> {
+        self.symbols.get_mut(index)?.resume();
+        self.status(index, now)
+    }
+
+    /// Halt a symbol whose price has left the band the day opened with, and
+    /// lift an automatic halt once its time is up. Returns the new state if
+    /// it changed.
+    fn review_halt(&mut self, index: usize, now: Timestamp) -> Option<SymbolStatus> {
+        let (limit_pct, halt_ms) = (self.price_limit_pct, self.halt_secs as i64 * 1000);
+        let s = self.symbols.get_mut(index)?;
+        if let Some(halt) = s.halt {
+            // A manual halt has no end: only a resume lifts it.
+            if halt.until_ms.is_some_and(|until| until <= now.0) {
+                s.resume();
+                return self.status(index, now);
+            }
+            return None;
+        }
+        if limit_pct <= 0.0 || !s.is_open(now) {
+            return None;
+        }
+        if band_move(s.band_cents, s.price_cents()).abs() < limit_pct {
+            return None;
+        }
+        s.halt(HaltReason::LimitMove, Some(now.0 + halt_ms), now.0);
+        self.status(index, now)
+    }
+
     /// Advance every symbol to `target`, book the resulting fills, and
     /// return the stream messages describing what happened.
     pub fn advance_to(&mut self, target: Timestamp) -> (u64, Vec<StreamMessage>) {
@@ -811,6 +1066,10 @@ impl Market {
         for i in 0..self.symbols.len() {
             let advanced = self.symbols[i].advance_to(target);
             total += advanced.ticks;
+            // A new day is a new band to measure the limit move from.
+            if advanced.closed_intervals().contains(&Interval::D1) {
+                self.symbols[i].reband();
+            }
             let sym = self.symbols[i].info.symbol;
             if !advanced.trader_trades.is_empty() {
                 fills.extend(self.apply_trades(sym, &advanced.trader_trades));
@@ -835,6 +1094,11 @@ impl Market {
                     book: s.book(STREAM_BOOK_DEPTH),
                     trades,
                 });
+            }
+        }
+        for i in 0..self.symbols.len() {
+            if let Some(status) = self.review_halt(i, target) {
+                messages.push(StreamMessage::Status(status));
             }
         }
         messages.extend(fills.into_iter().map(|fill| StreamMessage::Fill {
@@ -908,6 +1172,8 @@ impl Market {
             fill_log: options.fill_log,
             ledger_log: options.ledger_log,
             order_log: options.order_log.max(1),
+            price_limit_pct: options.price_limit_pct.max(0.0),
+            halt_secs: options.halt_secs,
         };
         // Through the same door as a live order, so the client-id index and
         // the eviction order come out the same.
@@ -993,6 +1259,8 @@ pub enum StreamMessage {
     Event(EventRecord),
     /// A trader's order executed (in whole or part).
     Fill { trader_id: u64, fill: FillRecord },
+    /// A symbol stopped trading, or started again.
+    Status(SymbolStatus),
 }
 
 /// Start-up options, all overridable through `FEHU_*` environment variables.
@@ -1034,6 +1302,17 @@ pub struct Options {
     pub state_file: Option<std::path::PathBuf>,
     /// Seconds between saves. `FEHU_SAVE_SECS`.
     pub save_secs: u64,
+    /// The trading calendar every symbol runs on. `FEHU_MARKET_HOURS`, as
+    /// `HH:MM-HH:MM` in UTC (`09:30-16:00`); unset means the market never
+    /// closes, which is what a game whose players log in at all hours wants.
+    pub market_hours: Option<MarketHours>,
+    /// How far the price may move from the band the day opened with before
+    /// trading stops, as a fraction. `FEHU_PRICE_LIMIT_PCT`; `0` turns
+    /// automatic halts off.
+    pub price_limit_pct: f64,
+    /// How long an automatic halt lasts, in simulated seconds.
+    /// `FEHU_HALT_SECS`.
+    pub halt_secs: u64,
 }
 
 impl Default for Options {
@@ -1053,6 +1332,9 @@ impl Default for Options {
             admin_key: None,
             state_file: None,
             save_secs: 30,
+            market_hours: None,
+            price_limit_pct: 0.10,
+            halt_secs: 300,
         }
     }
 }
@@ -1083,8 +1365,31 @@ impl Options {
                 .map(std::path::PathBuf::from)
                 .filter(|p| !p.as_os_str().is_empty()),
             save_secs: env_parse("FEHU_SAVE_SECS", d.save_secs).max(1),
+            market_hours: std::env::var("FEHU_MARKET_HOURS")
+                .ok()
+                .as_deref()
+                .and_then(parse_market_hours),
+            price_limit_pct: env_parse("FEHU_PRICE_LIMIT_PCT", d.price_limit_pct).max(0.0),
+            halt_secs: env_parse("FEHU_HALT_SECS", d.halt_secs).max(1),
         }
     }
+}
+
+/// A trading calendar from `HH:MM-HH:MM` (UTC, Monday to Friday). Anything
+/// else — `off`, an empty string, nonsense — means no calendar at all.
+fn parse_market_hours(value: &str) -> Option<MarketHours> {
+    let (open, close) = value.trim().split_once('-')?;
+    let secs = |hhmm: &str| -> Option<u32> {
+        let (h, m) = hhmm.trim().split_once(':')?;
+        let (h, m): (u32, u32) = (h.trim().parse().ok()?, m.trim().parse().ok()?);
+        (h < 24 && m < 60).then_some(h * 3600 + m * 60)
+    };
+    let (open_secs, close_secs) = (secs(open)?, secs(close)?);
+    (open_secs < close_secs).then_some(MarketHours {
+        open_secs,
+        close_secs,
+        ..MarketHours::default()
+    })
 }
 
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -1100,6 +1405,15 @@ fn clean(value: Option<String>, max: usize) -> Option<String> {
     value
         .map(|v| v.trim().chars().take(max).collect::<String>())
         .filter(|v| !v.is_empty())
+}
+
+/// How far `price` is from `band`, as a signed fraction. Zero when the band
+/// is not a price at all, so a symbol that has never traded cannot halt.
+fn band_move(band_cents: i64, price_cents: i64) -> f64 {
+    if band_cents <= 0 {
+        return 0.0;
+    }
+    price_cents as f64 / band_cents as f64 - 1.0
 }
 
 /// Milliseconds since the Unix epoch on the wall clock.
@@ -1130,7 +1444,9 @@ impl App {
         let start_ts = Timestamp(fine_start.0 - options.history_days as i64 * DAY_MS);
         let symbols = seeded_symbols(start_ts)
             .into_iter()
-            .map(|spec| {
+            .map(|mut spec| {
+                // Every symbol trades on the same calendar, if there is one.
+                spec.config.market_hours = options.market_hours;
                 let mut s = SymbolState::new(spec, options.max_bars, options.tape_len);
                 s.warm_up(options.history_days, now);
                 s
@@ -1162,6 +1478,8 @@ impl App {
                 fill_log: options.fill_log,
                 ledger_log: options.ledger_log,
                 order_log: options.order_log.max(1),
+                price_limit_pct: options.price_limit_pct.max(0.0),
+                halt_secs: options.halt_secs,
             }),
             tx,
             options,

@@ -29,7 +29,8 @@ use crate::events::{
     PushEventRequest, Scope, SimEvent,
 };
 use crate::market::{
-    App, Market, Quote, SnapshotDto, StreamMessage, SymbolInfo, SymbolState, wall_now_ms,
+    App, Closed, Market, Quote, SnapshotDto, StreamMessage, SymbolInfo, SymbolState, SymbolStatus,
+    wall_now_ms,
 };
 use crate::trading::{
     BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID, OpenOrderDto, OrderRecord,
@@ -62,6 +63,9 @@ pub fn router(app: AppState) -> Router {
             get(list_symbol_events).post(push_sim_event),
         )
         .route("/api/symbols/{symbol}/shares", get(get_shares))
+        .route("/api/symbols/{symbol}/status", get(get_status))
+        .route("/api/symbols/{symbol}/halt", post(halt_symbol))
+        .route("/api/symbols/{symbol}/resume", post(resume_symbol))
         .route("/api/symbols/{symbol}/book", get(get_book))
         .route("/api/symbols/{symbol}/trades", get(get_trades))
         .route(
@@ -206,6 +210,19 @@ impl ApiError {
     /// A valid key, but for somebody else's property.
     fn forbidden(what: impl Into<String>) -> Self {
         Self::new(StatusCode::FORBIDDEN, "forbidden", what)
+    }
+
+    /// The market will not take an order for this symbol right now.
+    fn closed(symbol: &str, closed: Closed) -> Self {
+        let code = match closed {
+            Closed::Session { .. } => "market_closed",
+            Closed::Halted(_) => "symbol_halted",
+        };
+        Self::new(
+            StatusCode::CONFLICT,
+            code,
+            format!("{symbol}: {closed}. Orders already resting can still be cancelled."),
+        )
     }
 
     fn unknown_user(id: u64) -> Self {
@@ -477,6 +494,7 @@ struct SymbolDetail {
     config: Config,
     ticks_total: u64,
     shares: SharesDto,
+    status: SymbolStatus,
 }
 
 /// `GET /api/symbols/{symbol}/shares`: where the symbol's shares are. The
@@ -530,9 +548,10 @@ async fn get_symbol(
     caller: Option<Caller>,
 ) -> Result<Json<SymbolDetail>, ApiError> {
     let market = app.market();
-    let s = market
-        .symbol(&symbol)
+    let idx = market
+        .symbol_index(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
+    let s = &market.symbols[idx];
     Ok(Json(SymbolDetail {
         info: s.info,
         quote: s.quote(),
@@ -540,7 +559,63 @@ async fn get_symbol(
         config: s.sim().config().clone(),
         ticks_total: s.ticks_total,
         shares: SharesDto::new(&market, s, caller),
+        status: market
+            .status(idx, app.clock.now())
+            .ok_or_else(|| ApiError::not_found(&symbol))?,
     }))
+}
+
+/// Whether a symbol can be traded right now, and if not, why not.
+async fn get_status(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+) -> Result<Json<SymbolStatus>, ApiError> {
+    let market = app.market();
+    let idx = market
+        .symbol_index(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    market
+        .status(idx, app.clock.now())
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(&symbol))
+}
+
+/// Stop trading in a symbol. It stays stopped until it is resumed.
+async fn halt_symbol(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    _admin: Admin,
+) -> Result<Json<SymbolStatus>, ApiError> {
+    let now = app.clock.now();
+    let mut market = app.market();
+    let idx = market
+        .symbol_index(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    let status = market
+        .halt(idx, now)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    tracing::info!(symbol = status.symbol, "trading halted");
+    let _ = app.tx.send(StreamMessage::Status(status));
+    Ok(Json(status))
+}
+
+/// Start trading again, whatever stopped it.
+async fn resume_symbol(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    _admin: Admin,
+) -> Result<Json<SymbolStatus>, ApiError> {
+    let now = app.clock.now();
+    let mut market = app.market();
+    let idx = market
+        .symbol_index(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    let status = market
+        .resume(idx, now)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    tracing::info!(symbol = status.symbol, "trading resumed");
+    let _ = app.tx.send(StreamMessage::Status(status));
+    Ok(Json(status))
 }
 
 async fn get_shares(
@@ -1097,6 +1172,10 @@ async fn submit_order(
             .ok_or_else(|| ApiError::not_found(&symbol))?;
         owned_trader(&market, caller, trader)?;
         let sym = market.symbols[idx].info.symbol;
+        // A closed session or a halt takes no new orders at all.
+        if let Some(closed) = market.symbols[idx].closed(app.clock.now()) {
+            return Err(ApiError::closed(sym, closed));
+        }
         // The same order sent twice — a retry after a timeout, say — is
         // placed once: the first response is replayed, and a re-used id that
         // asks for something else is refused rather than quietly obeyed.

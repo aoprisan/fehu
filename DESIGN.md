@@ -1048,7 +1048,38 @@ that move prices, are gated by `FEHU_ADMIN_KEY` when it is set — compared in
 constant time — and open when it is not, which is what a single-player game on
 localhost wants and a shared server does not.
 
-### 14.12 Keeping the market across a restart
+### 14.12 Sessions and halts
+
+Two things stop trading, and they are not the same thing.
+
+*Sessions.* `FEHU_MARKET_HOURS=09:30-16:00` gives every symbol the crate's
+`MarketHours` calendar (UTC, Monday to Friday), which the simulator already
+understands: ticks exist only inside sessions and each gap carries its
+overnight move (§3.3). The web app adds the trading half — outside a session
+`submit_order` refuses with `409 market_closed` — and reports `market_open`,
+`next_open_ms` and `next_close_ms`. Unset, there is no calendar and the market
+never closes, which is what a game whose players log in at all hours wants.
+
+*Halts.* Each symbol carries a band, `band_cents`, set where its day opened —
+re-measured whenever a daily bar closes — and a price more than
+`FEHU_PRICE_LIMIT_PCT` away from it halts the symbol for `FEHU_HALT_SECS` of
+simulated time. `Market::review_halt` runs at the end of every engine step,
+which is also where an automatic halt lifts itself; the band is then measured
+again from wherever the price got to, so a resume cannot immediately re-halt
+on the same move. The game master can halt a symbol by hand
+(`POST /api/symbols/{s}/halt`), and a manual halt has no `until_ms`: only a
+resume lifts it. `FEHU_PRICE_LIMIT_PCT=0` turns automatic halts off.
+
+A halt stops *orders*, not the world: the simulator keeps generating the
+reference price, so a symbol that reopens has moved, the way a real one gaps
+on the news that halted it. Resting orders stay resting and their reservations
+stay held — and cancelling is always allowed, whether the market is closed,
+halted or both, because a player must be able to pull an order out of a market
+that has stopped. `GET /api/symbols/{s}/status` answers all of this in one
+place, quotes carry `market_open` and `halted` for the symbol rail, and a
+`status` stream message reports every change.
+
+### 14.13 Keeping the market across a restart
 
 Prices are reproducible from a seed; accounts are not. `webapp/src/save.rs`
 therefore writes the whole `Market` to one file (`FEHU_STATE_FILE`) every
@@ -1081,7 +1112,7 @@ Tickers are `&'static str` throughout the server (`save::Symbol`), which
 that from the derive, and the `symbol*` modules turn a ticker on disk back
 into one of the build's four, refusing anything else.
 
-### 14.13 Tests
+### 14.14 Tests
 
 `tests/trading.rs`: book priority/partial fills/IOC/FOK/cancel/preview; the
 no-trader invariant against the bare simulator for 20 k ticks; ladder
@@ -1115,5 +1146,10 @@ saved market comes back whole — the same portfolio, ledger, order log, book,
 bars, events and holders, with keys that still work, ids that carry on and a
 `client_order_id` that still replays — a new player can still sign up
 afterwards, a file from another version or with unknown symbols is refused,
-and a failed write leaves the previous save intact. `webapp/tests/contract.rs`
+and a failed write leaves the previous save intact, a halt included. Sessions
+and halts: a limit move halts a symbol and refuses its orders while the others
+carry on, the halt lifts itself and re-bands, a manual halt outlasts any amount
+of time and only the game master can place or lift one, a resting order
+survives a halt and can still be cancelled, and a closed session refuses orders
+while an open one takes them. `webapp/tests/contract.rs`
 pins the JSON key sets the TypeScript UI is typed against.

@@ -84,6 +84,23 @@ export class MarketStream {
         if (fill.symbol === state.symbol) this.#store.emit('bars');
         break;
       }
+      case 'status': {
+        const quote = state.quotes.get(message.symbol);
+        if (quote !== undefined) {
+          quote.halted = message.halted;
+          quote.market_open = message.market_open;
+          this.#store.emit('symbols');
+        }
+        if (message.symbol === state.symbol) {
+          setOrderStatus(
+            message.tradable
+              ? `${message.symbol}: trading resumed`
+              : `${message.symbol}: ${message.halted ? 'trading halted' : 'market closed'}`,
+            !message.tradable,
+          );
+        }
+        break;
+      }
       case 'event': {
         const { type: _tag, ...record } = message;
         this.#actions.recordEvent(record);

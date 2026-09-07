@@ -139,6 +139,8 @@ async fn market_data_shapes() {
             "ask_cents",
             "shares_outstanding",
             "market_cap_cents",
+            "market_open",
+            "halted",
         ],
     );
 
@@ -157,6 +159,53 @@ async fn market_data_shapes() {
             "holders",
         ],
     );
+
+    let status_keys = [
+        "symbol",
+        "ts_ms",
+        "market_open",
+        "halted",
+        "tradable",
+        "halt",
+        "next_open_ms",
+        "next_close_ms",
+        "band_cents",
+        "move_pct",
+        "limit_pct",
+    ];
+    let status = get(&app, "/api/symbols/ACME/status").await;
+    assert_keys("SymbolStatus", &status, &status_keys);
+    assert_eq!(status["tradable"], true);
+    assert_eq!(
+        status["halt"],
+        Value::Null,
+        "nothing is halted to begin with"
+    );
+
+    // Halting fills the `halt` in, and the game master is not locked out
+    // here because this app sets no admin key.
+    let halted = post(&app, "/api/symbols/ACME/halt", json!({})).await;
+    assert_keys("SymbolStatus", &halted, &status_keys);
+    assert_keys(
+        "Halt",
+        &halted["halt"],
+        &[
+            "reason",
+            "since_ms",
+            "until_ms",
+            "band_cents",
+            "price_cents",
+            "move_pct",
+        ],
+    );
+    assert_eq!(
+        halted["halt"]["reason"], "manual",
+        "HaltReason is snake_case"
+    );
+    assert_eq!(halted["tradable"], false);
+    let resumed = post(&app, "/api/symbols/ACME/resume", json!({})).await;
+    assert_eq!(resumed["halt"], Value::Null);
+    assert_eq!(resumed["tradable"], true);
 
     let bars = get(&app, "/api/symbols/ACME/bars?interval=M1&limit=5").await;
     assert_keys(
@@ -621,6 +670,33 @@ async fn stream_message_shapes() {
         }
     }
     assert!(saw_tick, "the engine step published no tick to check");
+
+    // `status` flattens the symbol's state next to the tag.
+    let status = serde_json::to_value(StreamMessage::Status(
+        app.market()
+            .status(0, app.clock.now())
+            .expect("ACME exists"),
+    ))
+    .unwrap();
+    assert_keys(
+        "StatusMessage",
+        &status,
+        &[
+            "type",
+            "symbol",
+            "ts_ms",
+            "market_open",
+            "halted",
+            "tradable",
+            "halt",
+            "next_open_ms",
+            "next_close_ms",
+            "band_cents",
+            "move_pct",
+            "limit_pct",
+        ],
+    );
+    assert_eq!(status["type"], "status");
 
     // `event` flattens the record next to the tag.
     let record = post(

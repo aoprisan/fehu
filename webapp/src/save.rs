@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::account::{Account, User};
 use crate::events::EventRecord;
-use crate::market::App;
+use crate::market::{App, Halt};
 use crate::trading::{OrderRecord, Trader};
 
 /// A listed symbol's ticker.
@@ -40,7 +40,7 @@ pub type Symbol = &'static str;
 /// Bumped whenever the save format changes in a way older files cannot be
 /// read as. There is no migration path: a file from another version is
 /// refused.
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
 /// Everything needed to carry on where the server left off.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -70,6 +70,10 @@ pub struct SymbolSave {
     pub ticks_total: u64,
     pub tape: Vec<Trade>,
     pub trades_total: u64,
+    /// Set if trading in this symbol was stopped when the file was written.
+    pub halt: Option<Halt>,
+    /// The price the limit band is measured from.
+    pub band_cents: i64,
 }
 
 /// The people, their money and everything written down about them.
