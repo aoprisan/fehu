@@ -474,6 +474,7 @@ async fn trading_shapes() {
             "price_cents",
             "liquidity",
             "counterparty",
+            "fee_cents",
         ],
     );
 

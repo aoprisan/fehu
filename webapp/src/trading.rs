@@ -42,6 +42,56 @@ pub enum OrderStyle {
     Limit,
 }
 
+/// What the venue charges for a fill, in basis points of its notional.
+///
+/// Maker-taker pricing, with one deliberate restriction: the taker pays and
+/// the maker does not. A maker *rebate* is allowed — it only ever credits an
+/// account — but a maker *fee* is not, and the reason is reservations. A
+/// taker's cash is checked with the fee included in the same moment the
+/// order is submitted and filled, so it can always be paid. A maker's fill
+/// happens later, against a reservation made when the order was accepted;
+/// charging it would mean reserving the fee too and releasing exactly the
+/// same amount back across every partial fill and cancel, which rounding
+/// makes a piece of work of its own. Until that is done, a positive
+/// `maker_bps` is refused rather than half-implemented.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fees {
+    /// Charged to whoever took liquidity. Never negative.
+    pub taker_bps: i64,
+    /// Paid to whoever provided it, as a negative number. Never positive.
+    pub maker_bps: i64,
+}
+
+impl Fees {
+    /// The fee on a fill of `notional_cents`, signed the way the ledger is:
+    /// negative takes money out of the account, positive puts it in.
+    ///
+    /// Truncated towards zero, so the venue never rounds a fee up and a fill
+    /// too small to owe a whole cent owes nothing.
+    #[must_use]
+    pub fn on(&self, liquidity: Liquidity, notional_cents: i64) -> i64 {
+        let bps = match liquidity {
+            Liquidity::Taker => self.taker_bps.max(0),
+            Liquidity::Maker => self.maker_bps.min(0),
+        };
+        if bps == 0 {
+            return 0;
+        }
+        // A taker's `bps` is positive and the money leaves, so the ledger
+        // amount is the negative of it; a maker's is negative and the rebate
+        // arrives.
+        let charge = i128::from(notional_cents) * i128::from(bps) / 10_000;
+        i64::try_from(-charge).unwrap_or(i64::MIN)
+    }
+
+    /// The worst a taker could be charged for a fill of `notional_cents`,
+    /// as a positive number, for the cash check made before submitting.
+    #[must_use]
+    pub fn taker_cost(&self, notional_cents: i64) -> i64 {
+        -self.on(Liquidity::Taker, notional_cents)
+    }
+}
+
 /// One execution from a trader's point of view.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FillRecord {
@@ -57,6 +107,11 @@ pub struct FillRecord {
     /// `maker` if the trader's order was resting, `taker` if it took.
     pub liquidity: Liquidity,
     pub counterparty: Counterparty,
+    /// The venue's fee, signed the way the ledger is: negative was taken out
+    /// of the account, positive was a rebate paid in. Its own ledger entry,
+    /// never folded into the price.
+    #[serde(default)]
+    pub fee_cents: i64,
 }
 
 /// A market participant. No margin, no shorting: buys need cash in the
@@ -250,13 +305,22 @@ impl Trader {
         account: &mut Account,
         symbol: &'static str,
         trade: &Trade,
+        fees: Fees,
     ) -> Vec<FillRecord> {
         let me = self.owner();
         let mut out = Vec::new();
         let taker_is_trader = matches!(trade.taker.owner, Owner::Trader(_));
         let maker_is_trader = matches!(trade.maker.owner, Owner::Trader(_));
         if trade.taker.owner == me {
-            self.book_fill(account, symbol, trade.taker_side, trade, trade.taker.order);
+            let fee = self.book_fill(
+                account,
+                symbol,
+                trade.taker_side,
+                trade,
+                trade.taker.order,
+                fees,
+                Liquidity::Taker,
+            );
             out.push(self.record(
                 symbol,
                 trade.taker.order,
@@ -264,12 +328,21 @@ impl Trader {
                 trade,
                 Liquidity::Taker,
                 maker_is_trader,
+                fee,
             ));
         }
         if trade.maker.owner == me {
             let side = trade.taker_side.opposite();
             self.release(account, symbol, side, trade.qty, trade.price_cents);
-            self.book_fill(account, symbol, side, trade, trade.maker.order);
+            let fee = self.book_fill(
+                account,
+                symbol,
+                side,
+                trade,
+                trade.maker.order,
+                fees,
+                Liquidity::Maker,
+            );
             out.push(self.record(
                 symbol,
                 trade.maker.order,
@@ -277,11 +350,16 @@ impl Trader {
                 trade,
                 Liquidity::Maker,
                 taker_is_trader,
+                fee,
             ));
         }
         out
     }
 
+    /// Settle one side of a trade and charge the venue's fee on it, as two
+    /// ledger entries: the trade, then the fee. Returns the fee, signed the
+    /// way the ledger is.
+    #[allow(clippy::too_many_arguments)]
     fn book_fill(
         &mut self,
         account: &mut Account,
@@ -289,16 +367,22 @@ impl Trader {
         side: Side,
         trade: &Trade,
         order: OrderId,
-    ) {
+        fees: Fees,
+        liquidity: Liquidity,
+    ) -> i64 {
         let value = notional_cents(trade.price_cents, trade.qty);
         account.settle(side, value, symbol, order.0, trade.ts.0);
+        let fee = fees.on(liquidity, value);
+        account.charge_fee(fee, symbol, order.0, trade.ts.0);
         let pos = self.positions.entry(symbol).or_default();
         pos.apply(side, trade.qty, trade.price_cents);
         if pos.qty == 0 && pos.realised_pnl_cents == 0 && pos.cash_cents == 0 {
             self.positions.remove(symbol);
         }
+        fee
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         symbol: &'static str,
@@ -307,6 +391,7 @@ impl Trader {
         trade: &Trade,
         liquidity: Liquidity,
         counterparty_is_trader: bool,
+        fee_cents: i64,
     ) -> FillRecord {
         let rec = FillRecord {
             id: self.next_fill_id,
@@ -323,6 +408,7 @@ impl Trader {
             } else {
                 Counterparty::Synthetic
             },
+            fee_cents,
         };
         self.next_fill_id += 1;
         if self.fills.len() >= self.fill_cap {
@@ -932,6 +1018,17 @@ pub struct TraderSummary {
 
 #[cfg(test)]
 mod tests {
+
+    /// The settlement path with the venue charging nothing, which is what
+    /// most of these check. Fees have their own tests over the HTTP surface.
+    fn apply(
+        trader: &mut Trader,
+        account: &mut Account,
+        symbol: &'static str,
+        trade: &Trade,
+    ) -> Vec<FillRecord> {
+        trader.apply_trade(account, symbol, trade, Fees::default())
+    }
     use super::*;
     use crate::account::AccountId;
     use fehu::{Party, Timestamp};
@@ -975,7 +1072,8 @@ mod tests {
         t.reserve(&mut a, "ACME", Side::Buy, 10, 5_000);
         assert_eq!(a.available_cents(), 50_000);
         // Half of it fills as maker.
-        let fills = t.apply_trade(
+        let fills = apply(
+            &mut t,
             &mut a,
             "ACME",
             &trade(Owner::Synthetic, Owner::Trader(ME), Side::Sell, 5, 5_000),
@@ -993,7 +1091,8 @@ mod tests {
         // Sell 3 as taker at 6000.
         assert!(t.check(&a, "ACME", Side::Sell, 6, 0).is_err());
         t.check(&a, "ACME", Side::Sell, 3, 0).unwrap();
-        let fills = t.apply_trade(
+        let fills = apply(
+            &mut t,
             &mut a,
             "ACME",
             &trade(Owner::Trader(ME), Owner::Synthetic, Side::Sell, 3, 6_000),
@@ -1005,7 +1104,8 @@ mod tests {
         // A self-trade books both sides and nets to nothing.
         t.reserve(&mut a, "ACME", Side::Sell, 2, 7_000);
         assert_eq!(t.free_shares("ACME"), 0);
-        let fills = t.apply_trade(
+        let fills = apply(
+            &mut t,
             &mut a,
             "ACME",
             &trade(Owner::Trader(ME), Owner::Trader(ME), Side::Buy, 2, 7_000),
@@ -1023,7 +1123,8 @@ mod tests {
     fn a_sell_can_never_exceed_what_is_held() {
         let (mut t, mut a) = trader(1_000_000);
         // Buy 100 as taker.
-        t.apply_trade(
+        apply(
+            &mut t,
             &mut a,
             "ACME",
             &trade(Owner::Trader(ME), Owner::Synthetic, Side::Buy, 100, 5_000),
@@ -1054,7 +1155,8 @@ mod tests {
         let (mut one, mut a) = trader(1_000_000);
         let mut two = Trader::new(TraderId(2), UserId(1), AccountId(1), "two".into(), 10, 0);
         for t in [&mut one, &mut two] {
-            t.apply_trade(
+            apply(
+                t,
                 &mut a,
                 "ACME",
                 &trade(Owner::Trader(t.id), Owner::Synthetic, Side::Buy, 50, 4_000),

@@ -1266,7 +1266,10 @@ carry on, the halt lifts itself and re-bands, a manual halt outlasts any amount
 of time and only the game master can place or lift one, a resting order
 survives a halt and can still be cancelled, a halted book fills nothing while
 the price moves through it and the resume settles what the new quotes cross,
-and a closed session refuses orders while an open one takes them. Stops: a
+and a closed session refuses orders while an open one takes them. Fees: a
+taker pays and a maker is paid, each as its own ledger entry beside the trade
+it belongs to, and a buy that could afford the shares but not the fee is
+refused rather than overdrawn. Stops: a
 trigger waits, fires when the price reaches it, becomes an order in the log
 and tells its owner; one behind the market, unfunded or malformed is refused
 when it is armed; it is private property that only its owner may see or
@@ -1364,10 +1367,24 @@ at 1 again and every `?since=` is a gap.
 
 ### 15.3 Money the market does not move
 
-**Fees.** Nothing is charged: no commission, no maker rebate, no exchange fee.
-They belong on the settlement path (`Trader::book_fill` → `Account::settle`)
-as a separate ledger entry per fill rather than as an adjustment to the price,
-so the tape stays the price and the ledger stays the money.
+**Fees (implemented).** `Fees { taker_bps, maker_bps }` on the `Market`, set
+by `FEHU_TAKER_FEE_BPS` and `FEHU_MAKER_FEE_BPS` and zero by default.
+`Trader::book_fill` settles the trade and then charges the fee as its own
+`LedgerKind::Fee` entry beside it, never as an adjustment to the price: the
+tape stays the price and the ledger stays the money. Each `FillRecord`
+carries the `fee_cents` it was charged, signed the way the ledger is.
+
+One restriction is deliberate: the taker pays and the maker does not. A maker
+*rebate* is allowed, because it only ever credits an account, but a maker
+*fee* is refused rather than half-implemented. The reason is reservations. A
+taker's cash is checked with the fee included in the same moment the order is
+submitted and filled — `Market::place` adds `Fees::taker_cost` to the
+worst-case cost, so a buy that can afford the shares but not the fee is
+refused before anything happens. A maker's fill comes later, against a
+reservation made when the order was accepted; charging it would mean
+reserving the fee as well and releasing exactly that much back across every
+partial fill and cancel, and the rounding makes that a piece of work of its
+own rather than a corner of this one.
 
 **Corporate actions.** `shares_outstanding` never changes, so a split, a
 dividend and a buyback that retires stock are all unrepresentable — the

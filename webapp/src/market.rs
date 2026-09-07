@@ -19,8 +19,8 @@ use crate::limit::{Decision, Limiter, Rate};
 use crate::metrics::Metrics;
 use crate::save::{MarketSave, STATE_VERSION, Save, SymbolSave};
 use crate::trading::{
-    BookDto, FillRecord, HoldingDto, MAX_STOPS_PER_TRADER, OrderRecord, OrderResponse, Refused,
-    StopOrder, StopRequest, TradeDto, Trader,
+    BookDto, Fees, FillRecord, HoldingDto, MAX_STOPS_PER_TRADER, OrderRecord, OrderResponse,
+    Refused, StopOrder, StopRequest, TradeDto, Trader,
 };
 
 /// Milliseconds in one day.
@@ -735,6 +735,8 @@ pub struct Market {
     pub orders_refused: u64,
     /// Fills booked to traders' accounts since start-up.
     pub fills_booked: u64,
+    /// What the venue charges for a fill.
+    pub fees: Fees,
     /// A move this far from the band halts a symbol; `0` turns that off.
     price_limit_pct: f64,
     /// How long an automatic halt lasts, in simulated seconds.
@@ -999,6 +1001,7 @@ impl Market {
     /// Book every trade in `trades` (for symbol `sym`) to the traders
     /// involved. Returns the fills created, in order.
     pub fn apply_trades(&mut self, sym: &'static str, trades: &[Trade]) -> Vec<FillRecord> {
+        let fees = self.fees;
         let mut fills = Vec::new();
         for t in trades {
             // A resting order that trades has moved on since it was accepted.
@@ -1016,7 +1019,7 @@ impl Market {
             }
             for id in parties.into_iter().flatten() {
                 if let Some((trader, account)) = self.trader_and_account(id) {
-                    fills.extend(trader.apply_trade(account, sym, t));
+                    fills.extend(trader.apply_trade(account, sym, t, fees));
                 }
             }
         }
@@ -1073,6 +1076,7 @@ impl Market {
         let trader = TraderId(req.trader_id);
         let sym = self.symbols[idx].info.symbol;
         let rules = self.symbols[idx].exchange.book().rules();
+        let fees = self.fees;
         if req.stop_price_cents <= 0 {
             return Err(PlaceError::Invalid(
                 "a stop price must be above zero".into(),
@@ -1132,7 +1136,12 @@ impl Market {
             .account_of(trader)
             .ok_or(PlaceError::UnknownTrader(trader.0))?;
         self.traders[&trader]
-            .check(account, sym, req.side, req.qty, stop.cost_cents())
+            .check(account, sym, req.side, req.qty, {
+                // The order it fires will take liquidity, so the advisory
+                // check counts the taker fee too.
+                let cost = stop.cost_cents();
+                cost.saturating_add(fees.taker_cost(cost))
+            })
             .map_err(PlaceError::Refused)?;
         self.next_stop_id += 1;
         self.symbols[idx].stops.push(stop.clone());
@@ -1387,6 +1396,7 @@ impl Market {
             orders_placed: 0,
             orders_refused: 0,
             fills_booked: 0,
+            fees: options.fees(),
             price_limit_pct: options.price_limit_pct.max(0.0),
             halt_secs: options.halt_secs,
         };
@@ -1503,6 +1513,10 @@ impl Market {
                 }));
             }
         }
+        // A crossing order pays the taker fee out of the same cash, and it
+        // is charged the moment it fills, so it is checked here rather than
+        // discovered afterwards.
+        let cost = cost.saturating_add(self.fees.taker_cost(cost));
         // Validate the order against the account that would fund it: it must
         // be active, a buy must have the cash available, and a sell the shares
         // — nothing may be sold that the trader does not hold.
@@ -1725,6 +1739,14 @@ pub struct Options {
     /// The share lot every symbol trades in. `FEHU_LOT`; `1` allows every
     /// share, which is the default.
     pub lot: u64,
+    /// What a taker pays, in basis points of the fill's notional.
+    /// `FEHU_TAKER_FEE_BPS`; `0`, the default, charges nothing. Negative
+    /// values are refused: the venue does not pay takers.
+    pub taker_fee_bps: i64,
+    /// What a maker is paid, in basis points, as a negative number.
+    /// `FEHU_MAKER_FEE_BPS`; `0`, the default, pays nothing. Positive values
+    /// are refused — see [`crate::trading::Fees`].
+    pub maker_fee_bps: i64,
 }
 
 impl Default for Options {
@@ -1752,11 +1774,24 @@ impl Default for Options {
             rate_burst: 40.0,
             tick_cents: 1,
             lot: 1,
+            taker_fee_bps: 0,
+            maker_fee_bps: 0,
         }
     }
 }
 
 impl Options {
+    /// What the venue charges, with the two restrictions the settlement path
+    /// depends on applied: a taker fee is never negative and a maker fee is
+    /// never positive.
+    #[must_use]
+    pub fn fees(&self) -> Fees {
+        Fees {
+            taker_bps: self.taker_fee_bps.clamp(0, 10_000),
+            maker_bps: self.maker_fee_bps.clamp(-10_000, 0),
+        }
+    }
+
     /// Defaults overridden by any `FEHU_*` variable that parses.
     pub fn from_env() -> Self {
         let d = Self::default();
@@ -1793,6 +1828,8 @@ impl Options {
             rate_burst: env_parse("FEHU_RATE_BURST", d.rate_burst).max(0.0),
             tick_cents: env_parse("FEHU_TICK_CENTS", d.tick_cents).clamp(1, 1_000_000),
             lot: env_parse("FEHU_LOT", d.lot).clamp(1, 1_000_000),
+            taker_fee_bps: env_parse("FEHU_TAKER_FEE_BPS", d.taker_fee_bps),
+            maker_fee_bps: env_parse("FEHU_MAKER_FEE_BPS", d.maker_fee_bps),
         }
     }
 }
@@ -1929,6 +1966,7 @@ impl App {
                 orders_placed: 0,
                 orders_refused: 0,
                 fills_booked: 0,
+                fees: options.fees(),
                 price_limit_pct: options.price_limit_pct.max(0.0),
                 halt_secs: options.halt_secs,
             }),

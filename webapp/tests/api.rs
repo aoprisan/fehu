@@ -2787,6 +2787,165 @@ async fn order_ids_are_unique_across_symbols_and_survive_retries() {
 }
 
 #[tokio::test]
+async fn the_taker_pays_a_fee_and_the_maker_is_paid_a_rebate() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        price_limit_pct: 0.0,
+        // 25 bps to take, 5 bps back for providing.
+        taker_fee_bps: 25,
+        maker_fee_bps: -5,
+        ..Options::default()
+    });
+    let maker = sign_up(&app, "morgan").await;
+    let taker = sign_up(&app, "tarek").await;
+
+    // The maker needs shares to offer, which costs a taker fee of its own.
+    let (code, body) = post(
+        &maker,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": maker.trader, "side": "buy", "qty": 100, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let (_, m) = get(&maker, &format!("/api/traders/{}", maker.trader)).await;
+    let bought = &m["fills"][0];
+    let notional = bought["price_cents"].as_i64().unwrap() * 100;
+    assert_eq!(
+        bought["fee_cents"].as_i64().unwrap(),
+        -(notional * 25 / 10_000),
+        "the taker pays 25 bps: {bought}"
+    );
+    assert_eq!(
+        m["cash_cents"].as_i64().unwrap(),
+        10_000_000 - notional - notional * 25 / 10_000,
+        "the fee left the account on top of the price"
+    );
+
+    // Now the maker rests an offer inside the spread and the taker lifts it.
+    let (_, book) = get(&app, "/api/symbols/ACME/book").await;
+    let mid = (book["bid_cents"].as_i64().unwrap() + book["ask_cents"].as_i64().unwrap()) / 2;
+    let (code, body) = post(
+        &maker,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": maker.trader, "side": "sell", "qty": 100, "type": "limit",
+                "price_cents": mid }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["status"], "resting");
+    let cash_before = get(&maker, &format!("/api/traders/{}", maker.trader))
+        .await
+        .1["cash_cents"]
+        .as_i64()
+        .unwrap();
+
+    let (code, body) = post(
+        &taker,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": taker.trader, "side": "buy", "qty": 100, "type": "limit",
+                "price_cents": mid, "tif": "ioc" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["filled"], 100);
+
+    let traded = mid * 100;
+    let (_, m) = get(&maker, &format!("/api/traders/{}", maker.trader)).await;
+    let sold = &m["fills"][0];
+    assert_eq!(sold["liquidity"], "maker");
+    assert_eq!(
+        sold["fee_cents"].as_i64().unwrap(),
+        traded * 5 / 10_000,
+        "the maker is paid, not charged: {sold}"
+    );
+    assert_eq!(
+        m["cash_cents"].as_i64().unwrap(),
+        cash_before + traded + traded * 5 / 10_000
+    );
+
+    let (_, t) = get(&taker, &format!("/api/traders/{}", taker.trader)).await;
+    assert_eq!(
+        t["fills"][0]["fee_cents"].as_i64().unwrap(),
+        -(traded * 25 / 10_000)
+    );
+    assert_eq!(
+        t["cash_cents"].as_i64().unwrap(),
+        10_000_000 - traded - traded * 25 / 10_000
+    );
+
+    // Every fee is its own ledger entry, next to the trade it belongs to.
+    let account = t["account_id"].as_u64().unwrap();
+    let (_, ledger) = get(&taker, &format!("/api/accounts/{account}/ledger?limit=10")).await;
+    let entries = ledger["entries"].as_array().unwrap();
+    let fee = entries
+        .iter()
+        .find(|e| e["kind"] == "fee")
+        .unwrap_or_else(|| panic!("no fee entry: {ledger}"));
+    assert_eq!(
+        fee["amount_cents"].as_i64().unwrap(),
+        -(traded * 25 / 10_000)
+    );
+    assert_eq!(fee["symbol"], "ACME");
+    assert_eq!(fee["order_id"], t["fills"][0]["order_id"]);
+
+    // The books still balance with the fees in them.
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
+async fn a_taker_fee_cannot_overdraw_the_account_that_pays_it() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        // A fee big enough that ignoring it would push the buyer negative.
+        taker_fee_bps: 500,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "penniless").await;
+    let id = player.trader;
+    let ask = get(&app, "/api/symbols/ACME/book").await.1["ask_cents"]
+        .as_i64()
+        .unwrap();
+    // Almost exactly the whole account: affordable at the price, not with the
+    // fee on top.
+    let qty = (10_000_000 / ask) as u64;
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": qty, "type": "market" }),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the fee is part of what a buy has to afford: {body}"
+    );
+    assert_eq!(body["error"]["code"], "order_refused");
+
+    // Leave room for it and the same order goes through, fee and all.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": qty / 2, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(
+        p["cash_cents"].as_i64().unwrap() >= 0,
+        "a fee must never overdraw: {p}"
+    );
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
 async fn a_symbol_quoted_in_ticks_and_traded_in_lots_refuses_anything_else() {
     let app = App::new(Options {
         history_days: 0,

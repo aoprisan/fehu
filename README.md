@@ -141,7 +141,10 @@ that halts a symbol and how long the halt lasts. `FEHU_RATE_PER_SEC` (20) and
 `FEHU_TICK_CENTS` (1) and `FEHU_LOT` (1) make every symbol quote in a coarser
 price step and trade in lots: the synthetic ladder and its prints obey them
 too, and an order off the grid is refused by the book rather than by the
-server.
+server. `FEHU_TAKER_FEE_BPS` (0) charges whoever takes liquidity, in basis
+points of the fill, and `FEHU_MAKER_FEE_BPS` (0, negative) pays whoever
+provided it; each fee is its own ledger entry beside the trade, and a buy has
+to be able to afford the fee as well as the shares.
 `FEHU_STATE_FILE` keeps the market
 across restarts (`FEHU_SAVE_SECS`, 30 by default, sets how often it is
 written). `FEHU_ADMIN_KEY` locks the

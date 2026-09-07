@@ -178,6 +178,10 @@ pub enum LedgerKind {
     Buy,
     /// A sell settled: cash came in.
     Sell,
+    /// The venue's fee on a fill, or the rebate it paid for providing
+    /// liquidity. Always its own entry: the tape stays the price and the
+    /// ledger stays the money.
+    Fee,
 }
 
 /// One movement of money, in the order it happened.
@@ -411,6 +415,35 @@ impl Account {
         };
         self.balance_cents = self.balance_cents.saturating_add(signed);
         self.write(kind, signed, ts_ms, Some(symbol), Some(order_id), None)
+    }
+
+    /// Charge the venue's fee on a fill, or pay its rebate. `amount_cents`
+    /// is signed the way the ledger is: negative takes money out, positive
+    /// puts it in. Zero writes nothing — a fee of nothing is not an event.
+    ///
+    /// This does not check the balance. It cannot: the fill has already
+    /// happened, and a fee is not something a trader can decline. What keeps
+    /// it honest is that only a taker is charged, and a taker's cash was
+    /// checked with the fee included before the order was ever submitted.
+    pub fn charge_fee(
+        &mut self,
+        amount_cents: i64,
+        symbol: &'static str,
+        order_id: u64,
+        ts_ms: i64,
+    ) -> Option<LedgerEntry> {
+        if amount_cents == 0 {
+            return None;
+        }
+        self.balance_cents = self.balance_cents.saturating_add(amount_cents);
+        Some(self.write(
+            LedgerKind::Fee,
+            amount_cents,
+            ts_ms,
+            Some(symbol),
+            Some(order_id),
+            None,
+        ))
     }
 
     /// Move the account to `status`. A closed account is terminal, and an

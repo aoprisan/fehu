@@ -361,6 +361,12 @@ export interface FillRecord {
   /** `"maker"` if the trader's order was resting, `"taker"` if it took. */
   liquidity: 'maker' | 'taker';
   counterparty: 'synthetic' | 'trader';
+  /**
+   * The venue's fee, signed the way the ledger is: negative was taken out of
+   * the account, positive was a rebate paid in. Its own ledger entry, never
+   * folded into the price.
+   */
+  fee_cents: number;
 }
 
 /** `trading::PositionDto`. */
@@ -452,7 +458,7 @@ export interface CreateTraderRequest {
 export type AccountStatus = 'active' | 'frozen' | 'closed';
 
 /** `account::LedgerKind`. */
-export type LedgerKind = 'open' | 'deposit' | 'withdrawal' | 'buy' | 'sell';
+export type LedgerKind = 'open' | 'deposit' | 'withdrawal' | 'buy' | 'sell' | 'fee';
 
 /** `account::UserDto`. */
 export interface UserDto {
