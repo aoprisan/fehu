@@ -1,0 +1,846 @@
+<title>fehu Trading Layer Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,500;1,400&display=swap">
+<style>
+  :root {
+    --ground: #eef1ee;
+    --surface: #fafbfa;
+    --sunk: #e5e9e6;
+    --ink: #141c1a;
+    --ink-2: #3c4844;
+    --muted: #5f6c66;
+    --rule: #d3d9d4;
+    --rule-soft: #e2e7e3;
+    --accent: #27496d;
+    --accent-soft: #dfe6ef;
+    --done: #1c6b4b;
+    --done-soft: #d8e9e0;
+    --left: #a4502a;
+    --left-soft: #f2e2d8;
+    --caveat: #7d6817;
+    --caveat-soft: #eee7cf;
+    --shadow: 0 1px 2px rgba(20, 28, 26, .06);
+    --f-display: "IBM Plex Sans Condensed", "Helvetica Neue", Arial, sans-serif;
+    --f-body: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+    --f-data: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0f1513;
+      --surface: #161e1c;
+      --sunk: #1b2422;
+      --ink: #e7ebe8;
+      --ink-2: #c2ccc7;
+      --muted: #8e9b95;
+      --rule: #29332f;
+      --rule-soft: #212b28;
+      --accent: #8bafd6;
+      --accent-soft: #1c2a38;
+      --done: #55c294;
+      --done-soft: #14322a;
+      --left: #dd9061;
+      --left-soft: #33231a;
+      --caveat: #cdb254;
+      --caveat-soft: #2c2716;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .3);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0f1513;
+    --surface: #161e1c;
+    --sunk: #1b2422;
+    --ink: #e7ebe8;
+    --ink-2: #c2ccc7;
+    --muted: #8e9b95;
+    --rule: #29332f;
+    --rule-soft: #212b28;
+    --accent: #8bafd6;
+    --accent-soft: #1c2a38;
+    --done: #55c294;
+    --done-soft: #14322a;
+    --left: #dd9061;
+    --left-soft: #33231a;
+    --caveat: #cdb254;
+    --caveat-soft: #2c2716;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .3);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--f-body);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .sheet {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 40px 24px 96px;
+  }
+
+  /* ---- masthead ---- */
+
+  .masthead {
+    border-bottom: 2px solid var(--ink);
+    padding-bottom: 20px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 20px 32px;
+  }
+  .wordmark {
+    font-family: var(--f-display);
+    font-weight: 700;
+    font-size: 46px;
+    line-height: .95;
+    letter-spacing: -.015em;
+    margin: 0;
+  }
+  .wordmark span { color: var(--accent); }
+  .thesis {
+    margin: 8px 0 0;
+    max-width: 46ch;
+    color: var(--ink-2);
+    font-size: 15.5px;
+  }
+  .stamp {
+    font-family: var(--f-data);
+    font-size: 12px;
+    color: var(--muted);
+    text-align: right;
+    line-height: 1.8;
+    white-space: nowrap;
+  }
+  .stamp b { color: var(--ink-2); font-weight: 500; }
+
+  /* ---- figures strip ---- */
+
+  .figures {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 1px;
+    background: var(--rule-soft);
+    border-bottom: 1px solid var(--rule);
+    margin-top: 0;
+  }
+  .fig {
+    background: var(--ground);
+    padding: 14px 4px 16px;
+  }
+  .fig dt {
+    font-family: var(--f-display);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .fig dd {
+    margin: 4px 0 0;
+    font-family: var(--f-data);
+    font-variant-numeric: tabular-nums;
+    font-size: 23px;
+    font-weight: 500;
+    letter-spacing: -.02em;
+  }
+  .fig dd small {
+    display: block;
+    font-size: 11.5px;
+    font-weight: 400;
+    color: var(--muted);
+    letter-spacing: 0;
+  }
+
+  /* ---- controls ---- */
+
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin: 28px 0 0;
+  }
+  .controls-label {
+    font-family: var(--f-display);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-right: 4px;
+  }
+  .chip {
+    font-family: var(--f-display);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: .02em;
+    color: var(--ink-2);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 5px 12px;
+    cursor: pointer;
+    transition: background .12s, border-color .12s, color .12s;
+  }
+  .chip:hover { border-color: var(--muted); }
+  .chip[aria-pressed="true"] {
+    background: var(--ink);
+    border-color: var(--ink);
+    color: var(--ground);
+  }
+  .chip:focus-visible,
+  .disclose:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /* ---- sections ---- */
+
+  section { margin-top: 44px; }
+  section[hidden] { display: none; }
+
+  .head {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    border-bottom: 1px solid var(--ink);
+    padding-bottom: 6px;
+  }
+  .head h2 {
+    font-family: var(--f-display);
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    margin: 0;
+  }
+  .head .count {
+    font-family: var(--f-data);
+    font-size: 12px;
+    color: var(--muted);
+    margin-left: auto;
+    font-variant-numeric: tabular-nums;
+  }
+  .lede {
+    margin: 14px 0 0;
+    max-width: 68ch;
+    color: var(--ink-2);
+  }
+
+  /* ---- progress meters ---- */
+
+  .meters {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 20px 28px;
+    margin-top: 22px;
+  }
+  .meter-title {
+    font-family: var(--f-display);
+    font-size: 13.5px;
+    font-weight: 600;
+    letter-spacing: .02em;
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .meter-title em {
+    font-style: normal;
+    font-family: var(--f-data);
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .track {
+    display: flex;
+    gap: 3px;
+    margin-top: 7px;
+  }
+  .track i {
+    height: 9px;
+    flex: 1;
+    border-radius: 1px;
+    background: var(--done);
+  }
+  .track i.open { background: var(--left); }
+  .track i.note { background: var(--caveat); }
+  .meter-note {
+    margin: 7px 0 0;
+    font-size: 13.5px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+
+  /* ---- blotter ---- */
+
+  .scroller { overflow-x: auto; margin-top: 20px; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 620px;
+  }
+  thead th {
+    font-family: var(--f-display);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    text-align: left;
+    padding: 0 14px 7px 0;
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 9px 14px 9px 0;
+    border-bottom: 1px solid var(--rule-soft);
+    vertical-align: baseline;
+    font-size: 15px;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.sha {
+    font-family: var(--f-data);
+    font-size: 13px;
+    color: var(--accent);
+    white-space: nowrap;
+  }
+  td.ref {
+    font-family: var(--f-data);
+    font-size: 13px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  td.what { color: var(--ink-2); }
+  td.what b { font-weight: 500; color: var(--ink); }
+
+  /* ---- inventory ---- */
+
+  .inventory {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 26px 34px;
+    margin-top: 22px;
+  }
+  .inv h3 {
+    font-family: var(--f-display);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: .11em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .inv ul { margin: 0; padding: 0; list-style: none; }
+  .inv li {
+    font-size: 14.5px;
+    line-height: 1.5;
+    color: var(--ink-2);
+    padding: 5px 0 5px 18px;
+    position: relative;
+  }
+  .inv li::before {
+    content: "";
+    position: absolute;
+    left: 2px;
+    top: 12px;
+    width: 6px;
+    height: 6px;
+    background: var(--done);
+    border-radius: 50%;
+  }
+  .inv li b { font-weight: 500; color: var(--ink); }
+  code {
+    font-family: var(--f-data);
+    font-size: .88em;
+    background: var(--sunk);
+    padding: 1px 4px;
+    border-radius: 2px;
+  }
+
+  /* ---- dossiers ---- */
+
+  .dossier {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--left);
+    box-shadow: var(--shadow);
+    margin-top: 18px;
+  }
+  .dossier-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 14px;
+    padding: 16px 20px 14px;
+  }
+  .dossier-head h3 {
+    font-family: var(--f-display);
+    font-size: 21px;
+    font-weight: 600;
+    letter-spacing: -.005em;
+    margin: 0;
+    flex: 1 1 260px;
+  }
+  .pill {
+    font-family: var(--f-display);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .11em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+  .pill.blocked { background: var(--left-soft); color: var(--left); }
+  .pill.think { background: var(--caveat-soft); color: var(--caveat); }
+  .pill.ref { background: var(--accent-soft); color: var(--accent); font-family: var(--f-data); font-weight: 500; letter-spacing: .02em; }
+  .dossier-body { padding: 0 20px 4px; }
+  .dossier-body p { margin: 0 0 14px; max-width: 72ch; color: var(--ink-2); }
+  .dossier-body p:first-child { margin-top: 0; }
+
+  .disclose {
+    width: 100%;
+    text-align: left;
+    font-family: var(--f-display);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--accent);
+    background: var(--sunk);
+    border: none;
+    border-top: 1px solid var(--rule);
+    padding: 10px 20px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+  .disclose .caret {
+    display: inline-block;
+    transition: transform .16s ease;
+    font-family: var(--f-data);
+  }
+  .disclose[aria-expanded="true"] .caret { transform: rotate(90deg); }
+  .detail {
+    border-top: 1px solid var(--rule);
+    padding: 16px 20px 6px;
+  }
+  .detail[hidden] { display: none; }
+  .detail h4 {
+    font-family: var(--f-display);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .11em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 8px;
+  }
+  .detail ol, .detail ul {
+    margin: 0 0 16px;
+    padding-left: 20px;
+    max-width: 72ch;
+  }
+  .detail li { font-size: 15px; color: var(--ink-2); margin-bottom: 6px; }
+  .detail li b { font-weight: 500; color: var(--ink); }
+  .plan {
+    background: var(--sunk);
+    border-left: 2px solid var(--accent);
+    padding: 12px 16px;
+    margin: 0 0 16px;
+    font-size: 14.5px;
+    color: var(--ink-2);
+    max-width: 72ch;
+  }
+  .plan b { color: var(--ink); font-weight: 500; }
+
+  /* ---- watch-outs ---- */
+
+  .notes { margin-top: 20px; display: grid; gap: 1px; background: var(--rule-soft); border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+  .note-row {
+    background: var(--ground);
+    padding: 14px 0 15px;
+    display: grid;
+    grid-template-columns: 128px 1fr;
+    gap: 4px 20px;
+  }
+  .note-row .tag {
+    font-family: var(--f-display);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: var(--caveat);
+    padding-top: 3px;
+  }
+  .note-row p { margin: 0; font-size: 15px; color: var(--ink-2); max-width: 70ch; }
+
+  /* ---- verification ---- */
+
+  .verify {
+    margin-top: 20px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 4px 0;
+  }
+  .verify .row {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 8px 18px;
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  .verify .row:last-child { border-bottom: none; }
+  .verify code { background: none; padding: 0; font-size: 13.5px; color: var(--ink-2); }
+  .verify .ok {
+    font-family: var(--f-display);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .1em;
+    color: var(--done);
+    margin-left: auto;
+    white-space: nowrap;
+  }
+
+  footer {
+    margin-top: 52px;
+    padding-top: 16px;
+    border-top: 1px solid var(--rule);
+    font-family: var(--f-data);
+    font-size: 12px;
+    color: var(--muted);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    justify-content: space-between;
+  }
+
+  @media (max-width: 880px) {
+    .figures { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media (max-width: 620px) {
+    .sheet { padding: 28px 16px 72px; }
+    .wordmark { font-size: 38px; }
+    .stamp { text-align: left; }
+    .figures { grid-template-columns: repeat(2, 1fr); }
+    .note-row { grid-template-columns: 1fr; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+</style>
+
+<div class="sheet">
+
+  <header class="masthead">
+    <div>
+      <h1 class="wordmark">fehu <span>/ trading layer</span></h1>
+      <p class="thesis">A deterministic synthetic market — GARCH volatility and Poisson jumps under a limit order book — plus the axum web app that lets real players trade against it. This is where §15 of <code>DESIGN.md</code> stands.</p>
+    </div>
+    <div class="stamp">
+      branch <b>main</b> @ <b>ec824d5</b><br>
+      save format <b>version 4</b><br>
+      symbols <b>ACME NBLA HLIO PXCO</b>
+    </div>
+  </header>
+
+  <dl class="figures">
+    <div class="fig"><dt>Core crate</dt><dd>4,186<small>lines · 9 modules · no_std</small></dd></div>
+    <div class="fig"><dt>Web server</dt><dd>8,832<small>lines · 13 modules</small></dd></div>
+    <div class="fig"><dt>Browser UI</dt><dd>3,061<small>lines TypeScript</small></dd></div>
+    <div class="fig"><dt>Tests</dt><dd>184<small>across 7,587 lines</small></dd></div>
+    <div class="fig"><dt>HTTP routes</dt><dd>39<small>plus SSE stream</small></dd></div>
+    <div class="fig"><dt>§15 items</dt><dd>10 / 13<small>shipped · 3 left</small></dd></div>
+  </dl>
+
+  <nav class="controls" aria-label="Filter the board">
+    <span class="controls-label">Show</span>
+    <button class="chip" type="button" data-filter="all" aria-pressed="true">Everything</button>
+    <button class="chip" type="button" data-filter="have" aria-pressed="false">What we have</button>
+    <button class="chip" type="button" data-filter="left" aria-pressed="false">What is left</button>
+    <button class="chip" type="button" data-filter="notes" aria-pressed="false">Watch-outs</button>
+  </nav>
+
+  <section data-group="have">
+    <div class="head">
+      <h2>Roadmap, by section</h2>
+      <span class="count">§15.1 – §15.4</span>
+    </div>
+    <div class="meters">
+
+      <div class="meter">
+        <div class="meter-title"><span>15.1 &nbsp;Orders the book took</span><em>4/4</em></div>
+        <div class="track"><i></i><i></i><i></i><i></i></div>
+        <p class="meter-note">Stops and stop-limits, GTD and day, icebergs, tick and lot size. All in the crate, so the book refuses bad orders itself.</p>
+      </div>
+
+      <div class="meter">
+        <div class="meter-title"><span>15.2 &nbsp;Stream promises</span><em>1/1</em></div>
+        <div class="track"><i></i><i class="note"></i></div>
+        <p class="meter-note">Sequence numbers and <code>?since=</code> replay shipped. The buffer is memory, not a log — a restart is still a gap.</p>
+      </div>
+
+      <div class="meter">
+        <div class="meter-title"><span>15.3 &nbsp;Money the market moves</span><em>2/5</em></div>
+        <div class="track"><i></i><i></i><i class="open"></i><i class="open"></i><i class="open"></i></div>
+        <p class="meter-note">Fees and dividends land on the ledger. Splits, retiring buybacks and runtime listing are the open ground.</p>
+      </div>
+
+      <div class="meter">
+        <div class="meter-title"><span>15.4 &nbsp;Running it for real</span><em>3/4</em></div>
+        <div class="track"><i></i><i></i><i></i><i class="open"></i></div>
+        <p class="meter-note">Reconciliation, rate limits and health metrics are live. One mutex still serialises all four symbols.</p>
+      </div>
+
+    </div>
+  </section>
+
+  <section data-group="have">
+    <div class="head">
+      <h2>What we have</h2>
+      <span class="count">foundation</span>
+    </div>
+    <p class="lede">The parts that were already load-bearing before the trading-layer push, and are exercised by the test suite on every commit.</p>
+    <div class="inventory">
+
+      <div class="inv">
+        <h3>Price process</h3>
+        <ul>
+          <li><b>Four layers</b> — fundamental value, OU mean reversion on the log-spread, GARCH(1,1) variance, Merton jumps</li>
+          <li><b>Events with decay</b> — a shipped feature or a scandal fades on its own schedule</li>
+          <li><b>Market hours</b> and overnight gaps under an optional calendar</li>
+          <li><b>Coarse mode</b> — ten years of daily bars, highs and lows drawn from the Brownian-bridge extremum</li>
+          <li><b>Bit-identical</b> across native and WebAssembly: xoshiro256++, <code>libm</code>, no clocks</li>
+        </ul>
+      </div>
+
+      <div class="inv">
+        <h3>Exchange</h3>
+        <ul>
+          <li><b>Limit order book</b> with FIFO queues, priority carried on <code>seq</code> rather than the order id</li>
+          <li><b>Synthetic makers</b> quoting a ladder around the reference, on the tick grid and in whole lots</li>
+          <li><b>Synthetic takers</b> printing the tick volume as flow</li>
+          <li><b>Square-root impact</b> — a trader's sweep pushes the next tick, then the push fades</li>
+          <li><b>Market, limit, FOK, IOC</b>, plus stops, GTD, day and iceberg</li>
+        </ul>
+      </div>
+
+      <div class="inv">
+        <h3>Web app</h3>
+        <ul>
+          <li><b>Users, accounts, traders</b> — money in cents on a ledger with signed, consecutive entries</li>
+          <li><b>Share supply</b> bounded: holdings plus resting bids ≤ shares outstanding</li>
+          <li><b>Sessions and halts</b> that freeze the book without stopping the clock</li>
+          <li><b>Idempotent submission</b>, an order log that never evicts a live order, amend as cancel-and-replace</li>
+          <li><b>Save and restore</b> at format 4, validated market-wide before a snapshot is accepted</li>
+        </ul>
+      </div>
+
+      <div class="inv">
+        <h3>Client and ops</h3>
+        <ul>
+          <li><b>Framework-free TypeScript UI</b> — chart, book, tape, ticket, account and event panels</li>
+          <li><b>SSE stream</b> that resumes at its own sequence and reloads only on a real gap</li>
+          <li><b>Reconciliation endpoint</b> under the market lock, game-master authenticated</li>
+          <li><b>Rate limits</b> per API key, spent by writes and never by reads</li>
+          <li><b>Health metrics</b> — counts, means and high-water marks per route and per engine step</li>
+        </ul>
+      </div>
+
+    </div>
+  </section>
+
+  <section data-group="have">
+    <div class="head">
+      <h2>Ten passes that landed</h2>
+      <span class="count">10 commits · merged in #6</span>
+    </div>
+    <p class="lede">Each its own commit, each with regression coverage and <code>DESIGN.md</code> updated in the same breath. Everything new is off by default — <code>FEHU_TICK_CENTS</code>, <code>FEHU_LOT</code> and both fee knobs sit at 1/1/0/0, so the determinism tests still pass bit for bit.</p>
+    <div class="scroller">
+      <table>
+        <thead>
+          <tr><th>Commit</th><th>§</th><th>What it does</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="sha">b109624</td><td class="ref">15.4 · 15.5</td><td class="what"><b>Reconciliation and hardening.</b> Hashed API keys, validated saves and books, cross-symbol order-id collisions fixed, stream-gap disconnect, halts that freeze the book.</td></tr>
+          <tr><td class="sha">d21249f</td><td class="ref">15.1</td><td class="what"><b>Stop and stop-limit.</b> Held per symbol, fired at the end of every step; funds checked twice, because a stop reserves nothing while it waits.</td></tr>
+          <tr><td class="sha">d82fdf8</td><td class="ref">15.2</td><td class="what"><b>Sequence numbers and replay.</b> Every message numbered in a bounded ring; <code>?since=N</code> resumes, and <code>hello</code> says honestly whether you missed anything.</td></tr>
+          <tr><td class="sha">293543a</td><td class="ref">15.4</td><td class="what"><b>Rate limits.</b> A token bucket per API key — the only identity the server has. Keyless requests share one bucket.</td></tr>
+          <tr><td class="sha">6a60b6e</td><td class="ref">15.4</td><td class="what"><b>Metrics on <code>/api/health</code>.</b> Timed around the market lock and the fan-out, because what matters is how long the market is unavailable to everybody else.</td></tr>
+          <tr><td class="sha">147880e</td><td class="ref">15.1</td><td class="what"><b>Tick and lot size.</b> A property of the listing, carried through saves; the ladder rounds bid down and ask up so a tick can never collapse the spread.</td></tr>
+          <tr><td class="sha">a96b7e1</td><td class="ref">15.3</td><td class="what"><b>Fees.</b> Charged as their own ledger entry beside the trade, never folded into the price: the tape stays the price, the ledger stays the money.</td></tr>
+          <tr><td class="sha">1237af1</td><td class="ref">15.1</td><td class="what"><b>GTD and day orders.</b> The deadline lands on the order record, so the engine sees one thing: a resting order with a time on it. Swept on halted symbols too.</td></tr>
+          <tr><td class="sha">12a2cd5</td><td class="ref">15.3</td><td class="what"><b>Dividends.</b> Paid per share and taken ex in the same breath — a jump on the reference and a shift on the fundamental, so mean reversion cannot pay it back.</td></tr>
+          <tr><td class="sha">e75ea92</td><td class="ref">15.1</td><td class="what"><b>Icebergs.</b> Each new slice posts at the <em>back</em> of its price queue, which is what stops a hidden order holding the front forever. Priority split from identity.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section data-group="left">
+    <div class="head">
+      <h2>What is left</h2>
+      <span class="count">3 workstreams</span>
+    </div>
+    <p class="lede">None of these is simply unwritten. Each is blocked on a decision that wants making deliberately rather than in passing — which is why they are described here rather than filed as tickets.</p>
+
+    <article class="dossier">
+      <div class="dossier-head">
+        <h3>1 &nbsp;Splits, and buybacks that retire stock</h3>
+        <span class="pill ref">§15.3</span>
+        <span class="pill blocked">Needs a rounding decision</span>
+      </div>
+      <div class="dossier-body">
+        <p>A split is easy to describe and a lot of work to do honestly. It has to rewrite, atomically: every position's quantity and average cost; every resting order's price and size <em>and the reservation behind it</em>; the simulator's price <em>and</em> fundamental, or the price mean-reverts straight back; and every bar in <code>Candles</code>, the coarse daily history and the tape — or the chart lies.</p>
+        <p>Three of those live inside the crate, and <code>Simulator</code>, <code>Candles</code> and <code>OrderBook</code> have no way to rescale anything.</p>
+      </div>
+      <button class="disclose" type="button" aria-expanded="false" aria-controls="d1"><span class="caret">▸</span> The two details that make it more than plumbing</button>
+      <div class="detail" id="d1" hidden>
+        <h4>Blockers</h4>
+        <ol>
+          <li><b>Levels collide.</b> Dividing prices can round two book levels into one, and the merged queue still has to come out ordered by <code>seq</code> — which is now the priority.</li>
+          <li><b>Reservations stop matching.</b> After dividing a resting buy's price and multiplying its size, the reservation no longer equals <code>price × qty</code>, and reconciliation checks exactly that. Restrict to integer n-for-1 splits, round the reservation down and release the remainder — probably right, but it is a decision, not a default.</li>
+        </ol>
+        <h4>Suggested order</h4>
+        <p class="plan">Give the crate <b><code>Simulator::rescale</code></b>, <b><code>Candles::rescale</code></b> and <b><code>OrderBook::rescale</code></b> with their own tests first. Then wire <code>POST /api/symbols/{s}/split</code> on top — the web-app half is the easy half.</p>
+        <h4>The buyback is blocked elsewhere</h4>
+        <p style="max-width:72ch;color:var(--ink-2);margin:0 0 16px;">Retiring stock needs <code>shares_outstanding</code> to change, and that is <code>SymbolInfo</code> — build metadata the save file deliberately does not carry. Same question as workstream 2, and it should be answered once for both.</p>
+      </div>
+    </article>
+
+    <article class="dossier">
+      <div class="dossier-head">
+        <h3>2 &nbsp;Listing and delisting at runtime</h3>
+        <span class="pill ref">§15.3</span>
+        <span class="pill blocked">Core representation change</span>
+      </div>
+      <div class="dossier-body">
+        <p><code>save::Symbol</code> is a <code>&amp;'static str</code> and <code>TICKERS</code> is a build-time array of four — and both assumptions run through the whole web app. The ledger, fills, order records, positions and reservations are all keyed on an interned static ticker, and <code>serde</code> is told as much.</p>
+        <p>This is a refactor of a core representation rather than a feature, and it is the thing to do <em>before</em> a retiring buyback, not after.</p>
+      </div>
+      <button class="disclose" type="button" aria-expanded="false" aria-controls="d2"><span class="caret">▸</span> What making symbols dynamic actually costs</button>
+      <div class="detail" id="d2" hidden>
+        <h4>Blockers</h4>
+        <ul>
+          <li><b>Replace the representation everywhere</b> — <code>webapp/src/save.rs</code> and every <code>symbol</code> module, plus each keyed collection that assumes a static lifetime.</li>
+          <li><b>Teach the save file a symbol table.</b> Today a file listing other symbols is refused outright (§14.14); that check has to become a lookup.</li>
+          <li><b>Answer what a delisting means</b> for the positions in that symbol — and for the money they were worth.</li>
+        </ul>
+      </div>
+    </article>
+
+    <article class="dossier" style="border-left-color: var(--caveat);">
+      <div class="dossier-head">
+        <h3>3 &nbsp;Splitting the market lock per symbol</h3>
+        <span class="pill ref">§15.4</span>
+        <span class="pill think">Think twice</span>
+      </div>
+      <div class="dossier-body">
+        <p><code>Mutex&lt;Market&gt;</code> is not only a bottleneck — it is what currently makes three separate things correct. A game server with four symbols and one engine step a second is nowhere near needing this.</p>
+      </div>
+      <button class="disclose" type="button" aria-expanded="false" aria-controls="d3"><span class="caret">▸</span> What the one lock is buying today</button>
+      <div class="detail" id="d3" hidden>
+        <h4>Correctness that would have to be re-established</h4>
+        <ul>
+          <li><b>Reconciliation</b> sees one consistent market-wide snapshot.</li>
+          <li><b>Share supply</b> — held plus resting bids ≤ outstanding — is checked and acted on with nothing moving in between.</li>
+          <li><b>Order ids</b> are allocated above every book's counter under one lock, which is what fixed the cross-symbol collisions in <code>b109624</code>.</li>
+        </ul>
+        <p class="plan">Splitting it per symbol, with accounts still shared, means writing down an ordering discipline for those three and a lock hierarchy that cannot deadlock. That is <b>a design pass with a performance target attached</b>, not a refactor to do speculatively.</p>
+      </div>
+    </article>
+  </section>
+
+  <section data-group="notes">
+    <div class="head">
+      <h2>Watch-outs</h2>
+      <span class="count">noticed along the way</span>
+    </div>
+    <p class="lede">Not blockers, and not bugs anyone has hit — but each is a place where the next person will otherwise be surprised.</p>
+    <div class="notes">
+
+      <div class="note-row">
+        <span class="tag">Doctests</span>
+        <p><code>cargo test --no-default-features</code> <em>including doctests</em> fails, and did before this work: the README example uses <code>?</code> with <code>Box&lt;dyn Error&gt;</code>, and the error types only implement <code>std::error::Error</code> under the <code>std</code> feature. The <code>just test</code> recipe passes <code>--tests</code>, which skips doctests, so nothing is red in practice. Fixing it means rewriting the README example not to use <code>?</code>.</p>
+      </div>
+
+      <div class="note-row">
+        <span class="tag">Maker fees</span>
+        <p>A positive maker fee is refused on purpose. A taker's fee is checked with the order, in the same moment it fills; a maker's would have to be reserved on acceptance and released exactly across every partial fill and cancel, and the rounding in that is a piece of work of its own. A maker <em>rebate</em> is allowed — it only ever credits.</p>
+      </div>
+
+      <div class="note-row">
+        <span class="tag">Stop history</span>
+        <p>The stop store holds untriggered stops only. A stop that fires lives on as its order record and its <code>stop_triggered</code> message, not as a stop with a terminal status. A history of triggers would be a small bounded log and a listing endpoint.</p>
+      </div>
+
+      <div class="note-row">
+        <span class="tag">Replay buffer</span>
+        <p>The replay buffer is memory, not a log. A restart begins the sequence at 1 again, so every <code>?since=</code> after one is a gap. Persisting the last sequence in the save file is easy; persisting the messages would not be.</p>
+      </div>
+
+      <div class="note-row">
+        <span class="tag">Admin auth</span>
+        <p>The game-master endpoints are open unless <code>FEHU_ADMIN_KEY</code> is set — which keeps the bundled UI's event panel working out of the box, and means anyone can move the prices on a shared server until that variable is set.</p>
+      </div>
+
+    </div>
+  </section>
+
+  <section data-group="have">
+    <div class="head">
+      <h2>Verification</h2>
+      <span class="count">green on every commit</span>
+    </div>
+    <div class="verify">
+      <div class="row"><code>cargo test --all-features</code><span class="ok">pass</span></div>
+      <div class="row"><code>cargo test --no-default-features --tests</code><span class="ok">pass</span></div>
+      <div class="row"><code>cargo test -p fehu-webapp</code><span class="ok">pass</span></div>
+      <div class="row"><code>cargo clippy --all-targets -- -D warnings</code><span class="ok">clean</span></div>
+      <div class="row"><code>cargo fmt --all --check</code><span class="ok">clean</span></div>
+      <div class="row"><code>(cd webapp/ui &amp;&amp; npm run build)</code><span class="ok">types.ts + static rebuilt</span></div>
+    </div>
+  </section>
+
+  <footer>
+    <span>Sourced from DESIGN.md §15, HANDOFF.md and the tree at ec824d5</span>
+    <span>Save format 4 · earlier files migrate on load</span>
+  </footer>
+
+</div>
+
+<script>
+  (function () {
+    var chips = Array.prototype.slice.call(document.querySelectorAll('.chip'));
+    var sections = Array.prototype.slice.call(document.querySelectorAll('section[data-group]'));
+
+    chips.forEach(function (chip) {
+      chip.addEventListener('click', function () {
+        var want = chip.dataset.filter;
+        chips.forEach(function (c) {
+          c.setAttribute('aria-pressed', String(c === chip));
+        });
+        sections.forEach(function (s) {
+          s.hidden = want !== 'all' && s.dataset.group !== want;
+        });
+      });
+    });
+
+    document.querySelectorAll('.disclose').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var panel = document.getElementById(btn.getAttribute('aria-controls'));
+        var open = btn.getAttribute('aria-expanded') === 'true';
+        btn.setAttribute('aria-expanded', String(!open));
+        panel.hidden = open;
+      });
+    });
+  })();
+</script>
