@@ -1,149 +1,424 @@
-# Game economy engine implementation plan
+# Game economy engine: implementation plan
 
-Assessment date: 2026-09-07. This is a proposed implementation, grounded in the current source; no runtime changes are included.
+Fehu today is a synthetic stock market: a deterministic price process, a
+limit order book, cash accounts and traders, behind an HTTP/SSE API. To be
+the economy server for a game it needs three things it does not have: a
+currency whose supply is conserved and auditable, goods that players can
+produce, hold and consume, and a command journal so that every acknowledged
+economic action survives a restart. Most of the rest already exists and
+should be reused rather than rebuilt.
 
-Fehu can become the authoritative economy server for a game. Its deterministic simulator and exchange are useful subsystems, but it currently models a synthetic financial market rather than a complete economy. The main work is a conserved currency ledger, durable atomic settlement, trusted game commands, and resource production and consumption.
+This plan is grounded in the current source (webapp save version 5). It is
+written in two tiers so that a playable economy does not wait on
+production-grade storage.
 
-Use a centrally issued, custodial game token as the currency. Give it balances, transfers, an explicit supply, mint/burn authority, and an auditable transaction history. A blockchain is unnecessary for this deployment. Merely listing a symbol named COIN would create a traded asset priced in the existing cash; it would not make that asset the settlement currency.
+## Decisions taken and questions left open
 
-**Working assumptions:** one persistent game world per deployment; one currency (GAME); server custody; no real-money redemption or external chain; trusted game backend authorizes rewards; players can trade and transfer within permissions. These are implementation defaults, not requirements inferred from a specific game genre. Multiple currencies, external wallets, and cross-world transfers are later extensions.
+Assumptions this plan is built on. Each is a default, not a requirement
+inferred from a particular game.
 
-## Current capabilities and gaps
+- **One world per server, one currency.** The currency is called GAME and is
+  counted in integer cents, exactly as cash is today. Multiple currencies
+  and cross-world transfers are extensions, so ids carry a currency field
+  from the start but only one currency is implemented.
+- **Server custody, no chain.** The server is the only ledger. There is no
+  wallet key material, no external chain and no redemption for real money.
+- **A trusted game backend.** Rewards, quest results and inventory grants
+  come from a service credential, never from a player request. Fehu owns
+  currency, inventory, jobs and markets; the game owns everything else and
+  submits results.
+- **Two deployment tiers.** *Tier one* is one host, one process, the game
+  backend on the same network, and a journal-plus-snapshot on local disk.
+  That is what the repository's own defaults point at (an unset admin key is
+  documented as what "a single-player game on localhost wants"). *Tier two*
+  is a live service: crash-safe commits in SQLite, an event outbox, quotas
+  and load tests. Tier two is listed at the end and is not on the path to a
+  playable economy.
+- **One market mode.** Funded markets replace synthetic ones on the server.
+  The demo becomes an economy with an operator faucet and well-funded NPC
+  merchants. The synthetic ladder and prints stay in the library crate for
+  the determinism tests and for anyone using `fehu` as a bare simulator.
 
-| Area | Evidence in this checkout | Required change |
+Open product choices that gate tuning, not implementation: reward cadence
+and sizes, genesis supply and mint cap, the initial goods and recipes,
+whether players may transfer currency to each other, target player count,
+and whether production pauses while the server is down. Implement with
+configuration for each and decide later with measurements.
+
+## The token question
+
+The request asks whether the currency can be modelled as a centralised
+crypto token. The parts of the token model worth taking are exactly three:
+
+1. an explicit **supply**, where mint and burn are the only operations that
+   change it and both require operator authority and a recorded reason;
+2. every movement as a set of signed **postings that sum to zero**, so the
+   ledger is conserved by construction and can be audited by summing;
+3. a plain **balance, supply and transfer** interface, which is what the
+   ERC-20 surface amounts to once signatures and allowances are removed.
+
+Everything else in the token model is a cost with no gameplay return here:
+18 decimals, allowances, signed transactions, gas, and a chain. Listing a
+symbol named COIN on the existing exchange would not do any of the three
+either: it would create a traded asset priced in the current cash, not a
+settlement currency. A future bridge to an external chain is a separate
+project with its own custody and reorg decisions; nothing below prevents
+it, and nothing below should be shaped by it.
+
+## What exists and what changes
+
+Evidence is from this checkout. Line references are to `webapp/src/` unless
+the path says otherwise.
+
+| Area | Today | Change |
 |---|---|---|
-| Price simulation | `src/sim.rs`, `src/event.rs`, `src/exchange.rs`: seeded reference prices, event effects, synthetic flow and trader impact | Retain as a price reference and NPC strategy input; distinguish reference price from actual traded price |
-| Exchange | `src/book.rs`, `webapp/src/market.rs`: orders, fills, reservations, stops, fees, listing and delisting | Settle currency and goods against funded counterparties; generic resource markets need explicit asset identities |
-| Accounts | `webapp/src/account.rs`: integer cents, status checks, balances, reservations, capped per-account ledger | Add balanced transactions, global supply accounting, system wallets, atomic transfers and durable history |
-| Issuance permissions | `api.rs::open_account`, `deposit`, `trader_deposit`, `withdraw`, and trader creation allow player-controlled funding and defunding; account status changes require only ownership | Remove funding and withdrawal from player commands; separate operator freezes from voluntary account closure |
-| Synthetic liquidity | `market.rs::book` only settles owners with trader IDs; `reconcile.rs` explicitly notes synthetic inventory is not independently held | Replace synthetic execution in economy mode with budgeted NPC orders; all fills need currency and goods on both sides |
-| Corporate payouts | `account.rs::pay_dividend`, `pay_delisting` credit holders, with balance-cap clipping | Debit an issuer/treasury or record authorized issuance; never silently clip contractual payouts |
-| Arithmetic | `account.rs::notional_cents`, settlement and reservations use saturation in several paths | Checked arithmetic and explicit failure before any mutation for authoritative amounts |
-| Persistence | `save.rs`: version 5 snapshots, file sync and rename, optional periodic autosave; restore validation | Commit each acknowledged economic mutation durably; snapshots become recovery checkpoints/export |
-| Retries | `market.rs::record_order` evicts completed orders and their client IDs; saves include original order responses | Durable command deduplication independent of display history, including rewards and transfers |
-| Actor topology | `actor.rs`, `market.rs`: serialized market writes, symbol tasks, unbounded mailboxes | Keep one economy writer; add bounded admission and an explicit durable commit boundary across book and ledger |
-| Integration | `api.rs`, `events.rs`: JSON APIs, semantic events mapping to price changes, in-memory SSE replay | Economic commands, durable event delivery, game identity mapping, documented versioned contracts |
-| Game economy | Current domain consists of symbols, accounts, traders and simulator events | Add goods, inventories, recipes, timed jobs, NPC demand, rewards and sinks |
+| Money representation | `account.rs`: integer cents, `MAX_BALANCE_CENTS` of 10^15, signed ledger entries with running balance, per-account capped ledger | Keep all of it. Add a supply counter and make every movement a balanced transaction |
+| Funding | `open_account` and `create_trader` take `cash_cents` from the request body; `deposit`, `withdraw` and `trader_deposit` are open to the owner | Opening balance is zero. Deposit and withdraw become operator mint and burn. Player routes cannot create or destroy currency |
+| Fees | `Account::charge_fee` debits the taker; nothing is credited, so fee cents leave the system | Fees post to a venue wallet. Nothing leaves the system except through burn |
+| Corporate payouts | `pay_dividend` and `pay_delisting` credit holders from nowhere and clip silently at the balance cap | Debit an issuer wallet per symbol; refuse the payout if it cannot be funded or fits nobody, never clip |
+| Freeze and close | `set_status` is owner-gated, so a player can unfreeze themselves | Operator freeze and voluntary close are separate transitions with separate authority |
+| Counterparties | `Market::book` settles only parties with a trader id; `reconcile.rs` says synthetic liquidity holds no inventory | Every fill has a funded trader on both sides. NPC merchants are traders with wallets and inventory |
+| Assets | One kind: a stock with `shares_outstanding`, dividends and delisting | An asset kind field. Goods are assets that use the same holdings, reservations and book but have no dividends or buyout |
+| Arithmetic | `notional_cents` and settlement saturate | Checked arithmetic on every authoritative path; refuse before mutating |
+| Persistence | `save.rs`: whole-market snapshot, atomic rename, optional periodic autosave | Snapshot stays. Add an append-only command journal so nothing acknowledged is lost between snapshots |
+| Retries | `client_order_id` is deduplicated only while the order record is retained | An idempotency key on every mutation, kept in the journal for the life of the world |
+| Game events | `events.rs`: a catalogue of twelve semantic kinds mapped onto price effects, plus raw simulator events | Keep. Add effects on NPC demand and recipe yields alongside the price effects |
+| Concurrency | `actor.rs`: one market actor, one actor per symbol, unbounded mailboxes | Keep the topology. Money and books already change only inside one market job; the journal write goes in that job |
 
-Existing save, contract and concurrency tests are useful starting points. They do not establish durable money conservation: reconciliation checks retained ledger entries and shares, not a complete funded counterparty ledger. This assessment is based on source inspection; the existing test suite was not run for this documentation-only change.
+Baseline: `cargo test --all-features` and `cargo test -p fehu-webapp` pass
+on this checkout (see the end of this document).
 
-## Currency design
+## The ledger
 
-GAME is the unit of account and quote currency. Preserve integer cents: 1 GAME = 100 cents. Do not introduce an 18-decimal denomination merely to resemble crypto. Use `CurrencyId` now, but implement one quote currency initially. Preserve signed integer posting deltas, nonnegative wallet balances, and checked wide intermediate multiplication. Keep monetary integers as JSON numbers, matching every existing DTO in `webapp/ui/src/types.ts` and the contract test: `MAX_BALANCE_CENTS` (10^15) is below 2^53, so JavaScript clients lose nothing today. Switch to decimal strings only if the cap is raised past 2^53, and do it for every money field at once under a new API version.
+The ledger is pure integer arithmetic with no clock, network or allocation
+beyond `alloc`, so it belongs in the library crate as `src/ledger.rs`, next
+to `book.rs`. That keeps the workspace at two crates and lets the property
+tests run on the `no_std` path. `serde` derives sit behind the existing
+`serde` feature as they do for every other library type.
 
-The relevant inspiration from [ERC-20](https://eips.ethereum.org/EIPS/eip-20) is its balance, supply and transfer interface. The proposed HTTP service is not ERC-20 compatible, and bearer API keys are not blockchain wallet keys. Spending allowances and signed player transactions can be added if gameplay requires delegated spending; they are unnecessary for the initial trusted-backend integration.
+```rust
+// src/ledger.rs (sketch)
 
-Create wallets for players, treasury, reward budgets, NPC merchants, companies and fee collection. Minting moves value from an issuance control account into a wallet and increases supply; burning reverses that operation. Ordinary transfers, rewards paid from a budget, trading fees and taxes only redistribute supply. Mark actual burns explicitly. Treasury funds remain part of total supply; report circulating player supply separately.
+pub struct CurrencyId(pub u16);           // only GAME = 0 is implemented
+pub struct WalletId(pub u64);
 
-Start with an operator-configured genesis supply placed in treasury, then allocate finite reward and NPC budgets. Permit further minting only through a separately scoped operator command with a reason and configured cap. Do not choose inflation rates or genesis amounts before game reward/spend rates are specified. Measure faucets and sinks before introducing automated monetary policy.
+pub enum WalletKind {
+    Player,     // one per account; the account's balance moves here
+    Treasury,   // genesis supply lands here
+    Budget,     // a finite pool a service credential may pay rewards from
+    Npc,        // a merchant or producer
+    Issuer,     // per symbol: funds dividends and delisting buyouts
+    Venue,      // receives fees
+    Issuance,   // the mint/burn control account; may go negative
+}
 
-Invariants enforced on every commit:
+pub struct Wallet {
+    pub id: WalletId,
+    pub kind: WalletKind,
+    pub currency: CurrencyId,
+    pub status: WalletStatus,             // Active | Frozen | Closed
+    balance_cents: i64,                   // >= 0 except Issuance
+    reserved_cents: i64,                  // 0 <= reserved <= balance
+}
 
-- Posting deltas sum to zero per currency, including the issuance control account. Sum of spendable wallet balances equals minted minus burned supply.
-- Wallet balance is nonnegative; `0 <= reserved <= balance`; available is balance minus reserved. Holds do not increase supply.
-- A transfer debits and credits exactly once. Every fee, rebate, payout and NPC trade has an explicit funding source.
-- Inventory is nonnegative; goods held for orders or jobs cannot be transferred or consumed. Production and consumption have explicit quantities and causes.
-- A rejected command changes neither authoritative state nor supply. Repeating an accepted command returns its original result.
-- Freeze policy blocks new outgoing spending and trading; freeze cancels open orders and stops atomically and releases their holds. Credits remain allowed; only operators may unfreeze an operator freeze. Closure requires no balance, inventory, holds or jobs.
+pub struct Posting {
+    pub wallet: WalletId,
+    pub amount_cents: i64,                // signed; the set sums to zero
+}
 
-A future on-chain version is a separate project: decide chain, custody, signing, deposits, withdrawal limits, confirmations and reorg recovery. Use an escrow-backed bridge and unique external transfer IDs; never run independently mintable internal and external supplies under one advertised total. Defer this until interoperability is an actual game requirement.
+pub enum Reason {
+    Genesis, Mint, Burn, Transfer, Reward, Purchase, Fee, Rebate,
+    Buy, Sell, Dividend, Delisting, JobCost, JobRefund, Migration,
+}
 
-## Authority, storage and transaction boundary
+pub struct Transaction {
+    pub id: u64,                          // sequential, never reused
+    pub command_id: u64,                  // the journal entry that caused it
+    pub tick: u64,
+    pub reason: Reason,
+    pub postings: Vec<Posting>,           // 2..=N, balanced
+    pub memo: Option<String>,
+}
 
-Keep the `fehu` library portable and deterministic. Put game-domain transitions in a new `fehu-economy` workspace crate with no clocks, network or database access; preserve `no_std + alloc` where practical. The Axum application owns authentication, persistence, clock inputs and command sequencing. Initially deploy one writer per world, with read projections for quotes and histories.
+pub struct Supply {
+    pub minted_cents: i64,
+    pub burned_cents: i64,
+}
 
-Use SQLite on persistent local storage for the first single-server deployment. Its [atomic transactions](https://www.sqlite.org/atomiccommit.html) provide the all-or-nothing storage boundary; it permits [one concurrent writer](https://www.sqlite.org/lang_transaction.html), consistent with the proposed actor model. Durability settings, filesystem behavior and failure recovery must be validated in implementation. Multi-host failover or sustained write load beyond this design requires a separate storage/deployment decision, potentially PostgreSQL; adding HTTP replicas alone does not create safe multiple economy writers.
+pub struct Ledger {
+    wallets: BTreeMap<WalletId, Wallet>,
+    supply: Supply,
+    next_tx: u64,
+}
 
-Proposed persistent records:
+impl Ledger {
+    /// Validate every posting against status, balance, reservation and cap,
+    /// then apply all of them or none. Never saturates: overflow is an error.
+    pub fn post(&mut self, tx: Transaction) -> Result<&Transaction, LedgerError>;
+    pub fn hold(&mut self, w: WalletId, cents: i64) -> Result<HoldId, LedgerError>;
+    pub fn release(&mut self, h: HoldId) -> Result<(), LedgerError>;
+    /// Sum of all non-issuance balances == minted - burned.
+    pub fn check(&self) -> Result<(), Vec<String>>;
+}
+```
 
-| Records | Essential fields and constraints |
+Invariants `Ledger::check` enforces and the reconcile endpoint reports:
+
+- Postings in every transaction sum to zero per currency. The sum of all
+  wallet balances except issuance equals minted minus burned.
+- Balances are non-negative outside the issuance wallet. Reserved is
+  between zero and balance. Holds never change supply.
+- A rejected transaction changes nothing. A repeated command returns its
+  original result without posting again.
+- A frozen wallet accepts credits, refuses debits, and has its open orders
+  and stops cancelled in the same transaction that freezes it. Closing
+  requires zero balance, zero holds, zero inventory and no running jobs.
+
+Changes to `webapp/src/account.rs` once the ledger exists. `Account` keeps
+its id, owner, name and the per-account ledger view; its balance becomes a
+`Player` wallet in the shared ledger.
+
+| Today | After |
 |---|---|
-| World/currency configuration | world ID, schema/rules version, currency ID, decimals, cap, minted/burned counters, simulation tick |
-| Identities/wallets | external player ID unique per world, principal scopes, owner, wallet kind, currency, status, balance/version |
-| Credentials | API key digests as `auth.rs` stores them (domain-separated SHA-256), principal, scopes, issued/revoked; keys remain issued once and never stored in clear |
-| Transactions/postings | immutable transaction ID, command ID, tick, recorded time, reason/source; signed postings with wallet and currency |
-| Commands | unique `(world, principal, idempotency_key)`, canonical payload hash, command sequence, status and original response |
-| Reservations | unique hold ID, wallet or inventory owner, amount/quantity, purpose, order/job reference and lifecycle |
-| Assets/inventory | asset type, unit/lot size, transferability, owner quantity, issuance/consumption totals |
-| Markets/orders/fills | base asset, quote currency, matching sequence, immutable fill ID, order lifecycle and reservation references |
-| Recipes/jobs | versioned recipe, inputs, outputs, cost, start/due tick, unique completion ID |
-| Checkpoints/outbox | compatible state snapshot and committed sequence; ordered durable domain events and delivery cursor |
+| `Account::open(.., deposit_cents, ..)` | Opens with zero. The `cash_cents` request field is removed from `open_account` and `create_trader` |
+| `Account::deposit` | `Ledger::post(Reason::Mint)` from issuance, operator only, with a reason and a configured per-world cap |
+| `Account::withdraw` | `Ledger::post(Reason::Burn)` to issuance, operator only |
+| `Account::settle` | Buy and sell become one transaction with postings on both traders and the venue wallet for the fee |
+| `Account::charge_fee` | Folded into the settlement transaction; the fee is a posting to `Venue` |
+| `Account::pay_dividend`, `pay_delisting` | One transaction per symbol: issuer wallet debited by the total, each holder credited. If the issuer cannot fund it or any holder is at the cap, the whole payout is refused with the shortfall reported |
+| `Account::set_status` | Split into `freeze`/`unfreeze` (operator) and `close` (owner, with the emptiness precondition) |
+| `notional_cents` saturation | Returns `Result`; a product that does not fit is refused before any state changes |
+| `LedgerEntry` | Becomes a per-wallet projection of `Transaction` postings; the running balance and capped history stay for the API |
 
-Do not add a database call after the existing live book mutation and call that atomic. Implement a staged transition:
+## Assets: stocks and goods share one table
 
-1. Admit and authenticate a typed command, resolve world/principal, and check its durable deduplication record. Same key and payload returns the original result; changed payload returns `409 idempotency_conflict`.
-2. Sequence it in the economy actor. Evaluate matching and settlement on isolated candidate state using a fixed simulation tick, rule version and recorded RNG state. Initially correctness can use cloned affected state; optimize with transition deltas after profiling.
-3. Validate all postings, inventory changes, holds and supply constraints. A failed validation discards the candidate, including all book changes.
-4. Commit the command (its canonical payload, clock and tick inputs, rule version and RNG position), its result, economic records and outbox events in one database transaction. The command journal is the single source of truth: the library is deterministic, so a checkpoint plus the ordered journal replays to the exact committed state. Do not also persist state deltas; a second representation can disagree with replay. Revisit only if replay from the last checkpoint is measured to be too slow for recovery, and then persist deltas as a cache validated against replay, never as authority.
-5. Install the committed candidate and update read projections, then acknowledge and publish events. If installation fails after commit, stop serving economic mutations and rebuild from durable state. If commit outcome is uncertain, resolve using the command ID before retrying.
+Holdings, share reservations, the book and the fill path already handle
+integer units of a named symbol. Goods reuse all of it. The one addition is
+a kind on `SymbolInfo`:
 
-Symbol actors may calculate candidate transitions but must not expose them as committed state. Start with the economy actor owning authoritative mutable books and symbol actors serving committed projections; parallelize preparation later if needed. This avoids distributed commit across symbol tasks: today only the market changes a book, but the engine step fans one job out to every symbol task and each mutates its own book concurrently before the join. Engine ticks, stop triggers, expiries, NPC decisions and production completions must use the same pipeline. Publish no fill before its settlement commits.
+```rust
+pub enum AssetKind {
+    /// Fixed supply, pays dividends, can be delisted with a buyout.
+    Stock { shares_outstanding: u64 },
+    /// Produced and consumed. Supply is whatever has been issued minus
+    /// whatever has been consumed; nothing else creates it.
+    Good { issued: u64, consumed: u64, unit: &'static str },
+}
+```
 
-Checkpoint plus ordered committed commands must restore books, holds, simulator/RNG state, jobs and balances at one sequence. Record policy changes and tick order, so replay never depends on current wall time or a changed recipe. Preserve the original simulation mode and its deterministic native/Wasm tests. Funded mode may skip the synthetic ladder and prints without perturbing the bare price series, because that flow already draws from its own `long_jump`ed stream; any change to the draw order of the shared path must bump `STATE_VERSION` or `EXCHANGE_VERSION` and update the golden hashes in `tests/determinism.rs` in the same change, never the constants alone.
+Rules that follow from the kind: dividend and delist routes refuse a good;
+purchase and consume routes refuse a stock; the reconcile pass checks that
+holdings plus resting sell reservations equal `shares_outstanding` for a
+stock and `issued - consumed` for a good. Goods live in the same
+`Trader::positions` map, so a trader's inventory and portfolio are the same
+structure and the same holdings endpoint. Unique items, durability and land
+are extensions that would need a separate non-fungible table; they are out
+of scope.
 
-## Game interactions and API
+Recipes and jobs are small on top of that:
 
-Use `/api/v1/economy` for the authoritative contract; retain legacy APIs only behind an explicit compatibility flag until the funded path passes the acceptance scenario, then remove them. Require authenticated service credentials in economy mode and fail startup if authority/storage configuration is missing. Never put operator credentials in the browser. Scope service principals to provisioning, rewards, inventory grants, events or administration; derive player identity from authentication rather than trusting a body field.
+```rust
+pub struct Recipe {
+    pub id: RecipeId, pub version: u32,
+    pub inputs: Vec<(Symbol, u64)>, pub outputs: Vec<(Symbol, u64)>,
+    pub cost_cents: i64, pub duration_ticks: u64,
+}
 
-| Endpoint under `/api/v1/economy` | Caller and behavior |
-|---|---|
-| `POST /players` | Game service; idempotently map external player ID and create zero-balance wallet |
-| `GET /wallets/{id}`, `GET /wallets/{id}/transactions?cursor=` | Owner or scoped service; balance, held/available amounts and durable history |
-| `POST /transfers` | Owner or authorized service; atomically move available currency to another wallet |
-| `POST /rewards` | Reward service; source event ID, configured reward rule and recipient; transfer from budget, never trust client reward amounts |
-| `POST /purchases` | Player/service; catalog item and quantity; atomically charge currency and deliver inventory at server-authoritative price |
-| `POST /admin/mints`, `/admin/burns`, `/admin/wallet-status` | Restricted operator; policy validation and immutable audit reason |
-| `GET /currencies/{id}/supply` | Authorized game observer; total supply, treasury, player holdings and mint/burn totals |
-| `GET /players/{id}/inventory`, `POST /inventory/transfers` | Owner/service; query and move available goods under asset rules |
-| `POST /production-jobs`, `GET /production-jobs/{id}` | Owner/service; validate recipe, consume/hold inputs and schedule completion |
-| `POST /markets/{id}/orders`, `DELETE /markets/{id}/orders/{order_id}` | Owner; funded atomic settlement and reservation lifecycle; preserve existing order features as migrated |
-| `POST /game-events` | Scoped game backend; durable unique source event, versioned effects on production/demand/reference price |
-| `GET /commands/{id}`, `GET /events?after=` | Authorized caller; recover uncertain responses and replay durable events |
-| `GET /admin/reconciliation` | Operator; global supply, ledger, inventory, order and job consistency |
+pub struct Job {
+    pub id: JobId, pub recipe: (RecipeId, u32), pub owner: TraderId,
+    pub started_tick: u64, pub due_tick: u64, pub status: JobStatus,
+}
+```
 
-Every mutation requires `Idempotency-Key`; game events also have a unique `(source, event_id)` independent of transport retries. Keep deduplication evidence for the world's lifetime initially. Authorize access before returning any replayed response. Use stable error codes (`insufficient_funds`, `insufficient_inventory`, `budget_exhausted`, `frozen`, `idempotency_conflict`, `overloaded`) and a request ID. Include transaction ID and committed world sequence in success responses.
+Starting a job consumes the inputs and posts the cost in one transaction.
+Completion issues the outputs at the due tick, from the engine step, and
+happens exactly once because it is a journaled command like everything
+else. Cancellation before completion refunds nothing unless the recipe says
+so. Production pauses while the server is down; catch-up is a later policy
+with bounded work.
 
-Example transfer body: `{"from_wallet_id":"w1","to_wallet_id":"w2","currency_id":"GAME","amount_cents":2500}`. The sender must be owned or explicitly delegated to the caller. A retry after a timeout uses the same key; it must not debit again.
+## Commands and the journal
 
-Provide an OpenAPI contract and a small TypeScript client for the game backend. Durable events use at-least-once delivery with stable event IDs and authorized cursor replay; consumers deduplicate. Keep high-frequency quote SSE separate from economic events. Use header-based streaming authentication or short-lived stream tickets instead of long-lived keys in URLs. The committed bundle currently sends the key as `?api_key=` from `webapp/ui/src/stream.ts`, so this change regenerates `webapp/static` via `just ui` and must ship with the server change. Add bounded queues, body limits, per-service/player quotas and restrictive configurable CORS.
+The library is deterministic, so a checkpoint plus the ordered inputs since
+that checkpoint reproduces the exact state. That is the persistence design:
+journal the commands, not the state changes.
 
-Fehu should own currency, economic inventory, jobs and market orders for atomic purchases. The game owns combat, movement and quest adjudication and submits trusted results. A quest reward is not proof that a quest occurred: the game backend must validate it. If inventory remains in another service, an outbox-driven delivery/compensation workflow replaces local atomic delivery; specify pending status and recovery before enabling purchases in that configuration.
+```rust
+// webapp/src/journal.rs (sketch)
 
-## Economy simulation beyond trading
+pub enum Command {
+    CreatePlayer { external_id: String },
+    Mint { to: WalletId, cents: i64, reason: String },
+    Burn { from: WalletId, cents: i64, reason: String },
+    Transfer { from: WalletId, to: WalletId, cents: i64 },
+    Reward { budget: WalletId, to: WalletId, rule: RewardRule, source_event: String },
+    Purchase { buyer: TraderId, item: Symbol, qty: u64 },
+    Consume { owner: TraderId, item: Symbol, qty: u64 },
+    PlaceOrder(OrderRequest), Amend(..), Cancel(..), PlaceStop(..), CancelStop(..),
+    StartJob { owner: TraderId, recipe: RecipeId },
+    GameEvent(GameEventRequest),
+    Freeze { wallet: WalletId }, Unfreeze { .. }, Close { .. },
+    ListSymbol(..), Delist(..), Dividend(..),
+    Step { target: Timestamp, wall_ms: i64 },   // the engine tick
+}
 
-Implement fungible goods first: ore, fuel, food and crafted materials, with integer inventory units. Unique items, durability and land ownership are extensions. Stocks may remain a distinct asset type; do not apply dividends, fixed shares outstanding or delisting buyouts to consumable goods.
+pub struct JournalEntry {
+    pub seq: u64,                 // dense, starts after the checkpoint's seq
+    pub principal: PrincipalId,
+    pub idempotency_key: Option<String>,
+    pub payload_hash: [u8; 32],
+    pub command: Command,
+    pub result: CommandResult,    // the response that was acknowledged
+}
+```
 
-Add versioned recipes and timed jobs: for example, consume 2 ore and 1 fuel, pay a configured fee, then produce 1 ingot at the due simulation tick. Define cancellation explicitly: before start, release holds; after inputs are consumed, no automatic refund unless the recipe defines one. Completion is durable and occurs once even across restarts. Pause simulation during server downtime initially; catch-up/offline production is an explicit later policy with bounded work and recorded tick advancement.
+How a mutation runs, all inside the one market job that already serialises
+money and book changes:
 
-Add funded NPC merchants and producers. Their demand, inventory targets and recipe costs determine order intentions; the existing simulator may supply a noisy reference signal. Economy markets must bypass both the automatic synthetic ladder and synthetic taker flow, which can currently fill player orders during ticks and requotes. NPC orders use ordinary funded trader identities, fees and holds. Exhausted NPC inventory/currency means reduced liquidity or no quote, not implicit issuance.
+1. Authenticate and resolve the principal. Look the idempotency key up in
+   the journal index. Same key and same payload hash returns the recorded
+   result. Same key and a different payload returns `409`.
+2. Apply the command to the market. Every apply path validates fully before
+   it mutates, so a refused command leaves nothing behind.
+3. Append the entry to the journal file and `fsync`. Only then acknowledge
+   and publish. If the append fails the process stops accepting mutations
+   and logs the sequence it reached; the in-memory state is ahead of disk
+   and must not be served as committed.
+4. The periodic snapshot (`save.rs`, bumped to version 6) records the
+   journal sequence it includes, and the journal is truncated at the next
+   snapshot boundary.
 
-Prefer one market mode. Two modes means two code paths through `market.rs` and `exchange.rs`, two contract-test surfaces and two UI behaviours maintained indefinitely. The demo should be economy mode with an operator faucet and generously funded NPC merchants rather than a separate synthetic mode; keep the legacy synthetic path only for the deterministic library tests and the bare `fehu` crate, and remove it from the server once funded markets pass the acceptance scenario. Expose last trade, bid/ask, traded volume and reference separately; charts must not label generated reference volume as executed economic trades. Report per-window mint/burn, reward spending, consumption, player supply, inventory stocks, turnover, spreads and price baskets. Balance these in scripted scenarios before tuning live parameters.
+Replay on start: load the newest snapshot, then apply journal entries after
+its sequence in order. The engine tick is journaled with its wall-clock
+input, so replay never reads the clock. Recipe and fee changes are commands
+too, so a replayed job completes under the recipe that was current when it
+started. The `client_order_id` mechanism is subsumed: it becomes the
+idempotency key of `PlaceOrder`.
 
-## Implementation sequence and acceptance gates
+This is tier one. It loses at most the mutations after the last successful
+`fsync`, which is none if the append is awaited before acknowledging. What
+it does not provide is concurrent writers, a queryable history beyond the
+retained ledger views, or an outbox for at-least-once delivery to the game
+backend. Those are tier two and replace the journal file with SQLite
+without changing the command model.
 
-| Phase | Implementation scope | Exit evidence |
+Determinism under funded markets: skipping the synthetic ladder and prints
+does not perturb the bare price series because that flow already draws from
+its own `long_jump`ed stream. Any change to the draw order of the shared
+path bumps `STATE_VERSION` or `EXCHANGE_VERSION` and updates the golden
+hashes in `tests/determinism.rs` in the same change, never the constants
+alone.
+
+## API
+
+Authoritative routes live under `/api/v1/economy`. Existing routes stay
+until the funded path passes the acceptance scenario, then the ones that
+create currency are removed and the rest are aliased. Money stays a JSON
+number: the balance cap is below 2^53, so nothing is lost in JavaScript,
+and every existing DTO in `webapp/ui/src/types.ts` and the contract test
+already uses numbers.
+
+Every mutation takes an `Idempotency-Key` header. Every success returns the
+transaction id and the journal sequence. Errors use stable codes:
+`insufficient_funds`, `insufficient_inventory`, `budget_exhausted`,
+`frozen`, `idempotency_conflict`, `overloaded`, `unauthorized`.
+
+Principals are of three kinds and are resolved from the bearer key, never
+from a body field: a **player** (today's user), a **service** with scopes
+(`provision`, `reward`, `inventory`, `events`), and an **operator**
+(today's admin key, now required to be set outside a demo build).
+
+| Route | Who | Does |
 |---|---|---|
-| 1. Authority boundary | `api.rs`, `auth.rs`, `market.rs::Options`; economy mode with a legacy-route compatibility flag, scoped service identity, zero-funded onboarding, deny player deposits/withdrawals/mints/unfreezes, inventory authority decision | Contract tests prove players cannot create currency through any legacy or new route; missing production credentials/storage fail closed |
-| 2. Domain ledger | New `fehu-economy` crate; wallet/currency/transaction/hold types, checked arithmetic, treasury issuance, transfers, fees and budgets; replace balance mutators | Property tests prove conservation, no overflow/negative balances, exact holds, atomic insufficient-funds rejection and freeze behavior |
-| 3. Durable command execution | New `webapp/src/storage/` and migrations, typed commands, transaction boundary, immutable journal, deduplication, checkpoints/outbox; refactor actors and save path | Crash injection before/after commit and before response proves no acknowledged loss, partial transfer or duplicate reward; restart reconstructs exact committed state |
-| 4. Funded trading | `src/exchange.rs`, `market.rs`, `trading.rs`, `reconcile.rs`; explicit funded mode, NPC wallets, atomic book/ledger/inventory changes, funded payouts, exact fees/rebates | Player-player and player-NPC partial fills, stops, IOC/FOK, amendments, dividends and delistings conserve currency/assets; failed commits expose no ghost fills |
-| 5. Game loop | Asset catalog/inventory, recipes/jobs, reward and purchase services, NPC demand/production, scheduled economic effects | Full scenario below survives retries and restarts with correct goods and supply; scarce inputs/budgets constrain activity |
-| 6. Integration and rollout | API DTOs/OpenAPI/client, `webapp/ui/src/types.ts` and panels, durable subscriptions, metrics, backup/restore, migration and bounded load tests | Real game client completes scenario; privacy and overload tests pass; restore drill reconciles; UI assets regenerated with `just ui` |
+| `POST /players` | service:provision | Map an external player id to a user, account, trader and zero-balance wallet. Idempotent on the external id |
+| `GET /wallets/{id}`, `GET /wallets/{id}/transactions` | owner or service | Balance, reserved, available, and the retained posting history |
+| `POST /transfers` | owner or service | Move available currency between two wallets in one transaction |
+| `POST /rewards` | service:reward | Pay a configured reward rule from a budget wallet, keyed on the game's source event id |
+| `POST /purchases` | owner or service:inventory | Charge the catalogue price and issue the good, or refuse, in one transaction |
+| `POST /consume` | owner or service:inventory | Destroy units of a good the caller holds free of reservations |
+| `GET /players/{id}/inventory` | owner or service | Positions in goods, with reservations |
+| `POST /jobs`, `GET /jobs/{id}` | owner | Start a recipe; poll its status |
+| `POST /markets/{symbol}/orders` and the existing amend, cancel and stop routes | owner | Unchanged semantics, funded on both sides |
+| `POST /game-events` | service:events | The existing catalogue, journaled, with a unique source id |
+| `POST /admin/mint`, `/admin/burn`, `/admin/freeze`, `/admin/unfreeze`, `/admin/recipes`, `/admin/catalog` | operator | Supply and policy changes, each with a reason string that lands in the journal |
+| `GET /supply` | any authenticated | Minted, burned, treasury, budgets, player holdings, venue |
+| `GET /commands/{key}` | the principal that sent it | Recover the result of a command whose response was lost |
+| `GET /reconcile` | operator | The existing pass, extended to supply, inventory and jobs |
 
-Deliver phases in dependency order. Phases 1–3 establish the token service; 4–6 complete the requested game economy. Do not call the wallet-only milestone a complete economy engine.
+The SSE stream keeps ticks and quotes public and fills private as it does
+now, but the key moves out of the query string into a header or a
+short-lived stream ticket. That changes `webapp/ui/src/stream.ts` and needs
+`just ui` to regenerate the committed bundle in the same commit.
 
-Phase 3 is the riskiest phase and phases 1–2 deliver little on their own, so ship a minimal slice first: phase 1, phase 2, and a command journal appended before each acknowledgement over the existing version-5 snapshot path, with restart replaying the journal from the last snapshot. That slice is a usable custodial token service and validates the journaling design before SQLite, the outbox and checkpoint tables are built. Only then reshape the actor topology.
+## NPC merchants and producers
 
-Rough order of magnitude, to be replaced by measurement after the prototype: phases 1 and 2 are days each; phase 3 and phase 4 are weeks each and dominate; phase 5 is weeks and depends on product decisions listed below; phase 6 is a week plus whatever the game client integration needs. Avoid committing to throughput or dates without measurement.
+An NPC is a trader with a wallet funded from treasury and an inventory
+issued at world start. It quotes from a policy, not from the simulator: a
+merchant targets an inventory level and a margin over its cost basis, and
+places ordinary limit orders through the same `PlaceOrder` command as a
+player. A producer runs recipes and sells the output. The price simulator
+survives as a noisy reference each NPC may read when setting its quotes, so
+game events still move prices, but through NPC decisions rather than
+through prints that nobody paid for.
 
-End-to-end acceptance scenario: initialize treasury supply, onboard two players, pay one verified quest reward, buy ore from a funded NPC, craft an ingot, list and sell it to the second player, pay the configured fee, and consume a purchased item. Verify every wallet, inventory, hold, fee destination and total supply. Repeat requests, overlap transfer and order attempts, and restart at each commit boundary; the economic result must remain the same. Also run depleted-treasury, exhausted-NPC, recipient-cap, freeze-during-order and duplicate-job-completion cases.
+When an NPC runs out of currency or stock, its side of the book goes empty.
+That is the point: scarcity is visible, and nothing is issued implicitly.
+NPC decisions run inside the engine step, so they are journaled with it and
+replay identically.
 
-## Migration, verification and release
+## Milestones
 
-Treat the current snapshot as a baseline, not a full audit history: older entries are intentionally discarded. Stop writes, take a version-5 snapshot through existing validation, and import once with a unique migration ID. Issue the sum of imported cash balances as explicitly labeled migration genesis; credit those wallets with matching postings. Import holdings and reservations with declared asset allocations and match them against open orders. Seed remaining issuer/NPC inventory only from an approved outstanding-supply allocation; cancel synthetic quotes and rebuild funded ones. Preserve users, key hashes and client order responses that still exist. Do not invent evicted transaction history or claim missing client IDs are deduplicated; use a new API/world epoch for post-cutover keys.
+Each milestone is shippable on its own and gates the next. Sizes are rough
+and to be replaced by measurement after the first two.
 
-Validate cash, holdings, orders, stops and account links before enabling writes. Map legacy freeze states conservatively and require operator review before lifting them. Recompute holds from imported orders and compare; fail migration on disagreement. Archive the original snapshot and migration report. After accepting new economy transactions, rollback requires replay/migration of those transactions into a compatible binary; restoring the old snapshot would discard acknowledged actions.
+| # | Scope | Done when | Size |
+|---|---|---|---|
+| 0 | Baseline: run `just ci`, record the results here | Green | hours |
+| 1 | `src/ledger.rs` with property tests on the `no_std` path; `account.rs` rewired to it; funding routes made operator-only; fees to venue; payouts funded; freeze split from close; save version 6 | Contract tests show no player route changes supply; reconcile reports zero drift after the existing API tests | days |
+| 2 | `webapp/src/journal.rs`; every mutation journaled inside its market job; `Idempotency-Key`; replay on start; engine tick journaled with its wall input; `GET /commands/{key}` | Kill the process at random points under the concurrency test; restart reproduces the last acknowledged state and no duplicate reward | week |
+| 3 | `AssetKind`; goods in holdings; NPC wallets and policies; synthetic ladder and prints disabled on the server; catalogue, purchase and consume routes | Player-to-player and player-to-NPC fills, partial fills, IOC/FOK, amendments, stops, dividends and delistings conserve currency and units | weeks |
+| 4 | Recipes and jobs; rewards from budgets; game events with production and demand effects; `/api/v1/economy` routes and `types.ts`; UI panels for wallet, inventory and jobs; `just ui` | The acceptance scenario below passes, including retries and restarts at every step | weeks |
+| 5 | Tier two: SQLite journal and history, outbox with cursor replay for the game backend, bounded admission and quotas, load test with a declared target, backup and restore drill | p95 command latency and recovery time under the declared load; restore reconciles | weeks, only if tier one is outgrown |
 
-Implementation validation should extend `webapp/tests/contract.rs`, `save.rs`, `concurrency.rs` and add ledger, inventory, recovery and integration suites. Run targeted tests at each phase, preserve determinism/save-load properties, then use `just ci` for the release candidate. Benchmark with a declared target for concurrent players, economic commands/second, symbols and tick rate; report p95/p99 latency, queue depth, memory, commit latency and recovery time. Load must be bounded without dropping accepted commands.
+Milestone 1 alone is a correct custodial token: conserved supply, operator
+mint and burn, transfers and audited history. Milestone 2 makes it safe to
+rely on. Milestones 3 and 4 make it an economy.
 
-Release requires reconciled backup restoration, zero unexplained supply drift, durable retry safety, authorization tests, and the full gameplay scenario. Outstanding product choices before tuning: reward cadence, genesis/cap policy, consumable goods and recipes, transfer restrictions, desired player scale, and whether downtime pauses production. External chain compatibility requires a separate decision before any bridge work.
+## Acceptance scenario
+
+Initialise a world with a genesis supply in treasury. Onboard two players.
+Pay one a quest reward from a budget wallet. That player buys ore from an
+NPC merchant, starts a smelting job, waits for the tick that completes it,
+lists the ingot, and the second player buys it. The venue takes its fee.
+The second player consumes the ingot.
+
+After each step, and again after replaying every request with the same
+idempotency key and after restarting the server at each journal boundary:
+both wallets, the NPC, the budget, treasury and venue sum to the genesis
+supply; ore and ingot counts equal issued minus consumed; no hold is
+outstanding without an order or job behind it. Also run the negative cases:
+an empty budget, an NPC out of stock, a recipient at the balance cap, a
+freeze while an order is resting, and a job completion delivered twice.
+
+## Save format
+
+There is no production data to migrate; the current snapshot is a demo.
+Save version 6 adds the ledger, wallets, asset kinds, recipes, jobs and the
+journal sequence. A version 5 file is refused, as today, and the demo world
+is regenerated from seeds. If a version 5 world is ever worth keeping, one
+importer posts its balances as a labelled `Migration` transaction from
+issuance, marks every symbol a stock, and records the sequence it started
+from. That is a day of work when needed and does not need designing now.
+
+## Test baseline
+
+Run on this checkout before writing the plan, with the environment's
+default toolchain:
+
+```
+cargo test --all-features      # library: all suites pass, 0 failed
+cargo test -p fehu-webapp      # webapp: all suites pass, 0 failed
+```
+
+`just lint`, the `no_std` path and the wasm build were not run for this
+documentation-only change; milestone 0 runs `just ci` in full.
