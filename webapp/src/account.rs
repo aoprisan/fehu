@@ -184,6 +184,9 @@ pub enum LedgerKind {
     Fee,
     /// A dividend paid on shares held when it was declared.
     Dividend,
+    /// A delisting bought the holder out: the shares are gone and this is
+    /// what they were worth.
+    Delisting,
 }
 
 /// One movement of money, in the order it happened.
@@ -470,6 +473,39 @@ impl Account {
         self.balance_cents = self.balance_cents.saturating_add(amount);
         Some(self.write(
             LedgerKind::Dividend,
+            amount,
+            ts_ms,
+            Some(symbol),
+            None,
+            memo,
+        ))
+    }
+
+    /// Buy the holder out of a delisted symbol. Like a dividend, this is
+    /// money the market moves rather than money the holder asked to move: a
+    /// frozen account is paid, because it owned the shares that were taken
+    /// away from it.
+    ///
+    /// A payout of nothing writes no entry — a company can be worth nothing,
+    /// and a zero-cent line in the ledger records only that it was.
+    pub fn pay_delisting(
+        &mut self,
+        amount_cents: i64,
+        symbol: &'static str,
+        memo: Option<String>,
+        ts_ms: i64,
+    ) -> Option<LedgerEntry> {
+        if amount_cents <= 0 {
+            return None;
+        }
+        let room = MAX_BALANCE_CENTS.saturating_sub(self.balance_cents);
+        let amount = amount_cents.min(room.max(0));
+        if amount == 0 {
+            return None;
+        }
+        self.balance_cents = self.balance_cents.saturating_add(amount);
+        Some(self.write(
+            LedgerKind::Delisting,
             amount,
             ts_ms,
             Some(symbol),

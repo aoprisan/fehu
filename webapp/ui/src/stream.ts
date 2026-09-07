@@ -145,6 +145,30 @@ export class MarketStream {
         }
         break;
       }
+      case 'listed': {
+        state.quotes.set(message.quote.symbol, message.quote);
+        this.#store.emit('symbols');
+        setOrderStatus(`${message.quote.symbol} listed`);
+        break;
+      }
+      case 'delisted': {
+        state.quotes.delete(message.symbol);
+        // The tab for a symbol that no longer exists cannot be left selected:
+        // every panel behind it would ask the server for a symbol it has just
+        // been told is gone.
+        if (state.symbol === message.symbol) {
+          const next = state.quotes.keys().next();
+          state.symbol = next.done === true ? null : next.value;
+          void Promise.allSettled([this.#actions.loadBars(), this.#actions.loadBookAndTape()]);
+        }
+        this.#store.emit('symbols', 'bars', 'book', 'tape');
+        void this.#actions.refreshTrader();
+        setOrderStatus(
+          `${message.symbol} delisted at ${(message.cents_per_share / 100).toFixed(2)} a share`,
+          true,
+        );
+        break;
+      }
       case 'event': {
         const { type: _tag, ...record } = message;
         this.#actions.recordEvent(record);

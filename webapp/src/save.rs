@@ -8,15 +8,21 @@
 //!
 //! The file is versioned ([`STATE_VERSION`]) and self-describing JSON: the
 //! `fehu` crate's own `Exchange`/`Candles` representations nested inside the
-//! web app's users, accounts, traders and logs. A file from an unsupported version,
-//! or one listing symbols this build does not have, is refused rather than
-//! guessed at — a save that only half-loads is worse than none.
+//! web app's users, accounts, traders and logs. A file from an unsupported
+//! version is refused rather than guessed at — a save that only half-loads is
+//! worse than none.
+//!
+//! Since version 5 the file is also the symbol table. Symbols are listed and
+//! delisted while the server runs, so the build has no say in which ones a
+//! restored market has: each [`SymbolSave`] carries its own [`SymbolInfo`],
+//! every ticker in the file is registered as it is read ([`crate::symbols`]),
+//! and the listing a file describes is the listing that comes back.
 //!
 //! Writes are atomic: the snapshot goes to a temporary file beside the
 //! target, which is then renamed over it, so a crash mid-write leaves the
 //! previous save intact.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,21 +33,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::account::{Account, User};
 use crate::events::EventRecord;
-use crate::market::{App, Halt};
+use crate::market::{App, Halt, SymbolInfo};
 use crate::trading::{OrderRecord, StopOrder, Trader};
 
 /// A listed symbol's ticker.
 ///
-/// This is `&'static str` — every ticker is one of the four the build lists —
-/// but spelled as an alias so `serde`'s derive does not mistake it for data
-/// borrowed from the input and demand a `'de: 'static` bound. The [`symbol`]
-/// modules below turn a ticker on disk back into one of ours.
+/// This is `&'static str` — a ticker registered with [`crate::symbols`], and
+/// so alive for as long as the process — but spelled as an alias so `serde`'s
+/// derive does not mistake it for data borrowed from the input and demand a
+/// `'de: 'static` bound. The [`symbol`] modules below turn a ticker on disk
+/// back into one of ours.
 pub type Symbol = &'static str;
 
 /// Current save format. Version 2 is migrated by hashing its plaintext
-/// credentials and version 3 by starting the stop store empty; all other
+/// credentials, version 3 by starting the stop store empty, and version 4 by
+/// taking each symbol's metadata from the build it was written by; all other
 /// older or newer versions are refused.
-pub const STATE_VERSION: u32 = 4;
+pub const STATE_VERSION: u32 = 5;
 
 /// Everything needed to carry on where the server left off.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -58,12 +66,20 @@ pub struct Save {
     pub market: MarketSave,
 }
 
-/// One symbol's simulator, book and bar history.
+/// One symbol's listing, simulator, book and bar history.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+// The listing's ticker is registered on the way in, not borrowed from the
+// input, so the derive needs no `'de: 'static`.
+#[serde(bound(deserialize = ""))]
 pub struct SymbolSave {
-    /// Ticker. The rest of the symbol's metadata comes from the build, so a
-    /// file listing symbols this build does not have is refused.
+    /// Ticker.
     pub symbol: String,
+    /// What the listing is: name, sector, shares outstanding, seed. Version 4
+    /// and earlier carried none of it — the build supplied it — so
+    /// [`read`] fills it in from the build's seeded symbols when migrating,
+    /// and every version-5 file has it.
+    #[serde(default)]
+    pub info: Option<SymbolInfo>,
     pub exchange: Exchange,
     pub candles: Candles,
     pub coarse_daily: Vec<Candle>,
@@ -105,6 +121,11 @@ pub struct MarketSave {
     /// the counter starts where a fresh market would.
     #[serde(default)]
     pub next_stop_id: u64,
+    /// The lowest id a new order may take. Books carry their own counters and
+    /// the market allocates above all of them; this is what a delisted
+    /// symbol's book leaves behind, so its orders' ids are never reissued.
+    #[serde(default)]
+    pub next_order_id: u64,
 }
 
 /// Why a save could not be written or read.
@@ -118,7 +139,8 @@ pub enum SaveError {
     Invalid(Vec<String>),
     /// Written by a different version of the format.
     Version { found: u32, expected: u32 },
-    /// The symbols in the file are not the symbols this build lists.
+    /// A version-4 file names a symbol whose metadata this build does not
+    /// have. Only migration can hit this: a version-5 file carries its own.
     Symbols {
         found: Vec<String>,
         expected: Vec<String>,
@@ -141,7 +163,8 @@ impl std::fmt::Display for SaveError {
             ),
             Self::Symbols { found, expected } => write!(
                 f,
-                "state file lists {found:?}, this build lists {expected:?}"
+                "state file is version 4 and lists {found:?}, whose metadata has to come from \
+                 this build, which seeds {expected:?}"
             ),
         }
     }
@@ -203,27 +226,74 @@ pub fn read(path: &Path) -> Result<Save, SaveError> {
         save.market.next_stop_id = save.market.next_stop_id.max(1);
         save.version = 4;
     }
+    if save.version == 4 {
+        // Version 4 kept a symbol's metadata in the build, so a file could
+        // only ever list the build's own symbols. That is where the metadata
+        // for these has to come from — there is nowhere else — and a file
+        // naming anything else cannot be migrated.
+        adopt_build_metadata(&mut save)?;
+        save.version = 5;
+    }
     if save.version != STATE_VERSION {
         return Err(SaveError::Version {
             found: save.version,
             expected: STATE_VERSION,
         });
     }
-    let found: Vec<String> = save.symbols.iter().map(|s| s.symbol.clone()).collect();
-    let expected: Vec<String> = crate::market::TICKERS.iter().map(|s| (*s).into()).collect();
-    if found != expected {
-        return Err(SaveError::Symbols { found, expected });
-    }
     validate_accounting(&save)?;
     Ok(save)
+}
+
+/// Fill in a version-4 file's symbol metadata from the build's seeded
+/// symbols, which is where it lived when the file was written.
+fn adopt_build_metadata(save: &mut Save) -> Result<(), SaveError> {
+    let mut seeded: BTreeMap<&'static str, crate::market::SymbolInfo> =
+        crate::market::seeded_symbols(fehu::Timestamp(save.sim_now_ms))
+            .into_iter()
+            .map(|spec| (spec.info.symbol, spec.info))
+            .collect();
+    let mut unknown = Vec::new();
+    for symbol in &mut save.symbols {
+        match crate::symbols::lookup(&symbol.symbol).and_then(|t| seeded.remove(t)) {
+            Some(info) => symbol.info = Some(info),
+            None => unknown.push(symbol.symbol.clone()),
+        }
+    }
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(SaveError::Symbols {
+            found: unknown,
+            expected: crate::market::TICKERS.iter().map(|s| (*s).into()).collect(),
+        })
+    }
 }
 
 /// Validate before maps can silently discard duplicate identities on restore.
 fn validate_accounting(save: &Save) -> Result<(), SaveError> {
     let mut issues = Vec::new();
+    let mut listed = BTreeSet::new();
     for symbol in &save.symbols {
         if let Err(issue) = symbol.exchange.book().validate_state() {
             issues.push(format!("{} book: {issue}", symbol.symbol));
+        }
+        // The file is the symbol table, so it has to be one: every listing
+        // names itself, and it names itself once. Two entries for a ticker
+        // would give the market two books for one symbol, and the second
+        // would be unreachable behind the first.
+        match &symbol.info {
+            None => issues.push(format!("{} carries no listing", symbol.symbol)),
+            Some(info) => {
+                if crate::symbols::lookup(&symbol.symbol) != Some(info.symbol) {
+                    issues.push(format!(
+                        "{} is filed under a listing for {}",
+                        symbol.symbol, info.symbol
+                    ));
+                }
+                if !listed.insert(info.symbol) {
+                    issues.push(format!("{} is listed more than once", info.symbol));
+                }
+            }
         }
     }
     let users = check_ids(
@@ -360,9 +430,12 @@ pub async fn autosave(app: Arc<App>, path: PathBuf, period: Duration) {
 }
 
 // ---------------------------------------------------------------------------
-// Symbols are `&'static str` in memory — one of the four the build lists — and
-// plain strings on disk. These modules do the swap, and refuse a ticker the
-// build does not have.
+// Symbols are `&'static str` in memory and plain strings on disk. These
+// modules do the swap. A ticker read from a file is registered rather than
+// looked up: the file is the symbol table, so the symbols it names are the
+// symbols there are, and a record naming one no longer listed — the fills and
+// ledger entries of a delisted company — still resolves to the same string it
+// always did. Only a malformed ticker is refused.
 
 /// A `&'static str` ticker.
 pub mod symbol {
@@ -439,10 +512,9 @@ pub mod symbol_map {
     }
 }
 
-/// The listed symbol `ticker` names, as the `&'static str` the rest of the
-/// server uses.
+/// `ticker`, as the one `&'static str` the rest of the server uses for it.
 fn intern(ticker: &str) -> Result<&'static str, String> {
-    crate::market::intern(ticker).ok_or_else(|| format!("unknown symbol {ticker:?}"))
+    crate::symbols::register(ticker).map_err(|e| format!("symbol {ticker:?}: {e}"))
 }
 
 #[cfg(test)]
