@@ -93,6 +93,7 @@ read that portfolio, cancel those orders or move that money. The key is shown
 | `GET` | `/api/symbols/{sym}/shares` | The symbol's shares: outstanding, held by traders, bid for, still available, and who holds them |
 | `GET` | `/api/symbols/{sym}/status` | Whether the symbol can be traded: session open, halted, the limit band and the next open/close |
 | `POST` | `/api/symbols/{sym}/halt`, `/resume` | Game master: stop and start trading in one symbol |
+| `POST` | `/api/symbols/{sym}/dividend` | Game master: `{"cents_per_share":50}` — pays every holder and takes the price ex |
 | `GET` | `/api/symbols/{sym}/bars?interval=M1\|M5\|H1\|D1&limit=500` | OHLCV bars, oldest first, in-progress bar last |
 | `POST` | `/api/symbols/{sym}/events` | Raw simulator event: `{"type":"jump","pct":-0.1}`, `drift_shift`, `drift_for_total_move`, `vol_shift`, `fundamental_shift`, `fundamental_target`; optional `at_ms` / `delay_secs`, `source`, `note` |
 | `POST` | `/api/game/events` | Semantic game event: `{"kind":"scandal","symbol":"ACME","magnitude":1.5}`; market-wide kinds (`market_crash`, `rate_hike`, …) need no symbol |
@@ -112,16 +113,20 @@ read that portfolio, cancel those orders or move that money. The key is shown
 | `GET` | `/api/traders`, `/api/traders/{id}` | Traders; a portfolio with cash, positions marked to the reference price, open orders and fills |
 | `POST` | `/api/traders/{id}/deposit` | Add money to the trader's account: `{"amount_cents":250000}` |
 | `POST` | `/api/traders/{id}/cancel_all` | Cancel every resting order of a trader |
-| `POST` | `/api/symbols/{sym}/orders` | `{"trader_id":1,"side":"buy","qty":100,"type":"market"}` or `"type":"limit","price_cents":8400`, optional `"tif":"gtc\|ioc\|fok"`, `"client_order_id":"abc-1"` and `"post_only":true`; responds with fills and status |
+| `POST` | `/api/symbols/{sym}/orders` | `{"trader_id":1,"side":"buy","qty":100,"type":"market"}` or `"type":"limit","price_cents":8400`, optional `"tif":"gtc\|ioc\|fok"`, `"client_order_id":"abc-1"`, `"post_only":true`, `"display_qty":20` to show only a slice of a resting order at a time, and `"expires_at_ms"` or `"day":true` to have the resting remainder withdrawn later; responds with fills and status |
 | `GET` | `/api/symbols/{sym}/orders?trader_id=` | A trader's resting orders on that symbol |
 | `GET`/`DELETE` | `/api/symbols/{sym}/orders/{id}` | Look up / cancel (`?trader_id=`) a resting order |
 | `PATCH` | `/api/symbols/{sym}/orders/{id}` | Amend a resting order: `{"trader_id":1,"price_cents":8500,"qty":50}` — a cancel and a fresh order, so it loses queue position |
 | `GET` | `/api/orders/{id}` | One order and what became of it — filled and cancelled ones included |
 | `GET` | `/api/traders/{id}/orders?status=resting\|filled\|cancelled&limit=100` | A trader's orders, newest first |
+| `POST` | `/api/symbols/{sym}/stops` | Arm a stop: `{"trader_id":1,"side":"sell","qty":100,"stop_price_cents":8000}`, plus `"limit_price_cents"` for a stop-limit. The trigger must be on the far side of the market |
+| `GET` | `/api/symbols/{sym}/stops?trader_id=`, `/api/traders/{id}/stops` | A trader's held stops, on one symbol or all of them |
+| `DELETE` | `/api/symbols/{sym}/stops/{id}?trader_id=` | Withdraw a stop before it fires |
 | `GET` | `/api/symbols/{sym}/book?depth=10` | Aggregated bids and asks, reference price, pending trader flow |
 | `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first |
 | `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and — for `?api_key=`, since `EventSource` cannot set headers — that player's `fill`s |
-| `GET` | `/api/health` | Uptime, simulated time, tick/trade counters |
+| `GET` | `/api/reconcile` | Game master: check ownership, reservations, share supply and retained cash ledgers; returns `valid` and `issues` |
+| `GET` | `/api/health` | Uptime, simulated time, tick/trade counters, orders placed and refused, stream and rate-limit state, and how long requests and engine steps are taking |
 
 At start-up each symbol generates a year of daily bars in coarse mode and then
 three days of 1 s ticks, so every interval has history before the first
@@ -131,7 +136,17 @@ wall second; `FEHU_BIND`, `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`,
 and `FEHU_LEDGER_LOG` are the other knobs. `FEHU_MARKET_HOURS=09:30-16:00`
 gives the market a UTC weekday session (unset, it never closes);
 `FEHU_PRICE_LIMIT_PCT` (0.10) and `FEHU_HALT_SECS` (300) set the limit move
-that halts a symbol and how long the halt lasts. `FEHU_STATE_FILE` keeps the market
+that halts a symbol and how long the halt lasts. `FEHU_RATE_PER_SEC` (20) and
+`FEHU_RATE_BURST` (40) set how fast one client may change things, and
+`FEHU_STREAM_REPLAY` (1024) how many stream messages are kept for `?since=`.
+`FEHU_TICK_CENTS` (1) and `FEHU_LOT` (1) make every symbol quote in a coarser
+price step and trade in lots: the synthetic ladder and its prints obey them
+too, and an order off the grid is refused by the book rather than by the
+server. `FEHU_TAKER_FEE_BPS` (0) charges whoever takes liquidity, in basis
+points of the fill, and `FEHU_MAKER_FEE_BPS` (0, negative) pays whoever
+provided it; each fee is its own ledger entry beside the trade, and a buy has
+to be able to afford the fee as well as the shares.
+`FEHU_STATE_FILE` keeps the market
 across restarts (`FEHU_SAVE_SECS`, 30 by default, sets how often it is
 written). `FEHU_ADMIN_KEY` locks the
 game-master endpoints (`POST /api/game/events` and
@@ -149,8 +164,8 @@ withdrawal cannot touch the cash a resting buy order has reserved, and an
 order is validated against its account before it reaches the exchange (the
 account must be active and its available balance must cover the worst-case
 cost). Fills settle through the account, so every cent that moves is on its
-ledger. Nothing is persisted: accounts start with cash, no shares, no margin
-and no shorting.
+ledger. New accounts start with cash, no shares, no margin and no shorting.
+Persistence is optional, as described below.
 
 The market can stop. Give it `FEHU_MARKET_HOURS` and orders outside the
 session are refused with `409 market_closed`; leave it unset and it trades
@@ -166,20 +181,25 @@ to pull an order out of a market that has stopped. `GET
 `halted`, and the stream sends a `status` message whenever it changes.
 
 Set `FEHU_STATE_FILE` and the market survives a restart. The whole thing is
-written there — every symbol's simulator, book and bars, and every user,
-account, ledger, position, resting order and API key — every `FEHU_SAVE_SECS`
+written there — every symbol's simulator, book, bars and held stops, and
+every user, account, ledger, position, resting order and API key — every `FEHU_SAVE_SECS`
 seconds and once more on a clean shutdown, and read back at start-up in place
 of the warm-up, continuing from the simulated time it had reached. The write
 goes through a temporary file and a rename, so an interrupted save cannot
-destroy the last good one; a file from another format version, or one listing
+destroy the last good one; a file from an unsupported format version, or one listing
 different symbols, stops the server rather than starting a market without its
-accounts. Without the variable nothing is kept and every start warms up a
+accounts. The reader also refuses inconsistent account balances, retained
+ledgers, reservations, ownership links, identity counters and key ownership,
+and malformed book indexes, price queues or quantities.
+Without the variable nothing is kept and every start warms up a
 fresh market.
 
 Keys are the only credential: they are 128 bits of operating-system entropy,
-issued at sign-up and held in memory beside the accounts they open. Nothing
-is persisted, so there is no key store to steal separately — but a deployment
-that adds persistence must hash them before writing them down.
+issued once at sign-up. Authentication and saves retain domain-separated
+SHA-256 hashes; a stored hash cannot be used as a bearer key. Save format 3
+reads version-2 files by hashing their original keys, so players keep using
+the same credentials. The next save writes only hashes; any older backups
+still contain the original keys.
 
 Three rules shape what the book will take. A **post-only** order (`"post_only":true`)
 must rest: if its price would trade on arrival it is refused rather than
@@ -213,9 +233,36 @@ adds a user's positions up per symbol — owned, reserved and sellable — acros
 every trader of theirs, and shares belong to the trader that bought them: one
 trader cannot sell another's, even under the same user.
 
-What is deliberately *not* built — stop orders, fees, corporate actions,
-sequence numbers on the stream — and the decisions behind what is, are listed
-in [DESIGN.md §15](DESIGN.md#15-not-built-yet).
+A **stop** is a line drawn on the price rather than an order: it rests
+nowhere, holds no queue position and reserves nothing, and the book has never
+heard of it. Arm one on the far side of the market — a buy above, a sell
+below — and when the last price reaches it the engine sends the order it
+becomes through the same checks as anything else, which is also where the
+account is checked for the second time, because the money may have moved
+since. A halted or closed symbol holds its triggers and fires them when
+trading resumes, and the owner is told either way with a `stop_triggered`
+message carrying the order it became or the reason it could not be placed.
+
+One client cannot flood the market. Every request that *changes* something —
+an order, an amendment, a cancel, a stop, money, an event — spends a token
+from a bucket kept per API key, refilling at `FEHU_RATE_PER_SEC` with a burst
+of `FEHU_RATE_BURST`; requests with no key share one bucket. Over the limit is
+`429 rate_limited` with a `Retry-After`. Reading is never limited, and
+`FEHU_RATE_PER_SEC=0` turns the whole thing off.
+
+Every stream message is numbered. `GET /api/stream` opens with a `hello`
+saying which sequence the connection joins at and how far back the server can
+still reach; `GET /api/stream?since=N` replays everything published after `N`
+that its buffer (`FEHU_STREAM_REPLAY`) still holds, before the live feed. A
+client that falls behind is disconnected rather than handed later messages as
+if nothing were missing, and reconnects with the sequence it got to. When the
+buffer cannot reach that far back the `hello` says `gap: true`, which is when
+— and only when — reloading the snapshots is the only recovery. The bundled
+UI does all of this.
+
+What is deliberately *not* built — fees, corporate actions, tick and lot
+sizes — and the decisions behind what is, are listed in
+[DESIGN.md §15](DESIGN.md#15-not-built-yet).
 
 ## License
 

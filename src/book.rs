@@ -188,8 +188,17 @@ pub enum OrderError {
     ZeroQuantity,
     /// `qty` exceeds [`MAX_ORDER_QTY`].
     QuantityTooLarge,
+    /// `qty` is not a whole number of the symbol's lots.
+    OddLot,
     /// A limit price outside `[1, 10^15]`.
     BadPrice,
+    /// A limit price that is not on the symbol's tick grid.
+    OffTick,
+    /// The display slice of an iceberg is zero, larger than the order, not a
+    /// whole number of lots, or asked for on an order that cannot rest.
+    BadDisplay,
+    /// No further unique order ids can be assigned.
+    IdExhausted,
     /// Synthetic orders are managed by the exchange; give NPCs a `TraderId`.
     SyntheticOwner,
 }
@@ -199,7 +208,14 @@ impl fmt::Display for OrderError {
         f.write_str(match self {
             Self::ZeroQuantity => "order quantity must be at least 1",
             Self::QuantityTooLarge => "order quantity is too large",
+            Self::OddLot => "order quantity must be a whole number of lots",
             Self::BadPrice => "limit price must be in [1, 10^15] cents",
+            Self::OffTick => "limit price must be a whole number of ticks",
+            Self::BadDisplay => {
+                "an iceberg's display quantity must be a whole number of lots between 1 and \
+                 its own size, on a gtc limit order"
+            }
+            Self::IdExhausted => "order id space is exhausted",
             Self::SyntheticOwner => "synthetic orders cannot be submitted directly",
         })
     }
@@ -207,6 +223,77 @@ impl fmt::Display for OrderError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for OrderError {}
+
+/// What a symbol will quote and trade in.
+///
+/// A real venue does not accept every price and every size: it quotes in
+/// ticks and trades in lots, so that the book has a manageable number of
+/// price levels and a size means something. Both default to the finest
+/// possible — one cent, one share — which constrains nothing and is what the
+/// sample market runs with unless it is told otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MarketRules {
+    /// Prices must be a whole number of these cents. `1` allows every cent.
+    pub tick_cents: i64,
+    /// Quantities must be a whole number of these shares. `1` allows every
+    /// share.
+    pub lot: u64,
+}
+
+impl Default for MarketRules {
+    fn default() -> Self {
+        Self {
+            tick_cents: 1,
+            lot: 1,
+        }
+    }
+}
+
+impl MarketRules {
+    /// Whether `price_cents` sits on the tick grid.
+    #[must_use]
+    pub fn allows_price(&self, price_cents: i64) -> bool {
+        self.tick_cents <= 1 || price_cents % self.tick_cents == 0
+    }
+
+    /// Whether `qty` is a whole number of lots.
+    #[must_use]
+    pub fn allows_qty(&self, qty: u64) -> bool {
+        self.lot <= 1 || qty.is_multiple_of(self.lot)
+    }
+
+    /// `price_cents` rounded down to the tick, never below one tick: a price
+    /// of zero is not a price.
+    #[must_use]
+    pub fn floor_price(&self, price_cents: i64) -> i64 {
+        if self.tick_cents <= 1 {
+            return price_cents;
+        }
+        let floored = price_cents - price_cents.rem_euclid(self.tick_cents);
+        floored.max(self.tick_cents)
+    }
+
+    /// `price_cents` rounded up to the tick.
+    #[must_use]
+    pub fn ceil_price(&self, price_cents: i64) -> i64 {
+        if self.tick_cents <= 1 {
+            return price_cents;
+        }
+        let up = price_cents.saturating_add(self.tick_cents - 1);
+        self.floor_price(up)
+    }
+
+    /// `qty` rounded down to whole lots. Zero when it does not reach one:
+    /// the caller decides whether that means "skip" or "refuse".
+    #[must_use]
+    pub fn floor_qty(&self, qty: u64) -> u64 {
+        if self.lot <= 1 {
+            return qty;
+        }
+        qty - qty % self.lot
+    }
+}
 
 /// Why a cancel failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,12 +329,41 @@ pub struct Resting {
     pub side: Side,
     /// Limit price.
     pub price_cents: i64,
-    /// Original quantity.
+    /// Original quantity, hidden part included.
     pub qty: u64,
-    /// Quantity still open.
+    /// Quantity still open *and visible*: what can trade at this queue
+    /// position right now. For an ordinary order this is everything left;
+    /// for an iceberg it is the slice on show.
     pub remaining: u64,
-    /// When it was placed.
+    /// Quantity still open and not on show. Zero for an ordinary order.
+    /// Nothing in the book's depth, preview or available-quantity ever
+    /// counts it: that is what makes it hidden.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub hidden: u64,
+    /// The slice an iceberg shows at a time. Zero for an ordinary order.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub display: u64,
+    /// Queue priority within its price level: lower goes first. Separate
+    /// from the id because an iceberg keeps its identity when it refreshes
+    /// and loses its place, so the two cannot be the same number.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub seq: u64,
+    /// When it was placed, or last refreshed.
     pub ts: Timestamp,
+}
+
+impl Resting {
+    /// Everything still open: what is on show plus what is not.
+    #[must_use]
+    pub fn outstanding(&self) -> u64 {
+        self.remaining.saturating_add(self.hidden)
+    }
+
+    /// This order shows less than it is.
+    #[must_use]
+    pub fn is_iceberg(&self) -> bool {
+        self.display > 0
+    }
 }
 
 /// One side of a trade.
@@ -397,7 +513,7 @@ pub(crate) fn notional(price_cents: i64, qty: u64) -> i64 {
 }
 
 /// The book. See the [module docs](self).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OrderBook {
     /// Keyed by price; the best bid is the last key.
@@ -407,6 +523,22 @@ pub struct OrderBook {
     /// Every resting order's side and price, for cancels and lookups.
     index: BTreeMap<OrderId, (Side, i64)>,
     next_id: u64,
+    /// Queue priority, handed out on every post and every iceberg refresh.
+    /// Zero in a file written before icebergs existed, which is the signal
+    /// to seed it from the ids.
+    #[cfg_attr(feature = "serde", serde(default))]
+    next_seq: u64,
+    /// The tick and lot this book enforces. Not serialised: the exchange
+    /// owns the truth in its [`TradingParams`](crate::TradingParams) and
+    /// sets it here whenever a book is assembled, so the two cannot drift.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    rules: MarketRules,
+}
+
+impl Default for OrderBook {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OrderBook {
@@ -418,21 +550,120 @@ impl OrderBook {
             asks: BTreeMap::new(),
             index: BTreeMap::new(),
             next_id: 1,
+            next_seq: 1,
+            rules: MarketRules::default(),
         }
     }
 
-    /// Validate an order without submitting it.
-    pub fn validate(order: &Order) -> Result<(), OrderError> {
+    /// The id that the next accepted submission will receive.
+    #[must_use]
+    pub fn next_order_id(&self) -> OrderId {
+        OrderId(self.next_id)
+    }
+
+    /// Skip unused ids below `minimum`. Never moves the counter backwards.
+    /// Coordinators can use this to allocate trader ids across several books.
+    pub fn advance_order_id(&mut self, minimum: OrderId) {
+        self.next_id = self.next_id.max(minimum.0);
+    }
+
+    /// Check structural invariants, including indexes, price queues, quantities
+    /// and the next id. Useful after deserializing a book from external storage.
+    /// Returns the first broken invariant without changing the book.
+    pub fn validate_state(&self) -> Result<(), &'static str> {
+        if self.next_id == 0 || self.next_id == u64::MAX {
+            return Err("next order id is zero or exhausted");
+        }
+        let mut expected = BTreeMap::new();
+        for (side, levels) in [(Side::Buy, &self.bids), (Side::Sell, &self.asks)] {
+            for (&price, queue) in levels {
+                if !(1..=MAX_PRICE_CENTS).contains(&price) || queue.is_empty() {
+                    return Err("price level is invalid or empty");
+                }
+                let mut previous = 0;
+                let mut total = 0u64;
+                for order in queue {
+                    if order.side != side || order.price_cents != price {
+                        return Err("resting order does not match its price level");
+                    }
+                    if order.id.0 == 0 || order.id.0 >= self.next_id {
+                        return Err("order id is zero or beyond the next id");
+                    }
+                    if order.seq <= previous || order.seq >= self.next_seq {
+                        return Err("queue priority is out of order or beyond the next one");
+                    }
+                    previous = order.seq;
+                    if order.qty == 0
+                        || order.qty > MAX_ORDER_QTY
+                        || order.remaining == 0
+                        || order.outstanding() > order.qty
+                    {
+                        return Err("resting order quantity is invalid");
+                    }
+                    if order.hidden > 0 && order.display == 0 {
+                        return Err("hidden quantity without a display slice");
+                    }
+                    if order.display > 0 && order.remaining > order.display {
+                        return Err("an iceberg shows more than its slice");
+                    }
+                    total = total
+                        .checked_add(order.remaining)
+                        .ok_or("price level quantity overflows")?;
+                    if expected.insert(order.id, (side, price)).is_some() {
+                        return Err("resting order id is duplicated");
+                    }
+                }
+            }
+        }
+        if expected != self.index {
+            return Err("order index does not match resting orders");
+        }
+        if self
+            .best_bid()
+            .zip(self.best_ask())
+            .is_some_and(|(bid, ask)| bid >= ask)
+        {
+            return Err("resting bids and asks cross");
+        }
+        Ok(())
+    }
+
+    /// The tick and lot this book enforces.
+    #[must_use]
+    pub fn rules(&self) -> MarketRules {
+        self.rules
+    }
+
+    /// Set the tick and lot. The exchange does this when it assembles a
+    /// book; nothing already resting is re-checked, because the rules a book
+    /// is loaded with are the ones it was written with.
+    pub fn set_rules(&mut self, rules: MarketRules) {
+        self.rules = rules;
+    }
+
+    /// Validate an order without submitting it, against this book's rules.
+    pub fn validate(&self, order: &Order) -> Result<(), OrderError> {
+        Self::validate_with(order, self.rules)
+    }
+
+    /// Validate an order against `rules`, without a book to hand.
+    pub fn validate_with(order: &Order, rules: MarketRules) -> Result<(), OrderError> {
         if order.qty == 0 {
             return Err(OrderError::ZeroQuantity);
         }
         if order.qty > MAX_ORDER_QTY {
             return Err(OrderError::QuantityTooLarge);
         }
-        if let OrderKind::Limit { price_cents } = order.kind
-            && !(1..=MAX_PRICE_CENTS).contains(&price_cents)
-        {
-            return Err(OrderError::BadPrice);
+        if !rules.allows_qty(order.qty) {
+            return Err(OrderError::OddLot);
+        }
+        if let OrderKind::Limit { price_cents } = order.kind {
+            if !(1..=MAX_PRICE_CENTS).contains(&price_cents) {
+                return Err(OrderError::BadPrice);
+            }
+            if !rules.allows_price(price_cents) {
+                return Err(OrderError::OffTick);
+            }
         }
         Ok(())
     }
@@ -444,9 +675,53 @@ impl OrderBook {
     /// See [`OrderError`]. Synthetic owners are accepted here; the exchange
     /// is what forbids them.
     pub fn submit(&mut self, order: Order, ts: Timestamp) -> Result<Placement, OrderError> {
-        Self::validate(&order)?;
+        self.submit_with_display(order, None, ts)
+    }
+
+    /// Submit an iceberg: an order that shows `display_qty` at a time and
+    /// keeps the rest back, posting the next slice — at the back of the queue
+    /// for its price — as each one fills.
+    ///
+    /// Only a `Gtc` limit order can be one: the whole idea is a resting
+    /// order that does not advertise its size, and an order that cannot rest
+    /// has nothing to hide. It still *takes* with its whole quantity on
+    /// arrival — the slicing is about what it shows while resting, not about
+    /// how much of the far side it will lift.
+    ///
+    /// # Errors
+    /// [`OrderError::BadDisplay`] if the slice is zero, larger than the
+    /// order, not a whole number of lots, or asked for on an order that
+    /// cannot rest; otherwise as [`submit`](Self::submit).
+    pub fn submit_iceberg(
+        &mut self,
+        order: Order,
+        display_qty: u64,
+        ts: Timestamp,
+    ) -> Result<Placement, OrderError> {
+        if display_qty == 0
+            || display_qty > order.qty
+            || !self.rules.allows_qty(display_qty)
+            || order.tif != TimeInForce::Gtc
+            || !matches!(order.kind, OrderKind::Limit { .. })
+        {
+            return Err(OrderError::BadDisplay);
+        }
+        self.submit_with_display(order, Some(display_qty), ts)
+    }
+
+    fn submit_with_display(
+        &mut self,
+        order: Order,
+        display_qty: Option<u64>,
+        ts: Timestamp,
+    ) -> Result<Placement, OrderError> {
+        self.validate(&order)?;
+        let next = self.next_id.checked_add(1).ok_or(OrderError::IdExhausted)?;
+        if self.next_id == 0 {
+            return Err(OrderError::IdExhausted);
+        }
         let id = OrderId(self.next_id);
-        self.next_id += 1;
+        self.next_id = next;
         let limit = match order.kind {
             OrderKind::Market => None,
             OrderKind::Limit { price_cents } => Some(price_cents),
@@ -471,13 +746,25 @@ impl OrderBook {
         let status = if remaining == 0 {
             OrderStatus::Filled
         } else if let (Some(price_cents), TimeInForce::Gtc) = (limit, order.tif) {
+            // What rests is sliced only if this is an iceberg; what showed
+            // is what can trade, and the rest waits its turn.
+            let display = display_qty.unwrap_or(0);
+            let shown = if display == 0 {
+                remaining
+            } else {
+                display.min(remaining)
+            };
+            let seq = self.take_seq();
             self.rest(Resting {
                 id,
                 owner: order.owner,
                 side: order.side,
                 price_cents,
                 qty: order.qty,
-                remaining,
+                remaining: shown,
+                hidden: remaining - shown,
+                display,
+                seq,
                 ts,
             });
             OrderStatus::Resting
@@ -659,6 +946,9 @@ impl OrderBook {
         ts: Timestamp,
         out: &mut Vec<Trade>,
     ) -> u64 {
+        // A refreshing iceberg needs a new priority mid-match, and the level
+        // it is in borrows the book, so the counter travels with us.
+        let mut seq = self.next_seq.max(1);
         while qty > 0 {
             let opposite = self.side_mut(side.opposite());
             let Some((&price, level)) = (match side {
@@ -690,8 +980,23 @@ impl OrderBook {
                     },
                 });
                 if front.remaining == 0 {
-                    done_ids.push(front.id);
-                    level.pop_front();
+                    if front.hidden > 0 {
+                        // An iceberg shows its next slice — and gives up its
+                        // place for it, which is what stops a hidden order
+                        // from holding the front of a queue forever.
+                        let slice = front.display.max(1).min(front.hidden);
+                        front.remaining = slice;
+                        front.hidden -= slice;
+                        front.seq = seq;
+                        front.ts = ts;
+                        seq = seq.saturating_add(1);
+                        if let Some(refreshed) = level.pop_front() {
+                            level.push_back(refreshed);
+                        }
+                    } else {
+                        done_ids.push(front.id);
+                        level.pop_front();
+                    }
                 }
             }
             let empty = level.is_empty();
@@ -702,7 +1007,36 @@ impl OrderBook {
                 self.index.remove(&id);
             }
         }
+        self.next_seq = seq;
         qty
+    }
+
+    /// The next queue priority, and never zero: zero is the mark of a book
+    /// written before priority was its own number.
+    fn take_seq(&mut self) -> u64 {
+        let seq = self.next_seq.max(1);
+        self.next_seq = seq.saturating_add(1);
+        seq
+    }
+
+    /// Give every resting order a queue priority, if a file did not carry
+    /// one. Before icebergs, priority *was* the id, so the ids it was
+    /// written with are exactly the right seeds. A book that already has
+    /// priorities is left alone.
+    pub fn seed_priority(&mut self) {
+        if self.next_seq != 0 {
+            return;
+        }
+        let mut highest = 0;
+        for levels in [&mut self.bids, &mut self.asks] {
+            for level in levels.values_mut() {
+                for order in level.iter_mut() {
+                    order.seq = order.id.0;
+                    highest = highest.max(order.id.0);
+                }
+            }
+        }
+        self.next_seq = highest.saturating_add(1).max(self.next_id).max(1);
     }
 
     fn rest(&mut self, order: Resting) {
@@ -887,6 +1221,78 @@ mod tests {
             .unwrap();
         assert_eq!(done.notional_cents(), p.notional_cents);
         assert_eq!(b.preview(Side::Sell, 10, Some(9_885)).filled, 0);
+    }
+
+    #[test]
+    fn state_validation_detects_corrupted_books() {
+        let good = book_with_ladder();
+        assert_eq!(good.validate_state(), Ok(()));
+        let mut bad = good.clone();
+        bad.index.clear();
+        assert!(bad.validate_state().is_err());
+        let mut bad = good.clone();
+        bad.next_id = 1;
+        assert!(bad.validate_state().is_err());
+        let mut bad = good.clone();
+        bad.bids.first_entry().unwrap().get_mut()[0].remaining = 0;
+        assert!(bad.validate_state().is_err());
+        let mut bad = good.clone();
+        bad.asks.first_entry().unwrap().get_mut()[0].side = Side::Buy;
+        assert!(bad.validate_state().is_err());
+        let mut bad = good.clone();
+        bad.asks.insert(12345, VecDeque::new());
+        assert!(bad.validate_state().is_err());
+        let mut book = good;
+        book.submit(
+            Order::market(Owner::Trader(T), Side::Buy, 125),
+            Timestamp(1),
+        )
+        .unwrap();
+        assert_eq!(book.validate_state(), Ok(()));
+        book.cancel_all(Owner::Synthetic);
+        assert_eq!(book.validate_state(), Ok(()));
+    }
+
+    #[test]
+    fn advancing_ids_preserves_existing_orders_and_never_rewinds() {
+        let mut book = book_with_ladder();
+        let depth = book.depth(Side::Buy, 10);
+        book.advance_order_id(OrderId(100));
+        book.advance_order_id(OrderId(2));
+        assert_eq!(book.next_order_id(), OrderId(100));
+        assert_eq!(book.depth(Side::Buy, 10), depth);
+        let result = book
+            .submit(Order::market(Owner::Trader(T), Side::Buy, 1), Timestamp(0))
+            .unwrap();
+        assert_eq!(result.id, OrderId(100));
+        assert_eq!(book.validate_state(), Ok(()));
+    }
+
+    #[test]
+    fn exhausted_ids_reject_orders_without_mutating_the_book() {
+        let mut book = book_with_ladder();
+        book.next_id = u64::MAX;
+        let before = book.clone();
+        assert_eq!(
+            book.submit(Order::market(Owner::Trader(T), Side::Buy, 1), Timestamp(0)),
+            Err(OrderError::IdExhausted)
+        );
+        assert_eq!(book, before);
+    }
+
+    #[test]
+    fn default_book_never_assigns_the_hidden_order_id() {
+        let mut book = OrderBook::default();
+        assert_eq!(book, OrderBook::new());
+        let placed = book
+            .submit(
+                Order::limit(Owner::Trader(T), Side::Buy, 100, 1),
+                Timestamp(0),
+            )
+            .unwrap();
+        assert_eq!(placed.id, OrderId(1));
+        assert_ne!(placed.id, OrderId::HIDDEN);
+        assert_eq!(book.cancel(placed.id).unwrap().id, placed.id);
     }
 
     #[test]

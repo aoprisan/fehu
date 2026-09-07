@@ -285,8 +285,46 @@ export interface OpenOrderDto {
   side: Side;
   price_cents: number;
   qty: number;
+  /** Everything still open: what is on show plus what an iceberg holds back. */
   remaining: number;
+  /** The slice an iceberg shows at a time; `null` for an ordinary order. */
+  display_qty: number | null;
+  /** What is on show right now. Equal to `remaining` unless it is an iceberg. */
+  shown_qty: number;
   ts_ms: number;
+}
+
+/**
+ * `trading::StopOrder` — a trigger held aside until the price touches it.
+ * It is not an order: it rests nowhere and reserves nothing until it fires,
+ * and then it becomes an ordinary order.
+ */
+export interface StopOrder {
+  stop_id: number;
+  trader_id: number;
+  symbol: string;
+  side: Side;
+  qty: number;
+  /** A buy fires at or above this price, a sell at or below. */
+  stop_price_cents: number;
+  /** The limit the fired order carries; `null` fires a market order. */
+  limit_price_cents: number | null;
+  /** The time in force of the order it fires, not of the trigger itself. */
+  tif: TimeInForce;
+  client_order_id: string | null;
+  created_at_ms: number;
+}
+
+/** Body of `POST /api/symbols/{symbol}/stops`. */
+export interface StopRequest {
+  trader_id: number;
+  side: Side;
+  qty: number;
+  stop_price_cents: number;
+  /** Absent makes it a stop-market rather than a stop-limit. */
+  limit_price_cents?: number | null;
+  tif?: TimeInForce;
+  client_order_id?: string | null;
 }
 
 /**
@@ -313,6 +351,12 @@ export interface OrderRecord {
   avg_price_cents: number | null;
   submitted_at_ms: number;
   updated_at_ms: number;
+  /**
+   * Simulated time this order is withdrawn at if it is still resting: a
+   * good-till-date order's deadline, or a day order's session close. `null`
+   * leaves it resting until it fills or is cancelled.
+   */
+  expires_at_ms: number | null;
 }
 
 /** `trading::FillRecord`. */
@@ -328,6 +372,12 @@ export interface FillRecord {
   /** `"maker"` if the trader's order was resting, `"taker"` if it took. */
   liquidity: 'maker' | 'taker';
   counterparty: 'synthetic' | 'trader';
+  /**
+   * The venue's fee, signed the way the ledger is: negative was taken out of
+   * the account, positive was a rebate paid in. Its own ledger entry, never
+   * folded into the price.
+   */
+  fee_cents: number;
 }
 
 /** `trading::PositionDto`. */
@@ -390,6 +440,8 @@ export interface PortfolioDto {
   unrealised_pnl_cents: number;
   positions: PositionDto[];
   open_orders: OpenOrderDto[];
+  /** Triggers waiting for a price, oldest first. */
+  stops: StopOrder[];
   /** Newest first. */
   fills: FillRecord[];
   /**
@@ -417,7 +469,14 @@ export interface CreateTraderRequest {
 export type AccountStatus = 'active' | 'frozen' | 'closed';
 
 /** `account::LedgerKind`. */
-export type LedgerKind = 'open' | 'deposit' | 'withdrawal' | 'buy' | 'sell';
+export type LedgerKind =
+  | 'open'
+  | 'deposit'
+  | 'withdrawal'
+  | 'buy'
+  | 'sell'
+  | 'fee'
+  | 'dividend';
 
 /** `account::UserDto`. */
 export interface UserDto {
@@ -539,6 +598,22 @@ export type OrderRequest = OrderKind & {
    * meaningful for a `gtc` limit order.
    */
   post_only?: boolean;
+  /**
+   * Show only this much at a time, keeping the rest back and posting the
+   * next slice — at the back of the queue for its price — as each one fills.
+   * Only a `gtc` limit order can hide anything.
+   */
+  display_qty?: number;
+  /**
+   * Simulated time at which the resting remainder is withdrawn. Absent
+   * leaves it resting until it fills or is cancelled.
+   */
+  expires_at_ms?: number;
+  /**
+   * A day order: the resting remainder is withdrawn at the close of the
+   * session it was sent in. Needs a trading calendar.
+   */
+  day?: boolean;
 };
 
 /** Body of `PATCH /api/symbols/{symbol}/orders/{id}`. */
@@ -579,12 +654,23 @@ export interface OrderResponse {
 
 // --- the SSE stream (market::StreamMessage) --------------------------------
 
-/** First message on every connection. */
+/**
+ * First message on every connection. Its `seq` is where the connection joins
+ * rather than a number of its own: the next message is `seq + 1`.
+ */
 export interface HelloMessage {
   type: 'hello';
   sim_now_ms: number;
   time_scale: number;
   quotes: Quote[];
+  /** The earliest sequence `?since=` can still ask for. */
+  oldest_seq: number;
+  /**
+   * This connection asked to resume from further back than the server's
+   * replay buffer reaches: messages were missed for good, and the client
+   * should reload its snapshots rather than trust its state.
+   */
+  gap: boolean;
 }
 
 /** The last tick of one engine step for one symbol. */
@@ -616,14 +702,54 @@ export interface FillMessage {
 /** A symbol stopped trading, or started again. */
 export type StatusMessage = { type: 'status' } & SymbolStatus;
 
-export type StreamMessage =
+/** A resting order reached its expiry and was withdrawn. */
+export interface OrderExpiredMessage {
+  type: 'order_expired';
+  trader_id: number;
+  order: OrderRecord;
+}
+
+/**
+ * A stop fired. It is held no longer: it either became `order`, or was
+ * `refused` when the account was checked the second time.
+ */
+export interface StopTriggeredMessage {
+  type: 'stop_triggered';
+  trader_id: number;
+  stop: StopOrder;
+  /** The price that reached the trigger. */
+  price_cents: number;
+  order: OrderResponse | null;
+  refused: string | null;
+}
+
+/**
+ * Every message carries the sequence number it was published under, so a
+ * client can tell a quiet market from a gap and resume with `?since=`.
+ */
+export type Sequenced<M> = M & { seq: number };
+
+export type StreamMessage = Sequenced<
   | HelloMessage
   | TickMessage
   | EventMessage
   | FillMessage
-  | StatusMessage;
+  | StatusMessage
+  | StopTriggeredMessage
+  | OrderExpiredMessage
+>;
 
 /** The server's error body: `{"error": {"code", "message"}}`. */
 export interface ApiErrorBody {
   error?: { code: string; message: string };
+}
+
+/** Game-master audit of one consistent market snapshot. */
+export interface Reconciliation {
+  valid: boolean;
+  accounts_checked: number;
+  traders_checked: number;
+  symbols_checked: number;
+  resting_orders_checked: number;
+  issues: string[];
 }

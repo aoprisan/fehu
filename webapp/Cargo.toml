@@ -13,6 +13,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "syn
 tokio-stream = { version = "0.1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 getrandom = "0.3"
+sha2 = "0.10"
 # `float_roundtrip` so a saved simulator restores bit-exactly.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 tracing = "0.1"

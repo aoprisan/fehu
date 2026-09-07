@@ -1011,6 +1011,12 @@ is gone, which is no basis for a client that wants to know what happened.
 resting order's record follows it whether it is hit by another trader's order
 or by the engine's synthetic flow; cancels mark it from the two cancel paths.
 Eviction drops the oldest *finished* records first and never a live one.
+Before a trader submission, the target book's id counter advances to the
+largest next id across all symbol books under the market lock. This keeps
+trader order ids unique across symbols, including after synthetic flow and
+restarts, without changing prices or resting orders. Fill and cancel updates
+also require a matching symbol. Older builds could overwrite records when
+separate books assigned the same id; already lost history cannot be recovered.
 
 Three checks stand between a submission and the book, all in `api.rs` because
 they are exchange rules rather than book mechanics. **Post-only**
@@ -1044,9 +1050,11 @@ client side can otherwise guarantee.
 Market data is public; everything a user owns is not. Each user is issued one
 API key when they are created (`webapp/src/auth.rs`: 128 bits of
 operating-system entropy behind a `fehu_` prefix), returned **once** — in the
-response that created them — and held in the `Keyring` beside the accounts it
-opens. Nothing is persisted, so there is no separate key store to steal; a
-deployment that adds persistence must hash the keys before writing them down.
+response that created them. `Keyring` retains a domain-separated SHA-256
+hash for authentication and persistence. A newly issued credential can be
+taken once for that response; restored keyrings cannot recover it. Debug
+output omits both keys and hashes. These are random 128-bit credentials,
+not user-chosen passwords.
 
 A request presents it as `Authorization: Bearer <key>` or `X-Api-Key`, and the
 `Caller` extractor turns that into a `UserId` — 401 with no key or an unknown
@@ -1066,6 +1074,27 @@ gets ticks and events only. And the game-master endpoints, which push events
 that move prices, are gated by `FEHU_ADMIN_KEY` when it is set — compared in
 constant time — and open when it is not, which is what a single-player game on
 localhost wants and a shared server does not.
+
+The key is also what a rate limit is keyed on. `webapp/src/limit.rs` holds a
+token bucket per user, refilling at `FEHU_RATE_PER_SEC` with a burst of
+`FEHU_RATE_BURST`, and a middleware spends one token per request that would
+*change* something — every unsafe method. Reads are not limited: they are
+cheap, idempotent and mostly public, and a reverse proxy is the right place
+to shape them. What is worth protecting is the one market lock every order
+goes through.
+
+A key is the only thing the server can honestly identify a client by: it sees
+no addresses and would not trust a forwarded one it could not verify. So
+requests with no key share a single bucket — a blunt instrument, deliberately,
+because the only unauthenticated writes are signing up and, on a server with
+no `FEHU_ADMIN_KEY`, the game master's own endpoints. A refusal is `429
+rate_limited` with a `Retry-After` naming the second at which the missing
+token will have been earned. The bucket table is bounded: full buckets are
+swept first, since a bucket that has refilled says nothing a fresh one would
+not, and when every bucket is mid-burst a client there is no room for falls
+back to the shared one — stricter than its own allowance, never looser,
+because running out of memory must not become a way to buy requests.
+`FEHU_RATE_PER_SEC=0` turns all of it off.
 
 ### 14.12 Sessions and halts
 
@@ -1094,11 +1123,66 @@ reference price, so a symbol that reopens has moved, the way a real one gaps
 on the news that halted it. Resting orders stay resting and their reservations
 stay held — and cancelling is always allowed, whether the market is closed,
 halted or both, because a player must be able to pull an order out of a market
-that has stopped. `GET /api/symbols/{s}/status` answers all of this in one
+that has stopped.
+
+Staying resting means staying *unfilled*. A halted symbol advances through
+`Exchange::advance_without_matching`, which moves the reference process but
+runs neither the synthetic flow nor a requote, so the book — quotes, resting
+orders and their queue positions — is exactly what it was when trading
+stopped, however far the price has travelled meanwhile. Resuming (by hand or
+when an automatic halt's time is up) calls `Exchange::resync`, which requotes
+around wherever the reference got to; whatever those new quotes cross settles
+through `Market::apply_trades` as ordinary maker fills and reaches their
+owners as `fill` stream messages. So the gap is priced into one reopening
+print rather than into a trickle of fills nobody could have cancelled. `GET /api/symbols/{s}/status` answers all of this in one
 place, quotes carry `market_open` and `halted` for the symbol rail, and a
 `status` stream message reports every change.
 
-### 14.13 Keeping the market across a restart
+### 14.13 Stops: orders the book has not heard of yet
+
+A stop is not an order. It rests nowhere, holds no queue position, reserves
+neither cash nor shares, and the book has never been told about it. It is a
+line drawn on the price, and `SymbolState::stops` is where the lines for one
+symbol are kept — a plain `Vec<StopOrder>`, oldest first, saved with the
+symbol so a restart does not lose anybody's exit.
+
+`POST /api/symbols/{s}/stops` arms one: a side, a quantity,
+`stop_price_cents`, and optionally `limit_price_cents`, which is what makes
+it a stop-limit rather than a plain stop. The trigger must be on the far side
+of the market — a buy above the last price, a sell below — because a stop
+that has already been reached is a market order wearing a disguise, and
+almost always a typo. Unlike an order it is accepted while the symbol is
+halted or its session closed: the trigger simply waits.
+
+`Market::fire_stops` runs at the end of every engine step, after
+`review_halt` so a symbol that resumed in this step fires the triggers the
+price reached while it was stopped, and skipped entirely for a symbol that is
+halted or outside its session. A buy fires at or above its price, a sell at
+or below, both against the last tick, oldest stop first. Firing removes the
+stop and sends the order it became through `Market::place` — the same door as
+any submission, so it takes the same cash, share and supply checks, prints
+the same fills, and is written to the same order log.
+
+That second check is the point of the design rather than an afterthought. A
+stop reserves nothing while it waits, so the money that would have paid for
+it can be spent or withdrawn in the meantime; the check when it fires is what
+catches that. A stop that fires and cannot be placed is spent either way: it
+is reported, not retried, because a trigger that keeps trying is a different
+instrument. Both outcomes reach the trader as a `stop_triggered` stream
+message carrying the trigger, the price that reached it, and either the order
+or the refusal — private to its owner, like a fill, because a stop says what
+somebody intends to do.
+
+Stops are listed per symbol (`GET /api/symbols/{s}/stops?trader_id=`), per
+trader (`GET /api/traders/{id}/stops`) and in the portfolio, withdrawn with
+`DELETE /api/symbols/{s}/stops/{stop_id}`, and capped at
+`MAX_STOPS_PER_TRADER` per trader — a trigger costs its owner nothing to
+hold, which without a cap is somebody else's memory. Stop ids are their own
+sequence: a stop only enters the order log when it becomes an order. The
+store holds untriggered stops only, so a fired one lives on as its order
+record and its stream message, not as a stop with a terminal status.
+
+### 14.14 Keeping the market across a restart
 
 Prices are reproducible from a seed; accounts are not. `webapp/src/save.rs`
 therefore writes the whole `Market` to one file (`FEHU_STATE_FILE`) every
@@ -1111,8 +1195,11 @@ traders, order log, event log and keyring — `serde_json`'s `float_roundtrip`
 is on, so a restored simulator continues bit-exactly. Symbols are the one
 thing not saved: their metadata comes from the build and only the ticker is
 written, so a file listing symbols this build does not have is refused, as is
-one from another format version. Refusing is the point — a market that comes
-back without its accounts is worse than one that does not come back.
+one from an unsupported format version. Version 2 is migrated to version 3
+by hashing the saved API keys; the next write contains only hashes, while
+existing backups remain unchanged. Refusing unknown formats is the point — a
+market that comes back without its accounts is worse than one that does not
+come back.
 
 Two details make the restart seamless. `sim_now_ms` is the furthest the
 market reached — the clock, or a symbol's own clock if an engine step left it
@@ -1121,7 +1208,8 @@ wall time to catch up. And the response each order was accepted with is saved
 beside the order log, so a `client_order_id` retried across a restart still
 replays rather than being refused.
 
-Writes are atomic: the snapshot goes to `<file>.tmp` and is renamed over the
+Writes are atomic: buffered output is explicitly flushed with errors checked,
+then synced to disk. The snapshot goes to `<file>.tmp` and is renamed over the
 target, so an interrupted write leaves the previous save intact. A failed
 periodic save is logged and retried at the next tick; it never takes the
 server down.
@@ -1131,7 +1219,7 @@ Tickers are `&'static str` throughout the server (`save::Symbol`), which
 that from the derive, and the `symbol*` modules turn a ticker on disk back
 into one of the build's four, refusing anything else.
 
-### 14.14 Tests
+### 14.15 Tests
 
 `tests/trading.rs`: book priority/partial fills/IOC/FOK/cancel/preview; the
 no-trader invariant against the bare simulator for 20 k ticks; ladder
@@ -1141,7 +1229,13 @@ round-trip cost against a seed-matched control; permanent fraction lands on
 the fundamental; resting bids/asks fill when the market trades through them;
 trader-to-trader trades leave the reference alone; ownership on cancel;
 market-order collar; flow direction follows the return (> 70 % of volume);
-determinism with interleaved orders; serde round trip (JSON and postcard)
+determinism with interleaved orders; a tick and lot enforced on both sides —
+every synthetic quote and print on the grid and in whole lots, an off-tick or
+odd-lot order refused, a market order's collar landing on the grid — and the
+default rules constraining nothing; an iceberg showing a slice, refreshing at
+the back of the queue, keeping its size out of the depth, the preview and a
+fill-or-kill, and giving everything back when cancelled, with a display slice
+that is zero, too big, off-lot or on an order that cannot rest refused; serde round trip (JSON and postcard)
 continuing identically for 2 k ticks. `webapp/tests/api.rs` covers the HTTP
 surface end to end, including reservations and rejections; users opening
 accounts and paying money in, the ledger adding up to the balance after a
@@ -1173,9 +1267,31 @@ and a failed write leaves the previous save intact, a halt included. Sessions
 and halts: a limit move halts a symbol and refuses its orders while the others
 carry on, the halt lifts itself and re-bands, a manual halt outlasts any amount
 of time and only the game master can place or lift one, a resting order
-survives a halt and can still be cancelled, and a closed session refuses orders
-while an open one takes them. `webapp/tests/contract.rs`
-pins the JSON key sets the TypeScript UI is typed against.
+survives a halt and can still be cancelled, a halted book fills nothing while
+the price moves through it and the resume settles what the new quotes cross,
+and a closed session refuses orders while an open one takes them. Fees: a
+taker pays and a maker is paid, each as its own ledger entry beside the trade
+it belongs to, and a buy that could afford the shares but not the fee is
+refused rather than overdrawn. Dividends: holders are paid into the account
+each trader trades on, as their own ledger entry, somebody holding none of it
+is paid nothing, the price goes ex by about the dividend, the share count is
+untouched, and one bigger than the company or from anybody but the game master
+is refused. Expiry: an order with a date is withdrawn when
+it passes and its reservation comes back, a date already gone is refused
+rather than silently cancelled, a day order ends with its session, and a day
+order without a calendar is refused. Stops: a
+trigger waits, fires when the price reaches it, becomes an order in the log
+and tells its owner; one behind the market, unfunded or malformed is refused
+when it is armed; it is private property that only its owner may see or
+withdraw; a halted symbol holds its triggers and fires them on the resume;
+one whose money has left in the meantime is refused when it fires rather than
+half-placed; and held stops come back from a save and still fire.
+The stream: a client that falls behind is disconnected rather than skipped,
+a reconnect with `?since=` replays exactly what it missed once each and in
+order, asking for more than the buffer holds is answered with `gap: true`
+alongside what is left, and a replay hands nobody somebody else's fills.
+`webapp/tests/contract.rs` pins the JSON key sets the TypeScript UI is typed
+against.
 
 ---
 
@@ -1188,77 +1304,190 @@ first and a patch second.
 
 ### 15.1 Orders the book will not take
 
-**Stop and stop-limit.** The one piece of the order-type work not done. A stop
-is not an order in the book: it is a trigger held aside until the price
-touches it, and only then submitted. That means a per-symbol store of
-untriggered stops (`stop_price_cents`, side, quantity, and either "market" or
-a limit price), evaluated at the end of every engine step against the last
-tick the way `review_halt` is (§14.12) — a buy stop triggers at or above its
-price, a sell stop at or below — then placed through `place_order` and logged
-like any other order. It needs its own listing and cancel endpoints, a
-`stop_triggered` stream message, cash or shares checked twice (once when
-accepted, once when triggered, because the balance may have moved in
-between), a decision about what a trigger does while a symbol is halted (hold
-it, most likely, and fire on resume), and a save-format bump to carry the
-untriggered stops. That last point is why it is a pass of its own rather than
-a corner of the amend work.
+**Stop and stop-limit (implemented, §14.13).** Held per symbol, fired at the
+end of every engine step against the last tick, placed through
+`Market::place` and logged like any other order. The funds are checked twice
+— once when the stop is accepted and once when it fires — because a stop
+reserves nothing while it waits. A halted or closed symbol holds its
+triggers and fires them on the resume, `stop_triggered` reports both
+outcomes to the owner, and save format 4 carries the untriggered stops.
 
-**Iceberg, GTD and day orders.** Iceberg needs the book to re-post a slice as
-each one fills, which is `book.rs`, not the web app. GTD and day orders need
-an expiry sweep on the engine step, which is easy but pointless until sessions
-are the default rather than an option (§14.12).
+**GTD and day orders (implemented).** A submission may carry
+`expires_at_ms`, or `day: true` for the close of the session it was sent in.
+Either way the deadline lands on the `OrderRecord` — which is saved, and
+which the log never evicts while an order is live — so by the time the engine
+sees them a day order and a good-till-date order are the same thing: a
+resting order with a time on it. `Market::sweep_expired` runs at the end of
+every step, cancels what is due, releases what it reserved and tells the
+owner with an `order_expired` message. It runs on halted symbols too: a halt
+stops trading, not the clock, and an order whose date has passed should not
+come back when the market does. A `day` order without a trading calendar is
+refused rather than left to live forever, because there is no close for it to
+end at.
 
-**Tick and lot size.** Prices are integer cents and quantities whole shares,
-and nothing else is enforced: a symbol cannot say "quote me in five-cent
-steps" or "trade me in lots of ten". `TradingParams` is where they would go,
-with the check in `OrderBook::validate` so the crate refuses them rather than
-the web app.
+**Iceberg (implemented).** `display_qty` on a `gtc` limit order shows a slice
+at a time and keeps the rest back; `OrderBook::submit_iceberg` posts the
+first slice and `match_incoming` posts the next one as each is exhausted —
+*at the back of the queue for its price*, which is what stops a hidden order
+from holding the front of a queue forever.
 
-### 15.2 What the stream does not promise
+That last point is why this needed the book rather than the web app. Priority
+used to be the order id: `validate_state` required ids to increase down a
+queue, so an order could never lose its place without losing its identity. A
+`Resting` now carries `seq` — priority, handed out on every post and every
+refresh — beside `id`, which is identity and never changes. A book from a
+file written before this has `next_seq == 0`, and `seed_priority` fills it in
+from the ids, which is exactly what priority was then.
 
-A client that falls behind silently loses messages: `BroadcastStream` drops
-them, `api.rs` filters the error away, and nothing in the protocol lets the
-client notice. Every message wants a per-connection sequence number and the
-`hello` a "you are joining at sequence N" line, plus a `?since=` that replays
-what a reconnecting client missed from a bounded buffer. Until then a client
-that cares about correctness — rather than about drawing a chart — must poll
-`/api/traders/{id}` after anything it sent, which is what the bundled UI does.
+`Resting` also gains `hidden` (open but not on show) and `display` (the
+slice). Depth, `preview` and the quantity a fill-or-kill measures itself
+against all count `remaining` only, so hidden size is genuinely hidden: a FOK
+that cannot see enough is killed even when the liquidity is there. But it is
+still liquidity — a large enough market order walks slice after slice until
+the order is gone. Everything that asks "what is still owed" —
+reservations, cancels, amends, reconciliation, the order log — uses
+`Resting::outstanding()`, so hiding size never makes it free: a buy iceberg
+reserves cash for all of it, and cancelling gives all of it back.
+
+**Tick and lot size (implemented).** `MarketRules { tick_cents, lot }` lives
+in `TradingParams`, and the exchange copies it into the book whenever one is
+assembled — from `new` or from a save — so the two cannot drift and the book
+can refuse an order without asking anybody. `OrderBook::validate` is where
+the refusal happens (`OffTick`, `OddLot`), which means the crate refuses them
+and the web app only reports it.
+
+The rules bind both sides. The synthetic ladder quotes on the tick grid,
+rounding its best bid down and its best ask up so a tick can never collapse
+the spread the model asked for, and sizes each level in whole lots with a
+floor of one. Synthetic prints are in lots too, since a print is a trade at
+this venue; whatever is left below a lot goes unprinted. A trader's market
+order is converted to a collar limit rounded *into* the collar — down for a
+buy, up for a sell — because the far side's quotes are themselves on the
+grid, so rounding the other way would allow a price the collar did not.
+
+`FEHU_TICK_CENTS` and `FEHU_LOT` set them for every symbol at start-up. Both
+default to 1, which constrains nothing and leaves every price and size the
+market produced before unchanged. They are a property of the listing, so a
+restored market keeps the ones it was saved with rather than whatever the
+environment now says.
+
+### 15.2 What the stream promises (implemented)
+
+Every message the server publishes goes through `App::publish`, which gives
+it the next sequence number and keeps it in a bounded ring buffer
+(`FEHU_STREAM_REPLAY`, 1024 by default). The number rides in the envelope
+alongside the tag — `{"seq": 41, "type": "tick", …}` — so a client can tell a
+quiet market from a gap without guessing.
+
+`GET /api/stream?since=N` resumes: everything published after `N` that the
+buffer still holds is replayed, oldest first, before the live feed. The
+subscription is taken while the sequence lock is held, so no message can slip
+between the replay and the live feed — each arrives exactly once, in order.
+The `hello` that opens a connection carries `seq` (where the connection
+joins, so the first live message is `seq + 1`), `oldest_seq` (how far back
+`?since=` can still reach) and `gap`, which is set when the client asked for
+more than the buffer had. `gap` is the honest answer to the one question the
+protocol could not previously answer: *did I miss anything?* Only then does a
+client have to reload its snapshots.
+
+Privacy survives the replay. A fill and a `stop_triggered` belong to their
+trader, and the buffer holds everybody's, so the same filter runs over the
+replay as over the live feed: a stream that has not proved who it speaks for
+gets neither, however far back it asks.
+
+Falling behind still ends the connection rather than silently skipping —
+`BroadcastStream`'s lag error terminates the stream — but now the client
+reconnects with the sequence it got to and picks up where it left off. The
+bundled UI does exactly that: it reopens at its own `seq` rather than letting
+`EventSource` rejoin the live feed, and reloads snapshots only when the
+`hello` reports a gap.
+
+What is still not promised: the buffer is memory, not a log, so a client that
+is away longer than `FEHU_STREAM_REPLAY` messages gets `gap: true` and has to
+resynchronise; nothing is persisted, so a server restart starts the sequence
+at 1 again and every `?since=` is a gap.
 
 ### 15.3 Money the market does not move
 
-**Fees.** Nothing is charged: no commission, no maker rebate, no exchange fee.
-They belong on the settlement path (`Trader::book_fill` → `Account::settle`)
-as a separate ledger entry per fill rather than as an adjustment to the price,
-so the tape stays the price and the ledger stays the money.
+**Fees (implemented).** `Fees { taker_bps, maker_bps }` on the `Market`, set
+by `FEHU_TAKER_FEE_BPS` and `FEHU_MAKER_FEE_BPS` and zero by default.
+`Trader::book_fill` settles the trade and then charges the fee as its own
+`LedgerKind::Fee` entry beside it, never as an adjustment to the price: the
+tape stays the price and the ledger stays the money. Each `FillRecord`
+carries the `fee_cents` it was charged, signed the way the ledger is.
 
-**Corporate actions.** `shares_outstanding` never changes, so a split, a
-dividend and a buyback that retires stock are all unrepresentable — the
-`buyback` game event moves the price and nothing else. A split is the
-awkward one: it rewrites every position's quantity and average cost, every
-resting order's price and size, and the bar history, or the chart lies.
-Dividends are easier and would land as a ledger entry against holders of
-record.
+One restriction is deliberate: the taker pays and the maker does not. A maker
+*rebate* is allowed, because it only ever credits an account, but a maker
+*fee* is refused rather than half-implemented. The reason is reservations. A
+taker's cash is checked with the fee included in the same moment the order is
+submitted and filled — `Market::place` adds `Fees::taker_cost` to the
+worst-case cost, so a buy that can afford the shares but not the fee is
+refused before anything happens. A maker's fill comes later, against a
+reservation made when the order was accepted; charging it would mean
+reserving the fee as well and releasing exactly that much back across every
+partial fill and cancel, and the rounding makes that a piece of work of its
+own rather than a corner of this one.
+
+**Dividends (implemented).** `POST /api/symbols/{s}/dividend` pays
+`cents_per_share` on every share a trader holds, as its own
+`LedgerKind::Dividend` entry against the account each trader trades on, and
+takes the price ex in the same breath: a `Jump` of `−d/p` on the reference and
+a `FundamentalShift` of `ln(1 − d/p)` on what the price reverts to. Both
+halves are the point. Paying without the price falling would be money from
+nothing — hold over the declaration, collect, sell — and dropping only the
+reference would let mean reversion pay it back. A frozen account is still paid:
+it owns its shares. Nothing is created or destroyed, so `shares_outstanding`
+is untouched, and the whole thing is recorded in the event log as
+`corporate:dividend`.
+
+**Splits and buybacks that retire stock.** Still unbuilt, and each is blocked
+on something specific rather than merely unwritten. A split rewrites every
+position's quantity and average cost, every resting order's price and size,
+the reservations behind them, the simulator's price and fundamental, and the
+whole bar history and tape — or the chart lies. Most of that is inside the
+crate (`Simulator`, `Candles`, `OrderBook` all lack any way to rescale) and
+the rounding is not free: two book levels can collide when prices are divided,
+and a resting buy's reservation no longer matches `price × qty` afterwards. A
+buyback that retires stock needs `shares_outstanding` to change, and that is
+build metadata which the save file deliberately does not carry — the same
+question as listing, below, and it should be answered once for both.
 
 **Listing and delisting.** The symbol set is fixed at build time
 (`TICKERS`), which the save format depends on: a file listing other symbols is
-refused (§14.13). Adding symbols at runtime means a symbol table in the save
+refused (§14.14). Adding symbols at runtime means a symbol table in the save
 file and a story for what happens to a delisted symbol's positions.
 
 ### 15.4 Running it for more than a game
 
-* **Reconciliation.** `Account::issues` checks one account. Nothing checks the
-  market as a whole: that the traders' positions plus the synthetic book's
-  inventory add up to `shares_outstanding`, or that every account's ledger
-  sums to its balance. Both are cheap to compute and belong behind an endpoint
-  and a test that runs them after a busy market.
-* **Rate limits.** There are none. One client can submit orders as fast as it
-  can open sockets.
+* **Reconciliation (implemented).** `GET /api/reconcile` runs under the
+  market lock and uses the same game-master authentication as event writes.
+  It checks account/user/trader links, account invariants, cash reservations
+  against all resting buys (including shared accounts), share reservations
+  against resting sells, nonnegative positions and the outstanding-supply
+  bound. It checks consecutive ids and arithmetic in each retained ledger
+  and reconciles its closing balance to the account. Evicted ledger history
+  cannot be verified: the first retained entry supplies the opening anchor.
+  Synthetic quotes are replenished liquidity, not an independently tracked
+  inventory, so the supply check is holdings plus resting bids ≤ outstanding.
+  The report is read-only and does not repair inconsistent state.
+* **Rate limits (implemented, §14.11).** A token bucket per API key, spent
+  by every request that changes something and by nothing that only reads.
+  Requests with no key share one bucket. Still missing: anything per address
+  — the server sees none — and any limit on how much *work* a request makes
+  rather than how many arrive.
 * **One lock.** `Mutex<Market>` serialises every order across all four
   symbols. Splitting it per symbol — with the accounts still shared — is the
   first scaling step, and the point at which the ordering guarantees now
   provided by "there is one lock" have to be written down.
-* **Metrics.** `/api/health` counts ticks, trades and users. There is nothing
-  on latency, order rates, or how long the engine step takes.
+* **Metrics (implemented).** `GET /api/health` now also reports orders
+  placed and refused, fills booked, stops held, stream messages published and
+  subscribers, clients being rate-limited, and timings — count, last, mean and
+  high-water mark — for every HTTP request and every engine step, the latter
+  measured around the market lock and the fan-out rather than the simulators
+  alone, because what matters is how long the market is unavailable to
+  everybody else. They are counters and running maxima since start-up, not a
+  time series: no window, no percentile, no history. A deployment that wants
+  those should scrape this into something that keeps them.
 
 ### 15.5 Decisions a real venue would revisit
 
@@ -1268,21 +1497,25 @@ company.
 * **The game-master endpoints are open unless `FEHU_ADMIN_KEY` is set.** That
   keeps the bundled UI's event panel working out of the box; on a shared
   server it means anyone can move the prices until the variable is set.
-* **A halt stops orders, not the world** (§14.12). The simulator keeps moving
-  the reference while a symbol is halted, so it reopens gapped. A real halt
-  freezes the print; matching that would need the crate to advance a
-  simulator's clock without generating ticks.
+* **A halt stops orders, not the world** (§14.12). The book is frozen and
+  nothing matches, but the simulator keeps moving the reference, so a symbol
+  reopens gapped and the reopening print is a plain requote rather than the
+  auction a real venue would run.
 * **An amendment is a cancel and a fresh order** (§14.10). It loses queue
   position, which a real in-place amend of quantity-down would not, and if the
   replacement cannot be placed — no cash, no shares, a halt in between — the
   original is already gone.
-* **API keys are held as keys, not hashes** (§14.11). Nothing is persisted
-  except the save file, which carries them in the clear; a deployment that
-  keeps that file anywhere but a private disk wants them hashed first.
 * **The stream takes its key in the query string**, because `EventSource`
   cannot set headers. Keys can therefore reach access logs.
-* **A restore trusts the file.** The version and the symbol list are checked;
-  the balances, positions and ids inside are not re-validated against each
-  other, so a hand-edited save can produce a market that `Account::issues`
-  would have refused to create.
+* **Restore validation covers accounting and identities.** The file reader
+  checks nonzero unique user/account/trader/event ids and counters beyond
+  retained ids, one well-formed key digest per user, then runs market-wide
+  reconciliation before accepting a snapshot. Inconsistent balances, retained
+  ledgers, ownership, reservations and share supply are refused. This is not
+  a complete validator for the simulator or historical order records; those
+  remain further work. Book validation checks nonempty price levels, valid
+  quantities, uncrossed sides, FIFO id ordering, unique ids below the next
+  counter and an exact match between the index and resting orders. The
+  low-level `App::restore` constructor expects an already validated snapshot
+  from `save::read`.
 

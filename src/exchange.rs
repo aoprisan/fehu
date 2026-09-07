@@ -23,8 +23,8 @@ use rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
 
 use crate::book::{
-    CancelError, Order, OrderBook, OrderError, OrderId, OrderKind, Owner, Party, Placement,
-    Preview, Resting, Side, TimeInForce, Trade, TraderId, notional,
+    CancelError, MarketRules, Order, OrderBook, OrderError, OrderId, OrderKind, Owner, Party,
+    Placement, Preview, Resting, Side, TimeInForce, Trade, TraderId, notional,
 };
 use crate::config::{Config, ConfigError, check_finite, check_range};
 use crate::event::{Event, EventKind};
@@ -135,11 +135,27 @@ pub struct TradingParams {
     pub flow: FlowParams,
     /// Traders' price impact.
     pub impact: ImpactParams,
+    /// What the symbol quotes and trades in. The synthetic ladder and prints
+    /// obey these too, so a book with a five-cent tick has five-cent levels.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub rules: MarketRules,
 }
 
 impl TradingParams {
     /// Check every field against its documented range.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=1_000_000).contains(&self.rules.tick_cents) {
+            return Err(ConfigError::OutOfRange {
+                field: "trading.rules.tick_cents",
+                reason: "must be in [1, 10^6]",
+            });
+        }
+        if !(1..=1_000_000).contains(&self.rules.lot) {
+            return Err(ConfigError::OutOfRange {
+                field: "trading.rules.lot",
+                reason: "must be in [1, 10^6]",
+            });
+        }
         let l = &self.liquidity;
         check_range(
             "trading.liquidity.half_spread",
@@ -299,11 +315,19 @@ impl Exchange {
     fn assemble(
         sim: Simulator,
         params: TradingParams,
-        book: OrderBook,
+        mut book: OrderBook,
         flow_rng: Xoshiro256PlusPlus,
         pending_flow: i64,
         interim_volume: u64,
     ) -> Self {
+        // The params are the truth; the book holds a copy so it can refuse an
+        // order without asking. Setting it here covers both a fresh exchange
+        // and one read back from a save.
+        book.set_rules(params.rules);
+        // A book from a file written before icebergs has no queue priority
+        // of its own; back then priority was the id, so the ids are the
+        // seeds. A book that has one is left alone.
+        book.seed_priority();
         let cfg = sim.config();
         let days = cfg
             .market_hours
@@ -369,6 +393,12 @@ impl Exchange {
         &self.book
     }
 
+    /// Skip unused order ids below `minimum`, without changing liquidity or
+    /// the price process. Used to coordinate trader ids across exchanges.
+    pub fn advance_order_id(&mut self, minimum: OrderId) {
+        self.book.advance_order_id(minimum);
+    }
+
     /// Wall time the exchange has been advanced to.
     #[must_use]
     pub fn clock(&self) -> Timestamp {
@@ -399,14 +429,19 @@ impl Exchange {
         if order.owner == Owner::Synthetic {
             return Err(OrderError::SyntheticOwner);
         }
-        OrderBook::validate(&order)?;
+        self.book.validate(&order)?;
         let order = match order.kind {
             OrderKind::Market => {
                 let collar = self.params.liquidity.market_collar;
                 let r = self.reference_cents as f64;
+                // Rounded *into* the collar, not out of it: the far side's
+                // quotes sit on the tick grid, so a buy limit rounded down
+                // still reaches every ask the collar allowed, and rounding it
+                // up would allow one it did not.
+                let rules = self.params.rules;
                 let price_cents = match order.side {
-                    Side::Buy => libm::ceil(r * (1.0 + collar)) as i64,
-                    Side::Sell => libm::floor(r * (1.0 - collar)) as i64,
+                    Side::Buy => rules.floor_price(libm::ceil(r * (1.0 + collar)) as i64),
+                    Side::Sell => rules.ceil_price(libm::floor(r * (1.0 - collar)) as i64),
                 }
                 .clamp(1, crate::book::MAX_PRICE_CENTS);
                 let tif = match order.tif {
@@ -422,6 +457,35 @@ impl Exchange {
             OrderKind::Limit { .. } => order,
         };
         let placement = self.book.submit(order, self.sim.clock())?;
+        self.account(&placement.trades);
+        for t in &placement.trades {
+            self.interim_volume = self.interim_volume.saturating_add(t.qty);
+        }
+        Ok(placement)
+    }
+
+    /// Submit a trader's iceberg: a `Gtc` limit order that shows
+    /// `display_qty` at a time and posts the next slice, at the back of the
+    /// queue for its price, as each one fills.
+    ///
+    /// It still takes with its whole quantity on arrival. Only what rests is
+    /// sliced, and only what is on show ever appears in the depth, the
+    /// preview or the quantity a fill-or-kill measures itself against.
+    ///
+    /// # Errors
+    /// See [`OrderError`]. Synthetic owners are rejected.
+    pub fn submit_iceberg(
+        &mut self,
+        order: Order,
+        display_qty: u64,
+    ) -> Result<Placement, OrderError> {
+        if order.owner == Owner::Synthetic {
+            return Err(OrderError::SyntheticOwner);
+        }
+        self.book.validate(&order)?;
+        let placement = self
+            .book
+            .submit_iceberg(order, display_qty, self.sim.clock())?;
         self.account(&placement.trades);
         for t in &placement.trades {
             self.interim_volume = self.interim_volume.saturating_add(t.qty);
@@ -452,9 +516,10 @@ impl Exchange {
     pub fn preview_market(&self, side: Side, qty: u64) -> Preview {
         let collar = self.params.liquidity.market_collar;
         let r = self.reference_cents as f64;
+        let rules = self.params.rules;
         let limit = match side {
-            Side::Buy => libm::ceil(r * (1.0 + collar)) as i64,
-            Side::Sell => libm::floor(r * (1.0 - collar)) as i64,
+            Side::Buy => rules.floor_price(libm::ceil(r * (1.0 + collar)) as i64),
+            Side::Sell => rules.ceil_price(libm::floor(r * (1.0 - collar)) as i64),
         };
         self.book.preview(side, qty, Some(limit))
     }
@@ -469,6 +534,32 @@ impl Exchange {
                 // requested wall time so a partial tick is not lost.
                 self.sim.set_clock(target);
                 r
+            })
+        })
+    }
+
+    /// Advance the reference process without matching or requoting the book.
+    /// Resting orders and their queue positions remain unchanged. Tick volume
+    /// includes only executions already submitted before this advance.
+    /// Call [`resync`](Self::resync) and settle its returned trades when
+    /// matching resumes, before accepting new orders against the old quotes.
+    pub fn advance_without_matching(
+        &mut self,
+        dur: Duration,
+    ) -> impl Iterator<Item = StepReport> + '_ {
+        let target = self.sim.clock() + dur;
+        core::iter::from_fn(move || {
+            (self.sim.next_tick_ts() <= target).then(|| {
+                let impact = self.apply_impact();
+                let tick = self.sim.step();
+                self.reference_cents = tick.price_cents;
+                let volume = core::mem::take(&mut self.interim_volume);
+                self.sim.set_clock(target);
+                StepReport {
+                    tick: Tick { volume, ..tick },
+                    trades: Vec::new(),
+                    impact,
+                }
             })
         })
     }
@@ -565,6 +656,7 @@ impl Exchange {
             weights.push(w);
             total += w;
         }
+        let rules = self.params.rules;
         let mut left = v;
         for (k, w) in weights.iter().enumerate() {
             let qty = if k + 1 == n {
@@ -574,6 +666,9 @@ impl Exchange {
                 let q = if q < 1.0 { 1 } else { q as u64 };
                 q.min(left)
             };
+            // Prints are trades at this venue, so they are in lots too.
+            // Whatever is left over below one lot goes unprinted.
+            let qty = rules.floor_qty(qty);
             let side = if math::uniform(&mut self.flow_rng) < p_buy {
                 Side::Buy
             } else {
@@ -631,9 +726,15 @@ impl Exchange {
             1.0
         };
         let hs = l.half_spread * regime;
-        let bid1 = (libm::floor(rf * (1.0 - hs)) as i64).min(r - 1);
-        let ask1 = (libm::ceil(rf * (1.0 + hs)) as i64).max(r + 1);
-        let step = (round(rf * l.level_step) as i64).max(1);
+        // The ladder is quoted on the tick grid, away from the reference on
+        // both sides, so the spread a tick rule produces is never tighter
+        // than the model asked for.
+        let rules = self.params.rules;
+        let bid1 = rules.floor_price((libm::floor(rf * (1.0 - hs)) as i64).min(r - 1));
+        let ask1 = rules.ceil_price((libm::ceil(rf * (1.0 + hs)) as i64).max(r + 1));
+        let step = rules
+            .ceil_price((round(rf * l.level_step) as i64).max(1))
+            .max(rules.tick_cents);
         let touch = l.touch_depth * cfg.volume.base_per_day;
         let ts = self.sim.clock();
         let mut growth = 1.0;
@@ -649,6 +750,9 @@ impl Exchange {
                 } else {
                     qty as u64
                 };
+                // Whole lots, and at least one: a level too small to be a
+                // lot is quoted as one rather than left empty.
+                let qty = rules.floor_qty(qty).max(rules.lot);
                 let price = match side {
                     Side::Buy => bid1 - offset,
                     Side::Sell => ask1.saturating_add(offset),

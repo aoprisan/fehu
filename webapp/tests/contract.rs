@@ -24,6 +24,8 @@ fn test_app() -> Arc<App> {
         history_days: 2,
         warmup_hours: 1,
         now_ms: Some(NOW_MS),
+        // Shapes, not timing: the limiter has its own tests.
+        rate_per_sec: 0.0,
         ..Options::default()
     })
 }
@@ -339,11 +341,40 @@ async fn trading_shapes() {
         "unrealised_pnl_cents",
         "positions",
         "open_orders",
+        "stops",
         "fills",
         "api_key",
     ];
     assert_keys("PortfolioDto", &trader, &portfolio_keys);
     let id = trader["id"].as_u64().unwrap();
+
+    // A stop is its own shape: a trigger, not an order.
+    let price = get(&app, "/api/symbols/ACME/book").await["reference_cents"]
+        .as_i64()
+        .unwrap();
+    let stop = post_as(
+        &app,
+        key,
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "stop_price_cents": price * 2 }),
+    )
+    .await;
+    assert_keys(
+        "StopOrder",
+        &stop,
+        &[
+            "stop_id",
+            "trader_id",
+            "symbol",
+            "side",
+            "qty",
+            "stop_price_cents",
+            "limit_price_cents",
+            "tif",
+            "client_order_id",
+            "created_at_ms",
+        ],
+    );
 
     // A market buy fills against the synthetic ladder, giving a position,
     // a fill and prints on the tape.
@@ -426,6 +457,8 @@ async fn trading_shapes() {
             "price_cents",
             "qty",
             "remaining",
+            "display_qty",
+            "shown_qty",
             "ts_ms",
         ],
     );
@@ -443,6 +476,7 @@ async fn trading_shapes() {
             "price_cents",
             "liquidity",
             "counterparty",
+            "fee_cents",
         ],
     );
 
@@ -499,6 +533,7 @@ async fn trading_shapes() {
             "avg_price_cents",
             "submitted_at_ms",
             "updated_at_ms",
+            "expires_at_ms",
         ],
     );
     assert_eq!(records[0]["status"], "resting", "OrderStatus is lower-case");
@@ -671,19 +706,34 @@ async fn account_shapes() {
 async fn stream_message_shapes() {
     let app = test_app();
 
-    // `hello` is built by the SSE handler from the same pieces.
-    let hello = serde_json::to_value(StreamMessage::Hello {
-        sim_now_ms: NOW_MS,
-        time_scale: 1.0,
-        quotes: Vec::new(),
+    // `hello` is built by the SSE handler from the same pieces, and every
+    // message goes out inside the envelope that numbers it.
+    let hello = serde_json::to_value(fehu_webapp::market::Sequenced {
+        seq: 7,
+        message: StreamMessage::Hello {
+            sim_now_ms: NOW_MS,
+            time_scale: 1.0,
+            quotes: Vec::new(),
+            oldest_seq: 1,
+            gap: false,
+        },
     })
     .unwrap();
     assert_keys(
         "HelloMessage",
         &hello,
-        &["type", "sim_now_ms", "time_scale", "quotes"],
+        &[
+            "seq",
+            "type",
+            "sim_now_ms",
+            "time_scale",
+            "quotes",
+            "oldest_seq",
+            "gap",
+        ],
     );
     assert_eq!(hello["type"], "hello");
+    assert_eq!(hello["seq"], 7, "the envelope numbers every message");
 
     // Drive one engine step and capture what the stream would carry.
     let mut rx = app.tx.subscribe();
@@ -691,13 +741,18 @@ async fn stream_message_shapes() {
     engine::advance_to(&app, target);
 
     let mut saw_tick = false;
+    let mut last_seq = 0;
     while let Ok(message) = rx.try_recv() {
         let value = serde_json::to_value(&message).unwrap();
-        if value["type"] == "tick" {
+        let seq = value["seq"].as_u64().expect("every message is numbered");
+        assert!(seq > last_seq, "sequence numbers only go up: {value}");
+        last_seq = seq;
+        if value["type"] == "tick" && !saw_tick {
             assert_keys(
                 "TickMessage",
                 &value,
                 &[
+                    "seq",
                     "type",
                     "symbol",
                     "ts_ms",
@@ -712,7 +767,6 @@ async fn stream_message_shapes() {
             );
             assert_keys("BookDto", &value["book"], &["bids", "asks"]);
             saw_tick = true;
-            break;
         }
     }
     assert!(saw_tick, "the engine step published no tick to check");
@@ -743,6 +797,73 @@ async fn stream_message_shapes() {
         ],
     );
     assert_eq!(status["type"], "status");
+
+    // `stop_triggered` carries the trigger and whatever it became.
+    let triggered = serde_json::to_value(StreamMessage::StopTriggered {
+        trader_id: 1,
+        stop: fehu_webapp::trading::StopOrder {
+            stop_id: 1,
+            trader_id: 1,
+            symbol: "ACME",
+            side: fehu::Side::Buy,
+            qty: 1,
+            stop_price_cents: 100,
+            limit_price_cents: None,
+            tif: fehu::TimeInForce::Gtc,
+            client_order_id: None,
+            created_at_ms: NOW_MS,
+        },
+        price_cents: 101,
+        order: None,
+        refused: Some("insufficient funds".into()),
+    })
+    .unwrap();
+    assert_keys(
+        "StopTriggeredMessage",
+        &triggered,
+        &[
+            "type",
+            "trader_id",
+            "stop",
+            "price_cents",
+            "order",
+            "refused",
+        ],
+    );
+    assert_eq!(triggered["type"], "stop_triggered");
+
+    // `order_expired` carries the record of the order the clock took away.
+    let owner = post(&app, "/api/traders", json!({ "name": "expiry" })).await;
+    let owner_key = api_key_of(&owner);
+    let owner_id = owner["id"].as_u64().unwrap();
+    let bid = get(&app, "/api/symbols/ACME/book").await["bid_cents"]
+        .as_i64()
+        .unwrap();
+    post_as(
+        &app,
+        Some(owner_key.as_str()),
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": owner_id, "side": "buy", "qty": 1, "type": "limit",
+                "price_cents": bid / 2 }),
+    )
+    .await;
+    let record = app
+        .market()
+        .orders_of(fehu::TraderId(owner_id))
+        .next()
+        .expect("the order is in the log")
+        .clone();
+    let expired = serde_json::to_value(StreamMessage::OrderExpired {
+        trader_id: owner_id,
+        order: record,
+    })
+    .unwrap();
+    assert_keys(
+        "OrderExpiredMessage",
+        &expired,
+        &["type", "trader_id", "order"],
+    );
+    assert_eq!(expired["type"], "order_expired");
 
     // `event` flattens the record next to the tag.
     let record = post(
@@ -808,4 +929,23 @@ async fn ui_assets_are_served() {
             "index.html does not reference {asset} — rebuild with `just ui`",
         );
     }
+}
+
+#[tokio::test]
+async fn reconciliation_contract() {
+    let report = get(&test_app(), "/api/reconcile").await;
+    assert_keys(
+        "Reconciliation",
+        &report,
+        &[
+            "valid",
+            "accounts_checked",
+            "traders_checked",
+            "symbols_checked",
+            "resting_orders_checked",
+            "issues",
+        ],
+    );
+    assert_eq!(report["valid"], true);
+    assert!(report["issues"].as_array().unwrap().is_empty());
 }

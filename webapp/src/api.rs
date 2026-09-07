@@ -7,12 +7,13 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRequestParts, OptionalFromRequestParts, Path, Query, State};
+use axum::extract::{FromRequestParts, OptionalFromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use fehu::{Candle, Config, Interval, Order, OrderKind, Owner, TraderId};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::BroadcastStream;
@@ -28,14 +29,15 @@ use crate::events::{
     CatalogEntry, EventRecord, GameEventKind, GameEventRequest, MAX_MAGNITUDE, Prepared,
     PushEventRequest, Scope, SimEvent,
 };
+use crate::limit::Decision;
 use crate::market::{
-    App, Closed, Market, Quote, SnapshotDto, StreamMessage, SymbolInfo, SymbolState, SymbolStatus,
-    wall_now_ms,
+    App, Closed, Market, PlaceError, Quote, Sequenced, SnapshotDto, StreamMessage, Subscription,
+    SymbolInfo, SymbolState, SymbolStatus, wall_now_ms,
 };
 use crate::trading::{
-    AmendRequest, AmendResponse, BookDto, CreateTraderRequest, FillRecord, HolderDto,
-    MAX_CLIENT_ORDER_ID, OpenOrderDto, OrderRecord, OrderRequest, OrderResponse, PortfolioDto,
-    PositionDto, Refused, TradeDto, TraderSummary, UserHoldingsResponse,
+    AmendRequest, AmendResponse, BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID,
+    OpenOrderDto, OrderRecord, OrderRequest, OrderResponse, PortfolioDto, PositionDto, Refused,
+    StopOrder, StopRequest, TradeDto, TraderSummary, UserHoldingsResponse,
 };
 
 type AppState = Arc<App>;
@@ -55,6 +57,7 @@ pub fn router(app: AppState) -> Router {
         .route("/assets/app.js", get(app_js))
         .route("/assets/app.css", get(app_css))
         .route("/api/health", get(health))
+        .route("/api/reconcile", get(reconcile))
         .route("/api/symbols", get(list_symbols))
         .route("/api/symbols/{symbol}", get(get_symbol))
         .route("/api/symbols/{symbol}/bars", get(get_bars))
@@ -63,6 +66,7 @@ pub fn router(app: AppState) -> Router {
             get(list_symbol_events).post(push_sim_event),
         )
         .route("/api/symbols/{symbol}/shares", get(get_shares))
+        .route("/api/symbols/{symbol}/dividend", post(pay_dividend))
         .route("/api/symbols/{symbol}/status", get(get_status))
         .route("/api/symbols/{symbol}/halt", post(halt_symbol))
         .route("/api/symbols/{symbol}/resume", post(resume_symbol))
@@ -76,9 +80,15 @@ pub fn router(app: AppState) -> Router {
             "/api/symbols/{symbol}/orders/{order_id}",
             get(get_order).patch(amend_order).delete(cancel_order),
         )
+        .route(
+            "/api/symbols/{symbol}/stops",
+            get(list_stops).post(submit_stop),
+        )
+        .route("/api/symbols/{symbol}/stops/{stop_id}", delete(cancel_stop))
         .route("/api/traders", get(list_traders).post(create_trader))
         .route("/api/traders/{trader_id}", get(get_trader))
         .route("/api/traders/{trader_id}/orders", get(list_trader_orders))
+        .route("/api/traders/{trader_id}/stops", get(list_trader_stops))
         .route("/api/orders/{order_id}", get(get_order_record))
         .route("/api/traders/{trader_id}/cancel_all", post(cancel_all))
         .route("/api/traders/{trader_id}/deposit", post(trader_deposit))
@@ -100,9 +110,51 @@ pub fn router(app: AppState) -> Router {
         .route("/api/game/events", get(list_events).post(push_game_event))
         .route("/api/events", get(list_events))
         .route("/api/stream", get(stream))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&app),
+            rate_limit_writes,
+        ))
+        .layer(middleware::from_fn_with_state(Arc::clone(&app), count))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(app)
+}
+
+/// Time every request and count how it ended.
+///
+/// Outermost, so it sees what the client saw — the rate limiter's refusals
+/// included, which is the point: a server turning requests away is exactly
+/// what `/api/health` should be able to say.
+async fn count(State(app): State<AppState>, request: Request, next: Next) -> Response {
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    app.metrics
+        .request(started.elapsed(), response.status().as_u16());
+    response
+}
+
+/// Refuse a client that is changing the market faster than
+/// `FEHU_RATE_PER_SEC` allows.
+///
+/// Only unsafe methods are counted. Reads are cheap, idempotent and mostly
+/// public; what is worth protecting is the one market lock every order goes
+/// through, and a client that can open sockets faster than it can be told to
+/// stop.
+async fn rate_limit_writes(
+    State(app): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if request.method().is_safe() {
+        return Ok(next.run(request).await);
+    }
+    // Whoever the key says, or nobody — an unknown key shares the anonymous
+    // bucket, and the handler is left to refuse it properly.
+    let who = api_key_of_headers(request.headers()).and_then(|key| app.market().keys.user_of(&key));
+    match app.allow(who) {
+        Decision::Allowed => Ok(next.run(request).await),
+        Decision::Limited { retry_after } => Err(ApiError::rate_limited(retry_after)),
+    }
 }
 
 /// JSON error body: `{"error": {"code": ..., "message": ...}}`.
@@ -111,6 +163,8 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    /// Seconds for a `Retry-After` header, when the answer is "later".
+    retry_after_secs: Option<u64>,
 }
 
 impl ApiError {
@@ -119,6 +173,25 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    /// The client is changing things faster than the server will take.
+    fn rate_limited(retry_after: std::time::Duration) -> Self {
+        // Never advise waiting zero seconds: a client that obeys it would
+        // spin. The bucket refills continuously, so a second is honest.
+        let secs = retry_after.as_secs_f64().ceil().max(1.0) as u64;
+        Self {
+            retry_after_secs: Some(secs),
+            ..Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                format!(
+                    "too many requests: this server takes changes at \
+                     `FEHU_RATE_PER_SEC`. Try again in {secs}s"
+                ),
+            )
         }
     }
 
@@ -155,6 +228,14 @@ impl ApiError {
             StatusCode::NOT_FOUND,
             "unknown_order",
             format!("no resting order {id} (it may have filled or been cancelled)"),
+        )
+    }
+
+    fn unknown_stop(id: u64) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "unknown_stop",
+            format!("no stop {id} is being held for that trader (it may have fired)"),
         )
     }
 
@@ -196,6 +277,15 @@ impl ApiError {
                  which asked for something else"
             ),
         )
+    }
+
+    /// A submission the market would not place.
+    fn place(e: PlaceError) -> Self {
+        match e {
+            PlaceError::Refused(e) => Self::refused(e),
+            PlaceError::UnknownTrader(id) => Self::unknown_trader(id),
+            PlaceError::Invalid(message) => Self::invalid_order(message),
+        }
     }
 
     /// An order the trader's account would not fund.
@@ -288,21 +378,32 @@ impl IntoResponse for ApiError {
         let body = serde_json::json!({
             "error": { "code": self.code, "message": self.message }
         });
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        if let Some(secs) = self.retry_after_secs
+            && let Ok(value) = secs.to_string().parse()
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 
 /// The API key on a request: `Authorization: Bearer <key>`, or `X-Api-Key`.
 fn api_key_of(parts: &Parts) -> Option<String> {
-    let bearer = parts
-        .headers
+    api_key_of_headers(&parts.headers)
+}
+
+/// The API key a request carries, as `Authorization: Bearer <key>` or
+/// `X-Api-Key`.
+fn api_key_of_headers(headers: &HeaderMap) -> Option<String> {
+    let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| {
             let (scheme, key) = v.split_once(' ')?;
             scheme.eq_ignore_ascii_case("bearer").then_some(key)
         });
-    let key = bearer.or_else(|| parts.headers.get("x-api-key").and_then(|v| v.to_str().ok()))?;
+    let key = bearer.or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))?;
     let key = key.trim();
     (!key.is_empty()).then(|| key.to_owned())
 }
@@ -461,6 +562,29 @@ struct Health {
     cash_cents: i64,
     /// Traders' orders resting across every book.
     resting_orders: usize,
+    /// Stops held across every symbol, waiting for a price.
+    stops_held: usize,
+    /// Orders sent to a book since start-up, and submissions turned away
+    /// before they got there.
+    orders_placed: u64,
+    orders_refused: u64,
+    /// Fills booked to traders' accounts since start-up.
+    fills_booked: u64,
+    /// Messages published to the stream since start-up.
+    stream_messages: u64,
+    /// Streams currently connected.
+    stream_subscribers: usize,
+    /// Clients whose rate-limit allowance is being tracked.
+    tracked_clients: usize,
+    /// Request and engine-step timings since start-up.
+    metrics: crate::metrics::MetricsDto,
+}
+
+async fn reconcile(
+    State(app): State<AppState>,
+    _admin: Admin,
+) -> Json<crate::reconcile::Reconciliation> {
+    Json(app.market().reconcile())
 }
 
 async fn health(State(app): State<AppState>) -> Json<Health> {
@@ -493,6 +617,14 @@ async fn health(State(app): State<AppState>) -> Json<Health> {
                     .count()
             })
             .sum(),
+        stops_held: market.symbols.iter().map(|s| s.stops.len()).sum(),
+        orders_placed: market.orders_placed,
+        orders_refused: market.orders_refused,
+        fills_booked: market.fills_booked,
+        stream_messages: app.published(),
+        stream_subscribers: app.tx.receiver_count(),
+        tracked_clients: app.tracked_clients(),
+        metrics: app.metrics.snapshot(),
     })
 }
 
@@ -619,7 +751,7 @@ async fn halt_symbol(
         .halt(idx, now)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
     tracing::info!(symbol = status.symbol, "trading halted");
-    let _ = app.tx.send(StreamMessage::Status(status));
+    app.publish(StreamMessage::Status(status));
     Ok(Json(status))
 }
 
@@ -634,11 +766,17 @@ async fn resume_symbol(
     let idx = market
         .symbol_index(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
-    let status = market
+    let (status, fills) = market
         .resume(idx, now)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
     tracing::info!(symbol = status.symbol, "trading resumed");
-    let _ = app.tx.send(StreamMessage::Status(status));
+    app.publish(StreamMessage::Status(status));
+    for fill in fills {
+        app.publish(StreamMessage::Fill {
+            trader_id: fill.trader_id,
+            fill,
+        });
+    }
     Ok(Json(status))
 }
 
@@ -795,7 +933,7 @@ async fn push_sim_event(
         })
     };
     tracing::info!(id = record.id, symbol = %symbol, kind = %record.kind, "event accepted");
-    let _ = app.tx.send(StreamMessage::Event(record.clone()));
+    app.publish(StreamMessage::Event(record.clone()));
     Ok((StatusCode::ACCEPTED, Json(record)))
 }
 
@@ -874,7 +1012,7 @@ async fn push_game_event(
         })
     };
     tracing::info!(id = record.id, symbols = ?record.symbols, kind = %record.kind, magnitude, "game event accepted");
-    let _ = app.tx.send(StreamMessage::Event(record.clone()));
+    app.publish(StreamMessage::Event(record.clone()));
     Ok((StatusCode::ACCEPTED, Json(record)))
 }
 
@@ -1021,7 +1159,7 @@ async fn create_trader(
     let mut dto = portfolio(&market, id)?;
     if req.user_id.is_none() {
         // A new user was created for the trader: hand over their key, once.
-        dto.api_key = market.keys.key_of(UserId(dto.user_id)).map(str::to_owned);
+        dto.api_key = market.keys.take_issued_key(UserId(dto.user_id));
     }
     tracing::info!(
         trader = dto.id,
@@ -1165,6 +1303,7 @@ fn portfolio(market: &Market, id: TraderId) -> Result<PortfolioDto, ApiError> {
         unrealised_pnl_cents: unrealised,
         positions,
         open_orders,
+        stops: market.stops_of(t.id).cloned().collect(),
         fills: t.fills.iter().rev().cloned().collect(),
         // Only the response that creates a user carries their key.
         api_key: None,
@@ -1186,8 +1325,8 @@ async fn submit_order(
         tif: req.tif,
         qty: req.qty,
     };
-    fehu::OrderBook::validate(&order).map_err(|e| ApiError::invalid_order(e.to_string()))?;
     let client_order_id = clean_client_order_id(req.client_order_id)?;
+    let (day, expires_at_ms, display_qty) = (req.day, req.expires_at_ms, req.display_qty);
 
     let (response, fills, replayed) = {
         let mut market = app.market();
@@ -1195,6 +1334,13 @@ async fn submit_order(
             .symbol_index(&symbol)
             .ok_or_else(|| ApiError::not_found(&symbol))?;
         owned_trader(&market, caller, trader)?;
+        // Validated against this symbol's own book: the tick and lot are a
+        // property of the listing, not of orders in general.
+        market.symbols[idx]
+            .exchange
+            .book()
+            .validate(&order)
+            .map_err(|e| ApiError::invalid_order(e.to_string()))?;
         let sym = market.symbols[idx].info.symbol;
         // A closed session or a halt takes no new orders at all.
         if let Some(closed) = market.symbols[idx].closed(app.clock.now()) {
@@ -1207,6 +1353,7 @@ async fn submit_order(
         if !crossing.is_empty() {
             return Err(ApiError::self_trade(&crossing));
         }
+        let expires_at_ms = expiry_of(&market.symbols[idx], day, expires_at_ms, app.clock.now())?;
         // The same order sent twice — a retry after a timeout, say — is
         // placed once: the first response is replayed, and a re-used id that
         // asks for something else is refused rather than quietly obeyed.
@@ -1221,7 +1368,16 @@ async fn submit_order(
             };
             (accepted, Vec::new(), true)
         } else {
-            let (response, fills) = place_order(&mut market, idx, trader, order, client_order_id)?;
+            let (response, fills) = market
+                .place_full(
+                    idx,
+                    trader,
+                    order,
+                    client_order_id,
+                    expires_at_ms,
+                    display_qty,
+                )
+                .map_err(ApiError::place)?;
             (response, fills, false)
         }
     };
@@ -1240,7 +1396,7 @@ async fn submit_order(
         "order"
     );
     for fill in fills {
-        let _ = app.tx.send(StreamMessage::Fill {
+        app.publish(StreamMessage::Fill {
             trader_id: fill.trader_id,
             fill,
         });
@@ -1253,74 +1409,231 @@ struct TraderQuery {
     trader_id: u64,
 }
 
-/// Send a validated order to the exchange and book everything that follows:
-/// the money check, the share checks, the fills, the reservation of what
-/// rests, and the order log. The caller holds the market lock and has already
-/// established who the trader is and that the symbol is open to them.
-fn place_order(
-    market: &mut Market,
-    idx: usize,
-    trader: TraderId,
-    order: Order,
-    client_order_id: Option<String>,
-) -> Result<(OrderResponse, Vec<FillRecord>), ApiError> {
-    let sym = market.symbols[idx].info.symbol;
-    // Worst-case cash a buy can consume.
-    let cost = match order.kind {
-        OrderKind::Limit { price_cents } => {
-            i64::try_from(i128::from(price_cents) * i128::from(order.qty)).unwrap_or(i64::MAX)
+/// Body of `POST /api/symbols/{symbol}/dividend`.
+#[derive(Deserialize)]
+struct DividendRequest {
+    /// Paid on every share held, in cents. Must be positive and below the
+    /// price: a company cannot pay out more than it is worth.
+    cents_per_share: i64,
+    note: Option<String>,
+    source: Option<String>,
+}
+
+/// Declare a dividend: pay every holder, and take the price ex.
+///
+/// The money and the price move together. Paying without the price falling
+/// would be money from nothing — hold over the record, collect, sell — so the
+/// reference and the fundamental both drop by the dividend. The shares
+/// themselves are untouched: nothing is created or destroyed.
+async fn pay_dividend(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    _admin: Admin,
+    payload: Result<Json<DividendRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<DividendResponse>), ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let now = app.clock.now();
+    let (paid, record) = {
+        let mut market = app.market();
+        let idx = market
+            .symbol_index(&symbol)
+            .ok_or_else(|| ApiError::not_found(&symbol))?;
+        let price = market.symbols[idx].price_cents();
+        let paid = market
+            .pay_dividend(idx, req.cents_per_share, req.note.clone(), now.0)
+            .ok_or_else(|| {
+                ApiError::invalid_event(format!(
+                    "a dividend must be between 1 and {} cents a share, one less than the \
+                     price it is declared against",
+                    price - 1
+                ))
+            })?;
+        // Going ex: the price drops by the dividend, and so does what the
+        // price reverts to, or the market would simply pay it back.
+        let ratio = paid.cents_per_share as f64 / paid.price_cents as f64;
+        let effects = vec![
+            SimEvent::Jump { pct: -ratio },
+            SimEvent::FundamentalShift {
+                delta: (1.0 - ratio).ln(),
+            },
+        ];
+        let symbols = market.symbols[idx].info.symbol;
+        for event in &effects {
+            let prepared = event
+                .prepare()
+                .map_err(|e| ApiError::invalid_event(e.to_string()))?;
+            prepared
+                .apply(market.symbols[idx].exchange.simulator_mut(), now)
+                .map_err(|e| ApiError::invalid_event(e.to_string()))?;
         }
-        OrderKind::Market => {
-            market.symbols[idx]
-                .exchange
-                .preview_market(order.side, order.qty)
-                .notional_cents
-        }
+        let record = market.record(EventRecord {
+            id: 0,
+            received_at_ms: wall_now_ms(),
+            at_ms: now.0,
+            symbols: vec![symbols],
+            kind: "corporate:dividend".into(),
+            source: req.source.unwrap_or_else(|| "api".into()),
+            note: req.note,
+            magnitude: Some(paid.cents_per_share as f64 / 100.0),
+            effects,
+            summary: vec![format!(
+                "dividend of {} cents a share on {} shares, {} cents to {} account(s)",
+                paid.cents_per_share, paid.shares_paid, paid.total_cents, paid.accounts_paid
+            )],
+        });
+        (paid, record)
     };
-    // A symbol has a fixed number of shares: a buy can only be filled from the
-    // ones no trader holds or is already bidding for.
-    if order.side == fehu::Side::Buy {
-        let available = market.available_shares(sym);
-        if order.qty > available {
-            return Err(ApiError::refused(Refused::SupplyExhausted {
-                needed: order.qty,
-                available,
-            }));
-        }
-    }
-    // Validate the order against the account that would fund it: it must be
-    // active, a buy must have the cash available, and a sell the shares —
-    // nothing may be sold that the trader does not hold.
-    let account = market
-        .account_of(trader)
-        .ok_or_else(|| ApiError::unknown_trader(trader.0))?;
-    market.traders[&trader]
-        .check(account, sym, order.side, order.qty, cost)
-        .map_err(ApiError::refused)?;
-    let placement = market.symbols[idx]
-        .exchange
-        .submit(order)
-        .map_err(|e| ApiError::invalid_order(e.to_string()))?;
-    market.symbols[idx].record_trades(&placement.trades);
-    let fills = market.apply_trades(sym, &placement.trades);
-    if placement.status == fehu::OrderStatus::Resting
-        && let OrderKind::Limit { price_cents } = order.kind
-        && let Some((t, account)) = market.trader_and_account(trader)
-    {
-        t.reserve(account, sym, order.side, placement.remaining, price_cents);
-    }
-    let response = OrderResponse::new(sym, trader, order.side, order.qty, &placement);
+    tracing::info!(
+        symbol = paid.symbol,
+        cents_per_share = paid.cents_per_share,
+        total_cents = paid.total_cents,
+        accounts = paid.accounts_paid,
+        "dividend paid"
+    );
+    app.publish(StreamMessage::Event(record.clone()));
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(DividendResponse {
+            dividend: paid,
+            event: record,
+        }),
+    ))
+}
+
+/// What a dividend paid, and the event it was recorded as.
+#[derive(Serialize)]
+struct DividendResponse {
+    dividend: crate::market::Dividend,
+    event: EventRecord,
+}
+
+/// Arm a stop: a trigger the engine watches, not an order in the book.
+///
+/// Unlike an order this is accepted while the symbol is halted or its session
+/// is closed — the trigger simply waits, and fires when trading resumes.
+async fn submit_stop(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    caller: Caller,
+    payload: Result<Json<StopRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<StopOrder>), ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let req = StopRequest {
+        client_order_id: clean_client_order_id(req.client_order_id)?,
+        ..req
+    };
+    let mut market = app.market();
+    let idx = market
+        .symbol_index(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    owned_trader(&market, caller, TraderId(req.trader_id))?;
     let now = market.symbols[idx].exchange.clock().0;
-    market.record_order(OrderRecord::new(
-        client_order_id,
-        trader,
-        sym,
-        &order,
-        &placement,
-        response.clone(),
-        now,
-    ));
-    Ok((response, fills))
+    let stop = market.place_stop(idx, &req, now).map_err(ApiError::place)?;
+    tracing::info!(
+        trader = stop.trader_id,
+        symbol = stop.symbol,
+        stop = stop.stop_id,
+        side = ?stop.side,
+        qty = stop.qty,
+        at = stop.stop_price_cents,
+        "stop armed"
+    );
+    Ok((StatusCode::CREATED, Json(stop)))
+}
+
+/// A trader's stops on one symbol. Stops are private: they say what a trader
+/// intends to do, which is nobody else's business.
+async fn list_stops(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    Query(q): Query<TraderQuery>,
+    caller: Caller,
+) -> Result<Json<Vec<StopOrder>>, ApiError> {
+    let market = app.market();
+    owned_trader(&market, caller, TraderId(q.trader_id))?;
+    let s = market
+        .symbol(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    Ok(Json(
+        s.stops
+            .iter()
+            .filter(|stop| stop.trader_id == q.trader_id)
+            .cloned()
+            .collect(),
+    ))
+}
+
+/// Every stop a trader holds, across all symbols.
+async fn list_trader_stops(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    caller: Caller,
+) -> Result<Json<Vec<StopOrder>>, ApiError> {
+    let market = app.market();
+    let trader = TraderId(trader_id);
+    owned_trader(&market, caller, trader)?;
+    Ok(Json(market.stops_of(trader).cloned().collect()))
+}
+
+/// Withdraw a stop before it fires.
+async fn cancel_stop(
+    State(app): State<AppState>,
+    Path((symbol, stop_id)): Path<(String, u64)>,
+    Query(q): Query<TraderQuery>,
+    caller: Caller,
+) -> Result<Json<StopOrder>, ApiError> {
+    let mut market = app.market();
+    market
+        .symbol_index(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    let trader = TraderId(q.trader_id);
+    owned_trader(&market, caller, trader)?;
+    let stop = market
+        .cancel_stop(stop_id, trader)
+        .ok_or_else(|| ApiError::unknown_stop(stop_id))?;
+    tracing::info!(
+        trader = stop.trader_id,
+        symbol = stop.symbol,
+        stop = stop.stop_id,
+        "stop cancelled"
+    );
+    Ok(Json(stop))
+}
+
+/// When a submission's resting remainder should be withdrawn, if ever.
+///
+/// `expires_at_ms` names the moment; `day` asks for the close of the session
+/// the order is sent in, which needs a trading calendar to have a close at
+/// all. Both are about the *resting* remainder: an order that trades on
+/// arrival has nothing left to expire.
+fn expiry_of(
+    s: &SymbolState,
+    day: bool,
+    expires_at_ms: Option<i64>,
+    now: fehu::Timestamp,
+) -> Result<Option<i64>, ApiError> {
+    if day && expires_at_ms.is_some() {
+        return Err(ApiError::invalid_order(
+            "an order is either a day order or expires at a time of its own, not both",
+        ));
+    }
+    if day {
+        return match s.next_close_ms(now) {
+            Some(close) => Ok(Some(close)),
+            None => Err(ApiError::invalid_order(
+                "a day order needs a trading calendar (FEHU_MARKET_HOURS): with none, \
+                 the session never closes and there is nothing to expire at",
+            )),
+        };
+    }
+    match expires_at_ms {
+        None => Ok(None),
+        Some(at) if at > now.0 => Ok(Some(at)),
+        Some(at) => Err(ApiError::invalid_order(format!(
+            "expires_at_ms {at} is not in the future (it is now {})",
+            now.0
+        ))),
+    }
 }
 
 /// The price an order can reach: its limit, or for a market order the collar
@@ -1537,9 +1850,13 @@ async fn amend_order(
                 price_cents: req.price_cents.unwrap_or(resting.price_cents),
             },
             tif: fehu::TimeInForce::Gtc,
-            qty: req.qty.unwrap_or(resting.remaining),
+            qty: req.qty.unwrap_or(resting.outstanding()),
         };
-        fehu::OrderBook::validate(&order).map_err(|e| ApiError::invalid_order(e.to_string()))?;
+        market.symbols[idx]
+            .exchange
+            .book()
+            .validate(&order)
+            .map_err(|e| ApiError::invalid_order(e.to_string()))?;
 
         // Withdraw the old one first: it would otherwise be in the way of its
         // own replacement, both as liquidity and as a reservation.
@@ -1553,11 +1870,11 @@ async fn amend_order(
                 account,
                 sym,
                 cancelled.side,
-                cancelled.remaining,
+                cancelled.outstanding(),
                 cancelled.price_cents,
             );
         }
-        market.cancel_order_record(order_id, cancelled.remaining, now);
+        market.cancel_order_record(sym, order_id, cancelled.outstanding(), now);
 
         if req.post_only {
             check_post_only(&market.symbols[idx], &order)?;
@@ -1566,11 +1883,13 @@ async fn amend_order(
         if !crossing.is_empty() {
             return Err(ApiError::self_trade(&crossing));
         }
-        let (response, fills) = place_order(&mut market, idx, trader, order, client_order_id)?;
+        let (response, fills) = market
+            .place(idx, trader, order, client_order_id)
+            .map_err(ApiError::place)?;
         (
             response,
             fills,
-            cancelled.qty.saturating_sub(cancelled.remaining),
+            cancelled.qty.saturating_sub(cancelled.outstanding()),
         )
     };
     tracing::info!(
@@ -1582,7 +1901,7 @@ async fn amend_order(
         "order amended"
     );
     for fill in fills {
-        let _ = app.tx.send(StreamMessage::Fill {
+        app.publish(StreamMessage::Fill {
             trader_id: fill.trader_id,
             fill,
         });
@@ -1622,12 +1941,12 @@ async fn cancel_order(
             account,
             sym,
             cancelled.side,
-            cancelled.remaining,
+            cancelled.outstanding(),
             cancelled.price_cents,
         );
     }
     let now = market.symbols[idx].exchange.clock().0;
-    market.cancel_order_record(order_id, cancelled.remaining, now);
+    market.cancel_order_record(sym, order_id, cancelled.outstanding(), now);
     tracing::info!(
         trader = trader.0,
         symbol = sym,
@@ -1652,12 +1971,12 @@ async fn cancel_all(
         let cancelled = market.symbols[i].exchange.cancel_all(trader);
         if let Some((t, account)) = market.trader_and_account(trader) {
             for o in &cancelled {
-                t.release(account, sym, o.side, o.remaining, o.price_cents);
+                t.release(account, sym, o.side, o.outstanding(), o.price_cents);
                 out.push(OpenOrderDto::from_resting(sym, o));
             }
         }
         for o in &cancelled {
-            market.cancel_order_record(o.id.0, o.remaining, now);
+            market.cancel_order_record(sym, o.id.0, o.outstanding(), now);
         }
     }
     Ok(Json(out))
@@ -1680,7 +1999,7 @@ async fn create_user(
     tracing::info!(user = id.0, "user created");
     let mut dto = user_dto(&market, id)?;
     // The one and only time the key is handed out.
-    dto.api_key = market.keys.key_of(id).map(str::to_owned);
+    dto.api_key = market.keys.take_issued_key(id);
     Ok((StatusCode::CREATED, Json(dto)))
 }
 
@@ -2004,19 +2323,30 @@ async fn catalog() -> Json<Vec<CatalogEntry>> {
 }
 
 /// Server-sent events: a `hello` with the current quotes, then every tick
-/// and every accepted event. Each message is JSON with a `type` field.
+/// and every accepted event. Each message is JSON with a `type` field and the
+/// `seq` it was published under.
 #[derive(Deserialize)]
 struct StreamQuery {
     /// `EventSource` cannot set headers, so the stream takes the key in the
     /// query string. Without one the stream carries market data only.
     api_key: Option<String>,
+    /// Resume after this sequence number: everything published since, as far
+    /// back as the replay buffer still reaches, arrives before the live feed.
+    /// `hello` reports `gap: true` when the buffer no longer goes that far.
+    since: Option<u64>,
 }
 
 async fn stream(
     State(app): State<AppState>,
     Query(q): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = app.tx.subscribe();
+    let Subscription {
+        rx,
+        seq,
+        oldest_seq,
+        replay,
+        gap,
+    } = app.subscribe(q.since);
     let (hello, viewer) = {
         let market = app.market();
         (
@@ -2024,28 +2354,46 @@ async fn stream(
                 sim_now_ms: app.clock.now().0,
                 time_scale: app.clock.scale,
                 quotes: market.symbols.iter().map(SymbolState::quote).collect(),
+                oldest_seq,
+                gap,
             },
             q.api_key.as_deref().and_then(|k| market.keys.user_of(k)),
         )
     };
     // Ticks and events are public; a fill belongs to the trader that made it,
-    // so it goes only to a stream that proved it speaks for that trader.
+    // so it goes only to a stream that proved it speaks for that trader. The
+    // replay buffer holds everybody's, so the same rule applies to it.
     let owner = Arc::clone(&app);
-    // A lagging client silently skips the messages it missed.
+    let visible = move |m: &StreamMessage| match m {
+        StreamMessage::Fill { trader_id, .. }
+        | StreamMessage::StopTriggered { trader_id, .. }
+        | StreamMessage::OrderExpired { trader_id, .. } => viewer.is_some_and(|user| {
+            owner
+                .market()
+                .traders
+                .get(&TraderId(*trader_id))
+                .is_some_and(|t| t.user_id == user)
+        }),
+        _ => true,
+    };
+    let mine = visible.clone();
+    // A gap ends this connection: the client reconnects with `?since=` and
+    // picks up where it left off. Never present later messages as an
+    // uninterrupted stream.
     let live = BroadcastStream::new(rx)
+        .take_while(Result::is_ok)
         .filter_map(Result::ok)
-        .filter(move |m| match m {
-            StreamMessage::Fill { trader_id, .. } => viewer.is_some_and(|user| {
-                owner
-                    .market()
-                    .traders
-                    .get(&TraderId(*trader_id))
-                    .is_some_and(|t| t.user_id == user)
-            }),
-            _ => true,
-        });
-    let all = tokio_stream::once(hello)
-        .chain(live)
-        .filter_map(|m| Event::default().json_data(&m).ok().map(Ok));
+        .filter(move |m| mine(&m.message));
+    let missed: Vec<Sequenced> = replay.into_iter().filter(|m| visible(&m.message)).collect();
+    // The `hello` carries the sequence the connection joins at, so the first
+    // live message a client sees is `seq + 1` — or, after a replay, the
+    // number the replay left off at.
+    let all = tokio_stream::once(Sequenced {
+        seq,
+        message: hello,
+    })
+    .chain(tokio_stream::iter(missed))
+    .chain(live)
+    .filter_map(|m| Event::default().json_data(&m).ok().map(Ok));
     Sse::new(all).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }

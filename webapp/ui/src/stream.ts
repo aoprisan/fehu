@@ -1,7 +1,12 @@
 /**
  * The SSE client. One `EventSource` carries every symbol's ticks, the
- * accepted events and this trader's fills; `EventSource` reconnects on its
- * own, and each reconnect replays a `hello`.
+ * accepted events and this trader's fills; each connection opens with a
+ * `hello` saying which sequence number it joins at.
+ *
+ * Every message is numbered, so a reconnect asks to resume with `?since=`
+ * and the server replays what was missed out of its bounded buffer. When it
+ * cannot reach back that far it says so (`gap`), and then — and only then —
+ * the snapshots are reloaded, because current state is all that is left.
  */
 
 import { currentApiKey } from './api.js';
@@ -13,11 +18,18 @@ import type { StreamMessage, TickMessage } from './types.js';
 /** How often, in simulated seconds, a tick may trigger a portfolio refresh. */
 const MARK_REFRESH_SECS = 5;
 
+/** How long to wait before reopening a stream that dropped. */
+const RECONNECT_MS = 1_000;
+
 export class MarketStream {
   readonly #store: Store;
   readonly #actions: Actions;
   #source: EventSource | null = null;
   #lastMarkRefresh = 0;
+  /** The last sequence number seen, resumed from on the next connection. */
+  #seq: number | null = null;
+  /** Set until a `hello` says whether this connection missed anything. */
+  #resuming = false;
 
   constructor(store: Store, actions: Actions) {
     this.#store = store;
@@ -28,14 +40,30 @@ export class MarketStream {
     // Ticks and events are public, but a fill belongs to the trader that made
     // it, and `EventSource` cannot set headers — hence the key in the query.
     const key = currentApiKey();
-    const url = key === null ? '/api/stream' : `/api/stream?api_key=${encodeURIComponent(key)}`;
-    const es = new EventSource(url);
+    const params = new URLSearchParams();
+    if (key !== null) params.set('api_key', key);
+    // `EventSource` reconnects to the same URL, so resuming means opening a
+    // new one from where this client got to.
+    if (this.#seq !== null) params.set('since', String(this.#seq));
+    this.#resuming = this.#seq !== null;
+    const query = params.toString();
+    const es = new EventSource(query === '' ? '/api/stream' : `/api/stream?${query}`);
     this.#source = es;
     es.onopen = () => {
       this.#setConnection('live');
-      void this.#actions.loadBars();
+      // A first connection has no history to replay, so it loads everything.
+      // A resumed one waits for the `hello` to say whether anything was lost.
+      if (!this.#resuming) this.#reload();
     };
-    es.onerror = () => this.#setConnection('reconnecting');
+    es.onerror = () => {
+      this.#setConnection('reconnecting');
+      // Reopen at our own sequence rather than letting `EventSource` rejoin
+      // the live feed and silently skip whatever happened in between.
+      if (this.#seq !== null) {
+        es.close();
+        if (this.#source === es) window.setTimeout(() => this.connect(), RECONNECT_MS);
+      }
+    };
     es.onmessage = (ev: MessageEvent<string>) => {
       let message: StreamMessage;
       try {
@@ -45,6 +73,17 @@ export class MarketStream {
       }
       this.#handle(message);
     };
+  }
+
+  /** Take every snapshot again: the only recovery from a lost message. */
+  #reload(): void {
+    void Promise.allSettled([
+      this.#actions.loadSymbols(),
+      this.#actions.loadBars(),
+      this.#actions.loadEvents(),
+      this.#actions.loadBookAndTape(),
+      this.#actions.refreshTrader(),
+    ]);
   }
 
   close(): void {
@@ -59,12 +98,17 @@ export class MarketStream {
 
   #handle(message: StreamMessage): void {
     const state = this.#store.state;
+    if (typeof message.seq === 'number') this.#seq = message.seq;
     switch (message.type) {
       case 'hello': {
         state.timeScale = message.time_scale;
         state.simNow = message.sim_now_ms;
         for (const q of message.quotes) state.quotes.set(q.symbol, q);
         this.#store.emit('symbols', 'clock');
+        // Resumed, but the server could not reach back far enough: what was
+        // missed is gone, so the snapshots are the only truth left.
+        if (this.#resuming && message.gap) this.#reload();
+        this.#resuming = false;
         break;
       }
       case 'tick': {

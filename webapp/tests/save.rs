@@ -26,6 +26,8 @@ fn options(state_file: Option<std::path::PathBuf>) -> Options {
         warmup_hours: 1,
         now_ms: Some(NOW_MS),
         state_file,
+        // Persistence, not timing: the limiter has its own tests.
+        rate_per_sec: 0.0,
         ..Options::default()
     }
 }
@@ -131,6 +133,11 @@ async fn a_saved_market_comes_back_whole() {
 
     save::write(&before, &path).expect("state written");
     assert!(path.exists(), "the save file is where it was asked for");
+    let saved_text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !saved_text.contains(&key),
+        "saves must not contain bearer credentials"
+    );
 
     // A brand-new process would do exactly this.
     let after = App::restore(options(Some(path.clone())), save::read(&path).unwrap());
@@ -248,6 +255,174 @@ async fn a_halt_survives_a_restart() {
 }
 
 #[tokio::test]
+async fn held_stops_survive_a_restart_and_still_fire() {
+    let dir = TempDir::new("fehu-save-stops");
+    let path = dir.path().join("state.json");
+    // Halts hold stops rather than firing them, which is its own test; here
+    // the move that reaches the trigger must not also stop the symbol.
+    let options = |file| Options {
+        price_limit_pct: 0.0,
+        ..options(file)
+    };
+    let before = App::new(options(Some(path.clone())));
+    let (id, key) = busy_market(&before).await;
+    let price = get(&before, None, "/api/symbols/ACME/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    let trigger = price * 105 / 100;
+    let (status, stop) = post(
+        &before,
+        Some(&key),
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": 5, "stop_price_cents": trigger,
+                "limit_price_cents": trigger * 2, "client_order_id": "the-stop" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{stop}");
+    save::write(&before, &path).unwrap();
+
+    let after = App::restore(options(Some(path.clone())), save::read(&path).unwrap());
+    let (_, stops) = get(&after, Some(&key), &format!("/api/traders/{id}/stops")).await;
+    assert_eq!(stops[0], stop, "the same trigger came back, not a new one");
+
+    // The id counter came back with it, so the next stop is not the old one.
+    let (status, second) = post(
+        &after,
+        Some(&key),
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "stop_price_cents": trigger * 3 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    assert_ne!(second["stop_id"], stop["stop_id"]);
+
+    // And the restored trigger still fires, on the market that came back.
+    post(
+        &after,
+        Some(&key),
+        "/api/symbols/ACME/events",
+        json!({ "type": "jump", "pct": 0.10, "source": "restart" }),
+    )
+    .await;
+    engine::advance_to(
+        &after,
+        after.clock.now() + std::time::Duration::from_secs(10),
+    );
+    let (_, portfolio) = get(&after, Some(&key), &format!("/api/traders/{id}")).await;
+    assert_eq!(
+        portfolio["stops"].as_array().unwrap().len(),
+        1,
+        "the reached trigger fired, the far one did not: {portfolio}"
+    );
+    assert!(
+        portfolio["fills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["qty"] == 5),
+        "the stop it fired should have traded: {portfolio}"
+    );
+}
+
+#[tokio::test]
+async fn an_iceberg_comes_back_with_what_it_was_hiding() {
+    let dir = TempDir::new("fehu-save-iceberg");
+    let path = dir.path().join("state.json");
+    let before = App::new(options(Some(path.clone())));
+    let (id, key) = busy_market(&before).await;
+    let (bid, ask) = {
+        let book = get(&before, None, "/api/symbols/ACME/book").await.1;
+        (
+            book["bid_cents"].as_i64().unwrap(),
+            book["ask_cents"].as_i64().unwrap(),
+        )
+    };
+    let price = bid + 1;
+    assert!(price < ask, "the spread has room");
+    let (status, body) = post(
+        &before,
+        Some(&key),
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 200, "type": "limit",
+                "price_cents": price, "display_qty": 25 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let order_id = body["order_id"].as_u64().unwrap();
+    let reserved = get(&before, Some(&key), &format!("/api/traders/{id}"))
+        .await
+        .1["reserved_cents"]
+        .as_i64()
+        .unwrap();
+    save::write(&before, &path).unwrap();
+
+    // A file whose books do not add up is refused, so getting this far is
+    // already most of the check.
+    let after = App::restore(options(Some(path.clone())), save::read(&path).unwrap());
+    let (_, p) = get(&after, Some(&key), &format!("/api/traders/{id}")).await;
+    let open = p["open_orders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["order_id"] == order_id)
+        .unwrap_or_else(|| panic!("the iceberg came back: {p}"));
+    assert_eq!(open["remaining"], 200, "hidden size and all");
+    assert_eq!(open["shown_qty"], 25);
+    assert_eq!(open["display_qty"], 25);
+    assert_eq!(
+        p["reserved_cents"].as_i64().unwrap(),
+        reserved,
+        "and it still reserves the whole thing"
+    );
+
+    // The book that came back shows the slice, and still refreshes.
+    let book = get(&after, None, "/api/symbols/ACME/book").await.1;
+    let top = book["bids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["price_cents"] == price)
+        .unwrap_or_else(|| panic!("no level at {price}: {book}"));
+    assert_eq!(top["qty"], 25, "only the slice is on show: {book}");
+    let (status, second) = post(
+        &after,
+        None,
+        "/api/traders",
+        json!({ "name": "restored-seller" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    let other = second["id"].as_u64().unwrap();
+    let other_key = second["api_key"].as_str().unwrap().to_owned();
+    post(
+        &after,
+        Some(&other_key),
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": other, "side": "buy", "qty": 50, "type": "market" }),
+    )
+    .await;
+    let (status, hit) = post(
+        &after,
+        Some(&other_key),
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": other, "side": "sell", "qty": 25, "type": "limit",
+                "price_cents": price, "tif": "ioc" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{hit}");
+    assert_eq!(hit["filled"], 25);
+    let book = get(&after, None, "/api/symbols/ACME/book").await.1;
+    let top = book["bids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["price_cents"] == price)
+        .unwrap_or_else(|| panic!("the next slice should be showing: {book}"));
+    assert_eq!(top["qty"], 25, "a restored iceberg still refreshes: {book}");
+    assert!(after.market().reconcile().valid);
+}
+
+#[tokio::test]
 async fn a_save_this_build_cannot_use_is_refused() {
     let dir = TempDir::new("fehu-save-bad");
     let path = dir.path().join("state.json");
@@ -339,4 +514,90 @@ mod tempdir_lite {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+}
+
+#[tokio::test]
+async fn version_two_keys_are_migrated_without_changing_player_credentials() {
+    let dir = TempDir::new("fehu-save-key-migration");
+    let path = dir.path().join("state.json");
+    let app = App::new(options(None));
+    let (id, key) = busy_market(&app).await;
+    let mut legacy = app.save();
+    legacy.version = 2;
+    let user = app.market().traders[&fehu::TraderId(id)].user_id.0;
+    legacy.market.api_keys = vec![(key.clone(), user)];
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let migrated = save::read(&path).unwrap();
+    assert_eq!(migrated.version, save::STATE_VERSION);
+    assert!(!serde_json::to_string(&migrated).unwrap().contains(&key));
+    let digest = migrated.market.api_keys[0].0.clone();
+    let restored = App::restore(options(None), migrated);
+    assert_eq!(
+        get(&restored, Some(&key), &format!("/api/traders/{id}"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get(&restored, Some(&digest), &format!("/api/traders/{id}"))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    save::write(&restored, &path).unwrap();
+    assert!(!std::fs::read_to_string(&path).unwrap().contains(&key));
+    let again = App::restore(options(None), save::read(&path).unwrap());
+    assert_eq!(
+        get(&again, Some(&key), &format!("/api/traders/{id}"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn inconsistent_accounting_and_identity_saves_are_refused() {
+    let dir = TempDir::new("fehu-save-invariants");
+    let path = dir.path().join("state.json");
+    let app = App::new(options(None));
+    busy_market(&app).await;
+    let good = serde_json::to_value(app.save()).unwrap();
+    let mut cases = Vec::new();
+    let mut bad = good.clone();
+    bad["symbols"][0]["exchange"]["book"]["index"] = json!({});
+    cases.push(("book index disagrees with resting orders", bad));
+    let mut bad = good.clone();
+    let duplicate = bad["market"]["users"][0].clone();
+    bad["market"]["users"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    cases.push(("duplicate user", bad));
+    let mut bad = good.clone();
+    bad["market"]["next_trader_id"] = json!(1);
+    cases.push(("counter overlaps live trader", bad));
+    let mut bad = good.clone();
+    bad["market"]["accounts"][0]["balance_cents"] = json!(0);
+    cases.push(("ledger does not match cash", bad));
+    let mut bad = good.clone();
+    bad["market"]["accounts"][0]["reserved_cents"] = json!(0);
+    cases.push(("reservation does not match book", bad));
+    let mut bad = good.clone();
+    bad["market"]["traders"][0]["account_id"] = json!(999999);
+    cases.push(("orphan trader", bad));
+    let mut bad = good.clone();
+    bad["market"]["api_keys"][0][1] = json!(999999);
+    cases.push(("orphan key", bad));
+    let mut bad = good.clone();
+    bad["market"]["api_keys"][0][0] = json!("fehu_plaintext");
+    cases.push(("plaintext in current format", bad));
+    for (name, value) in cases {
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            matches!(save::read(&path), Err(save::SaveError::Invalid(_))),
+            "{name}"
+        );
+    }
+    std::fs::write(&path, serde_json::to_vec(&good).unwrap()).unwrap();
+    assert!(save::read(&path).is_ok());
 }

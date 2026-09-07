@@ -19,8 +19,9 @@ mod sim;
 mod time;
 
 pub use book::{
-    CancelError, Level, MAX_ORDER_QTY, Order, OrderBook, OrderError, OrderId, OrderKind,
-    OrderStatus, Owner, Party, Placement, Preview, Resting, Side, TimeInForce, Trade, TraderId,
+    CancelError, Level, MAX_ORDER_QTY, MarketRules, Order, OrderBook, OrderError, OrderId,
+    OrderKind, OrderStatus, Owner, Party, Placement, Preview, Resting, Side, TimeInForce, Trade,
+    TraderId,
 };
 pub use candles::{Candle, Candles, Interval};
 pub use config::{Config, ConfigError, GarchParams, JumpParams, VolumeParams};

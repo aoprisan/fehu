@@ -42,6 +42,56 @@ pub enum OrderStyle {
     Limit,
 }
 
+/// What the venue charges for a fill, in basis points of its notional.
+///
+/// Maker-taker pricing, with one deliberate restriction: the taker pays and
+/// the maker does not. A maker *rebate* is allowed — it only ever credits an
+/// account — but a maker *fee* is not, and the reason is reservations. A
+/// taker's cash is checked with the fee included in the same moment the
+/// order is submitted and filled, so it can always be paid. A maker's fill
+/// happens later, against a reservation made when the order was accepted;
+/// charging it would mean reserving the fee too and releasing exactly the
+/// same amount back across every partial fill and cancel, which rounding
+/// makes a piece of work of its own. Until that is done, a positive
+/// `maker_bps` is refused rather than half-implemented.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fees {
+    /// Charged to whoever took liquidity. Never negative.
+    pub taker_bps: i64,
+    /// Paid to whoever provided it, as a negative number. Never positive.
+    pub maker_bps: i64,
+}
+
+impl Fees {
+    /// The fee on a fill of `notional_cents`, signed the way the ledger is:
+    /// negative takes money out of the account, positive puts it in.
+    ///
+    /// Truncated towards zero, so the venue never rounds a fee up and a fill
+    /// too small to owe a whole cent owes nothing.
+    #[must_use]
+    pub fn on(&self, liquidity: Liquidity, notional_cents: i64) -> i64 {
+        let bps = match liquidity {
+            Liquidity::Taker => self.taker_bps.max(0),
+            Liquidity::Maker => self.maker_bps.min(0),
+        };
+        if bps == 0 {
+            return 0;
+        }
+        // A taker's `bps` is positive and the money leaves, so the ledger
+        // amount is the negative of it; a maker's is negative and the rebate
+        // arrives.
+        let charge = i128::from(notional_cents) * i128::from(bps) / 10_000;
+        i64::try_from(-charge).unwrap_or(i64::MIN)
+    }
+
+    /// The worst a taker could be charged for a fill of `notional_cents`,
+    /// as a positive number, for the cash check made before submitting.
+    #[must_use]
+    pub fn taker_cost(&self, notional_cents: i64) -> i64 {
+        -self.on(Liquidity::Taker, notional_cents)
+    }
+}
+
 /// One execution from a trader's point of view.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FillRecord {
@@ -57,6 +107,11 @@ pub struct FillRecord {
     /// `maker` if the trader's order was resting, `taker` if it took.
     pub liquidity: Liquidity,
     pub counterparty: Counterparty,
+    /// The venue's fee, signed the way the ledger is: negative was taken out
+    /// of the account, positive was a rebate paid in. Its own ledger entry,
+    /// never folded into the price.
+    #[serde(default)]
+    pub fee_cents: i64,
 }
 
 /// A market participant. No margin, no shorting: buys need cash in the
@@ -250,13 +305,22 @@ impl Trader {
         account: &mut Account,
         symbol: &'static str,
         trade: &Trade,
+        fees: Fees,
     ) -> Vec<FillRecord> {
         let me = self.owner();
         let mut out = Vec::new();
         let taker_is_trader = matches!(trade.taker.owner, Owner::Trader(_));
         let maker_is_trader = matches!(trade.maker.owner, Owner::Trader(_));
         if trade.taker.owner == me {
-            self.book_fill(account, symbol, trade.taker_side, trade, trade.taker.order);
+            let fee = self.book_fill(
+                account,
+                symbol,
+                trade.taker_side,
+                trade,
+                trade.taker.order,
+                fees,
+                Liquidity::Taker,
+            );
             out.push(self.record(
                 symbol,
                 trade.taker.order,
@@ -264,12 +328,21 @@ impl Trader {
                 trade,
                 Liquidity::Taker,
                 maker_is_trader,
+                fee,
             ));
         }
         if trade.maker.owner == me {
             let side = trade.taker_side.opposite();
             self.release(account, symbol, side, trade.qty, trade.price_cents);
-            self.book_fill(account, symbol, side, trade, trade.maker.order);
+            let fee = self.book_fill(
+                account,
+                symbol,
+                side,
+                trade,
+                trade.maker.order,
+                fees,
+                Liquidity::Maker,
+            );
             out.push(self.record(
                 symbol,
                 trade.maker.order,
@@ -277,11 +350,16 @@ impl Trader {
                 trade,
                 Liquidity::Maker,
                 taker_is_trader,
+                fee,
             ));
         }
         out
     }
 
+    /// Settle one side of a trade and charge the venue's fee on it, as two
+    /// ledger entries: the trade, then the fee. Returns the fee, signed the
+    /// way the ledger is.
+    #[allow(clippy::too_many_arguments)]
     fn book_fill(
         &mut self,
         account: &mut Account,
@@ -289,16 +367,22 @@ impl Trader {
         side: Side,
         trade: &Trade,
         order: OrderId,
-    ) {
+        fees: Fees,
+        liquidity: Liquidity,
+    ) -> i64 {
         let value = notional_cents(trade.price_cents, trade.qty);
         account.settle(side, value, symbol, order.0, trade.ts.0);
+        let fee = fees.on(liquidity, value);
+        account.charge_fee(fee, symbol, order.0, trade.ts.0);
         let pos = self.positions.entry(symbol).or_default();
         pos.apply(side, trade.qty, trade.price_cents);
         if pos.qty == 0 && pos.realised_pnl_cents == 0 && pos.cash_cents == 0 {
             self.positions.remove(symbol);
         }
+        fee
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         symbol: &'static str,
@@ -307,6 +391,7 @@ impl Trader {
         trade: &Trade,
         liquidity: Liquidity,
         counterparty_is_trader: bool,
+        fee_cents: i64,
     ) -> FillRecord {
         let rec = FillRecord {
             id: self.next_fill_id,
@@ -323,6 +408,7 @@ impl Trader {
             } else {
                 Counterparty::Synthetic
             },
+            fee_cents,
         };
         self.next_fill_id += 1;
         if self.fills.len() >= self.fill_cap {
@@ -371,6 +457,18 @@ pub struct OrderRequest {
     /// instead. Only meaningful for a `gtc` limit order.
     #[serde(default)]
     pub post_only: bool,
+    /// Show only this much at a time, keeping the rest back and posting the
+    /// next slice — at the back of the queue for its price — as each one
+    /// fills. Only a `gtc` limit order can hide anything.
+    pub display_qty: Option<u64>,
+    /// Simulated time at which the order is withdrawn if it is still
+    /// resting. Absent leaves it resting until it fills or is cancelled.
+    pub expires_at_ms: Option<i64>,
+    /// A day order: withdrawn at the close of the session it was sent in.
+    /// Needs a trading calendar; without one there is no close to expire at,
+    /// and the order is refused rather than quietly living forever.
+    #[serde(default)]
+    pub day: bool,
 }
 
 /// Body of `PATCH /api/symbols/{symbol}/orders/{order_id}`: a new price, a
@@ -418,6 +516,91 @@ impl OrderStyle {
 /// Longest `client_order_id` the server keeps.
 pub const MAX_CLIENT_ORDER_ID: usize = 64;
 
+/// Stops one trader may hold at once, across every symbol. A stop costs
+/// nothing to keep — it reserves neither cash nor shares — so without a cap
+/// one client could fill the market's memory with triggers that never fire.
+pub const MAX_STOPS_PER_TRADER: usize = 100;
+
+/// A trigger held aside until the price touches it.
+///
+/// A stop is not an order: it rests nowhere, reserves nothing and takes no
+/// queue position, and the book has never heard of it. When the last price
+/// reaches `stop_price_cents` the engine submits it like any other order —
+/// which is also when the account is checked for the second time, because
+/// the money may have moved since the stop was accepted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StopOrder {
+    pub stop_id: u64,
+    pub trader_id: u64,
+    #[serde(with = "crate::save::symbol")]
+    pub symbol: Symbol,
+    pub side: Side,
+    pub qty: u64,
+    /// A buy fires at or above this price, a sell at or below.
+    pub stop_price_cents: i64,
+    /// The limit the order carries when it fires. `null` fires a market
+    /// order — a plain stop rather than a stop-limit.
+    pub limit_price_cents: Option<i64>,
+    /// The time in force of the order it fires, not of the trigger: a stop
+    /// is held until it fires or is cancelled, whatever this says.
+    pub tif: TimeInForce,
+    /// Handed to the order the trigger places, so a stop is as idempotent as
+    /// anything else the trader sends.
+    pub client_order_id: Option<String>,
+    pub created_at_ms: i64,
+}
+
+impl StopOrder {
+    /// The order this fires.
+    #[must_use]
+    pub fn order(&self) -> Order {
+        Order {
+            owner: Owner::Trader(TraderId(self.trader_id)),
+            side: self.side,
+            kind: match self.limit_price_cents {
+                Some(price_cents) => OrderKind::Limit { price_cents },
+                None => OrderKind::Market,
+            },
+            tif: self.tif,
+            qty: self.qty,
+        }
+    }
+
+    /// Whether a last price of `price_cents` reaches the trigger.
+    #[must_use]
+    pub fn triggered_by(&self, price_cents: i64) -> bool {
+        match self.side {
+            Side::Buy => price_cents >= self.stop_price_cents,
+            Side::Sell => price_cents <= self.stop_price_cents,
+        }
+    }
+
+    /// Worst-case cash the order it fires could consume, for the check made
+    /// when the stop is accepted. A stop-market has no limit to work from,
+    /// so the trigger price stands in for one.
+    #[must_use]
+    pub fn cost_cents(&self) -> i64 {
+        let price = self.limit_price_cents.unwrap_or(self.stop_price_cents);
+        i64::try_from(i128::from(price) * i128::from(self.qty)).unwrap_or(i64::MAX)
+    }
+}
+
+/// Body of `POST /api/symbols/{symbol}/stops`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct StopRequest {
+    pub trader_id: u64,
+    pub side: Side,
+    pub qty: u64,
+    /// The price that fires it: above the market for a buy, below for a sell.
+    pub stop_price_cents: i64,
+    /// The limit the fired order carries. Absent makes it a stop-market.
+    pub limit_price_cents: Option<i64>,
+    #[serde(default)]
+    pub tif: TimeInForce,
+    /// Passed on to the order the trigger places.
+    pub client_order_id: Option<String>,
+}
+
 /// One submitted order for as long as the log keeps it: what was asked for,
 /// what has happened to it since, and the id the caller gave it.
 ///
@@ -451,6 +634,10 @@ pub struct OrderRecord {
     pub avg_price_cents: Option<f64>,
     pub submitted_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Simulated time this order is withdrawn at if it is still resting.
+    /// The engine sweeps for these at the end of every step.
+    #[serde(default)]
+    pub expires_at_ms: Option<i64>,
     /// The response the submission returned, replayed verbatim if the same
     /// `client_order_id` arrives again. Not part of the record's own JSON,
     /// but it is saved, so a retry across a restart still replays.
@@ -487,8 +674,22 @@ impl OrderRecord {
             avg_price_cents: placement.avg_price_cents(),
             submitted_at_ms: ts_ms,
             updated_at_ms: ts_ms,
+            expires_at_ms: None,
             accepted: Some(response),
         }
+    }
+
+    /// Withdraw this order at `at_ms` if it is still resting then.
+    #[must_use]
+    pub fn expiring_at(mut self, at_ms: Option<i64>) -> Self {
+        self.expires_at_ms = at_ms;
+        self
+    }
+
+    /// This order is live and its time is up at `now_ms`.
+    #[must_use]
+    pub fn has_expired(&self, now_ms: i64) -> bool {
+        self.is_live() && self.expires_at_ms.is_some_and(|at| at <= now_ms)
     }
 
     /// The order is neither filled nor cancelled: the book still has it.
@@ -580,7 +781,14 @@ pub struct OpenOrderDto {
     pub side: Side,
     pub price_cents: i64,
     pub qty: u64,
+    /// Everything still open: what is on show plus, for an iceberg, what is
+    /// not.
     pub remaining: u64,
+    /// The slice an iceberg shows at a time; `null` for an ordinary order.
+    pub display_qty: Option<u64>,
+    /// What is on show right now. Equal to `remaining` unless this is an
+    /// iceberg with something still held back.
+    pub shown_qty: u64,
     pub ts_ms: i64,
 }
 
@@ -593,7 +801,9 @@ impl OpenOrderDto {
             side: r.side,
             price_cents: r.price_cents,
             qty: r.qty,
-            remaining: r.remaining,
+            remaining: r.outstanding(),
+            display_qty: (r.display > 0).then_some(r.display),
+            shown_qty: r.remaining,
             ts_ms: r.ts.0,
         }
     }
@@ -820,6 +1030,9 @@ pub struct PortfolioDto {
     pub unrealised_pnl_cents: i64,
     pub positions: Vec<PositionDto>,
     pub open_orders: Vec<OpenOrderDto>,
+    /// Triggers waiting for a price, oldest first. Not orders: they rest
+    /// nowhere and reserve nothing until they fire.
+    pub stops: Vec<StopOrder>,
     /// Newest first.
     pub fills: Vec<FillRecord>,
     /// The key that proves a request speaks for the trader's user, shown **once**:
@@ -844,6 +1057,17 @@ pub struct TraderSummary {
 
 #[cfg(test)]
 mod tests {
+
+    /// The settlement path with the venue charging nothing, which is what
+    /// most of these check. Fees have their own tests over the HTTP surface.
+    fn apply(
+        trader: &mut Trader,
+        account: &mut Account,
+        symbol: &'static str,
+        trade: &Trade,
+    ) -> Vec<FillRecord> {
+        trader.apply_trade(account, symbol, trade, Fees::default())
+    }
     use super::*;
     use crate::account::AccountId;
     use fehu::{Party, Timestamp};
@@ -887,7 +1111,8 @@ mod tests {
         t.reserve(&mut a, "ACME", Side::Buy, 10, 5_000);
         assert_eq!(a.available_cents(), 50_000);
         // Half of it fills as maker.
-        let fills = t.apply_trade(
+        let fills = apply(
+            &mut t,
             &mut a,
             "ACME",
             &trade(Owner::Synthetic, Owner::Trader(ME), Side::Sell, 5, 5_000),
@@ -905,7 +1130,8 @@ mod tests {
         // Sell 3 as taker at 6000.
         assert!(t.check(&a, "ACME", Side::Sell, 6, 0).is_err());
         t.check(&a, "ACME", Side::Sell, 3, 0).unwrap();
-        let fills = t.apply_trade(
+        let fills = apply(
+            &mut t,
             &mut a,
             "ACME",
             &trade(Owner::Trader(ME), Owner::Synthetic, Side::Sell, 3, 6_000),
@@ -917,7 +1143,8 @@ mod tests {
         // A self-trade books both sides and nets to nothing.
         t.reserve(&mut a, "ACME", Side::Sell, 2, 7_000);
         assert_eq!(t.free_shares("ACME"), 0);
-        let fills = t.apply_trade(
+        let fills = apply(
+            &mut t,
             &mut a,
             "ACME",
             &trade(Owner::Trader(ME), Owner::Trader(ME), Side::Buy, 2, 7_000),
@@ -935,7 +1162,8 @@ mod tests {
     fn a_sell_can_never_exceed_what_is_held() {
         let (mut t, mut a) = trader(1_000_000);
         // Buy 100 as taker.
-        t.apply_trade(
+        apply(
+            &mut t,
             &mut a,
             "ACME",
             &trade(Owner::Trader(ME), Owner::Synthetic, Side::Buy, 100, 5_000),
@@ -966,7 +1194,8 @@ mod tests {
         let (mut one, mut a) = trader(1_000_000);
         let mut two = Trader::new(TraderId(2), UserId(1), AccountId(1), "two".into(), 10, 0);
         for t in [&mut one, &mut two] {
-            t.apply_trade(
+            apply(
+                t,
                 &mut a,
                 "ACME",
                 &trade(Owner::Trader(t.id), Owner::Synthetic, Side::Buy, 50, 4_000),

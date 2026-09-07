@@ -20,8 +20,19 @@ fn test_app() -> Arc<App> {
         history_days: 5,
         warmup_hours: 1,
         now_ms: Some(NOW_MS),
-        ..Options::default()
+        ..no_rate_limit()
     })
+}
+
+/// The defaults with rate limiting off. A test sends its requests as fast as
+/// the runtime will carry them, which is not what the limit is there for, and
+/// wall-clock timing has no place in an assertion. The limiter has its own
+/// tests.
+fn no_rate_limit() -> Options {
+    Options {
+        rate_per_sec: 0.0,
+        ..Options::default()
+    }
 }
 
 /// Whoever a request is sent as: the bare app is an anonymous caller, a
@@ -1785,8 +1796,332 @@ fn app_with(options: Options) -> Arc<App> {
     App::new(Options {
         history_days: 2,
         warmup_hours: 1,
+        rate_per_sec: 0.0,
         ..options
     })
+}
+
+#[tokio::test]
+async fn a_stop_waits_for_its_price_and_then_becomes_an_order() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        // Halts are their own test; this one is about the trigger.
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "stanislaw").await;
+    let id = player.trader;
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+
+    // A sell stop five per cent under the market: nothing until the price
+    // falls that far.
+    let price = get(&app, "/api/symbols/ACME/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    let trigger = price * 95 / 100;
+    let (code, stop) = post(
+        &player,
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "sell", "qty": 100, "stop_price_cents": trigger }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{stop}");
+    assert_eq!(stop["stop_price_cents"], trigger);
+    assert_eq!(stop["limit_price_cents"], Value::Null, "a plain stop");
+    let stop_id = stop["stop_id"].as_u64().unwrap();
+
+    // It reserves nothing: the shares are still free to sell by hand.
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["positions"][0]["free_shares"], 100);
+    assert_eq!(p["stops"][0]["stop_id"], stop_id);
+    assert_eq!(
+        get(&player, "/api/symbols/ACME/stops?trader_id=1").await.1[0]["stop_id"],
+        stop_id
+    );
+
+    // A move that does not reach it leaves it alone.
+    engine::advance_to(&app, Timestamp(NOW_MS + 2_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["stops"].as_array().unwrap().len(), 1, "fired too early");
+
+    let mut rx = app.tx.subscribe();
+    post(
+        &app,
+        "/api/symbols/ACME/events",
+        json!({ "type": "jump", "pct": -0.10, "source": "test" }),
+    )
+    .await;
+    engine::advance_to(&app, Timestamp(NOW_MS + 12_000));
+
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(
+        p["stops"].as_array().unwrap().is_empty(),
+        "the stop should be gone once it fires: {p}"
+    );
+    assert_eq!(p["positions"][0]["qty"], 0, "the stop sold the position");
+    assert_eq!(p["fills"][0]["side"], "sell");
+    assert_eq!(p["fills"][0]["liquidity"], "taker");
+
+    // And the trader was told, with the order the trigger placed.
+    let mut triggered = None;
+    while let Ok(message) = rx.try_recv() {
+        let value = serde_json::to_value(&message).unwrap();
+        if value["type"] == "stop_triggered" {
+            triggered = Some(value);
+        }
+    }
+    let triggered = triggered.expect("a fired stop is published");
+    assert_eq!(triggered["trader_id"], id);
+    assert_eq!(triggered["stop"]["stop_id"], stop_id);
+    assert_eq!(triggered["refused"], Value::Null);
+    assert_eq!(triggered["order"]["status"], "filled");
+    assert!(triggered["price_cents"].as_i64().unwrap() <= trigger);
+
+    // The order it became is in the log like any other.
+    let order_id = triggered["order"]["order_id"].as_u64().unwrap();
+    let (code, record) = get(&player, &format!("/api/orders/{order_id}")).await;
+    assert_eq!(code, StatusCode::OK, "{record}");
+    assert_eq!(record["kind"], "market");
+    assert_eq!(record["filled"], 100);
+}
+
+#[tokio::test]
+async fn a_stop_must_trigger_on_the_far_side_of_the_market() {
+    let app = test_app();
+    let player = sign_up(&app, "sabine").await;
+    let id = player.trader;
+    let price = get(&app, "/api/symbols/ACME/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+
+    // A buy stop under the market has already triggered, which makes it a
+    // market order pretending to be a trigger.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "stop_price_cents": price / 2 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_order");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("above"),
+        "{body}"
+    );
+
+    for bad in [
+        json!({ "trader_id": id, "side": "sell", "qty": 0, "stop_price_cents": price / 2 }),
+        json!({ "trader_id": id, "side": "sell", "qty": 1, "stop_price_cents": 0 }),
+        json!({ "trader_id": id, "side": "sell", "qty": 1, "stop_price_cents": price / 2,
+                "limit_price_cents": -1 }),
+    ] {
+        let (code, body) = post(&player, "/api/symbols/ACME/stops", bad.clone()).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{bad} gave {body}");
+    }
+
+    // A sell stop needs the shares, just like the sell it becomes.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "sell", "qty": 10, "stop_price_cents": price / 2 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "order_refused");
+}
+
+#[tokio::test]
+async fn a_stop_is_private_property_and_can_be_withdrawn() {
+    let app = test_app();
+    let owner = sign_up(&app, "olga").await;
+    let other = sign_up(&app, "otto").await;
+    let id = owner.trader;
+    let price = get(&app, "/api/symbols/HLIO/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    let (code, stop) = post(
+        &owner,
+        "/api/symbols/HLIO/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": 5, "stop_price_cents": price * 2 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{stop}");
+    let stop_id = stop["stop_id"].as_u64().unwrap();
+
+    // Somebody else's key cannot see it or take it away.
+    let (code, body) = get(&other, &format!("/api/symbols/HLIO/stops?trader_id={id}")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{body}");
+    let (code, body) = delete(
+        &other,
+        &format!("/api/symbols/HLIO/stops/{stop_id}?trader_id={id}"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{body}");
+    let (code, body) = get(&app, &format!("/api/traders/{id}/stops")).await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED, "{body}");
+
+    let (code, body) = get(&owner, &format!("/api/traders/{id}/stops")).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["stop_id"], stop_id);
+    let (code, body) = delete(
+        &owner,
+        &format!("/api/symbols/HLIO/stops/{stop_id}?trader_id={id}"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["stop_id"], stop_id);
+    // Twice is a mistake worth reporting, not a silent success.
+    let (code, body) = delete(
+        &owner,
+        &format!("/api/symbols/HLIO/stops/{stop_id}?trader_id={id}"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "unknown_stop");
+    let (_, p) = get(&owner, &format!("/api/traders/{id}")).await;
+    assert!(p["stops"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_halted_symbol_holds_its_stops_until_trading_resumes() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "hilda").await;
+    let id = player.trader;
+    let price = get(&app, "/api/symbols/PXCO/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    let trigger = price * 105 / 100;
+    let (code, stop) = post(
+        &player,
+        "/api/symbols/PXCO/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "stop_price_cents": trigger }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{stop}");
+
+    let (code, body) = post(&app, "/api/symbols/PXCO/halt", json!({})).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    // A stop can be armed while the market is stopped: it is not an order.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/PXCO/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "stop_price_cents": trigger * 2 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+
+    post(
+        &app,
+        "/api/symbols/PXCO/events",
+        json!({ "type": "jump", "pct": 0.10, "source": "test" }),
+    )
+    .await;
+    engine::advance_to(&app, Timestamp(NOW_MS + 10_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert_eq!(
+        p["stops"].as_array().unwrap().len(),
+        2,
+        "a halted symbol fires nothing: {p}"
+    );
+    assert!(p["fills"].as_array().unwrap().is_empty());
+
+    let (code, body) = post(&app, "/api/symbols/PXCO/resume", json!({})).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    engine::advance_to(&app, Timestamp(NOW_MS + 12_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert_eq!(
+        p["stops"].as_array().unwrap().len(),
+        1,
+        "the reached trigger should fire on the resume: {p}"
+    );
+    assert_eq!(p["positions"][0]["qty"], 10);
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
+async fn a_stop_the_money_no_longer_covers_is_refused_when_it_fires() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "penny").await;
+    let id = player.trader;
+    let price = get(&app, "/api/symbols/NBLA/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    // Affordable now: a tenth of the account at today's price.
+    let qty = (10_000_000 / price / 10).max(1) as u64;
+    let trigger = price * 105 / 100;
+    let (code, stop) = post(
+        &player,
+        "/api/symbols/NBLA/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": qty, "stop_price_cents": trigger }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{stop}");
+
+    // The money leaves between the arming and the trigger. Nothing was
+    // reserved for the stop, so this is allowed — and the second check is
+    // what catches it.
+    let account = stop_account(&app, id);
+    let (code, body) = post(
+        &player,
+        &format!("/api/accounts/{account}/withdraw"),
+        json!({ "amount_cents": 9_999_000 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+
+    let mut rx = app.tx.subscribe();
+    post(
+        &app,
+        "/api/symbols/NBLA/events",
+        json!({ "type": "jump", "pct": 0.10, "source": "test" }),
+    )
+    .await;
+    engine::advance_to(&app, Timestamp(NOW_MS + 10_000));
+
+    let mut triggered = None;
+    while let Ok(message) = rx.try_recv() {
+        let value = serde_json::to_value(&message).unwrap();
+        if value["type"] == "stop_triggered" {
+            triggered = Some(value);
+        }
+    }
+    let triggered = triggered.expect("a refused stop is still published");
+    assert_eq!(triggered["order"], Value::Null);
+    assert!(
+        triggered["refused"]
+            .as_str()
+            .unwrap()
+            .contains("insufficient funds"),
+        "{triggered}"
+    );
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(
+        p["stops"].as_array().unwrap().is_empty(),
+        "a fired stop is spent, refused or not: {p}"
+    );
+    assert!(p["fills"].as_array().unwrap().is_empty());
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+/// The account a trader's cash lives in.
+fn stop_account(app: &Arc<App>, trader: u64) -> u64 {
+    app.market().traders[&fehu::TraderId(trader)].account_id.0
 }
 
 #[tokio::test]
@@ -1916,6 +2251,83 @@ async fn a_resting_order_survives_a_halt_and_can_be_cancelled() {
     let (code, status) = post(&app, "/api/symbols/PXCO/resume", json!({})).await;
     assert_eq!(code, StatusCode::OK, "{status}");
     assert_eq!(status["tradable"], true);
+}
+
+#[tokio::test]
+async fn a_halt_freezes_the_book_and_resuming_settles_the_backlog() {
+    let app = test_app();
+    let player = sign_up(&app, "halina").await;
+    let id = player.trader;
+    let book = get(&player, "/api/symbols/NBLA/book").await.1;
+    let bid = book["bid_cents"].as_i64().unwrap();
+    let ask = book["ask_cents"].as_i64().unwrap();
+    // Inside the spread: with the market open the next synthetic print takes
+    // it, as `resting_bid_fills_when_the_market_trades_through_it` shows.
+    let price = (bid + ask) / 2;
+    let (code, order) = post(
+        &player,
+        "/api/symbols/NBLA/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 50, "type": "limit", "price_cents": price }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{order}");
+    assert_eq!(order["status"], "resting");
+    let resting = get(&player, "/api/symbols/NBLA/book").await.1;
+
+    let (code, status) = post(&app, "/api/symbols/NBLA/halt", json!({})).await;
+    assert_eq!(code, StatusCode::OK, "{status}");
+    assert_eq!(status["halted"], true);
+
+    // Ten minutes of price moves with trading stopped. The reference keeps
+    // ticking, but nothing may execute against the frozen book.
+    engine::advance_to(&app, Timestamp(NOW_MS + 600_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(
+        p["fills"].as_array().unwrap().is_empty(),
+        "a halted book filled an order: {p}"
+    );
+    assert_eq!(p["open_orders"][0]["order_id"], order["order_id"]);
+    assert_eq!(p["open_orders"][0]["remaining"], 50);
+    assert_eq!(p["cash_cents"], 10_000_000);
+    assert!(p["reserved_cents"].as_i64().unwrap() > 0);
+    let frozen = get(&player, "/api/symbols/NBLA/book").await.1;
+    assert_eq!(
+        (&frozen["bids"], &frozen["asks"]),
+        (&resting["bids"], &resting["asks"]),
+        "the book moved while the symbol was halted"
+    );
+    assert_ne!(
+        frozen["reference_cents"], resting["reference_cents"],
+        "the reference price should keep moving through a halt"
+    );
+
+    // Resuming requotes around wherever the price went, and whatever that
+    // crosses settles through the account like any other fill.
+    let (code, status) = post(&app, "/api/symbols/NBLA/resume", json!({})).await;
+    assert_eq!(code, StatusCode::OK, "{status}");
+    assert_eq!(status["tradable"], true);
+    let mut filled = 0;
+    for k in 601..=1_200 {
+        let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+        filled = p["positions"]
+            .as_array()
+            .unwrap()
+            .first()
+            .and_then(|q| q["qty"].as_i64())
+            .unwrap_or(0);
+        if filled == 50 {
+            assert_eq!(p["reserved_cents"], 0);
+            assert!(p["open_orders"].as_array().unwrap().is_empty());
+            assert_eq!(p["fills"][0]["liquidity"], "maker");
+            assert_eq!(p["fills"][0]["price_cents"], price);
+            assert_eq!(p["cash_cents"], 10_000_000 - 50 * price);
+            break;
+        }
+        engine::advance_to(&app, Timestamp(NOW_MS + k * 1000));
+    }
+    assert_eq!(filled, 50, "the bid never filled after the resume");
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
 }
 
 #[tokio::test]
@@ -2258,4 +2670,1143 @@ async fn an_order_can_be_amended_in_place() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "already replaced: {body}");
+}
+
+#[tokio::test]
+async fn reconciliation_checks_a_busy_market_and_detects_broken_reservations() {
+    let app = test_app();
+    let player = sign_up(&app, "audit").await;
+    for order in [
+        json!({"trader_id":player.trader,"type":"market","side":"buy","qty":100}),
+        json!({"trader_id":player.trader,"type":"limit","side":"buy","qty":10,"price_cents":1}),
+        json!({"trader_id":player.trader,"type":"limit","side":"sell","qty":10,"price_cents":1000000}),
+    ] {
+        let (status, body) = post(&player, "/api/symbols/ACME/orders", order).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    engine::step(&app);
+    let (status, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(report["valid"], true, "{report}");
+    assert_eq!(report["resting_orders_checked"], 2);
+    let restored = App::restore(app.options.clone(), app.save());
+    assert!(restored.market().reconcile().valid);
+    {
+        let mut market = app.market();
+        let account_id = market.traders[&fehu::TraderId(player.trader)].account_id;
+        market.accounts.get_mut(&account_id).unwrap().reserve(1);
+        market
+            .traders
+            .get_mut(&fehu::TraderId(player.trader))
+            .unwrap()
+            .reserved_shares
+            .insert("ACME", 101);
+    }
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], false);
+    let issues = report["issues"].to_string();
+    assert!(issues.contains("cash reservation"), "{report}");
+    assert!(issues.contains("share reservation"), "{report}");
+    assert!(issues.contains("exceed holdings"), "{report}");
+}
+
+#[tokio::test]
+async fn reconciliation_requires_the_configured_admin_key() {
+    let app = app_with(Options {
+        admin_key: Some("audit-secret".into()),
+        ..Options::default()
+    });
+    assert_eq!(
+        get(&app, "/api/reconcile").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let player = sign_up(&app, "player").await;
+    assert_eq!(
+        get(&player, "/api/reconcile").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let master = Player {
+        app,
+        user: 0,
+        trader: 0,
+        key: "audit-secret".into(),
+    };
+    assert_eq!(get(&master, "/api/reconcile").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn order_ids_are_unique_across_symbols_and_survive_retries() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        ..Options::default()
+    });
+    let player = sign_up(&app, "multi-symbol").await;
+    let mut orders = Vec::new();
+    for symbol in ["ACME", "NBLA", "HLIO", "PXCO"] {
+        let request = json!({"trader_id":player.trader,"side":"buy","type":"limit","price_cents":1,"qty":10,"client_order_id":symbol});
+        let (status, response) = post(
+            &player,
+            &format!("/api/symbols/{symbol}/orders"),
+            request.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        orders.push((symbol, request, response));
+    }
+    let ids: std::collections::BTreeSet<_> = orders
+        .iter()
+        .map(|(_, _, r)| r["order_id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 4, "each symbol's order needs its own identity");
+    let restored = App::restore(app.options.clone(), app.save());
+    let player = Player {
+        app: restored,
+        user: player.user,
+        trader: player.trader,
+        key: player.key,
+    };
+    let (status, new_order) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({"trader_id":player.trader,"side":"buy","type":"limit","price_cents":1,"qty":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(!ids.contains(&new_order["order_id"].as_u64().unwrap()));
+    for (symbol, request, response) in orders {
+        let (status, retry) =
+            post(&player, &format!("/api/symbols/{symbol}/orders"), request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(retry, response);
+        let (status, record) = get(&player, &format!("/api/orders/{}", response["order_id"])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(record["symbol"], symbol);
+    }
+}
+
+#[tokio::test]
+async fn an_iceberg_shows_a_slice_and_reserves_the_whole_thing() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let hider = sign_up(&app, "iris").await;
+    let seller = sign_up(&app, "sven").await;
+    let id = hider.trader;
+    let (_, book) = get(&app, "/api/symbols/ACME/book").await;
+    let bid = book["bid_cents"].as_i64().unwrap();
+    let ask = book["ask_cents"].as_i64().unwrap();
+    // Inside the spread, where the synthetic ladder has nothing: what shows
+    // at this price is this order and nothing else.
+    let price = bid + 1;
+    assert!(price < ask, "the spread has room: {book}");
+
+    let (code, body) = post(
+        &hider,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "limit",
+                "price_cents": price, "display_qty": 20 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["status"], "resting");
+    assert_eq!(body["remaining"], 100, "all of it is open");
+    let order_id = body["order_id"].as_u64().unwrap();
+
+    // The public book shows the slice and says nothing about the rest.
+    let (_, book) = get(&app, "/api/symbols/ACME/book").await;
+    assert_eq!(book["bid_cents"], price);
+    let top = book["bids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["price_cents"] == price)
+        .unwrap_or_else(|| panic!("no level at {price}: {book}"));
+    assert_eq!(top["qty"], 20, "only the slice is on show: {book}");
+    assert_eq!(top["orders"], 1);
+
+    // Its owner sees all of it — and pays for all of it. Hiding size does
+    // not make it free.
+    let (_, p) = get(&hider, &format!("/api/traders/{id}")).await;
+    let open = &p["open_orders"][0];
+    assert_eq!(open["remaining"], 100);
+    assert_eq!(open["shown_qty"], 20);
+    assert_eq!(open["display_qty"], 20);
+    assert_eq!(
+        p["reserved_cents"].as_i64().unwrap(),
+        price * 100,
+        "the hidden size is reserved too: {p}"
+    );
+
+    // Somebody sells into it: the slice fills and the next one is posted.
+    let (code, body) = post(
+        &seller,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": seller.trader, "side": "buy", "qty": 100, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let (code, body) = post(
+        &seller,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": seller.trader, "side": "sell", "qty": 20, "type": "limit",
+                "price_cents": price, "tif": "ioc" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["filled"], 20);
+
+    let (_, book) = get(&app, "/api/symbols/ACME/book").await;
+    let top = book["bids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["price_cents"] == price)
+        .unwrap_or_else(|| panic!("the next slice should be showing: {book}"));
+    assert_eq!(top["qty"], 20, "refreshed to a full slice: {book}");
+    let (_, p) = get(&hider, &format!("/api/traders/{id}")).await;
+    let open = &p["open_orders"][0];
+    assert_eq!(open["remaining"], 80, "twenty of it traded");
+    assert_eq!(open["shown_qty"], 20);
+    assert_eq!(p["positions"][0]["qty"], 20);
+    assert_eq!(p["reserved_cents"].as_i64().unwrap(), price * 80);
+
+    // Cancelling gives back everything, shown and hidden alike.
+    let (code, body) = delete(
+        &hider,
+        &format!("/api/symbols/ACME/orders/{order_id}?trader_id={id}"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["remaining"], 80);
+    let (_, p) = get(&hider, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["reserved_cents"], 0);
+    let (_, record) = get(&hider, &format!("/api/orders/{order_id}")).await;
+    assert_eq!(record["status"], "cancelled");
+    assert_eq!(record["filled"], 20);
+    assert_eq!(record["remaining"], 80);
+
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
+async fn an_iceberg_slice_has_to_make_sense() {
+    let app = test_app();
+    let player = sign_up(&app, "izzy").await;
+    let id = player.trader;
+    let bid = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+    let price = bid / 2;
+    for bad in [
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "limit",
+                "price_cents": price, "display_qty": 0 }),
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "limit",
+                "price_cents": price, "display_qty": 101 }),
+        // An order that cannot rest has nothing to hide.
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "limit",
+                "price_cents": price, "display_qty": 10, "tif": "ioc" }),
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "market",
+                "display_qty": 10 }),
+    ] {
+        let (code, body) = post(&player, "/api/symbols/ACME/orders", bad.clone()).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{bad} gave {body}");
+        assert_eq!(body["error"]["code"], "invalid_order");
+    }
+    // Nothing was placed by any of them.
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(p["open_orders"].as_array().unwrap().is_empty(), "{p}");
+    assert_eq!(p["reserved_cents"], 0);
+}
+
+#[tokio::test]
+async fn a_dividend_pays_the_holders_and_takes_the_price_ex() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let holder = sign_up(&app, "hilary").await;
+    let bystander = sign_up(&app, "bruce").await;
+    let id = holder.trader;
+    let (code, body) = post(
+        &holder,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let (_, before) = get(&holder, &format!("/api/traders/{id}")).await;
+    let cash_before = before["cash_cents"].as_i64().unwrap();
+    let price_before = get(&app, "/api/symbols/ACME/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+
+    let (code, body) = post(
+        &app,
+        "/api/symbols/ACME/dividend",
+        json!({ "cents_per_share": 50, "note": "Q3" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["dividend"]["cents_per_share"], 50);
+    assert_eq!(body["dividend"]["shares_paid"], 100);
+    assert_eq!(body["dividend"]["accounts_paid"], 1);
+    assert_eq!(body["dividend"]["total_cents"], 5_000);
+    assert_eq!(body["event"]["kind"], "corporate:dividend");
+
+    // The holder is paid, and it is its own ledger entry.
+    let (_, after) = get(&holder, &format!("/api/traders/{id}")).await;
+    assert_eq!(after["cash_cents"].as_i64().unwrap(), cash_before + 5_000);
+    assert_eq!(
+        after["positions"][0]["qty"], 100,
+        "a dividend moves money, not shares"
+    );
+    let account = after["account_id"].as_u64().unwrap();
+    let (_, ledger) = get(&holder, &format!("/api/accounts/{account}/ledger?limit=5")).await;
+    let entry = ledger["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "dividend")
+        .unwrap_or_else(|| panic!("no dividend entry: {ledger}"));
+    assert_eq!(entry["amount_cents"], 5_000);
+    assert_eq!(entry["symbol"], "ACME");
+    assert_eq!(entry["memo"], "Q3");
+
+    // Somebody holding none of it gets nothing.
+    let (_, none) = get(&bystander, &format!("/api/traders/{}", bystander.trader)).await;
+    assert_eq!(none["cash_cents"], 10_000_000);
+
+    // And the price goes ex: the next tick opens about a dividend lower.
+    engine::advance_to(&app, Timestamp(NOW_MS + 1_000));
+    let price_after = get(&app, "/api/symbols/ACME/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    assert!(
+        price_after < price_before,
+        "the price must drop by the dividend, or it is money from nothing: \
+         {price_before} -> {price_after}"
+    );
+    let drop = price_before - price_after;
+    assert!(
+        (drop - 50).abs() <= 5,
+        "about the dividend, give or take a tick of noise: dropped {drop}"
+    );
+
+    // Nothing was created or destroyed, and the books still balance.
+    let (_, shares) = get(&app, "/api/symbols/ACME/shares").await;
+    assert_eq!(shares["held_shares"], 100);
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
+async fn a_dividend_bigger_than_the_company_is_refused() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        admin_key: Some("chairman".into()),
+        ..Options::default()
+    });
+    let price = get(&app, "/api/symbols/ACME/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    let master = Player {
+        app: Arc::clone(&app),
+        user: 0,
+        trader: 0,
+        key: "chairman".into(),
+    };
+    for bad in [0, -1, price, price * 2] {
+        let (code, body) = post(
+            &master,
+            "/api/symbols/ACME/dividend",
+            json!({ "cents_per_share": bad }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {body}");
+    }
+    // And only the game master may declare one at all.
+    let player = sign_up(&app, "shareholder").await;
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/dividend",
+        json!({ "cents_per_share": 10 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+#[tokio::test]
+async fn an_order_with_a_date_is_withdrawn_when_it_passes() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "dora").await;
+    let id = player.trader;
+    let bid = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+    // Far under the market, so only the clock can take it away.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit",
+                "price_cents": bid / 2, "expires_at_ms": NOW_MS + 30_000 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let order_id = body["order_id"].as_u64().unwrap();
+    let (_, record) = get(&player, &format!("/api/orders/{order_id}")).await;
+    assert_eq!(record["expires_at_ms"], NOW_MS + 30_000);
+
+    // A date already gone is a mistake, not an instant cancel.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit",
+                "price_cents": bid / 2, "expires_at_ms": NOW_MS - 1 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    let mut rx = app.tx.subscribe();
+    engine::advance_to(&app, Timestamp(NOW_MS + 20_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert_eq!(
+        p["open_orders"].as_array().unwrap().len(),
+        1,
+        "not due yet: {p}"
+    );
+    assert!(p["reserved_cents"].as_i64().unwrap() > 0);
+
+    engine::advance_to(&app, Timestamp(NOW_MS + 40_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(
+        p["open_orders"].as_array().unwrap().is_empty(),
+        "its time was up: {p}"
+    );
+    assert_eq!(p["reserved_cents"], 0, "the reservation came back with it");
+    let (_, record) = get(&player, &format!("/api/orders/{order_id}")).await;
+    assert_eq!(record["status"], "cancelled");
+    assert_eq!(record["remaining"], 10);
+
+    // And the owner was told, rather than left to notice.
+    let mut expired = None;
+    while let Ok(message) = rx.try_recv() {
+        let value = serde_json::to_value(&message).unwrap();
+        if value["type"] == "order_expired" {
+            expired = Some(value);
+        }
+    }
+    let expired = expired.expect("an expiry is published");
+    assert_eq!(expired["trader_id"], id);
+    assert_eq!(expired["order"]["order_id"], order_id);
+    assert_eq!(expired["order"]["status"], "cancelled");
+
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
+async fn a_day_order_lasts_until_the_session_closes() {
+    // A session that is open at NOW_MS (22:13 UTC) and closes at 23:00.
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        market_hours: Some(fehu::MarketHours {
+            open_secs: 22 * 3600,
+            close_secs: 23 * 3600,
+            ..fehu::MarketHours::default()
+        }),
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "davide").await;
+    let id = player.trader;
+    let (_, status) = get(&app, "/api/symbols/ACME/status").await;
+    assert_eq!(status["market_open"], true, "{status}");
+    let close = status["next_close_ms"].as_i64().unwrap();
+    let bid = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit",
+                "price_cents": bid / 2, "day": true }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let order_id = body["order_id"].as_u64().unwrap();
+    let (_, record) = get(&player, &format!("/api/orders/{order_id}")).await;
+    assert_eq!(
+        record["expires_at_ms"], close,
+        "a day order ends with the session: {record}"
+    );
+
+    // Asking for both a day order and a date of its own is a contradiction.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit",
+                "price_cents": bid / 2, "day": true, "expires_at_ms": close + 1 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    engine::advance_to(&app, Timestamp(close + 60_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(
+        p["open_orders"].as_array().unwrap().is_empty(),
+        "the session closed on it: {p}"
+    );
+    assert_eq!(p["reserved_cents"], 0);
+}
+
+#[tokio::test]
+async fn a_day_order_needs_a_calendar_to_have_a_close() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        ..Options::default()
+    });
+    let player = sign_up(&app, "dahlia").await;
+    let bid = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": player.trader, "side": "buy", "qty": 10, "type": "limit",
+                "price_cents": bid / 2, "day": true }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("FEHU_MARKET_HOURS"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_taker_pays_a_fee_and_the_maker_is_paid_a_rebate() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        price_limit_pct: 0.0,
+        // 25 bps to take, 5 bps back for providing.
+        taker_fee_bps: 25,
+        maker_fee_bps: -5,
+        ..Options::default()
+    });
+    let maker = sign_up(&app, "morgan").await;
+    let taker = sign_up(&app, "tarek").await;
+
+    // The maker needs shares to offer, which costs a taker fee of its own.
+    let (code, body) = post(
+        &maker,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": maker.trader, "side": "buy", "qty": 100, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let (_, m) = get(&maker, &format!("/api/traders/{}", maker.trader)).await;
+    let bought = &m["fills"][0];
+    let notional = bought["price_cents"].as_i64().unwrap() * 100;
+    assert_eq!(
+        bought["fee_cents"].as_i64().unwrap(),
+        -(notional * 25 / 10_000),
+        "the taker pays 25 bps: {bought}"
+    );
+    assert_eq!(
+        m["cash_cents"].as_i64().unwrap(),
+        10_000_000 - notional - notional * 25 / 10_000,
+        "the fee left the account on top of the price"
+    );
+
+    // Now the maker rests an offer inside the spread and the taker lifts it.
+    let (_, book) = get(&app, "/api/symbols/ACME/book").await;
+    let mid = (book["bid_cents"].as_i64().unwrap() + book["ask_cents"].as_i64().unwrap()) / 2;
+    let (code, body) = post(
+        &maker,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": maker.trader, "side": "sell", "qty": 100, "type": "limit",
+                "price_cents": mid }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["status"], "resting");
+    let cash_before = get(&maker, &format!("/api/traders/{}", maker.trader))
+        .await
+        .1["cash_cents"]
+        .as_i64()
+        .unwrap();
+
+    let (code, body) = post(
+        &taker,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": taker.trader, "side": "buy", "qty": 100, "type": "limit",
+                "price_cents": mid, "tif": "ioc" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["filled"], 100);
+
+    let traded = mid * 100;
+    let (_, m) = get(&maker, &format!("/api/traders/{}", maker.trader)).await;
+    let sold = &m["fills"][0];
+    assert_eq!(sold["liquidity"], "maker");
+    assert_eq!(
+        sold["fee_cents"].as_i64().unwrap(),
+        traded * 5 / 10_000,
+        "the maker is paid, not charged: {sold}"
+    );
+    assert_eq!(
+        m["cash_cents"].as_i64().unwrap(),
+        cash_before + traded + traded * 5 / 10_000
+    );
+
+    let (_, t) = get(&taker, &format!("/api/traders/{}", taker.trader)).await;
+    assert_eq!(
+        t["fills"][0]["fee_cents"].as_i64().unwrap(),
+        -(traded * 25 / 10_000)
+    );
+    assert_eq!(
+        t["cash_cents"].as_i64().unwrap(),
+        10_000_000 - traded - traded * 25 / 10_000
+    );
+
+    // Every fee is its own ledger entry, next to the trade it belongs to.
+    let account = t["account_id"].as_u64().unwrap();
+    let (_, ledger) = get(&taker, &format!("/api/accounts/{account}/ledger?limit=10")).await;
+    let entries = ledger["entries"].as_array().unwrap();
+    let fee = entries
+        .iter()
+        .find(|e| e["kind"] == "fee")
+        .unwrap_or_else(|| panic!("no fee entry: {ledger}"));
+    assert_eq!(
+        fee["amount_cents"].as_i64().unwrap(),
+        -(traded * 25 / 10_000)
+    );
+    assert_eq!(fee["symbol"], "ACME");
+    assert_eq!(fee["order_id"], t["fills"][0]["order_id"]);
+
+    // The books still balance with the fees in them.
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
+async fn a_taker_fee_cannot_overdraw_the_account_that_pays_it() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        // A fee big enough that ignoring it would push the buyer negative.
+        taker_fee_bps: 500,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "penniless").await;
+    let id = player.trader;
+    let ask = get(&app, "/api/symbols/ACME/book").await.1["ask_cents"]
+        .as_i64()
+        .unwrap();
+    // Almost exactly the whole account: affordable at the price, not with the
+    // fee on top.
+    let qty = (10_000_000 / ask) as u64;
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": qty, "type": "market" }),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the fee is part of what a buy has to afford: {body}"
+    );
+    assert_eq!(body["error"]["code"], "order_refused");
+
+    // Leave room for it and the same order goes through, fee and all.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": qty / 2, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(
+        p["cash_cents"].as_i64().unwrap() >= 0,
+        "a fee must never overdraw: {p}"
+    );
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
+async fn a_symbol_quoted_in_ticks_and_traded_in_lots_refuses_anything_else() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        tick_cents: 25,
+        lot: 10,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "tessa").await;
+    let id = player.trader;
+    let (_, book) = get(&app, "/api/symbols/ACME/book").await;
+    let bid = book["bid_cents"].as_i64().unwrap();
+    assert_eq!(bid % 25, 0, "the quotes are on the grid: {book}");
+    for level in book["bids"].as_array().unwrap() {
+        assert_eq!(level["price_cents"].as_i64().unwrap() % 25, 0, "{level}");
+        assert_eq!(level["qty"].as_u64().unwrap() % 10, 0, "{level}");
+    }
+
+    // Off the tick, and in an odd lot: both refused before anything moves.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit",
+                "price_cents": bid - 1 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_order");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("tick"),
+        "{body}"
+    );
+
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 15, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("lot"),
+        "{body}"
+    );
+
+    // On the grid and in whole lots: taken, and it prints on the grid.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 20, "type": "limit",
+                "price_cents": bid - 25 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["status"], "resting");
+
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 30, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["filled"], 30);
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    for fill in p["fills"].as_array().unwrap() {
+        assert_eq!(fill["price_cents"].as_i64().unwrap() % 25, 0, "{fill}");
+    }
+
+    // A stop is priced on the same grid and fires an order in whole lots.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "sell", "qty": 10,
+                "stop_price_cents": bid - 26 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("tick"),
+        "{body}"
+    );
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "sell", "qty": 15,
+                "stop_price_cents": bid - 50 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "an odd lot: {body}");
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "sell", "qty": 10,
+                "stop_price_cents": bid - 50 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+
+    // The market keeps to the grid as it runs, and stays reconciled.
+    engine::advance_to(&app, Timestamp(NOW_MS + 60_000));
+    let (_, tape) = get(&app, "/api/symbols/ACME/trades?limit=50").await;
+    let trades = tape["trades"].as_array().unwrap();
+    assert!(!trades.is_empty(), "the market printed nothing: {tape}");
+    for trade in trades {
+        assert_eq!(trade["price_cents"].as_i64().unwrap() % 25, 0, "{trade}");
+    }
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
+async fn health_reports_what_the_server_is_doing_and_how_long_it_takes() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 1.0,
+        rate_burst: 2.0,
+        ..Options::default()
+    });
+    let (_, before) = get(&app, "/api/health").await;
+    assert_eq!(before["orders_placed"], 0);
+    assert_eq!(before["metrics"]["engine_step"]["count"], 0);
+    assert_eq!(
+        before["metrics"]["requests"]["micros_mean"], 0,
+        "no requests is not a division by zero: {before}"
+    );
+
+    let player = sign_up(&app, "watched").await;
+    let id = player.trader;
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 5, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    // A sell with nothing to sell: refused before it reaches a book.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/NBLA/orders",
+        json!({ "trader_id": id, "side": "sell", "qty": 5, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    // And one refused by the rate limiter rather than by the market.
+    let (code, _) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+    engine::advance_to(&app, Timestamp(NOW_MS + 2_000));
+
+    let (_, health) = get(&app, "/api/health").await;
+    assert_eq!(health["orders_placed"], 1, "{health}");
+    assert_eq!(health["orders_refused"], 1);
+    assert!(health["fills_booked"].as_u64().unwrap() >= 1);
+    assert_eq!(health["stops_held"], 0);
+    assert!(
+        health["stream_messages"].as_u64().unwrap() > 0,
+        "the engine step published something: {health}"
+    );
+    assert_eq!(health["tracked_clients"], 1, "one client has a bucket");
+    let metrics = &health["metrics"];
+    assert_eq!(metrics["requests_limited"], 1);
+    assert!(
+        metrics["requests_failed"].as_u64().unwrap() >= 2,
+        "the refused order and the limited one: {metrics}"
+    );
+    assert_eq!(metrics["engine_step"]["count"], 1);
+    assert!(
+        metrics["engine_step"]["micros_max"].as_u64().unwrap()
+            >= metrics["engine_step"]["micros_mean"].as_u64().unwrap(),
+        "the worst is at least the mean: {metrics}"
+    );
+    assert!(metrics["requests"]["count"].as_u64().unwrap() >= 5);
+}
+
+#[tokio::test]
+async fn a_client_changing_the_market_too_fast_is_told_to_slow_down() {
+    // One request per second, two at once: the third write in a burst is
+    // refused.
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 1.0,
+        rate_burst: 2.0,
+        ..Options::default()
+    });
+    // Signing up is a write too, and spends the shared anonymous bucket.
+    let player = sign_up(&app, "rapid").await;
+    let second = sign_up(&app, "steady").await;
+    let id = player.trader;
+    let order = json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market" });
+
+    // Each player's own bucket is separate from that one, and starts full.
+    for i in 0..2 {
+        let (code, body) = post(&player, "/api/symbols/ACME/orders", order.clone()).await;
+        assert_eq!(code, StatusCode::CREATED, "order {i}: {body}");
+    }
+    let (code, body) = post(&player, "/api/symbols/ACME/orders", order.clone()).await;
+    assert_eq!(code, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["code"], "rate_limited");
+
+    // The refusal is a refusal: the order it carried never ran.
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["positions"][0]["qty"], 2, "only the first two: {p}");
+
+    // Reading is never limited, however fast.
+    for _ in 0..50 {
+        let (code, _) = get(&player, &format!("/api/traders/{id}")).await;
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    // And a refusal says when to come back.
+    let response = router(Arc::clone(&app))
+        .oneshot(
+            Request::post("/api/symbols/ACME/orders")
+                .header(header::AUTHORIZATION, format!("Bearer {}", player.key))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(order.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.headers()[header::RETRY_AFTER],
+        "1",
+        "a refusal must say when to come back"
+    );
+
+    // Another player is not held back by the first one's spending.
+    let (code, body) = post(
+        &second,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": second.trader, "side": "buy", "qty": 1, "type": "market" }),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::CREATED,
+        "one client's flood is not another's: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rate_limiting_can_be_turned_off() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "unlimited").await;
+    for i in 0..60 {
+        let (code, body) = post(
+            &player,
+            "/api/symbols/ACME/orders",
+            json!({ "trader_id": player.trader, "side": "buy", "qty": 1, "type": "market" }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "order {i}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_lagging_stream_disconnects_instead_of_silently_skipping_messages() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        ..Options::default()
+    });
+    let response = router(Arc::clone(&app))
+        .oneshot(Request::get("/api/stream").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let hello = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert!(std::str::from_utf8(&hello).unwrap().contains("hello"));
+    // Do not poll the body while overflowing its bounded receiver.
+    let status = app
+        .market()
+        .status(0, app.clock.now())
+        .expect("ACME exists");
+    for _ in 0..8192 {
+        app.publish(fehu_webapp::market::StreamMessage::Status(status));
+    }
+    let next = tokio::time::timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("a gap must terminate promptly");
+    assert!(next.is_none(), "later messages must not hide the gap");
+}
+
+/// The `hello` a stream opens with, and the messages after it, as JSON.
+async fn stream_frames(app: &Arc<App>, uri: &str, want: usize) -> Vec<Value> {
+    let response = router(Arc::clone(app))
+        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    let mut body = response.into_body();
+    let mut out = Vec::new();
+    while out.len() < want {
+        let Ok(Some(Ok(frame))) = tokio::time::timeout(Duration::from_secs(1), body.frame()).await
+        else {
+            break;
+        };
+        let Some(bytes) = frame.data_ref() else {
+            continue;
+        };
+        for line in std::str::from_utf8(bytes).unwrap().lines() {
+            if let Some(json) = line.strip_prefix("data: ") {
+                out.push(serde_json::from_str(json).unwrap());
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_reconnecting_stream_replays_what_it_missed() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    // Nothing has been published yet: the stream joins at zero and says how
+    // far back it could be asked to go.
+    let opened = stream_frames(&app, "/api/stream", 1).await;
+    assert_eq!(opened[0]["type"], "hello");
+    assert_eq!(opened[0]["seq"], 0, "no messages yet: {}", opened[0]);
+    assert_eq!(opened[0]["gap"], false);
+
+    engine::advance_to(&app, Timestamp(NOW_MS + 5_000));
+    let live = stream_frames(&app, "/api/stream", 1).await;
+    let joined = live[0]["seq"].as_u64().unwrap();
+    assert!(joined > 0, "the engine step published something: {live:?}");
+
+    // A client that was watching from the start asks for everything since,
+    // and gets it, in order, before the live feed.
+    let replayed = stream_frames(&app, "/api/stream?since=0", joined as usize + 1).await;
+    assert_eq!(replayed[0]["type"], "hello");
+    assert_eq!(replayed[0]["gap"], false, "the buffer still reaches back");
+    assert_eq!(replayed[0]["seq"], joined, "joining where the live one did");
+    let numbers: Vec<u64> = replayed[1..]
+        .iter()
+        .map(|m| m["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        numbers,
+        (1..=joined).collect::<Vec<_>>(),
+        "every message since, once each, in order"
+    );
+
+    // Asking again from where that left off replays nothing.
+    let caught_up = stream_frames(&app, &format!("/api/stream?since={joined}"), 2).await;
+    assert_eq!(caught_up.len(), 1, "nothing to replay: {caught_up:?}");
+    assert_eq!(caught_up[0]["type"], "hello");
+}
+
+#[tokio::test]
+async fn a_stream_says_so_when_the_replay_buffer_cannot_reach_back() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        // Two messages of history: the third pushes the first out.
+        stream_replay: 2,
+        ..Options::default()
+    });
+    let status = app
+        .market()
+        .status(0, app.clock.now())
+        .expect("ACME exists");
+    for _ in 0..5 {
+        app.publish(fehu_webapp::market::StreamMessage::Status(status));
+    }
+    let frames = stream_frames(&app, "/api/stream?since=1", 4).await;
+    let hello = &frames[0];
+    assert_eq!(hello["type"], "hello");
+    assert_eq!(hello["seq"], 5);
+    assert_eq!(hello["oldest_seq"], 4, "only the last two are kept");
+    assert_eq!(
+        hello["gap"], true,
+        "message 2 is gone for good and the client must be told: {hello}"
+    );
+    // What is left is still replayed, rather than being withheld.
+    let numbers: Vec<u64> = frames[1..]
+        .iter()
+        .map(|m| m["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(numbers, vec![4, 5]);
+
+    // Within reach, there is no gap.
+    let frames = stream_frames(&app, "/api/stream?since=4", 2).await;
+    assert_eq!(frames[0]["gap"], false, "{}", frames[0]);
+    assert_eq!(frames[1]["seq"], 5);
+}
+
+#[tokio::test]
+async fn a_replay_keeps_other_traders_fills_to_themselves() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        ..Options::default()
+    });
+    let alice = sign_up(&app, "alice").await;
+    let bruno = sign_up(&app, "bruno").await;
+    let (code, body) = post(
+        &alice,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": alice.trader, "side": "buy", "qty": 10, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+
+    let mine = stream_frames(
+        &app,
+        &format!("/api/stream?since=0&api_key={}", alice.key),
+        8,
+    )
+    .await;
+    assert!(
+        mine.iter().any(|m| m["type"] == "fill"),
+        "a trader replays their own fills: {mine:?}"
+    );
+    let theirs = stream_frames(
+        &app,
+        &format!("/api/stream?since=0&api_key={}", bruno.key),
+        8,
+    )
+    .await;
+    assert!(
+        !theirs.iter().any(|m| m["type"] == "fill"),
+        "a replay must not hand over somebody else's fills: {theirs:?}"
+    );
+    let anonymous = stream_frames(&app, "/api/stream?since=0", 8).await;
+    assert!(!anonymous.iter().any(|m| m["type"] == "fill"));
 }

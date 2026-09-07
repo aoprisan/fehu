@@ -178,6 +178,12 @@ pub enum LedgerKind {
     Buy,
     /// A sell settled: cash came in.
     Sell,
+    /// The venue's fee on a fill, or the rebate it paid for providing
+    /// liquidity. Always its own entry: the tape stays the price and the
+    /// ledger stays the money.
+    Fee,
+    /// A dividend paid on shares held when it was declared.
+    Dividend,
 }
 
 /// One movement of money, in the order it happened.
@@ -413,6 +419,65 @@ impl Account {
         self.write(kind, signed, ts_ms, Some(symbol), Some(order_id), None)
     }
 
+    /// Charge the venue's fee on a fill, or pay its rebate. `amount_cents`
+    /// is signed the way the ledger is: negative takes money out, positive
+    /// puts it in. Zero writes nothing — a fee of nothing is not an event.
+    ///
+    /// This does not check the balance. It cannot: the fill has already
+    /// happened, and a fee is not something a trader can decline. What keeps
+    /// it honest is that only a taker is charged, and a taker's cash was
+    /// checked with the fee included before the order was ever submitted.
+    pub fn charge_fee(
+        &mut self,
+        amount_cents: i64,
+        symbol: &'static str,
+        order_id: u64,
+        ts_ms: i64,
+    ) -> Option<LedgerEntry> {
+        if amount_cents == 0 {
+            return None;
+        }
+        self.balance_cents = self.balance_cents.saturating_add(amount_cents);
+        Some(self.write(
+            LedgerKind::Fee,
+            amount_cents,
+            ts_ms,
+            Some(symbol),
+            Some(order_id),
+            None,
+        ))
+    }
+
+    /// Pay a dividend into the account. Like a fee, this is money the market
+    /// moves rather than money the holder asked to move: it is credited
+    /// whatever the account's status, because a frozen account still owns its
+    /// shares and a dividend is theirs.
+    pub fn pay_dividend(
+        &mut self,
+        amount_cents: i64,
+        symbol: &'static str,
+        memo: Option<String>,
+        ts_ms: i64,
+    ) -> Option<LedgerEntry> {
+        if amount_cents <= 0 {
+            return None;
+        }
+        let room = MAX_BALANCE_CENTS.saturating_sub(self.balance_cents);
+        let amount = amount_cents.min(room.max(0));
+        if amount == 0 {
+            return None;
+        }
+        self.balance_cents = self.balance_cents.saturating_add(amount);
+        Some(self.write(
+            LedgerKind::Dividend,
+            amount,
+            ts_ms,
+            Some(symbol),
+            None,
+            memo,
+        ))
+    }
+
     /// Move the account to `status`. A closed account is terminal, and an
     /// account with cash committed to resting orders cannot be closed.
     pub fn set_status(&mut self, status: AccountStatus) -> Result<(), MoneyError> {
@@ -460,6 +525,42 @@ impl Account {
                 money(self.reserved_cents),
                 money(self.balance_cents)
             ));
+        }
+        issues
+    }
+
+    /// Check the retained ledger's arithmetic and its link to the current
+    /// balance. Evicted history cannot be audited; its closing balance is
+    /// the opening anchor of the retained window.
+    pub fn ledger_issues(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        let Some(first) = self.ledger.front() else {
+            issues.push("ledger is empty".into());
+            return issues;
+        };
+        let mut balance = i128::from(first.balance_cents) - i128::from(first.amount_cents);
+        if first.id == 1 && balance != 0 {
+            issues.push("opening ledger balance is not zero".into());
+        }
+        let mut previous_id = first.id.checked_sub(1);
+        for entry in &self.ledger {
+            if previous_id.and_then(|id| id.checked_add(1)) != Some(entry.id) {
+                issues.push("ledger entry ids are not consecutive".into());
+            }
+            balance += i128::from(entry.amount_cents);
+            if balance != i128::from(entry.balance_cents) {
+                issues.push(format!(
+                    "ledger entry {} has an inconsistent balance",
+                    entry.id
+                ));
+            }
+            previous_id = Some(entry.id);
+        }
+        if previous_id != Some(self.entries_total) {
+            issues.push("ledger entry count does not match its last id".into());
+        }
+        if balance != i128::from(self.balance_cents) {
+            issues.push("ledger does not reconcile to the account balance".into());
         }
         issues
     }
@@ -824,6 +925,25 @@ mod tests {
         assert_eq!(ledger[0].id, 21, "newest first, opening entry included");
         assert_eq!(a.entries_total, 21);
         assert_eq!(a.balance_cents(), 2_000);
+    }
+
+    #[test]
+    fn ledger_audit_handles_eviction_and_detects_corruption() {
+        let mut a = account(100);
+        assert!(a.ledger_issues().is_empty());
+        for i in 1..=20 {
+            a.deposit(100, None, i).unwrap();
+        }
+        assert!(a.ledger_issues().is_empty());
+        let valid = a.clone();
+        a.ledger.back_mut().unwrap().amount_cents += 1;
+        assert!(!a.ledger_issues().is_empty());
+        a = valid.clone();
+        a.balance_cents += 1;
+        assert!(!a.ledger_issues().is_empty());
+        a = valid;
+        a.ledger.back_mut().unwrap().id += 1;
+        assert!(!a.ledger_issues().is_empty());
     }
 
     #[test]
