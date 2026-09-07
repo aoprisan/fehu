@@ -44,21 +44,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             App::new(options)
         }
     };
-    {
-        let market = app.market();
-        for s in &market.symbols {
-            let q = s.quote();
-            tracing::info!(
-                symbol = s.info.symbol,
-                price = format!("{:.2}", q.price_cents as f64 / 100.0),
-                daily_bars = s.bars(fehu::Interval::D1, usize::MAX).len(),
-                minute_bars = s.bars(fehu::Interval::M1, usize::MAX).len(),
-                ticks = s.ticks_total,
-                bid = q.bid_cents.map(|c| format!("{:.2}", c as f64 / 100.0)),
-                ask = q.ask_cents.map(|c| format!("{:.2}", c as f64 / 100.0)),
-                "ready"
-            );
-        }
+    for symbol in app.listings().all() {
+        let Ok((q, daily_bars, minute_bars, ticks)) = symbol
+            .ask(|s| {
+                (
+                    s.quote(),
+                    s.bars(fehu::Interval::D1, usize::MAX).len(),
+                    s.bars(fehu::Interval::M1, usize::MAX).len(),
+                    s.ticks_total,
+                )
+            })
+            .await
+        else {
+            continue;
+        };
+        tracing::info!(
+            symbol = q.symbol,
+            price = format!("{:.2}", q.price_cents as f64 / 100.0),
+            daily_bars,
+            minute_bars,
+            ticks,
+            bid = q.bid_cents.map(|c| format!("{:.2}", c as f64 / 100.0)),
+            ask = q.ask_cents.map(|c| format!("{:.2}", c as f64 / 100.0)),
+            "ready"
+        );
     }
     tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "warm-up done");
 
@@ -81,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     // One last save, so a clean shutdown loses nothing at all.
     if let Some(path) = app.options.state_file.as_deref() {
-        match save::write(&app, path) {
+        match save::write(&app, path).await {
             Ok(()) => tracing::info!(path = %path.display(), "state saved"),
             Err(e) => tracing::error!(path = %path.display(), error = %e, "state not saved"),
         }

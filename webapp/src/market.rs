@@ -1,759 +1,445 @@
-//! The seeded symbols, their simulators and bar history, and the shared
-//! application state.
+//! The market: the actor that clears every trade, the symbol actors it
+//! drives, and the shared application state that addresses them.
+//!
+//! # No locks
+//!
+//! Nothing in this server is behind a mutex. Every piece of state belongs
+//! to one tokio task and is reached only by sending that task a job
+//! ([`crate::actor`]):
+//!
+//! | actor | owns | who sends it jobs |
+//! |---|---|---|
+//! | one [`SymbolState`] actor per symbol | the simulator, the book, the bars, the tape, the halt, the stops | anyone for reads; **only the market** for anything that changes the book |
+//! | the [`Market`] actor | users, accounts, traders, the order log, the event log, the symbol table, the order-id counter | request handlers and the engine |
+//! | the [`Stream`] actor | the sequence counter and the replay buffer | anyone, to publish; connections, to subscribe |
+//! | the rate limiter actor | the token buckets | the rate-limit middleware |
+//!
+//! Two things are read on every request and change only at sign-up or
+//! listing time — who a key speaks for, and which symbols exist. They are
+//! published by the market on `tokio::sync::watch` channels as immutable
+//! snapshots, so a handler reads them without sending anything.
+//!
+//! # The one rule
+//!
+//! **Calls go one way: the market calls the symbols; the symbols call
+//! nobody.** A handler calls the market, or a symbol for a read, never one
+//! from inside the other. With no cycle there is no deadlock to design
+//! around, and the two invariants that used to need one big lock fall out:
+//!
+//! * The market is the only thing that ever changes a book — an order, a
+//!   cancel, a resume, a delisting, and the engine step itself all run as
+//!   jobs *on the market actor*, which calls the symbol for the book
+//!   operation and then books the money side before it runs anything else.
+//!   So the reservation behind every resting order is exactly what the book
+//!   says it should be, `held + bids ≤ outstanding` is checked against
+//!   numbers that cannot move under it, and every fill is in the accounts
+//!   before the next job sees the book.
+//! * A consistent snapshot of the whole market — for reconciliation, for a
+//!   save — is one job on the market that asks each symbol for a copy of
+//!   itself. Nothing else can be halfway through a book while it runs.
+//!
+//! What runs in parallel is what is expensive: the engine step advances
+//! every symbol's simulator at once (the market job fans the step out to
+//! every symbol actor and joins them), and every read of a quote, a book,
+//! a bar or the tape goes straight to that symbol's actor and waits on
+//! nothing else. What is serialised is what has to be: the money.
+//!
+//! Order ids span every book, because the order log and the client-order-id
+//! index do. The market keeps the counter: an order takes the larger of the
+//! counter and the target book's own next id, and the book's counter after
+//! the submit is folded back in, so no two trader orders in any two books
+//! share an id, and a delisted book's counter is folded in as it leaves.
+//!
+//! A symbol that is delisted is dropped from the published table and marked
+//! delisted under its own actor. A request that took a handle to it just
+//! before finds the mark and is answered "no such symbol".
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fehu::{
-    Candle, Candles, Config, Exchange, Interval, JumpParams, LiquidityParams, MarketHours, Side,
-    Snapshot, Tick, Timestamp, Trade, TraderId, TradingParams, VolumeParams,
-};
-use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use fehu::{Interval, MarketHours, Order, OrderStatus, Resting, Side, Timestamp, Trade, TraderId};
+use serde::Serialize;
+use tokio::sync::{broadcast, watch};
 
 use crate::account::{Account, AccountId, MoneyError, User, UserId, notional_cents};
+use crate::actor::{Actor, Gone};
 use crate::auth::Keyring;
 use crate::events::EventRecord;
 use crate::limit::{Decision, Limiter, Rate};
 use crate::metrics::Metrics;
-use crate::save::{MarketSave, STATE_VERSION, Save, Symbol, SymbolSave};
+use crate::save::{MarketSave, STATE_VERSION, Save};
 use crate::trading::{
-    BookDto, Fees, FillRecord, HoldingDto, MAX_STOPS_PER_TRADER, OrderRecord, OrderResponse,
-    Refused, StopOrder, StopRequest, TradeDto, Trader,
+    BookDto, Fees, FillRecord, HoldingDto, MAX_STOPS_PER_TRADER, OpenOrderDto, OrderRecord,
+    OrderResponse, Refused, StopOrder, StopRequest, TradeDto, Trader,
 };
 
-/// Milliseconds in one day.
-pub const DAY_MS: i64 = 86_400_000;
+pub use crate::symbol::*;
 
-/// What a listing is, apart from its price process: who it claims to be and
-/// how many shares of it exist.
-///
-/// This travels in the save file. It used to come from the build — the four
-/// literals below — but a symbol listed while the server runs has no build to
-/// come from, so the file carries the listing itself and the build only
-/// supplies the ones a fresh market starts with.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-// `symbol` is registered on the way in rather than borrowed from the input,
-// so the derive needs no `'de: 'static`.
-#[serde(bound(deserialize = ""))]
-pub struct SymbolInfo {
-    /// Ticker, e.g. `ACME`. Spelled as [`Symbol`] rather than `&'static str`
-    /// so `serde` does not read it as data borrowed from the input.
-    #[serde(with = "crate::save::symbol")]
-    pub symbol: Symbol,
-    /// Company name.
-    pub name: String,
-    /// Sector label.
-    pub sector: String,
-    /// One-line flavour text.
-    pub description: String,
-    /// Shares in existence. Nothing creates or destroys them: what the
-    /// traders hold plus what is still out in the market adds up to this, so
-    /// a buy cannot ask for more than is left (see
-    /// [`Market::available_shares`]).
-    pub shares_outstanding: u64,
-    /// RNG seed. Same seed + same events ⇒ same prices, every run.
-    pub seed: u64,
+/// When a move halts a symbol, and for how long.
+#[derive(Clone, Copy, Debug)]
+pub struct HaltPolicy {
+    /// A move this far from the band halts a symbol; `0` turns that off.
+    pub price_limit_pct: f64,
+    /// How long an automatic halt lasts, in simulated seconds.
+    pub halt_secs: u64,
 }
 
-/// A symbol's metadata plus the simulator config and trading parameters it
-/// is created with. This is what both a seeded symbol and one listed at
-/// runtime are built from.
-pub struct SymbolSpec {
-    pub info: SymbolInfo,
-    pub config: Config,
-    pub trading: TradingParams,
+/// A listed symbol: its ticker, and the actor that owns its state.
+pub struct Symbol {
+    pub ticker: &'static str,
+    actor: Actor<SymbolState>,
 }
 
-/// The tickers a fresh market starts with, in listing order.
-///
-/// These are the *seeded* symbols, not the symbol set: listings are added and
-/// removed while the server runs (`POST /api/symbols`,
-/// `DELETE /api/symbols/{symbol}`), and a restored market lists whatever its
-/// save file lists rather than whatever this array says.
-pub const TICKERS: [&str; 4] = ["ACME", "NBLA", "HLIO", "PXCO"];
+impl Symbol {
+    fn spawn(state: SymbolState) -> Arc<Self> {
+        Arc::new(Self {
+            ticker: state.info.symbol,
+            actor: Actor::spawn(state),
+        })
+    }
 
-/// `ticker` as the `&'static str` the server uses for it, matched
-/// case-insensitively, or `None` if this process has never registered it.
-///
-/// A lookup, never a registration: see [`crate::symbols`].
-pub fn intern(ticker: &str) -> Option<&'static str> {
-    crate::symbols::lookup(ticker)
-}
+    /// Ask the symbol something. For reads, anyone may; for anything that
+    /// changes the book, only the market does — see the module docs.
+    pub async fn ask<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&SymbolState) -> R + Send + 'static,
+    ) -> Result<R, Gone> {
+        self.actor.call(move |s| f(s)).await
+    }
 
-/// Register `ticker` and give back the one string the whole server will use
-/// for it. Panics only if the ticker is malformed, which the literals below
-/// are not.
-fn seeded(ticker: &str) -> &'static str {
-    crate::symbols::register(ticker).expect("seeded tickers are well formed")
-}
+    /// Ask the symbol something, unless it has been delisted.
+    pub async fn ask_listed<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&SymbolState) -> R + Send + 'static,
+    ) -> Result<Option<R>, Gone> {
+        self.actor.call(move |s| (!s.delisted).then(|| f(s))).await
+    }
 
-/// The four symbols a fresh market is seeded with. `start_ts` is the first
-/// tick's timestamp; the rest of the config is per symbol and deliberately
-/// varied so the charts look different from one another.
-pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
-    let base = |start_price_cents: i64, drift: f64, volatility: f64| Config {
-        start_price_cents,
-        drift,
-        volatility,
-        start_ts,
-        ..Config::default()
-    };
-    vec![
-        SymbolSpec {
-            info: SymbolInfo {
-                symbol: seeded("ACME"),
-                name: "Acme Industrial".into(),
-                sector: "Industrials".into(),
-                description: "Century-old conglomerate. Low volatility, steady drift, rare jumps."
-                    .into(),
-                shares_outstanding: 240_000_000,
-                seed: 0xACE,
-            },
-            config: Config {
-                jumps: JumpParams {
-                    intensity: 40.0,
-                    mean: -0.004,
-                    std: 0.02,
-                },
-                volume: VolumeParams {
-                    base_per_day: 2_500_000.0,
-                    ..VolumeParams::default()
-                },
-                ..base(8_420, 0.04, 0.22)
-            },
-            trading: TradingParams::default(),
-        },
-        SymbolSpec {
-            info: SymbolInfo {
-                symbol: seeded("NBLA"),
-                name: "Nebula Robotics".into(),
-                sector: "Technology".into(),
-                description:
-                    "Pre-profit robotics darling. High volatility, big drift, frequent jumps."
-                        .into(),
-                shares_outstanding: 85_000_000,
-                seed: 0x4E42,
-            },
-            config: Config {
-                jumps: JumpParams {
-                    intensity: 200.0,
-                    mean: -0.006,
-                    std: 0.05,
-                },
-                volume: VolumeParams {
-                    base_per_day: 900_000.0,
-                    return_sensitivity: 3.0,
-                    ..VolumeParams::default()
-                },
-                ..base(31_255, 0.15, 0.60)
-            },
-            // Thin book, wide spread: a market order moves it.
-            trading: TradingParams {
-                liquidity: LiquidityParams {
-                    half_spread: 0.0010,
-                    level_step: 0.0010,
-                    touch_depth: 0.0005,
-                    ..LiquidityParams::default()
-                },
-                ..TradingParams::default()
-            },
-        },
-        SymbolSpec {
-            info: SymbolInfo {
-                symbol: seeded("HLIO"),
-                name: "Helio Energy".into(),
-                sector: "Energy".into(),
-                description: "Solar and storage utility. Commodity-driven, moderate volatility."
-                    .into(),
-                shares_outstanding: 610_000_000,
-                seed: 0x4845,
-            },
-            config: Config {
-                jumps: JumpParams {
-                    intensity: 80.0,
-                    mean: -0.01,
-                    std: 0.035,
-                },
-                volume: VolumeParams {
-                    base_per_day: 4_000_000.0,
-                    ..VolumeParams::default()
-                },
-                ..base(2_310, 0.02, 0.42)
-            },
-            trading: TradingParams::default(),
-        },
-        SymbolSpec {
-            info: SymbolInfo {
-                symbol: seeded("PXCO"),
-                name: "Pax Consumer Co".into(),
-                sector: "Consumer Staples".into(),
-                description: "Household brands. Defensive: low volatility, shocks fade slowly."
-                    .into(),
-                shares_outstanding: 150_000_000,
-                seed: 0x5058,
-            },
-            config: Config {
-                mean_reversion_speed: 20.0,
-                jumps: JumpParams {
-                    intensity: 25.0,
-                    mean: -0.003,
-                    std: 0.015,
-                },
-                volume: VolumeParams {
-                    base_per_day: 1_500_000.0,
-                    ..VolumeParams::default()
-                },
-                ..base(5_780, 0.05, 0.16)
-            },
-            // Deep book: hard to move.
-            trading: TradingParams {
-                liquidity: LiquidityParams {
-                    touch_depth: 0.003,
-                    depth_growth: 1.5,
-                    ..LiquidityParams::default()
-                },
-                ..TradingParams::default()
-            },
-        },
-    ]
-}
-
-/// Why trading in a symbol stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HaltReason {
-    /// The price left the band the day opened with: a limit move.
-    LimitMove,
-    /// The game master stopped it, and only they can start it again.
-    Manual,
-}
-
-impl HaltReason {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::LimitMove => "limit move",
-            Self::Manual => "halted by the game master",
-        }
+    /// Change the symbol. The market's to call, nobody else's.
+    pub(crate) async fn change<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut SymbolState) -> R + Send + 'static,
+    ) -> Result<R, Gone> {
+        self.actor.call(f).await
     }
 }
 
-/// Trading in one symbol, stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Halt {
-    pub reason: HaltReason,
-    /// Simulated time trading stopped.
-    pub since_ms: i64,
-    /// When an automatic halt lifts by itself. A manual one has no end: it
-    /// stands until the game master resumes the symbol.
-    pub until_ms: Option<i64>,
-    /// The band the price left, and the price that left it.
-    pub band_cents: i64,
-    pub price_cents: i64,
-    /// How far the price had moved from the band, as a fraction.
-    pub move_pct: f64,
+/// The symbol table, in listing order. Published by the market as an
+/// immutable snapshot; a new one replaces it on every listing and
+/// delisting.
+#[derive(Default)]
+pub struct Listings {
+    symbols: Vec<Arc<Symbol>>,
 }
 
-/// Why an order cannot be sent for a symbol right now.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Closed {
-    /// Outside the trading session.
-    Session {
-        /// When the next session opens.
-        next_open_ms: i64,
-    },
-    /// Trading is halted.
-    Halted(Halt),
+impl Listings {
+    /// Every listing, in order.
+    pub fn all(&self) -> &[Arc<Symbol>] {
+        &self.symbols
+    }
+
+    /// The listing for `ticker`, matched case-insensitively.
+    pub fn get(&self, ticker: &str) -> Option<&Arc<Symbol>> {
+        self.symbols
+            .iter()
+            .find(|s| s.ticker.eq_ignore_ascii_case(ticker))
+    }
+
+    pub fn len(&self) -> usize {
+        self.symbols.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.symbols.is_empty()
+    }
 }
 
-impl std::fmt::Display for Closed {
+/// Who is who: the API keys, and who owns which trader. Published by the
+/// market as an immutable snapshot; read on every authenticated request,
+/// by the rate limiter and by every open stream without sending anything.
+#[derive(Clone, Debug, Default)]
+pub struct Directory {
+    keys: Keyring,
+    owners: BTreeMap<TraderId, UserId>,
+}
+
+impl Directory {
+    /// The user `key` speaks for, if it is one of ours.
+    pub fn user_of(&self, key: &str) -> Option<UserId> {
+        self.keys.user_of(key)
+    }
+
+    /// The user `trader` belongs to, if the trader exists.
+    pub fn owner_of(&self, trader: TraderId) -> Option<UserId> {
+        self.owners.get(&trader).copied()
+    }
+}
+
+/// Why a symbol could not be listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListingError {
+    /// A symbol with this ticker is already listed. Delist it first.
+    AlreadyListed(&'static str),
+    /// The market already lists as many symbols as it will.
+    Full { max: usize },
+}
+
+impl std::fmt::Display for ListingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Session { next_open_ms } => write!(
-                f,
-                "the market is closed; the next session opens at {next_open_ms}                  (milliseconds since the Unix epoch, simulated time)"
-            ),
-            Self::Halted(halt) => {
-                write!(f, "trading is halted ({})", halt.reason.label())?;
-                if let Some(until) = halt.until_ms {
-                    write!(f, " until {until}")?;
-                }
-                Ok(())
-            }
+            Self::AlreadyListed(t) => write!(f, "{t} is already listed"),
+            Self::Full { max } => write!(f, "this market lists at most {max} symbols"),
         }
     }
 }
 
-/// Whether a symbol can be traded right now, and if not, why not.
+impl std::error::Error for ListingError {}
+
+/// Why a symbol could not be delisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DelistError {
+    /// No such symbol.
+    Unknown,
+    /// The buy-out price is not a price.
+    Price,
+}
+
+impl std::fmt::Display for DelistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown => write!(f, "no such symbol"),
+            Self::Price => write!(f, "a buy-out price cannot be negative"),
+        }
+    }
+}
+
+impl std::error::Error for DelistError {}
+
+/// What a delisting undid, and what it paid for the shares.
+#[derive(Clone, Debug, Serialize)]
+pub struct Delisting {
+    pub symbol: &'static str,
+    /// Paid on every share held. Zero is a real answer: a company can be
+    /// worth nothing.
+    pub cents_per_share: i64,
+    /// What the symbol last traded at, for comparison.
+    pub last_price_cents: i64,
+    /// Resting orders withdrawn, releasing what they reserved.
+    pub orders_cancelled: usize,
+    /// Untriggered stops dropped. They reserved nothing.
+    pub stops_cancelled: usize,
+    pub shares_bought_out: u64,
+    /// Accounts credited. A holder paid nothing — a buy-out at zero — is
+    /// bought out but not credited.
+    pub accounts_paid: usize,
+    pub total_cents: i64,
+}
+
+/// What a dividend paid, and the price it went ex at.
 #[derive(Clone, Copy, Debug, Serialize)]
-pub struct SymbolStatus {
+pub struct Dividend {
     pub symbol: &'static str,
-    /// Simulated time this was asked.
-    pub ts_ms: i64,
-    /// A session is running (always, with no trading calendar).
-    pub market_open: bool,
-    pub halted: bool,
-    /// Orders are accepted: open, and not halted.
-    pub tradable: bool,
-    pub halt: Option<Halt>,
-    /// When the next session opens; `null` with no trading calendar.
-    pub next_open_ms: Option<i64>,
-    /// When the running session closes; `null` if none is running.
-    pub next_close_ms: Option<i64>,
-    /// The price the limit band is measured from, and how far the price has
-    /// moved from it.
-    pub band_cents: i64,
-    pub move_pct: f64,
-    /// The move that stops trading; `0` when automatic halts are off.
-    pub limit_pct: f64,
-}
-
-/// What one call to [`SymbolState::advance_to`] produced.
-#[derive(Clone, Debug, Default)]
-pub struct Advanced {
-    /// Last tick emitted, if any.
-    pub last: Option<Tick>,
-    /// Number of ticks emitted.
-    pub ticks: u64,
-    /// Per interval in [`Interval::ALL`] order: did at least one bar close?
-    pub closed: [bool; 4],
-    /// Trades of the last tick, for the stream.
-    pub last_trades: Vec<Trade>,
-    /// Every trade a trader took part in, in order.
-    pub trader_trades: Vec<Trade>,
-}
-
-impl Advanced {
-    /// Intervals that closed at least one bar.
-    pub fn closed_intervals(&self) -> Vec<Interval> {
-        Interval::ALL
-            .iter()
-            .zip(self.closed)
-            .filter(|(_, closed)| *closed)
-            .map(|(iv, _)| *iv)
-            .collect()
-    }
-}
-
-/// Live quote for the symbol list and the SSE hello message.
-#[derive(Clone, Debug, Serialize)]
-pub struct Quote {
-    pub symbol: &'static str,
-    pub name: String,
-    pub sector: String,
-    /// Timestamp of the last tick.
-    pub ts_ms: i64,
+    pub cents_per_share: i64,
+    /// The price the dividend was declared against, before it went ex.
     pub price_cents: i64,
-    /// Close of the previous daily bar, if there is one.
-    pub prev_close_cents: Option<i64>,
-    /// `price / prev_close − 1`, in percent.
-    pub change_pct: Option<f64>,
-    pub day_open_cents: Option<i64>,
-    pub day_high_cents: Option<i64>,
-    pub day_low_cents: Option<i64>,
-    pub day_volume: u64,
-    pub fundamental_cents: i64,
-    pub annual_vol: f64,
-    pub pending_events: usize,
-    pub bid_cents: Option<i64>,
-    pub ask_cents: Option<i64>,
-    /// Shares in existence for this symbol.
-    pub shares_outstanding: u64,
-    /// `price × shares_outstanding`.
-    pub market_cap_cents: i64,
-    /// A session is running.
-    pub market_open: bool,
-    /// Trading is stopped.
-    pub halted: bool,
+    pub shares_paid: u64,
+    /// Accounts credited. A user with two traders holding the same symbol is
+    /// paid once per trader, into whichever account each trades on.
+    pub accounts_paid: usize,
+    pub total_cents: i64,
 }
 
-/// Serialisable view of [`fehu::Snapshot`].
-#[derive(Clone, Debug, Serialize)]
-pub struct SnapshotDto {
-    pub ts_ms: i64,
-    pub price_cents: i64,
-    pub fundamental_cents: i64,
-    pub log_spread: f64,
-    pub annual_vol: f64,
-    pub drift_effect: f64,
-    pub vol_effect: f64,
-    pub pending_events: usize,
+/// Why a submission could not be placed. The web layer turns these into
+/// status codes; the engine turns them into a stop that fired and was
+/// refused.
+#[derive(Clone, Debug)]
+pub enum PlaceError {
+    /// The symbol is not listed (or was delisted a moment ago).
+    UnknownSymbol,
+    /// The symbol turned the order away before it reached the book.
+    Check(OrderCheck),
+    /// The account or the trader's shares would not fund it.
+    Refused(Refused),
+    /// The trader is not one this market knows.
+    UnknownTrader(u64),
+    /// The book itself refused the order.
+    Invalid(String),
+    /// The same `client_order_id` was already used for a different order.
+    DuplicateClientId {
+        client_order_id: String,
+        order_id: u64,
+    },
+    /// The symbol's actor has stopped.
+    Gone,
 }
 
-impl From<Snapshot> for SnapshotDto {
-    fn from(s: Snapshot) -> Self {
-        Self {
-            ts_ms: s.ts.0,
-            price_cents: s.price_cents,
-            fundamental_cents: s.fundamental_cents,
-            log_spread: s.log_spread,
-            annual_vol: s.annual_vol,
-            drift_effect: s.drift_effect,
-            vol_effect: s.vol_effect,
-            pending_events: s.pending_events,
+impl std::fmt::Display for PlaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownSymbol => write!(f, "no such symbol"),
+            Self::Check(OrderCheck::Invalid(message)) | Self::Invalid(message) => {
+                write!(f, "{message}")
+            }
+            Self::Check(OrderCheck::Closed(closed)) => write!(f, "{closed}"),
+            Self::Check(OrderCheck::SelfTrade(ids)) => {
+                write!(
+                    f,
+                    "the order would trade with the trader's own orders {ids:?}"
+                )
+            }
+            Self::Check(OrderCheck::WouldCross {
+                price_cents,
+                best_cents,
+            }) => write!(
+                f,
+                "a post-only order at {price_cents} would cross the market at {best_cents}"
+            ),
+            Self::Check(OrderCheck::UnknownOrder(id)) => write!(f, "no such order: {id}"),
+            Self::Refused(e) => write!(f, "{e}"),
+            Self::UnknownTrader(id) => write!(f, "no such trader: {id}"),
+            Self::DuplicateClientId {
+                client_order_id,
+                order_id,
+            } => write!(
+                f,
+                "client_order_id {client_order_id:?} was already used for order {order_id}"
+            ),
+            Self::Gone => write!(f, "the symbol has stopped"),
         }
     }
 }
 
-/// One symbol: its exchange (simulator plus order book), the bars
-/// aggregated from its ticks, the coarse daily bars generated as
-/// pre-history at start-up, and the tape.
-pub struct SymbolState {
-    pub info: SymbolInfo,
-    pub exchange: Exchange,
-    /// 1 m / 5 m / 1 h / 1 d bars aggregated from fine ticks.
-    pub candles: Candles,
-    /// Daily bars from coarse mode, before the fine-tick history starts.
-    pub coarse_daily: Vec<Candle>,
-    pub last_tick: Option<Tick>,
-    /// Fine ticks emitted since start-up (warm-up included).
-    pub ticks_total: u64,
-    /// Most recent trades, oldest first.
-    pub tape: VecDeque<Trade>,
-    tape_cap: usize,
-    /// Trades since start-up (warm-up included).
-    pub trades_total: u64,
-    /// Set while trading is stopped.
-    pub halt: Option<Halt>,
-    /// The price the current band is measured from: where the day opened, or
-    /// where trading resumed. A move of more than `price_limit_pct` away from
-    /// it halts the symbol.
-    pub band_cents: i64,
-    /// Stops waiting for the price to reach them, oldest first. They are not
-    /// orders and the book does not know about them; see [`StopOrder`].
+impl From<Gone> for PlaceError {
+    fn from(_: Gone) -> Self {
+        Self::Gone
+    }
+}
+
+impl From<OrderCheck> for PlaceError {
+    fn from(check: OrderCheck) -> Self {
+        Self::Check(check)
+    }
+}
+
+/// An order request as the market sees it: what the trader asked for,
+/// already cleaned by the web layer.
+#[derive(Clone, Debug)]
+pub struct PlaceRequest {
+    pub order: Order,
+    pub client_order_id: Option<String>,
+    pub post_only: bool,
+    pub day: bool,
+    pub expires_at_ms: Option<i64>,
+    pub display_qty: Option<u64>,
+}
+
+/// What placing an order came to.
+#[derive(Clone, Debug)]
+pub enum Placed {
+    /// The order was sent, and this is what happened to it.
+    New(OrderResponse),
+    /// The same `client_order_id` had already been placed: this is the
+    /// first response again, and nothing new happened.
+    Replayed(OrderResponse),
+}
+
+impl Placed {
+    pub fn response(&self) -> &OrderResponse {
+        match self {
+            Self::New(r) | Self::Replayed(r) => r,
+        }
+    }
+}
+
+/// An amendment as the market sees it: which resting order, and what it
+/// should become.
+#[derive(Clone, Debug)]
+pub struct Amendment {
+    pub order_id: u64,
+    /// A new price, or the old one.
+    pub price_cents: Option<i64>,
+    /// A new quantity, or what was left of the old one.
+    pub qty: Option<u64>,
+    pub post_only: bool,
+    pub client_order_id: Option<String>,
+}
+
+/// What an amendment came to.
+#[derive(Clone, Debug)]
+pub struct Amended {
+    pub replaced_order_id: u64,
+    /// How much of the withdrawn order had filled before it went.
+    pub replaced_filled: u64,
+    pub order: OrderResponse,
+}
+
+/// A symbol as a trader's records see it: what it is worth, and what the
+/// trader has resting and armed on it.
+#[derive(Clone, Debug)]
+pub struct SymbolView {
+    pub symbol: &'static str,
+    /// The reference price, which positions are marked to.
+    pub mark_cents: i64,
+    /// Every trader's resting orders.
+    pub open_orders: Vec<OpenOrderDto>,
+    /// Every trader's stops.
     pub stops: Vec<StopOrder>,
 }
 
-impl SymbolState {
-    fn new(spec: SymbolSpec, max_bars: usize, tape_cap: usize) -> Self {
-        Self::create(spec, max_bars, tape_cap).expect("seeded configs are valid")
-    }
-
-    /// Build a symbol from a spec that has not been vetted. The seeded ones
-    /// have been, and go through [`SymbolState::new`]; a listing asked for
-    /// over HTTP has not, and its config is checked here rather than
-    /// panicking on the request thread.
-    ///
-    /// # Errors
-    /// The first [`fehu::ConfigError`] in the simulator config or the trading
-    /// parameters.
-    fn create(
-        spec: SymbolSpec,
-        max_bars: usize,
-        tape_cap: usize,
-    ) -> Result<Self, fehu::ConfigError> {
-        let exchange = Exchange::new(spec.config, spec.trading, spec.info.seed)?;
-        Ok(Self {
-            info: spec.info,
-            exchange,
-            candles: Candles::new(max_bars),
-            coarse_daily: Vec::new(),
-            last_tick: None,
-            ticks_total: 0,
-            tape: VecDeque::new(),
-            tape_cap: tape_cap.max(1),
-            trades_total: 0,
-            halt: None,
-            band_cents: 0,
-            stops: Vec::new(),
-        })
-    }
-
-    /// The reference price process.
-    pub fn sim(&self) -> &fehu::Simulator {
-        self.exchange.simulator()
-    }
-
-    /// Generate `coarse_days` daily bars in coarse mode, then tick finely up
-    /// to `until` so the intraday intervals have history too. Both run on
-    /// the bare simulator (no traders exist yet, so the ticks are the ones
-    /// the exchange would have produced) and the book is synced at the end.
-    fn warm_up(&mut self, coarse_days: usize, until: Timestamp) {
-        let sim = self.exchange.simulator_mut();
-        self.coarse_daily = sim.coarse_candles(Interval::D1).take(coarse_days).collect();
-        let dur = until - sim.clock();
-        if dur > 0 {
-            for tick in sim.advance(Duration::from_millis(dur as u64)) {
-                self.candles.push(&tick);
-                self.last_tick = Some(tick);
-                self.ticks_total += 1;
-            }
-        }
-        self.exchange.resync();
-        self.band_cents = self.price_cents();
-    }
-
-    /// Advance the exchange's wall clock to `target` (no-op if it is not in
-    /// the future), aggregating every tick into the bars and every trade
-    /// into the tape.
-    pub fn advance_to(&mut self, target: Timestamp) -> Advanced {
-        let mut out = Advanced::default();
-        let dur = target - self.exchange.clock();
-        if dur <= 0 {
-            return out;
-        }
-        let Self {
-            exchange,
-            candles,
-            tape,
-            tape_cap,
-            ..
-        } = self;
-        let dur = Duration::from_millis(dur as u64);
-        let reports: Box<dyn Iterator<Item = fehu::StepReport> + '_> = if self.halt.is_some() {
-            Box::new(exchange.advance_without_matching(dur))
-        } else {
-            Box::new(exchange.advance(dur))
-        };
-        for report in reports {
-            let closed = candles.push(&report.tick);
-            for (flag, c) in out.closed.iter_mut().zip(closed) {
-                *flag |= c.is_some();
-            }
-            out.last = Some(report.tick);
-            out.ticks += 1;
-            out.trader_trades.extend(
-                report.trades.iter().filter(|t| {
-                    t.taker.owner.trader().is_some() || t.maker.owner.trader().is_some()
-                }),
-            );
-            self.trades_total += report.trades.len() as u64;
-            for t in &report.trades {
-                if tape.len() >= *tape_cap {
-                    tape.pop_front();
-                }
-                tape.push_back(*t);
-            }
-            out.last_trades = report.trades;
-        }
-        if out.last.is_some() {
-            self.last_tick = out.last;
-            self.ticks_total += out.ticks;
-        }
-        out
-    }
-
-    /// The symbol's trading calendar, if it has one.
-    pub fn market_hours(&self) -> Option<&MarketHours> {
-        self.sim().config().market_hours.as_ref()
-    }
-
-    /// A session is running at `now` (always, with no calendar).
-    pub fn is_open(&self, now: Timestamp) -> bool {
-        self.market_hours().is_none_or(|mh| mh.contains(now))
-    }
-
-    /// When the next session opens, with a calendar.
-    pub fn next_open_ms(&self, now: Timestamp) -> Option<i64> {
-        self.market_hours().map(|mh| {
-            if mh.contains(now) {
-                mh.next_open(now).0
-            } else {
-                mh.align(now).0
-            }
-        })
-    }
-
-    /// When the running session closes, if one is running.
-    pub fn next_close_ms(&self, now: Timestamp) -> Option<i64> {
-        self.market_hours()
-            .filter(|mh| mh.contains(now))
-            .map(|mh| mh.session_close(now).0)
-    }
-
-    /// Why an order cannot be sent right now, if it cannot: outside the
-    /// session, or halted. Cancelling is always allowed — a player must be
-    /// able to pull an order out of a market that has stopped.
-    pub fn closed(&self, now: Timestamp) -> Option<Closed> {
-        if let Some(halt) = self.halt {
-            return Some(Closed::Halted(halt));
-        }
-        if self.is_open(now) {
-            return None;
-        }
-        Some(Closed::Session {
-            next_open_ms: self.next_open_ms(now).unwrap_or(now.0),
-        })
-    }
-
-    /// Measure the band from where the price is now: a new day, or trading
-    /// starting again after a halt.
-    pub fn reband(&mut self) {
-        self.band_cents = self.price_cents();
-    }
-
-    /// Stop trading in this symbol.
-    pub fn halt(&mut self, reason: HaltReason, until_ms: Option<i64>, now_ms: i64) -> Halt {
-        let price_cents = self.price_cents();
-        let band_cents = if self.band_cents > 0 {
-            self.band_cents
-        } else {
-            price_cents
-        };
-        let halt = Halt {
-            reason,
-            since_ms: now_ms,
-            until_ms,
-            band_cents,
-            price_cents,
-            move_pct: band_move(band_cents, price_cents),
-        };
-        self.halt = Some(halt);
-        halt
-    }
-
-    /// Start trading again, measuring a fresh band from where the price got
-    /// to while it was stopped.
-    pub fn resume(&mut self) -> Option<Halt> {
-        let was = self.halt.take();
-        if was.is_some() {
-            self.reband();
-        }
-        was
-    }
-
-    /// Record trades executed between ticks (a trader's order) on the tape.
-    pub fn record_trades(&mut self, trades: &[Trade]) {
-        self.trades_total += trades.len() as u64;
-        for t in trades {
-            if self.tape.len() >= self.tape_cap {
-                self.tape.pop_front();
-            }
-            self.tape.push_back(*t);
-        }
-    }
-
-    /// Top `depth` levels of each side.
-    pub fn book(&self, depth: usize) -> BookDto {
-        let b = self.exchange.book();
-        BookDto {
-            bids: b.depth(fehu::Side::Buy, depth),
-            asks: b.depth(fehu::Side::Sell, depth),
-        }
-    }
-
-    /// The most recent `limit` bars of `iv`, oldest first, including the
-    /// in-progress bar. Daily bars include the coarse pre-history.
-    pub fn bars(&self, iv: Interval, limit: usize) -> Vec<Candle> {
-        let mut v: Vec<Candle> = Vec::new();
-        if iv == Interval::D1 {
-            v.extend(self.coarse_daily.iter().copied());
-        }
-        v.extend(self.candles.completed(iv).copied());
-        v.extend(self.candles.current(iv).copied());
-        if v.len() > limit {
-            v.drain(..v.len() - limit);
-        }
-        v
-    }
-
-    /// Everything about this symbol a restart needs: the exchange (simulator,
-    /// book and pending flow), the bars, and the tape.
-    pub fn to_save(&self) -> SymbolSave {
-        SymbolSave {
-            symbol: self.info.symbol.to_string(),
-            info: Some(self.info.clone()),
-            exchange: self.exchange.clone(),
-            candles: self.candles.clone(),
-            coarse_daily: self.coarse_daily.clone(),
-            last_tick: self.last_tick,
-            ticks_total: self.ticks_total,
-            tape: self.tape.iter().copied().collect(),
-            trades_total: self.trades_total,
-            halt: self.halt,
-            band_cents: self.band_cents,
-            stops: self.stops.clone(),
-        }
-    }
-
-    /// Rebuild a symbol from a save. Its listing comes out of the file with
-    /// it: which symbols a restored market has, and what they are, is what
-    /// was saved rather than what this build seeds.
-    fn from_save(info: SymbolInfo, save: SymbolSave, tape_cap: usize) -> Self {
-        let tape_cap = tape_cap.max(1);
-        let mut tape: VecDeque<Trade> = save.tape.into_iter().collect();
-        while tape.len() > tape_cap {
-            tape.pop_front();
-        }
+impl SymbolView {
+    fn of(s: &SymbolState) -> Self {
+        let sym = s.info.symbol;
         Self {
-            info,
-            exchange: save.exchange,
-            candles: save.candles,
-            coarse_daily: save.coarse_daily,
-            last_tick: save.last_tick,
-            ticks_total: save.ticks_total,
-            tape,
-            tape_cap,
-            trades_total: save.trades_total,
-            halt: save.halt,
-            band_cents: save.band_cents,
-            stops: save.stops,
-        }
-    }
-
-    /// The last traded price, or the simulator's reference before the first
-    /// tick.
-    pub fn price_cents(&self) -> i64 {
-        self.last_tick
-            .map_or_else(|| self.sim().snapshot().price_cents, |t| t.price_cents)
-    }
-
-    /// The whole company at the last traded price.
-    pub fn market_cap_cents(&self) -> i64 {
-        notional_cents(self.price_cents(), self.info.shares_outstanding)
-    }
-
-    /// Current quote.
-    pub fn quote(&self) -> Quote {
-        let snap = self.sim().snapshot();
-        let daily = self.bars(Interval::D1, 2);
-        let today = self.candles.current(Interval::D1);
-        let prev_close = match (today, daily.len()) {
-            (Some(_), n) if n >= 2 => Some(daily[n - 2].close),
-            (None, n) if n >= 1 => Some(daily[n - 1].close),
-            _ => None,
-        };
-        let price = self.last_tick.map_or(snap.price_cents, |t| t.price_cents);
-        Quote {
-            symbol: self.info.symbol,
-            name: self.info.name.clone(),
-            sector: self.info.sector.clone(),
-            ts_ms: self.last_tick.map_or(snap.ts.0, |t| t.ts.0),
-            price_cents: price,
-            prev_close_cents: prev_close,
-            change_pct: prev_close
-                .filter(|&p| p > 0)
-                .map(|p| (price as f64 / p as f64 - 1.0) * 100.0),
-            day_open_cents: today.map(|c| c.open),
-            day_high_cents: today.map(|c| c.high),
-            day_low_cents: today.map(|c| c.low),
-            day_volume: today.map_or(0, |c| c.volume),
-            fundamental_cents: snap.fundamental_cents,
-            annual_vol: snap.annual_vol,
-            pending_events: snap.pending_events,
-            bid_cents: self.exchange.book().best_bid(),
-            ask_cents: self.exchange.book().best_ask(),
-            shares_outstanding: self.info.shares_outstanding,
-            market_cap_cents: notional_cents(price, self.info.shares_outstanding),
-            market_open: self.is_open(Timestamp(self.last_tick.map_or(snap.ts.0, |t| t.ts.0))),
-            halted: self.halt.is_some(),
+            symbol: sym,
+            mark_cents: s.exchange.reference_cents(),
+            open_orders: s
+                .exchange
+                .book()
+                .orders()
+                .filter(|o| o.owner.trader().is_some())
+                .map(|o| OpenOrderDto::from_resting(sym, o))
+                .collect(),
+            stops: s.stops.clone(),
         }
     }
 }
 
-/// Everything behind the mutex: the symbols, the users, their accounts and
-/// traders, and the event log.
+/// The counts `GET /api/health` reports from the market.
+#[derive(Clone, Debug, Default)]
+pub struct MarketHealth {
+    pub symbols: usize,
+    pub ticks_total: u64,
+    pub trades_total: u64,
+    pub resting_orders: usize,
+    pub stops_held: usize,
+    pub users: usize,
+    pub accounts: usize,
+    pub traders: usize,
+    pub cash_cents: i64,
+    pub orders_placed: u64,
+    pub orders_refused: u64,
+    pub fills_booked: u64,
+    pub events_logged: usize,
+}
+
+/// The market: everybody's money, every order ever sent, and the symbols
+/// those orders went to. One actor; see the module docs for why.
 pub struct Market {
-    pub symbols: Vec<SymbolState>,
+    symbols: Vec<Arc<Symbol>>,
+    listings_tx: watch::Sender<Arc<Listings>>,
+    directory: Directory,
+    directory_tx: watch::Sender<Arc<Directory>>,
+    stream: Stream,
+    clock: SimClock,
+    halts: HaltPolicy,
+    max_symbols: usize,
     /// Most recent events, oldest first.
-    pub events: VecDeque<EventRecord>,
+    events: VecDeque<EventRecord>,
     event_cap: usize,
     next_event_id: u64,
     pub users: BTreeMap<UserId, User>,
     next_user_id: u64,
-    /// The API keys issued to those users.
-    pub keys: Keyring,
     pub accounts: BTreeMap<AccountId, Account>,
     next_account_id: u64,
     pub traders: BTreeMap<TraderId, Trader>,
@@ -761,14 +447,9 @@ pub struct Market {
     /// Ids for the stops held on the symbols. Separate from order ids: a
     /// stop only becomes an order when it fires.
     next_stop_id: u64,
-    /// The lowest order id a new order may take, whatever the books say.
-    ///
-    /// Order ids are allocated above every book's counter, which is only the
-    /// whole story while every book that ever existed is still here. A
-    /// delisted symbol's book leaves with its counter, and its orders stay in
-    /// the log: without this floor the next order could take an id one of
-    /// them already has.
-    order_id_floor: fehu::OrderId,
+    /// The lowest id the next trader order may take, in any book. See the
+    /// module docs.
+    next_order_id: fehu::OrderId,
     /// Every order the log still holds, by order id.
     orders: BTreeMap<u64, OrderRecord>,
     /// Order ids in the order they were accepted, for eviction.
@@ -787,23 +468,39 @@ pub struct Market {
     pub fills_booked: u64,
     /// What the venue charges for a fill.
     pub fees: Fees,
-    /// A move this far from the band halts a symbol; `0` turns that off.
-    price_limit_pct: f64,
-    /// How long an automatic halt lasts, in simulated seconds.
-    halt_secs: u64,
 }
 
+// ---------------------------------------------------------------------------
+// The clearing half: people, money, the order log. Synchronous; nothing here
+// touches a symbol.
+
 impl Market {
-    /// Index of a symbol by ticker, case-insensitively.
-    pub fn symbol_index(&self, ticker: &str) -> Option<usize> {
+    fn publish_directory(&self) {
+        self.directory_tx
+            .send_replace(Arc::new(self.directory.clone()));
+    }
+
+    fn publish_listings(&self) {
+        self.listings_tx.send_replace(Arc::new(Listings {
+            symbols: self.symbols.clone(),
+        }));
+    }
+
+    /// The listing for `ticker`, matched case-insensitively.
+    pub fn symbol(&self, ticker: &str) -> Option<&Arc<Symbol>> {
         self.symbols
             .iter()
-            .position(|s| s.info.symbol.eq_ignore_ascii_case(ticker))
+            .find(|s| s.ticker.eq_ignore_ascii_case(ticker))
+    }
+
+    /// Every listing, in order.
+    pub fn symbols(&self) -> &[Arc<Symbol>] {
+        &self.symbols
     }
 
     /// Register a user and issue their API key. `name` and `email` are
     /// trimmed and truncated; an empty name becomes `user-{id}`. The key is
-    /// read back once with [`crate::auth::Keyring::take_issued_key`], for the response
+    /// read back once with [`Market::take_issued_key`], for the response
     /// that created them.
     pub fn create_user(
         &mut self,
@@ -821,8 +518,16 @@ impl Market {
             accounts: Vec::new(),
         };
         self.users.insert(id, user);
-        self.keys.issue(id);
+        self.directory.keys.issue(id);
+        self.publish_directory();
         id
+    }
+
+    /// Take the key issued to `user` at sign-up, once.
+    pub fn take_issued_key(&mut self, user: UserId) -> Option<String> {
+        let key = self.directory.keys.take_issued_key(user);
+        self.publish_directory();
+        key
     }
 
     /// Open an account for `user_id` with an opening balance of
@@ -868,6 +573,8 @@ impl Market {
             id,
             Trader::new(id, user_id, account_id, name, self.fill_log, now_ms),
         );
+        self.directory.owners.insert(id, user_id);
+        self.publish_directory();
         id
     }
 
@@ -906,52 +613,27 @@ impl Market {
         Some((t, a))
     }
 
-    /// The canonical ticker of `ticker`, matched case-insensitively.
-    pub fn ticker(&self, ticker: &str) -> Option<&'static str> {
-        self.symbol(ticker).map(|s| s.info.symbol)
-    }
-
-    /// Shares of `symbol` the traders hold between them.
-    pub fn held_shares(&self, symbol: &str) -> u64 {
-        let Some(sym) = self.ticker(symbol) else {
-            return 0;
-        };
+    /// Shares of `sym` the traders hold between them.
+    pub fn held_shares(&self, sym: &str) -> u64 {
         self.traders
             .values()
             .map(|t| t.held_shares(sym))
             .fold(0, u64::saturating_add)
     }
 
-    /// Shares of `symbol` the traders' resting buy orders are still bidding
-    /// for. They are counted as spoken for: were they all to fill, the
-    /// traders would hold them.
-    pub fn bid_shares(&self, symbol: &str) -> u64 {
-        self.symbol(symbol).map_or(0, |s| {
-            s.exchange
-                .book()
-                .orders()
-                .filter(|o| o.side == Side::Buy && o.owner.trader().is_some())
-                .map(|o| o.outstanding())
-                .fold(0, u64::saturating_add)
-        })
-    }
-
-    /// Shares of `symbol` no trader holds or has bid for — what a buy can
-    /// still be filled from. A symbol has a fixed number of shares
-    /// ([`SymbolInfo::shares_outstanding`]), so once the traders between them
-    /// hold or bid for all of them there is nothing left to buy.
-    pub fn available_shares(&self, symbol: &str) -> u64 {
-        self.symbol(symbol).map_or(0, |s| {
-            s.info
-                .shares_outstanding
-                .saturating_sub(self.held_shares(symbol))
-                .saturating_sub(self.bid_shares(symbol))
-        })
+    /// Shares of `sym` that `user` could sell right now: what their traders
+    /// hold, less what their resting sells already promised.
+    pub fn user_free_shares(&self, user: UserId, sym: &str) -> u64 {
+        self.traders
+            .values()
+            .filter(|t| t.user_id == user)
+            .map(|t| t.free_shares(sym))
+            .fold(0, u64::saturating_add)
     }
 
     /// What `user` owns, one entry per symbol, added up across every trader
-    /// of theirs and marked to the reference price. Ordered by ticker.
-    pub fn user_holdings(&self, user: UserId) -> Vec<HoldingDto> {
+    /// of theirs and marked to `marks`. Ordered by ticker.
+    pub fn user_holdings(&self, user: UserId, marks: &[SymbolView]) -> Vec<HoldingDto> {
         let mut by_symbol: BTreeMap<&'static str, HoldingDto> = BTreeMap::new();
         for trader in self.traders.values().filter(|t| t.user_id == user) {
             for sym in trader.positions.keys() {
@@ -965,25 +647,14 @@ impl Market {
             .into_values()
             .map(|mut h| {
                 h.mark(
-                    self.symbol(h.symbol)
-                        .map_or(0, |s| s.exchange.reference_cents()),
+                    marks
+                        .iter()
+                        .find(|v| v.symbol == h.symbol)
+                        .map_or(0, |v| v.mark_cents),
                 );
                 h
             })
             .collect()
-    }
-
-    /// Shares of `symbol` that `user` could sell right now: what their
-    /// traders hold, less what their resting sells already promised.
-    pub fn user_free_shares(&self, user: UserId, symbol: &str) -> u64 {
-        let Some(sym) = self.ticker(symbol) else {
-            return 0;
-        };
-        self.traders
-            .values()
-            .filter(|t| t.user_id == user)
-            .map(|t| t.free_shares(sym))
-            .fold(0, u64::saturating_add)
     }
 
     /// One order by id, whatever became of it — as long as the log still
@@ -1039,18 +710,28 @@ impl Market {
         }
     }
 
-    /// Mark an order cancelled in the log.
-    pub fn cancel_order_record(&mut self, symbol: &str, order_id: u64, remaining: u64, ts_ms: i64) {
-        if let Some(record) = self.orders.get_mut(&order_id)
-            && record.symbol == symbol
+    /// Give back what a withdrawn order reserved and mark its record
+    /// cancelled.
+    fn release(&mut self, trader: TraderId, sym: &'static str, cancelled: &Resting, now_ms: i64) {
+        if let Some((t, account)) = self.trader_and_account(trader) {
+            t.release(
+                account,
+                sym,
+                cancelled.side,
+                cancelled.outstanding(),
+                cancelled.price_cents,
+            );
+        }
+        if let Some(record) = self.orders.get_mut(&cancelled.id.0)
+            && record.symbol == sym
         {
-            record.cancel(remaining, ts_ms);
+            record.cancel(cancelled.outstanding(), now_ms);
         }
     }
 
     /// Book every trade in `trades` (for symbol `sym`) to the traders
-    /// involved. Returns the fills created, in order.
-    pub fn apply_trades(&mut self, sym: &'static str, trades: &[Trade]) -> Vec<FillRecord> {
+    /// involved and publish the fills. Returns how many there were.
+    fn book(&mut self, sym: &'static str, trades: &[Trade]) -> Vec<FillRecord> {
         let fees = self.fees;
         let mut fills = Vec::new();
         for t in trades {
@@ -1074,44 +755,402 @@ impl Market {
             }
         }
         self.fills_booked = self.fills_booked.saturating_add(fills.len() as u64);
+        for fill in &fills {
+            self.stream.publish(StreamMessage::Fill {
+                trader_id: fill.trader_id,
+                fill: fill.clone(),
+            });
+        }
         fills
     }
 
-    /// What a symbol's trading state is at `now`.
-    pub fn status(&self, index: usize, now: Timestamp) -> Option<SymbolStatus> {
-        let s = self.symbols.get(index)?;
-        let halted = s.halt.is_some();
-        let market_open = s.is_open(now);
-        Some(SymbolStatus {
-            symbol: s.info.symbol,
-            ts_ms: now.0,
-            market_open,
-            halted,
-            tradable: market_open && !halted,
-            halt: s.halt,
-            next_open_ms: s.next_open_ms(now),
-            next_close_ms: s.next_close_ms(now),
-            band_cents: s.band_cents,
-            move_pct: band_move(s.band_cents, s.price_cents()),
-            limit_pct: self.price_limit_pct,
+    /// Assign the next id to `rec`, append it to the log, publish it and
+    /// return it.
+    pub fn record(&mut self, mut rec: EventRecord) -> EventRecord {
+        rec.id = self.next_event_id;
+        self.next_event_id += 1;
+        if self.events.len() >= self.event_cap {
+            self.events.pop_front();
+        }
+        self.events.push_back(rec.clone());
+        self.stream.publish(StreamMessage::Event(rec.clone()));
+        rec
+    }
+
+    /// The most recent `limit` events matching `keep`, newest first.
+    pub fn events(&self, limit: usize, keep: impl Fn(&EventRecord) -> bool) -> Vec<EventRecord> {
+        self.events
+            .iter()
+            .rev()
+            .filter(|e| keep(e))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// The stream, to publish on.
+    pub fn stream(&self) -> &Stream {
+        &self.stream
+    }
+
+    /// The simulated clock.
+    pub fn now(&self) -> Timestamp {
+        self.clock.now()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The trading half: everything that touches a book. Each of these is one
+// job on the market actor; the symbol calls inside it are the only awaits.
+
+impl Market {
+    /// The id the next trader order in a book whose counter is at
+    /// `book_next` takes.
+    fn allocate_order_id(&mut self, book_next: fehu::OrderId) -> fehu::OrderId {
+        let id = self.next_order_id.max(book_next);
+        self.next_order_id = fehu::OrderId(id.0 + 1);
+        id
+    }
+
+    /// Send an order: check it against the symbol, fund it from the
+    /// account, send it to the book, book what follows — the fills, the
+    /// reservation of what rests, the order log — and publish the fills.
+    pub async fn place(
+        &mut self,
+        symbol: &Symbol,
+        trader: TraderId,
+        req: PlaceRequest,
+    ) -> Result<Placed, PlaceError> {
+        let sym = symbol.ticker;
+        let now = self.clock.now();
+        let order = req.order;
+        let prepared = symbol
+            .ask_listed({
+                let (post_only, day, expires) = (req.post_only, req.day, req.expires_at_ms);
+                move |s| s.prepare(&order, post_only, day, expires, now)
+            })
+            .await?
+            .ok_or(PlaceError::UnknownSymbol)??;
+        // The same order sent twice — a retry after a timeout, say — is
+        // placed once: the first response is replayed, and a re-used id that
+        // asks for something else is refused rather than quietly obeyed.
+        if let Some(id) = req.client_order_id.as_deref()
+            && let Some(record) = self.order_by_client_id(trader, id)
+        {
+            return match record.accepted.clone() {
+                Some(accepted) if record.matches(&order, sym) => Ok(Placed::Replayed(accepted)),
+                _ => Err(PlaceError::DuplicateClientId {
+                    client_order_id: id.to_string(),
+                    order_id: record.order_id,
+                }),
+            };
+        }
+        let response = self
+            .fund_and_send(symbol, trader, order, prepared, req)
+            .await?;
+        Ok(Placed::New(response))
+    }
+
+    /// The second half of placing: the money and share checks, the book,
+    /// the booking. `prepared` is the symbol's word on the order.
+    async fn fund_and_send(
+        &mut self,
+        symbol: &Symbol,
+        trader: TraderId,
+        order: Order,
+        prepared: Prepared,
+        req: PlaceRequest,
+    ) -> Result<OrderResponse, PlaceError> {
+        let sym = symbol.ticker;
+        // A symbol has a fixed number of shares: a buy can only be filled from
+        // the ones no trader holds or is already bidding for. Both numbers
+        // are still what they were when the symbol counted them: nothing
+        // touches a book between here and the submit but this job.
+        if order.side == Side::Buy {
+            let outstanding = symbol.ask(|s| s.info.shares_outstanding).await?;
+            let available = outstanding
+                .saturating_sub(self.held_shares(sym))
+                .saturating_sub(prepared.bid_shares);
+            if order.qty > available {
+                self.orders_refused = self.orders_refused.saturating_add(1);
+                return Err(PlaceError::Refused(Refused::SupplyExhausted {
+                    needed: order.qty,
+                    available,
+                }));
+            }
+        }
+        // A crossing order pays the taker fee out of the same cash, and it
+        // is charged the moment it fills, so it is checked here rather than
+        // discovered afterwards.
+        let cost = prepared
+            .cost_cents
+            .saturating_add(self.fees.taker_cost(prepared.cost_cents));
+        // Validate the order against the account that would fund it: it must
+        // be active, a buy must have the cash available, and a sell the shares
+        // — nothing may be sold that the trader does not hold.
+        let account = self
+            .account_of(trader)
+            .ok_or(PlaceError::UnknownTrader(trader.0))?;
+        if let Err(e) = self.traders[&trader].check(account, sym, order.side, order.qty, cost) {
+            self.orders_refused = self.orders_refused.saturating_add(1);
+            return Err(PlaceError::Refused(e));
+        }
+        let book_next = symbol.ask(|s| s.exchange.book().next_order_id()).await?;
+        let min_id = self.allocate_order_id(book_next);
+        let display_qty = req.display_qty;
+        let submitted = symbol
+            .change(move |s| s.submit(order, min_id, display_qty))
+            .await?;
+        let Submitted {
+            placement,
+            next_order_id: book_next,
+            clock_ms,
+        } = match submitted {
+            Ok(submitted) => submitted,
+            Err(e) => {
+                self.orders_refused = self.orders_refused.saturating_add(1);
+                return Err(PlaceError::Invalid(e.to_string()));
+            }
+        };
+        self.next_order_id = self.next_order_id.max(book_next);
+        self.orders_placed = self.orders_placed.saturating_add(1);
+        self.book(sym, &placement.trades);
+        if placement.status == OrderStatus::Resting
+            && let fehu::OrderKind::Limit { price_cents } = order.kind
+            && let Some((t, account)) = self.trader_and_account(trader)
+        {
+            t.reserve(account, sym, order.side, placement.remaining, price_cents);
+        }
+        let response = OrderResponse::new(sym, trader, order.side, order.qty, &placement);
+        self.record_order(
+            OrderRecord::new(
+                req.client_order_id,
+                trader,
+                sym,
+                &order,
+                &placement,
+                response.clone(),
+                clock_ms,
+            )
+            .expiring_at(prepared.expires_at_ms),
+        );
+        Ok(response)
+    }
+
+    /// Replace a resting order with another at a new price or quantity: a
+    /// cancel and a fresh order, in that order. The replacement goes to the
+    /// back of the queue at its price, and if it cannot be placed — no
+    /// cash, no shares, a halt — the old order is already gone.
+    pub async fn amend(
+        &mut self,
+        symbol: &Symbol,
+        trader: TraderId,
+        req: Amendment,
+    ) -> Result<Amended, PlaceError> {
+        let sym = symbol.ticker;
+        let now = self.clock.now();
+        let Amendment {
+            order_id,
+            price_cents,
+            qty,
+            post_only,
+            client_order_id,
+        } = req;
+        let amended = symbol
+            .change(move |s| {
+                if s.delisted {
+                    return None;
+                }
+                Some(s.amend(order_id, trader, price_cents, qty, post_only, now))
+            })
+            .await?
+            .ok_or(PlaceError::UnknownSymbol)?;
+        // The old order may be gone even when the checks on its replacement
+        // failed: that is what an amendment means, and the reservation goes
+        // with it either way.
+        let (cancelled, order, prepared) = match amended {
+            Ok(amended) => amended,
+            Err(check) => return Err(PlaceError::Check(check)),
+        };
+        self.release(trader, sym, &cancelled, now.0);
+        let order_response = self
+            .fund_and_send(
+                symbol,
+                trader,
+                order,
+                prepared,
+                PlaceRequest {
+                    order,
+                    client_order_id,
+                    post_only,
+                    day: false,
+                    expires_at_ms: None,
+                    display_qty: None,
+                },
+            )
+            .await?;
+        Ok(Amended {
+            replaced_order_id: order_id,
+            replaced_filled: cancelled.qty.saturating_sub(cancelled.outstanding()),
+            order: order_response,
         })
     }
 
-    /// The move that halts a symbol; `0` when automatic halts are off.
-    pub fn price_limit_pct(&self) -> f64 {
-        self.price_limit_pct
+    /// Withdraw one of `trader`'s resting orders: out of the book, its
+    /// reservation released, its record marked cancelled.
+    pub async fn cancel(
+        &mut self,
+        symbol: &Symbol,
+        trader: TraderId,
+        order_id: u64,
+    ) -> Result<Option<Resting>, fehu::CancelError> {
+        let sym = symbol.ticker;
+        let Ok(cancelled) = symbol
+            .change(move |s| {
+                if s.delisted {
+                    return Ok(None);
+                }
+                s.cancel(order_id, trader).map(Some)
+            })
+            .await
+        else {
+            return Ok(None);
+        };
+        let Some(resting) = cancelled? else {
+            return Ok(None);
+        };
+        self.release(trader, sym, &resting, self.clock.now().0);
+        Ok(Some(resting))
     }
 
-    /// Stop trading in the symbol at `index` by hand. It stays stopped until
-    /// somebody resumes it.
-    pub fn halt(&mut self, index: usize, now: Timestamp) -> Option<SymbolStatus> {
-        self.symbols
-            .get_mut(index)?
-            .halt(HaltReason::Manual, None, now.0);
-        self.status(index, now)
+    /// Withdraw every resting order `trader` has, in every symbol.
+    pub async fn cancel_all(&mut self, trader: TraderId) -> Vec<OpenOrderDto> {
+        let now_ms = self.clock.now().0;
+        let mut out = Vec::new();
+        for symbol in self.symbols.clone() {
+            let sym = symbol.ticker;
+            let Ok(cancelled) = symbol.change(move |s| s.cancel_all(trader)).await else {
+                continue;
+            };
+            for resting in cancelled {
+                self.release(trader, sym, &resting, now_ms);
+                out.push(OpenOrderDto::from_resting(sym, &resting));
+            }
+        }
+        out
     }
 
-    /// Pay `cents_per_share` on every share of `index` a trader holds, and
+    /// Every stop `trader` holds, across every symbol, oldest first within
+    /// each.
+    pub async fn stops_of(&self, trader: TraderId) -> Vec<StopOrder> {
+        let mut stops = Vec::new();
+        for symbol in &self.symbols {
+            if let Ok(held) = symbol.ask(move |s| s.stops_of(trader)).await {
+                stops.extend(held);
+            }
+        }
+        stops
+    }
+
+    /// Hold a stop until the price reaches it.
+    ///
+    /// The account is checked here so an obviously unfundable trigger is
+    /// refused while the trader is still looking at the response, but nothing
+    /// is reserved: a stop that never fires costs its owner nothing, and the
+    /// real check is the one made when it does fire.
+    pub async fn place_stop(
+        &mut self,
+        symbol: &Symbol,
+        req: StopRequest,
+    ) -> Result<StopOrder, PlaceError> {
+        let trader = TraderId(req.trader_id);
+        let sym = symbol.ticker;
+        let (checked, now_ms) = {
+            let req = req.clone();
+            symbol
+                .ask_listed(move |s| (s.check_stop(&req), s.exchange.clock().0))
+                .await?
+                .ok_or(PlaceError::UnknownSymbol)?
+        };
+        checked.map_err(PlaceError::Invalid)?;
+        if self.stops_of(trader).await.len() >= MAX_STOPS_PER_TRADER {
+            return Err(PlaceError::Invalid(format!(
+                "a trader may hold {MAX_STOPS_PER_TRADER} stops at once; cancel one first"
+            )));
+        }
+        let stop = StopOrder {
+            stop_id: self.next_stop_id,
+            trader_id: req.trader_id,
+            symbol: sym,
+            side: req.side,
+            qty: req.qty,
+            stop_price_cents: req.stop_price_cents,
+            limit_price_cents: req.limit_price_cents,
+            tif: req.tif,
+            client_order_id: req.client_order_id,
+            created_at_ms: now_ms,
+        };
+        let account = self
+            .account_of(trader)
+            .ok_or(PlaceError::UnknownTrader(trader.0))?;
+        let fees = self.fees;
+        self.traders[&trader]
+            .check(account, sym, req.side, req.qty, {
+                // The order it fires will take liquidity, so the advisory
+                // check counts the taker fee too.
+                let cost = stop.cost_cents();
+                cost.saturating_add(fees.taker_cost(cost))
+            })
+            .map_err(PlaceError::Refused)?;
+        self.next_stop_id += 1;
+        let armed = stop.clone();
+        symbol.change(move |s| s.arm(armed)).await?;
+        Ok(stop)
+    }
+
+    /// Withdraw a held stop. `None` if the symbol holds no such stop of the
+    /// trader's.
+    pub async fn cancel_stop(
+        &mut self,
+        symbol: &Symbol,
+        trader: TraderId,
+        stop_id: u64,
+    ) -> Option<StopOrder> {
+        symbol
+            .change(move |s| s.disarm(stop_id, trader))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Stop trading in a symbol by hand. It stays stopped until somebody
+    /// resumes it.
+    pub async fn halt(&mut self, symbol: &Symbol) -> Option<SymbolStatus> {
+        let (now, halts) = (self.clock.now(), self.halts);
+        let status = symbol
+            .change(move |s| (!s.delisted).then(|| s.halt_by_hand(now, halts)))
+            .await
+            .ok()
+            .flatten()?;
+        self.stream.publish(StreamMessage::Status(status));
+        Some(status)
+    }
+
+    /// Start trading again, whatever stopped it. The requote's trades are
+    /// booked and their fills published.
+    pub async fn resume(&mut self, symbol: &Symbol) -> Option<SymbolStatus> {
+        let (now, halts) = (self.clock.now(), self.halts);
+        let (status, trades) = symbol
+            .change(move |s| (!s.delisted).then(|| s.resume_trading(now, halts)))
+            .await
+            .ok()
+            .flatten()?;
+        self.stream.publish(StreamMessage::Status(status));
+        self.book(symbol.ticker, &trades);
+        Some(status)
+    }
+
+    /// Pay `cents_per_share` on every share of `symbol` a trader holds, and
     /// drop the price by the same amount.
     ///
     /// Both halves matter. Paying without the price move would be money from
@@ -1121,18 +1160,22 @@ impl Market {
     /// created or destroyed, so `shares_outstanding` is untouched.
     ///
     /// A frozen account is paid too: it still owns its shares.
-    pub fn pay_dividend(
+    ///
+    /// # Errors
+    /// `None` if the dividend is not between one cent and the price.
+    pub async fn pay_dividend(
         &mut self,
-        index: usize,
+        symbol: &Symbol,
         cents_per_share: i64,
         note: Option<String>,
         now_ms: i64,
-    ) -> Option<Dividend> {
-        let symbol = self.symbols.get(index)?;
-        let sym = symbol.info.symbol;
-        let price_cents = symbol.price_cents();
+    ) -> Result<Option<(Dividend, Vec<crate::events::SimEvent>)>, Gone> {
+        let sym = symbol.ticker;
+        let Some(price_cents) = symbol.ask_listed(|s| s.price_cents()).await? else {
+            return Ok(None);
+        };
         if cents_per_share <= 0 || cents_per_share >= price_cents {
-            return None;
+            return Ok(None);
         }
         let owed: Vec<(AccountId, i64, u64)> = self
             .traders
@@ -1163,33 +1206,102 @@ impl Market {
                 paid.total_cents = paid.total_cents.saturating_add(amount);
             }
         }
-        Some(paid)
+        // Going ex: the price drops by the dividend, and so does what the
+        // price reverts to, or the market would simply pay it back.
+        let ratio = cents_per_share as f64 / price_cents as f64;
+        let effects = vec![
+            crate::events::SimEvent::Jump { pct: -ratio },
+            crate::events::SimEvent::FundamentalShift {
+                delta: (1.0_f64 - ratio).ln(),
+            },
+        ];
+        let at = self.clock.now();
+        let apply = effects.clone();
+        symbol
+            .change(move |s| {
+                for event in &apply {
+                    if let Ok(prepared) = event.prepare() {
+                        // The dividend is already paid; a price event the
+                        // simulator would refuse is a bug, not a request.
+                        let _ = prepared.apply(s.exchange.simulator_mut(), at);
+                    }
+                }
+            })
+            .await?;
+        Ok(Some((paid, effects)))
     }
 
-    /// List a new symbol.
-    ///
-    /// `state` is built outside the market lock — warming a simulator up is
-    /// the slow part and none of it needs the market — so the checks that
-    /// have to be made against the market are made here, at the moment the
-    /// listing goes in.
+    /// Push prepared simulator events into one symbol, taking effect at
+    /// `at`. `Ok(None)` if the symbol is not listed.
+    pub async fn apply_events(
+        &mut self,
+        symbol: &Symbol,
+        events: Vec<crate::events::Prepared>,
+        at: Timestamp,
+    ) -> Result<Option<Result<(), String>>, Gone> {
+        symbol
+            .change(move |s| {
+                if s.delisted {
+                    return None;
+                }
+                let sim = s.exchange.simulator_mut();
+                Some(
+                    events
+                        .into_iter()
+                        .try_for_each(|p| p.apply(sim, at))
+                        .map_err(|e| e.to_string()),
+                )
+            })
+            .await
+    }
+
+    /// Push prepared simulator events into every symbol at the same
+    /// simulated moment. Returns the tickers they went to.
+    pub async fn apply_events_everywhere(
+        &mut self,
+        events: Vec<crate::events::Prepared>,
+        at: Timestamp,
+    ) -> Result<Vec<&'static str>, String> {
+        let mut tickers = Vec::with_capacity(self.symbols.len());
+        for symbol in self.symbols.clone() {
+            match self.apply_events(&symbol, events.clone(), at).await {
+                Ok(Some(Ok(()))) => tickers.push(symbol.ticker),
+                Ok(Some(Err(e))) => return Err(e),
+                Ok(None) | Err(Gone) => {}
+            }
+        }
+        Ok(tickers)
+    }
+
+    /// List a new symbol: from this job on it is quoted, it ticks, and orders
+    /// in it are accepted like any other. `state` was built and warmed up
+    /// outside ([`App::prepare_listing`]); here it gets an actor and a place
+    /// in the table.
     ///
     /// # Errors
     /// [`ListingError`] if the ticker is already listed, or the market
     /// already has `max_symbols` of them.
-    pub fn list(&mut self, state: SymbolState, max_symbols: usize) -> Result<usize, ListingError> {
+    pub fn list(&mut self, state: SymbolState) -> Result<Quote, ListingError> {
         let ticker = state.info.symbol;
         if self.symbol(ticker).is_some() {
             return Err(ListingError::AlreadyListed(ticker));
         }
-        if self.symbols.len() >= max_symbols {
-            return Err(ListingError::Full { max: max_symbols });
+        if self.symbols.len() >= self.max_symbols {
+            return Err(ListingError::Full {
+                max: self.max_symbols,
+            });
         }
-        self.symbols.push(state);
-        Ok(self.symbols.len() - 1)
+        let quote = state.quote();
+        self.symbols.push(Symbol::spawn(state));
+        self.publish_listings();
+        self.stream.publish(StreamMessage::Listed {
+            quote: quote.clone(),
+        });
+        Ok(quote)
     }
 
-    /// Delist the symbol at `index`: withdraw its book, drop its stops, buy
-    /// every holder out at `cents_per_share`, and take it off the market.
+    /// Delist a symbol: withdraw its book, drop its stops, buy every holder
+    /// out at `cents_per_share`, and take it off the market.
     ///
     /// The order matters, and so does doing all of it. A delisting that
     /// only removed the symbol would strand cash in buy reservations that no
@@ -1219,62 +1331,47 @@ impl Market {
     /// money and the position goes.
     ///
     /// # Errors
-    /// [`DelistError`] if there is no symbol at `index` or the price is not a
+    /// [`DelistError`] if there is no such symbol or the price is not a
     /// price.
-    pub fn delist(
+    pub async fn delist(
         &mut self,
-        index: usize,
+        ticker: &str,
         cents_per_share: Option<i64>,
         note: Option<String>,
         now_ms: i64,
-    ) -> Result<(Delisting, Vec<StreamMessage>), DelistError> {
-        let symbol = self.symbols.get(index).ok_or(DelistError::Unknown)?;
-        let sym = symbol.info.symbol;
-        let last_price_cents = symbol.price_cents();
-        let cents_per_share = cents_per_share.unwrap_or(last_price_cents);
-        if cents_per_share < 0 {
+    ) -> Result<Delisting, DelistError> {
+        let index = self
+            .symbols
+            .iter()
+            .position(|s| s.ticker.eq_ignore_ascii_case(ticker))
+            .ok_or(DelistError::Unknown)?;
+        let symbol = Arc::clone(&self.symbols[index]);
+        let sym = symbol.ticker;
+        if cents_per_share.is_some_and(|c| c < 0) {
             return Err(DelistError::Price);
         }
-        let resting: Vec<(u64, TraderId)> = symbol
-            .exchange
-            .book()
-            .orders()
-            .filter_map(|o| o.owner.trader().map(|t| (o.id.0, t)))
-            .collect();
-        let mut messages = Vec::new();
+        let wound = symbol
+            .change(|s| s.wind_up())
+            .await
+            .map_err(|_| DelistError::Unknown)?;
+        let cents_per_share = cents_per_share.unwrap_or(wound.last_price_cents);
         let mut orders_cancelled = 0;
-        for (order_id, trader) in resting {
-            let Ok(cancelled) = self.symbols[index]
-                .exchange
-                .cancel(fehu::OrderId(order_id), trader)
-            else {
-                continue; // Filled or gone between the book and here.
-            };
-            if let Some((t, account)) = self.trader_and_account(trader) {
-                t.release(
-                    account,
-                    sym,
-                    cancelled.side,
-                    cancelled.outstanding(),
-                    cancelled.price_cents,
-                );
-            }
-            self.cancel_order_record(sym, order_id, cancelled.outstanding(), now_ms);
+        for (trader, resting) in &wound.cancelled {
+            self.release(*trader, sym, resting, now_ms);
             orders_cancelled += 1;
-            if let Some(record) = self.orders.get(&order_id) {
-                messages.push(StreamMessage::OrderExpired {
+            if let Some(record) = self.orders.get(&resting.id.0) {
+                self.stream.publish(StreamMessage::OrderExpired {
                     trader_id: trader.0,
                     order: record.clone(),
                 });
             }
         }
-        let stops_cancelled = std::mem::take(&mut self.symbols[index].stops).len();
         let mut paid = Delisting {
             symbol: sym,
             cents_per_share,
-            last_price_cents,
+            last_price_cents: wound.last_price_cents,
             orders_cancelled,
-            stops_cancelled,
+            stops_cancelled: wound.stops_cancelled,
             shares_bought_out: 0,
             accounts_paid: 0,
             total_cents: 0,
@@ -1306,177 +1403,87 @@ impl Market {
             }
         }
         // The book goes, and its order-id counter with it. The ids it handed
-        // out are still in the log, so the floor keeps the next order from
+        // out are still in the log, so the counter keeps the next order from
         // reaching back into them.
-        let removed = self.symbols.remove(index);
-        self.order_id_floor = self
-            .order_id_floor
-            .max(removed.exchange.book().next_order_id());
-        messages.push(StreamMessage::Delisted(paid.clone()));
-        Ok((paid, messages))
+        self.next_order_id = self.next_order_id.max(wound.next_order_id);
+        self.symbols.remove(index);
+        self.publish_listings();
+        self.stream.publish(StreamMessage::Delisted(paid.clone()));
+        Ok(paid)
     }
 
-    /// Hold a stop until the price reaches it.
+    /// One engine step: advance every symbol to `target` — all of them at
+    /// once, each on its own actor — then settle each in listing order:
+    /// book the fills, review the halt, sweep the expired orders, place the
+    /// stops that fired, and publish it all. Returns the ticks emitted.
     ///
-    /// The account is checked here so an obviously unfundable trigger is
-    /// refused while the trader is still looking at the response, but nothing
-    /// is reserved: a stop that never fires costs its owner nothing, and the
-    /// real check is the one made when it does fire.
-    pub fn place_stop(
-        &mut self,
-        idx: usize,
-        req: &StopRequest,
-        now_ms: i64,
-    ) -> Result<StopOrder, PlaceError> {
-        let trader = TraderId(req.trader_id);
-        let sym = self.symbols[idx].info.symbol;
-        let rules = self.symbols[idx].exchange.book().rules();
-        let fees = self.fees;
-        if req.stop_price_cents <= 0 {
-            return Err(PlaceError::Invalid(
-                "a stop price must be above zero".into(),
-            ));
-        }
-        // The trigger is a price like any other on this symbol, so it sits on
-        // the same grid: a stop at a price the market cannot print at is a
-        // trigger that may never be reached exactly.
-        if !rules.allows_price(req.stop_price_cents) {
-            return Err(PlaceError::Invalid(format!(
-                "a stop price must be a whole number of {}-cent ticks",
-                rules.tick_cents
-            )));
-        }
-        // A trigger the market has already passed is not a trigger: it is a
-        // market order with extra steps, and almost certainly a mistake.
-        let price = self.symbols[idx].price_cents();
-        let behind = match req.side {
-            Side::Buy => req.stop_price_cents <= price,
-            Side::Sell => req.stop_price_cents >= price,
-        };
-        if behind {
-            let (side, where_) = match req.side {
-                Side::Buy => ("buy", "above"),
-                Side::Sell => ("sell", "below"),
-            };
-            return Err(PlaceError::Invalid(format!(
-                "a {side} stop must trigger {where_} the market: {} is already reached at {price}",
-                req.stop_price_cents
-            )));
-        }
-        if self.stops_of(trader).count() >= MAX_STOPS_PER_TRADER {
-            return Err(PlaceError::Invalid(format!(
-                "a trader may hold {MAX_STOPS_PER_TRADER} stops at once; cancel one first"
-            )));
-        }
-        let stop = StopOrder {
-            stop_id: self.next_stop_id,
-            trader_id: req.trader_id,
-            symbol: sym,
-            side: req.side,
-            qty: req.qty,
-            stop_price_cents: req.stop_price_cents,
-            limit_price_cents: req.limit_price_cents,
-            tif: req.tif,
-            client_order_id: req.client_order_id.clone(),
-            created_at_ms: now_ms,
-        };
-        // The order it will become has to be one the book would take, or the
-        // trigger is armed to fail.
-        self.symbols[idx]
-            .exchange
-            .book()
-            .validate(&stop.order())
-            .map_err(|e| PlaceError::Invalid(e.to_string()))?;
-        let account = self
-            .account_of(trader)
-            .ok_or(PlaceError::UnknownTrader(trader.0))?;
-        self.traders[&trader]
-            .check(account, sym, req.side, req.qty, {
-                // The order it fires will take liquidity, so the advisory
-                // check counts the taker fee too.
-                let cost = stop.cost_cents();
-                cost.saturating_add(fees.taker_cost(cost))
-            })
-            .map_err(PlaceError::Refused)?;
-        self.next_stop_id += 1;
-        self.symbols[idx].stops.push(stop.clone());
-        Ok(stop)
-    }
-
-    /// Every stop a trader is holding, oldest first, across all symbols.
-    pub fn stops_of(&self, trader: TraderId) -> impl Iterator<Item = &StopOrder> {
-        self.symbols
+    /// This is one job on the market, so no order can slip in between a
+    /// book moving and the money following it.
+    pub async fn step(&mut self, target: Timestamp) -> u64 {
+        let halts = self.halts;
+        let symbols = self.symbols.clone();
+        // Post every step first, so the symbols work at once; then take the
+        // results in listing order.
+        let replies: Vec<_> = symbols
             .iter()
-            .flat_map(|s| s.stops.iter())
-            .filter(move |stop| stop.trader_id == trader.0)
-    }
-
-    /// Withdraw a held stop. `None` if no such stop is held, or it is
-    /// somebody else's.
-    pub fn cancel_stop(&mut self, stop_id: u64, trader: TraderId) -> Option<StopOrder> {
-        for symbol in &mut self.symbols {
-            if let Some(at) = symbol
-                .stops
-                .iter()
-                .position(|s| s.stop_id == stop_id && s.trader_id == trader.0)
-            {
-                return Some(symbol.stops.remove(at));
-            }
+            .map(|symbol| symbol.actor.request(move |s| s.step(target, halts)))
+            .collect();
+        let mut total = 0;
+        for (symbol, reply) in symbols.iter().zip(replies) {
+            let Ok(stepped) = reply.await else {
+                continue;
+            };
+            total += stepped.ticks;
+            self.settle(symbol, stepped).await;
         }
-        None
+        total
     }
 
-    /// Fire every stop the last price has reached, oldest first, and place
-    /// the orders they become.
-    ///
-    /// A symbol that is halted or outside its session fires nothing: the
-    /// triggers are held, and a resume in this same step lets them go. A stop
-    /// that fires is gone from the store either way — the account is checked
-    /// a second time here, and a trigger the money no longer covers is
-    /// reported rather than retried.
-    fn fire_stops(
-        &mut self,
-        index: usize,
-        now: Timestamp,
-        fills: &mut Vec<FillRecord>,
-    ) -> Vec<StreamMessage> {
-        let symbol = &mut self.symbols[index];
-        if symbol.stops.is_empty() || symbol.halt.is_some() || !symbol.is_open(now) {
-            return Vec::new();
+    /// Book and publish what one symbol's step did.
+    async fn settle(&mut self, symbol: &Symbol, stepped: Stepped) {
+        let sym = symbol.ticker;
+        if let Some(tick) = stepped.tick {
+            self.stream.publish(tick);
         }
-        let price_cents = symbol.price_cents();
-        let mut fired = Vec::new();
-        symbol.stops.retain(|stop| {
-            let hit = stop.triggered_by(price_cents);
-            if hit {
-                fired.push(stop.clone());
-            }
-            !hit
-        });
-        fired
-            .into_iter()
-            .map(|stop| {
-                let trader = TraderId(stop.trader_id);
-                let placed = self.place(index, trader, stop.order(), stop.client_order_id.clone());
-                let (order, refused) = match placed {
-                    Ok((response, placed_fills)) => {
-                        fills.extend(placed_fills);
-                        (Some(response), None)
-                    }
-                    Err(e) => (None, Some(e.to_string())),
-                };
-                StreamMessage::StopTriggered {
-                    trader_id: stop.trader_id,
-                    stop,
-                    price_cents,
-                    order,
-                    refused,
-                }
-            })
-            .collect()
+        self.book(sym, &stepped.trades);
+        if let Some(status) = stepped.status {
+            self.stream.publish(StreamMessage::Status(status));
+        }
+        self.book(sym, &stepped.resumed);
+        // Before the stops, so a trigger cannot fire an order that would
+        // immediately be swept.
+        self.sweep_expired(symbol, stepped.clock_ms).await;
+        for stop in stepped.fired {
+            let trader = TraderId(stop.trader_id);
+            let placed = self
+                .place(
+                    symbol,
+                    trader,
+                    PlaceRequest {
+                        order: stop.order(),
+                        client_order_id: stop.client_order_id.clone(),
+                        post_only: false,
+                        day: false,
+                        expires_at_ms: None,
+                        display_qty: None,
+                    },
+                )
+                .await;
+            let (order, refused) = match placed {
+                Ok(placed) => (Some(placed.response().clone()), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+            self.stream.publish(StreamMessage::StopTriggered {
+                trader_id: stop.trader_id,
+                stop,
+                price_cents: stepped.price_cents,
+                order,
+                refused,
+            });
+        }
     }
 
-    /// Withdraw every resting order whose time is up.
+    /// Withdraw every resting order in `symbol` whose time is up.
     ///
     /// A day order and a good-till-date order differ only in where the
     /// deadline came from; by the time the engine sees them they are both
@@ -1484,232 +1491,209 @@ impl Market {
     /// end of every step, on every symbol — a halted one included, because a
     /// halt stops trading, not the clock, and an order whose date has passed
     /// should not come back when the market does.
-    fn sweep_expired(&mut self, index: usize) -> Vec<StreamMessage> {
-        let sym = self.symbols[index].info.symbol;
-        let now_ms = self.symbols[index].exchange.clock().0;
-        let due: Vec<u64> = self
+    async fn sweep_expired(&mut self, symbol: &Symbol, now_ms: i64) {
+        let sym = symbol.ticker;
+        let due: Vec<(u64, TraderId)> = self
             .orders
             .values()
             .filter(|o| o.symbol == sym && o.has_expired(now_ms))
-            .map(|o| o.order_id)
+            .map(|o| (o.order_id, TraderId(o.trader_id)))
             .collect();
-        let mut messages = Vec::new();
-        for order_id in due {
-            let trader = TraderId(self.orders[&order_id].trader_id);
-            let Ok(cancelled) = self.symbols[index]
-                .exchange
-                .cancel(fehu::OrderId(order_id), trader)
-            else {
-                // Filled or already gone between the log and the book: the
-                // record is no longer live, so nothing is owed.
+        for (order_id, trader) in due {
+            // Filled or already gone between the log and the book: the
+            // record is no longer live, so nothing is owed.
+            let Ok(Some(_)) = self.cancel(symbol, trader, order_id).await else {
                 continue;
             };
-            if let Some((t, account)) = self.trader_and_account(trader) {
-                t.release(
-                    account,
-                    sym,
-                    cancelled.side,
-                    cancelled.outstanding(),
-                    cancelled.price_cents,
-                );
-            }
-            self.cancel_order_record(sym, order_id, cancelled.outstanding(), now_ms);
             if let Some(record) = self.orders.get(&order_id) {
-                messages.push(StreamMessage::OrderExpired {
+                self.stream.publish(StreamMessage::OrderExpired {
                     trader_id: trader.0,
                     order: record.clone(),
                 });
             }
         }
-        messages
     }
 
-    /// Start trading again, whatever stopped it.
-    pub fn resume(
-        &mut self,
-        index: usize,
-        now: Timestamp,
-    ) -> Option<(SymbolStatus, Vec<FillRecord>)> {
-        let symbol = self.symbols.get_mut(index)?;
-        let was_halted = symbol.resume().is_some();
-        let trades = if was_halted && symbol.is_open(now) {
-            symbol.exchange.resync()
-        } else {
-            Vec::new()
+    /// Every symbol as a trader's records see it, in listing order.
+    pub async fn views(&self) -> Vec<SymbolView> {
+        let mut views = Vec::with_capacity(self.symbols.len());
+        for symbol in &self.symbols {
+            if let Ok(Some(view)) = symbol.ask_listed(SymbolView::of).await {
+                views.push(view);
+            }
+        }
+        views
+    }
+
+    /// The counts `GET /api/health` reports.
+    pub async fn health(&self) -> MarketHealth {
+        let mut health = MarketHealth {
+            symbols: self.symbols.len(),
+            users: self.users.len(),
+            accounts: self.accounts.len(),
+            traders: self.traders.len(),
+            cash_cents: self
+                .accounts
+                .values()
+                .map(Account::balance_cents)
+                .fold(0i64, i64::saturating_add),
+            orders_placed: self.orders_placed,
+            orders_refused: self.orders_refused,
+            fills_booked: self.fills_booked,
+            events_logged: self.events.len(),
+            ..MarketHealth::default()
         };
-        symbol.record_trades(&trades);
-        let ticker = symbol.info.symbol;
-        let fills = self.apply_trades(ticker, &trades);
-        Some((self.status(index, now)?, fills))
-    }
-
-    /// Halt a symbol whose price has left the band the day opened with, and
-    /// lift an automatic halt once its time is up. Returns the new state if
-    /// it changed.
-    fn review_halt(
-        &mut self,
-        index: usize,
-        now: Timestamp,
-        fills: &mut Vec<FillRecord>,
-    ) -> Option<SymbolStatus> {
-        let (limit_pct, halt_ms) = (self.price_limit_pct, self.halt_secs as i64 * 1000);
-        let s = self.symbols.get_mut(index)?;
-        if let Some(halt) = s.halt {
-            // A manual halt has no end: only a resume lifts it.
-            if halt.until_ms.is_some_and(|until| until <= now.0) {
-                let (status, resumed_fills) = self.resume(index, now)?;
-                fills.extend(resumed_fills);
-                return Some(status);
-            }
-            return None;
-        }
-        if limit_pct <= 0.0 || !s.is_open(now) {
-            return None;
-        }
-        if band_move(s.band_cents, s.price_cents()).abs() < limit_pct {
-            return None;
-        }
-        s.halt(HaltReason::LimitMove, Some(now.0 + halt_ms), now.0);
-        self.status(index, now)
-    }
-
-    /// Advance every symbol to `target`, book the resulting fills, and
-    /// return the stream messages describing what happened.
-    pub fn advance_to(&mut self, target: Timestamp) -> (u64, Vec<StreamMessage>) {
-        let mut total = 0;
-        let mut messages = Vec::new();
-        let mut fills = Vec::new();
-        for i in 0..self.symbols.len() {
-            let advanced = self.symbols[i].advance_to(target);
-            total += advanced.ticks;
-            // A new day is a new band to measure the limit move from.
-            if advanced.closed_intervals().contains(&Interval::D1) {
-                self.symbols[i].reband();
-            }
-            let sym = self.symbols[i].info.symbol;
-            if !advanced.trader_trades.is_empty() {
-                fills.extend(self.apply_trades(sym, &advanced.trader_trades));
-            }
-            if let Some(t) = advanced.last {
-                let s = &self.symbols[i];
-                let trades = advanced
-                    .last_trades
-                    .iter()
-                    .rev()
-                    .take(MAX_STREAM_TRADES)
-                    .map(TradeDto::from)
-                    .collect();
-                messages.push(StreamMessage::Tick {
-                    symbol: sym,
-                    ts_ms: t.ts.0,
-                    price_cents: t.price_cents,
-                    volume: t.volume,
-                    closed: advanced.closed_intervals(),
-                    bid_cents: s.exchange.book().best_bid(),
-                    ask_cents: s.exchange.book().best_ask(),
-                    book: s.book(STREAM_BOOK_DEPTH),
-                    trades,
-                });
-            }
-        }
-        for i in 0..self.symbols.len() {
-            if let Some(status) = self.review_halt(i, target, &mut fills) {
-                messages.push(StreamMessage::Status(status));
-            }
-        }
-        // Before the stops, so a trigger cannot fire an order that would
-        // immediately be swept, and after the halts for the same reason a
-        // resume settles first.
-        for i in 0..self.symbols.len() {
-            let expired = self.sweep_expired(i);
-            messages.extend(expired);
-        }
-        // After the halts, so a symbol that just resumed fires the triggers
-        // the price reached while it was stopped.
-        for i in 0..self.symbols.len() {
-            let triggered = self.fire_stops(i, target, &mut fills);
-            messages.extend(triggered);
-        }
-        messages.extend(fills.into_iter().map(|fill| StreamMessage::Fill {
-            trader_id: fill_trader(&fill),
-            fill,
-        }));
-        (total, messages)
-    }
-
-    /// Look a symbol up by ticker, case-insensitively.
-    pub fn symbol(&self, ticker: &str) -> Option<&SymbolState> {
-        self.symbols
-            .iter()
-            .find(|s| s.info.symbol.eq_ignore_ascii_case(ticker))
-    }
-
-    pub fn symbol_mut(&mut self, ticker: &str) -> Option<&mut SymbolState> {
-        self.symbols
-            .iter_mut()
-            .find(|s| s.info.symbol.eq_ignore_ascii_case(ticker))
-    }
-
-    /// The people, their money and every log, ready to be written out.
-    pub fn to_save(&self) -> MarketSave {
-        MarketSave {
-            users: self.users.values().cloned().collect(),
-            accounts: self.accounts.values().cloned().collect(),
-            traders: self.traders.values().cloned().collect(),
-            // Oldest first, so restoring in order rebuilds the same log.
-            orders: self
-                .order_ids
-                .iter()
-                .filter_map(|id| self.orders.get(id))
-                .cloned()
-                .collect(),
-            order_responses: self
-                .order_ids
-                .iter()
-                .filter_map(|id| {
-                    let record = self.orders.get(id)?;
-                    Some((*id, record.accepted.clone()?))
+        for symbol in &self.symbols {
+            let Ok((ticks, trades, resting, stops)) = symbol
+                .ask(|s| {
+                    (
+                        s.ticks_total,
+                        s.trades_total,
+                        s.exchange
+                            .book()
+                            .orders()
+                            .filter(|o| o.owner != fehu::Owner::Synthetic)
+                            .count(),
+                        s.stops.len(),
+                    )
                 })
-                .collect(),
-            events: self.events.iter().cloned().collect(),
-            api_keys: self.keys.pairs(),
-            next_user_id: self.next_user_id,
-            next_account_id: self.next_account_id,
-            next_trader_id: self.next_trader_id,
-            next_event_id: self.next_event_id,
-            next_stop_id: self.next_stop_id,
-            next_order_id: self.next_order_id().0,
+                .await
+            else {
+                continue;
+            };
+            health.ticks_total += ticks;
+            health.trades_total += trades;
+            health.resting_orders += resting;
+            health.stops_held += stops;
+        }
+        health
+    }
+
+    /// Everything the server would need to carry on after a restart: a
+    /// copy of every symbol and of the clearing, taken in one job so
+    /// nothing is halfway through anything.
+    pub async fn snapshot(&self) -> Save {
+        let mut symbols = Vec::with_capacity(self.symbols.len());
+        let mut sim_now_ms = self.clock.now().0;
+        let mut next_order_id = self.next_order_id;
+        for symbol in &self.symbols {
+            let Ok((save, clock_ms, book_next)) = symbol
+                .ask(|s| {
+                    (
+                        s.to_save(),
+                        s.exchange.clock().0,
+                        s.exchange.book().next_order_id(),
+                    )
+                })
+                .await
+            else {
+                continue;
+            };
+            // The furthest the market has reached: usually the clock, but an
+            // engine step can leave a symbol ahead of it, and starting up
+            // behind a symbol's own clock would freeze it until wall time
+            // caught up.
+            sim_now_ms = sim_now_ms.max(clock_ms);
+            next_order_id = next_order_id.max(book_next);
+            symbols.push(save);
+        }
+        Save {
+            version: STATE_VERSION,
+            saved_at_ms: wall_now_ms(),
+            sim_now_ms,
+            symbols,
+            market: MarketSave {
+                users: self.users.values().cloned().collect(),
+                accounts: self.accounts.values().cloned().collect(),
+                traders: self.traders.values().cloned().collect(),
+                // Oldest first, so restoring in order rebuilds the same log.
+                orders: self
+                    .order_ids
+                    .iter()
+                    .filter_map(|id| self.orders.get(id))
+                    .cloned()
+                    .collect(),
+                order_responses: self
+                    .order_ids
+                    .iter()
+                    .filter_map(|id| {
+                        let record = self.orders.get(id)?;
+                        Some((*id, record.accepted.clone()?))
+                    })
+                    .collect(),
+                events: self.events.iter().cloned().collect(),
+                api_keys: self.directory.keys.pairs(),
+                next_user_id: self.next_user_id,
+                next_account_id: self.next_account_id,
+                next_trader_id: self.next_trader_id,
+                next_event_id: self.next_event_id,
+                next_stop_id: self.next_stop_id,
+                next_order_id: next_order_id.0,
+            },
         }
     }
+}
 
-    /// The id the next order would take. Above every book's counter and above
-    /// the floor left behind by any book that has been delisted.
-    pub fn next_order_id(&self) -> fehu::OrderId {
-        self.symbols
-            .iter()
-            .map(|s| s.exchange.book().next_order_id())
-            .chain(std::iter::once(self.order_id_floor))
-            .max()
-            .unwrap_or(fehu::OrderId(1))
-    }
+/// What a market is built with.
+struct MarketParts {
+    symbols: Vec<SymbolState>,
+    directory: Directory,
+    events: VecDeque<EventRecord>,
+    next_event_id: u64,
+    users: BTreeMap<UserId, User>,
+    next_user_id: u64,
+    accounts: BTreeMap<AccountId, Account>,
+    next_account_id: u64,
+    traders: BTreeMap<TraderId, Trader>,
+    next_trader_id: u64,
+    next_stop_id: u64,
+    next_order_id: fehu::OrderId,
+    /// Oldest first, with their accepted responses.
+    orders: Vec<OrderRecord>,
+}
 
-    /// Put a saved market back: users, money, traders and every log, with the
-    /// id counters where they left off so nothing is ever handed out twice.
-    fn from_save(symbols: Vec<SymbolState>, save: MarketSave, options: &Options) -> Self {
+impl Market {
+    /// Assemble the market and its symbol actors. Needs a runtime.
+    fn build(
+        parts: MarketParts,
+        options: &Options,
+        clock: SimClock,
+        stream: Stream,
+    ) -> (
+        Self,
+        watch::Receiver<Arc<Listings>>,
+        watch::Receiver<Arc<Directory>>,
+    ) {
+        let symbols: Vec<Arc<Symbol>> = parts.symbols.into_iter().map(Symbol::spawn).collect();
+        let (listings_tx, listings_rx) = watch::channel(Arc::new(Listings {
+            symbols: symbols.clone(),
+        }));
+        let (directory_tx, directory_rx) = watch::channel(Arc::new(parts.directory.clone()));
+        let event_cap = options.event_log.max(1);
+        let mut events = parts.events;
+        while events.len() > event_cap {
+            events.pop_front();
+        }
         let mut market = Self {
             symbols,
-            events: save.events.into_iter().collect(),
-            event_cap: options.event_log.max(1),
-            next_event_id: save.next_event_id.max(1),
-            users: save.users.into_iter().map(|u| (u.id, u)).collect(),
-            next_user_id: save.next_user_id.max(1),
-            keys: Keyring::from_pairs(save.api_keys),
-            accounts: save.accounts.into_iter().map(|a| (a.id, a)).collect(),
-            next_account_id: save.next_account_id.max(1),
-            traders: save.traders.into_iter().map(|t| (t.id, t)).collect(),
-            next_trader_id: save.next_trader_id.max(1),
-            order_id_floor: fehu::OrderId(save.next_order_id.max(1)),
-            next_stop_id: save.next_stop_id.max(1),
+            listings_tx,
+            directory: parts.directory,
+            directory_tx,
+            stream,
+            clock,
+            halts: options.halts(),
+            max_symbols: options.max_symbols,
+            events,
+            event_cap,
+            next_event_id: parts.next_event_id.max(1),
+            users: parts.users,
+            next_user_id: parts.next_user_id.max(1),
+            accounts: parts.accounts,
+            next_account_id: parts.next_account_id.max(1),
+            traders: parts.traders,
+            next_trader_id: parts.next_trader_id.max(1),
+            next_stop_id: parts.next_stop_id.max(1),
+            next_order_id: fehu::OrderId(parts.next_order_id.0.max(1)),
             orders: BTreeMap::new(),
             order_ids: VecDeque::new(),
             client_order_ids: BTreeMap::new(),
@@ -1720,31 +1704,13 @@ impl Market {
             orders_refused: 0,
             fills_booked: 0,
             fees: options.fees(),
-            price_limit_pct: options.price_limit_pct.max(0.0),
-            halt_secs: options.halt_secs,
         };
         // Through the same door as a live order, so the client-id index and
         // the eviction order come out the same.
-        let responses: BTreeMap<u64, OrderResponse> = save.order_responses.into_iter().collect();
-        for mut record in save.orders {
-            record.accepted = responses.get(&record.order_id).cloned();
+        for record in parts.orders {
             market.record_order(record);
         }
-        while market.events.len() > market.event_cap {
-            market.events.pop_front();
-        }
-        market
-    }
-
-    /// Assign the next id to `rec`, append it to the log and return it.
-    pub fn record(&mut self, mut rec: EventRecord) -> EventRecord {
-        rec.id = self.next_event_id;
-        self.next_event_id += 1;
-        if self.events.len() >= self.event_cap {
-            self.events.pop_front();
-        }
-        self.events.push_back(rec.clone());
-        rec
+        (market, listings_rx, directory_rx)
     }
 }
 
@@ -1769,163 +1735,6 @@ impl SimClock {
 pub const MAX_STREAM_TRADES: usize = 20;
 /// Book levels per side carried in one `tick` stream message.
 pub const STREAM_BOOK_DEPTH: usize = 8;
-
-/// Trader id of a fill (fills are always attributed; see `Trader::record`).
-fn fill_trader(f: &FillRecord) -> u64 {
-    f.trader_id
-}
-
-/// Why a submission could not be placed. The web layer turns these into
-/// status codes; the engine turns them into a stop that fired and was
-/// refused.
-#[derive(Clone, Debug)]
-pub enum PlaceError {
-    /// The account or the trader's shares would not fund it.
-    Refused(Refused),
-    /// The trader is not one this market knows.
-    UnknownTrader(u64),
-    /// The book itself refused the order.
-    Invalid(String),
-}
-
-impl std::fmt::Display for PlaceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Refused(e) => write!(f, "{e}"),
-            Self::UnknownTrader(id) => write!(f, "no such trader: {id}"),
-            Self::Invalid(message) => write!(f, "{message}"),
-        }
-    }
-}
-
-impl Market {
-    /// Send a validated order to the exchange and book everything that
-    /// follows: the money check, the share checks, the fills, the reservation
-    /// of what rests, and the order log. The caller holds the market lock and
-    /// has already established who the trader is and that the symbol is open
-    /// to them.
-    pub fn place(
-        &mut self,
-        idx: usize,
-        trader: TraderId,
-        order: fehu::Order,
-        client_order_id: Option<String>,
-    ) -> Result<(OrderResponse, Vec<FillRecord>), PlaceError> {
-        self.place_expiring(idx, trader, order, client_order_id, None)
-    }
-
-    /// [`place`](Self::place), for an order that is withdrawn at `expires_at_ms`
-    /// if it is still resting then.
-    pub fn place_expiring(
-        &mut self,
-        idx: usize,
-        trader: TraderId,
-        order: fehu::Order,
-        client_order_id: Option<String>,
-        expires_at_ms: Option<i64>,
-    ) -> Result<(OrderResponse, Vec<FillRecord>), PlaceError> {
-        self.place_full(idx, trader, order, client_order_id, expires_at_ms, None)
-    }
-
-    /// [`place`](Self::place), for an order that may also hide most of its
-    /// size behind a `display_qty` slice.
-    pub fn place_full(
-        &mut self,
-        idx: usize,
-        trader: TraderId,
-        order: fehu::Order,
-        client_order_id: Option<String>,
-        expires_at_ms: Option<i64>,
-        display_qty: Option<u64>,
-    ) -> Result<(OrderResponse, Vec<FillRecord>), PlaceError> {
-        let sym = self.symbols[idx].info.symbol;
-        // Worst-case cash a buy can consume.
-        let cost = match order.kind {
-            fehu::OrderKind::Limit { price_cents } => {
-                i64::try_from(i128::from(price_cents) * i128::from(order.qty)).unwrap_or(i64::MAX)
-            }
-            fehu::OrderKind::Market => {
-                self.symbols[idx]
-                    .exchange
-                    .preview_market(order.side, order.qty)
-                    .notional_cents
-            }
-        };
-        // A symbol has a fixed number of shares: a buy can only be filled from
-        // the ones no trader holds or is already bidding for.
-        if order.side == Side::Buy {
-            let available = self.available_shares(sym);
-            if order.qty > available {
-                self.orders_refused = self.orders_refused.saturating_add(1);
-                return Err(PlaceError::Refused(Refused::SupplyExhausted {
-                    needed: order.qty,
-                    available,
-                }));
-            }
-        }
-        // A crossing order pays the taker fee out of the same cash, and it
-        // is charged the moment it fills, so it is checked here rather than
-        // discovered afterwards.
-        let cost = cost.saturating_add(self.fees.taker_cost(cost));
-        // Validate the order against the account that would fund it: it must
-        // be active, a buy must have the cash available, and a sell the shares
-        // — nothing may be sold that the trader does not hold.
-        let account = self
-            .account_of(trader)
-            .ok_or(PlaceError::UnknownTrader(trader.0))?;
-        if let Err(e) = self.traders[&trader].check(account, sym, order.side, order.qty, cost) {
-            self.orders_refused = self.orders_refused.saturating_add(1);
-            return Err(PlaceError::Refused(e));
-        }
-        // The log and retry index span all symbols. Allocate above every
-        // book's counter while holding the market lock, including ids used by
-        // synthetic flow since the last trader submission. Counters already
-        // persist in saves.
-        let next_id = self
-            .symbols
-            .iter()
-            .map(|s| s.exchange.book().next_order_id())
-            .chain(std::iter::once(self.order_id_floor))
-            .max()
-            .unwrap_or(fehu::OrderId(1));
-        self.symbols[idx].exchange.advance_order_id(next_id);
-        let submitted = match display_qty {
-            None => self.symbols[idx].exchange.submit(order),
-            Some(display) => self.symbols[idx].exchange.submit_iceberg(order, display),
-        };
-        let placement = match submitted {
-            Ok(placement) => placement,
-            Err(e) => {
-                self.orders_refused = self.orders_refused.saturating_add(1);
-                return Err(PlaceError::Invalid(e.to_string()));
-            }
-        };
-        self.orders_placed = self.orders_placed.saturating_add(1);
-        self.symbols[idx].record_trades(&placement.trades);
-        let fills = self.apply_trades(sym, &placement.trades);
-        if placement.status == fehu::OrderStatus::Resting
-            && let fehu::OrderKind::Limit { price_cents } = order.kind
-            && let Some((t, account)) = self.trader_and_account(trader)
-        {
-            t.reserve(account, sym, order.side, placement.remaining, price_cents);
-        }
-        let response = OrderResponse::new(sym, trader, order.side, order.qty, &placement);
-        let now = self.symbols[idx].exchange.clock().0;
-        self.record_order(
-            OrderRecord::new(
-                client_order_id,
-                trader,
-                sym,
-                &order,
-                &placement,
-                response.clone(),
-                now,
-            )
-            .expiring_at(expires_at_ms),
-        );
-        Ok((response, fills))
-    }
-}
 
 /// What goes out over the SSE stream.
 #[derive(Clone, Debug, Serialize)]
@@ -1988,80 +1797,6 @@ pub enum StreamMessage {
     },
 }
 
-/// Why a symbol could not be listed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ListingError {
-    /// A symbol with this ticker is already listed. Delist it first.
-    AlreadyListed(&'static str),
-    /// The market already lists as many symbols as it will.
-    Full { max: usize },
-}
-
-impl std::fmt::Display for ListingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AlreadyListed(t) => write!(f, "{t} is already listed"),
-            Self::Full { max } => write!(f, "this market lists at most {max} symbols"),
-        }
-    }
-}
-
-impl std::error::Error for ListingError {}
-
-/// Why a symbol could not be delisted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DelistError {
-    /// No symbol at that index.
-    Unknown,
-    /// The buy-out price is not a price.
-    Price,
-}
-
-impl std::fmt::Display for DelistError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unknown => write!(f, "no such symbol"),
-            Self::Price => write!(f, "a buy-out price cannot be negative"),
-        }
-    }
-}
-
-impl std::error::Error for DelistError {}
-
-/// What a delisting undid, and what it paid for the shares.
-#[derive(Clone, Debug, Serialize)]
-pub struct Delisting {
-    pub symbol: &'static str,
-    /// Paid on every share held. Zero is a real answer: a company can be
-    /// worth nothing.
-    pub cents_per_share: i64,
-    /// What the symbol last traded at, for comparison.
-    pub last_price_cents: i64,
-    /// Resting orders withdrawn, releasing what they reserved.
-    pub orders_cancelled: usize,
-    /// Untriggered stops dropped. They reserved nothing.
-    pub stops_cancelled: usize,
-    pub shares_bought_out: u64,
-    /// Accounts credited. A holder paid nothing — a buy-out at zero — is
-    /// bought out but not credited.
-    pub accounts_paid: usize,
-    pub total_cents: i64,
-}
-
-/// What a dividend paid, and the price it went ex at.
-#[derive(Clone, Copy, Debug, Serialize)]
-pub struct Dividend {
-    pub symbol: &'static str,
-    pub cents_per_share: i64,
-    /// The price the dividend was declared against, before it went ex.
-    pub price_cents: i64,
-    pub shares_paid: u64,
-    /// Accounts credited. A user with two traders holding the same symbol is
-    /// paid once per trader, into whichever account each trades on.
-    pub accounts_paid: usize,
-    pub total_cents: i64,
-}
-
 /// A stream message with its place in the stream.
 ///
 /// Every message the server publishes takes the next number, so a client can
@@ -2076,25 +1811,123 @@ pub struct Sequenced {
     pub message: StreamMessage,
 }
 
-/// The sequence counter and the bounded buffer behind `?since=`.
-#[derive(Debug)]
+/// The sequence counter and the bounded buffer behind `?since=`, and the
+/// broadcast every open stream listens on. One actor: a message takes its
+/// number and goes into the buffer in the same job, and a subscription is
+/// taken in a job of its own, so nothing can slip between the replay and
+/// the live feed.
 struct StreamLog {
     /// The number the next published message will take.
     next_seq: u64,
     /// The most recently published messages, oldest first.
     recent: VecDeque<Sequenced>,
     cap: usize,
+    tx: broadcast::Sender<Sequenced>,
 }
 
 impl StreamLog {
-    fn new(cap: usize) -> Self {
-        Self {
-            // The first message published is 1, so 0 is "nothing yet" and a
-            // client may ask for everything with `?since=0`.
-            next_seq: 1,
-            recent: VecDeque::new(),
-            cap,
+    fn publish(&mut self, message: StreamMessage) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let sequenced = Sequenced { seq, message };
+        if self.cap > 0 {
+            while self.recent.len() >= self.cap {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(sequenced.clone());
         }
+        // `Err` only means nobody is listening right now.
+        let _ = self.tx.send(sequenced);
+        seq
+    }
+
+    fn subscribe(&self, since: Option<u64>) -> Subscription {
+        let rx = self.tx.subscribe();
+        let seq = self.next_seq.saturating_sub(1);
+        let oldest_seq = self.recent.front().map_or(self.next_seq, |m| m.seq);
+        let (replay, gap) = match since {
+            None => (Vec::new(), false),
+            Some(since) => (
+                self.recent
+                    .iter()
+                    .filter(|m| m.seq > since)
+                    .cloned()
+                    .collect(),
+                // The buffer starts after the first message they wanted, so
+                // whatever fell out of it is gone for good.
+                since + 1 < oldest_seq,
+            ),
+        };
+        Subscription {
+            rx,
+            seq,
+            oldest_seq,
+            replay,
+            gap,
+        }
+    }
+}
+
+/// The SSE stream: where every message the server publishes goes.
+///
+/// Publishing is fire-and-forget and synchronous, so an actor can publish
+/// from inside a job. Nothing reaches a client any other way: the number a
+/// message is given is what lets a reconnecting client tell "nothing
+/// happened" from "I missed something".
+#[derive(Clone)]
+pub struct Stream {
+    actor: Actor<StreamLog>,
+    tx: broadcast::Sender<Sequenced>,
+}
+
+impl Stream {
+    fn new(replay: usize) -> Self {
+        let (tx, _) = broadcast::channel(4096);
+        Self {
+            actor: Actor::spawn(StreamLog {
+                // The first message published is 1, so 0 is "nothing yet"
+                // and a client may ask for everything with `?since=0`.
+                next_seq: 1,
+                recent: VecDeque::new(),
+                cap: replay,
+                tx: tx.clone(),
+            }),
+            tx,
+        }
+    }
+
+    /// Publish a message to every open stream, numbering it and keeping it
+    /// in the replay buffer. Messages are numbered in the order they are
+    /// published.
+    pub fn publish(&self, message: StreamMessage) {
+        self.actor.send(move |log| {
+            log.publish(message);
+        });
+    }
+
+    /// Open a stream connection, optionally asking for everything after
+    /// `since`. Every message is either in `replay` or arrives on `rx`,
+    /// exactly once, in order.
+    pub async fn subscribe(&self, since: Option<u64>) -> Result<Subscription, Gone> {
+        self.actor.call(move |log| log.subscribe(since)).await
+    }
+
+    /// Messages published since start-up.
+    pub async fn published(&self) -> u64 {
+        self.actor
+            .call(|log| log.next_seq.saturating_sub(1))
+            .await
+            .unwrap_or(0)
+    }
+
+    /// Streams open right now.
+    pub fn subscribers(&self) -> usize {
+        self.tx.receiver_count()
+    }
+
+    /// A raw receiver on the live feed, with no replay and no filtering.
+    pub fn listen(&self) -> broadcast::Receiver<Sequenced> {
+        self.tx.subscribe()
     }
 }
 
@@ -2112,6 +1945,330 @@ pub struct Subscription {
     /// Set when `?since=` reached further back than the buffer goes: some
     /// messages are gone for good and the client must reload its snapshots.
     pub gap: bool,
+}
+
+/// Shared application state: the addresses of the actors, and what is
+/// published for reading without one. See the module docs.
+pub struct App {
+    pub options: Options,
+    pub clock: SimClock,
+    pub started_at: SystemTime,
+    /// When a move halts a symbol, and for how long.
+    pub halts: HaltPolicy,
+    /// The market actor. Every change to money or to a book is a job here.
+    pub market: Actor<Market>,
+    /// The symbol table, as the market last published it.
+    listings: watch::Receiver<Arc<Listings>>,
+    /// Keys and trader owners, as the market last published them.
+    directory: watch::Receiver<Arc<Directory>>,
+    /// The SSE stream.
+    pub stream: Stream,
+    /// How fast each client may change the market.
+    limits: Actor<Limiter>,
+    /// Counters for `GET /api/health`. Atomics, so nothing waits on them.
+    pub metrics: Metrics,
+}
+
+impl App {
+    /// Build the market and warm every symbol up to "now". This runs the
+    /// simulators synchronously; with the defaults it is roughly a million
+    /// ticks in total, well under a second in a release build. The actors
+    /// are spawned at the end, so this needs a tokio runtime.
+    pub fn new(options: Options) -> Arc<Self> {
+        let now = Timestamp(options.now_ms.unwrap_or_else(wall_now_ms));
+        let fine_start =
+            Interval::D1.bucket(now - Duration::from_secs(options.warmup_hours * 3600));
+        let start_ts = Timestamp(fine_start.0 - options.history_days as i64 * DAY_MS);
+        let symbols = seeded_symbols(start_ts)
+            .into_iter()
+            .map(|mut spec| {
+                // Every symbol trades on the same calendar, if there is one,
+                // and in the same tick and lot. Both are properties of the
+                // listing, so a restored market keeps the ones it was saved
+                // with rather than whatever the environment now says.
+                spec.config.market_hours = options.market_hours;
+                spec.trading.rules = fehu::MarketRules {
+                    tick_cents: options.tick_cents,
+                    lot: options.lot,
+                };
+                let mut s = SymbolState::new(spec, options.max_bars, options.tape_len);
+                s.warm_up(options.history_days, now);
+                s
+            })
+            .collect();
+        Self::assemble(
+            options,
+            now,
+            MarketParts {
+                symbols,
+                directory: Directory::default(),
+                events: VecDeque::new(),
+                next_event_id: 1,
+                users: BTreeMap::new(),
+                next_user_id: 1,
+                accounts: BTreeMap::new(),
+                next_account_id: 1,
+                traders: BTreeMap::new(),
+                next_trader_id: 1,
+                next_stop_id: 1,
+                next_order_id: fehu::OrderId(1),
+                orders: Vec::new(),
+            },
+        )
+    }
+
+    /// Build the app from a save instead of warming up: the market carries on
+    /// from the simulated time it had reached, with the same books, bars,
+    /// users and money.
+    ///
+    /// The save must already have been validated by [`crate::save::read`]:
+    /// this is the low-level constructor and checks nothing.
+    pub fn restore(options: Options, save: Save) -> Arc<Self> {
+        let now = Timestamp(save.sim_now_ms);
+        let symbols = save
+            .symbols
+            .into_iter()
+            .filter_map(|mut s| {
+                // Every symbol in a save that `save::read` accepted carries
+                // its listing; one that does not cannot be rebuilt, and there
+                // is no build metadata left to guess it from.
+                let info = s.info.take()?;
+                Some(SymbolState::from_save(info, s, options.tape_len))
+            })
+            .collect();
+        let m = save.market;
+        let directory = Directory {
+            keys: Keyring::from_pairs(m.api_keys),
+            owners: m.traders.iter().map(|t| (t.id, t.user_id)).collect(),
+        };
+        let responses: BTreeMap<u64, OrderResponse> = m.order_responses.into_iter().collect();
+        let orders = m
+            .orders
+            .into_iter()
+            .map(|mut record| {
+                record.accepted = responses.get(&record.order_id).cloned();
+                record
+            })
+            .collect();
+        Self::assemble(
+            options,
+            now,
+            MarketParts {
+                symbols,
+                directory,
+                events: m.events.into_iter().collect(),
+                next_event_id: m.next_event_id,
+                users: m.users.into_iter().map(|u| (u.id, u)).collect(),
+                next_user_id: m.next_user_id,
+                accounts: m.accounts.into_iter().map(|a| (a.id, a)).collect(),
+                next_account_id: m.next_account_id,
+                traders: m.traders.into_iter().map(|t| (t.id, t)).collect(),
+                next_trader_id: m.next_trader_id,
+                next_stop_id: m.next_stop_id,
+                next_order_id: fehu::OrderId(m.next_order_id),
+                orders,
+            },
+        )
+    }
+
+    fn assemble(options: Options, now: Timestamp, parts: MarketParts) -> Arc<Self> {
+        let clock = SimClock {
+            wall_epoch: Instant::now(),
+            sim_epoch: now,
+            scale: options.time_scale,
+        };
+        let stream = Stream::new(options.stream_replay);
+        let (market, listings, directory) = Market::build(parts, &options, clock, stream.clone());
+        let limits = Actor::spawn(Limiter::new(Rate {
+            per_sec: options.rate_per_sec,
+            burst: options.rate_burst,
+        }));
+        Arc::new(Self {
+            clock,
+            started_at: SystemTime::now(),
+            halts: options.halts(),
+            market: Actor::spawn(market),
+            listings,
+            directory,
+            stream,
+            limits,
+            metrics: Metrics::default(),
+            options,
+        })
+    }
+
+    /// Build a listing from `spec` without touching the market.
+    ///
+    /// Warming a simulator up is the slow part of listing a symbol and none
+    /// of it needs the market, so it happens here — on the request's own
+    /// task — and the finished symbol is handed to [`Market::list`]
+    /// afterwards. `history_days` days of coarse daily bars are generated so
+    /// the chart is not empty on the first morning; `0` lists a company with
+    /// no past, which is what an IPO is.
+    ///
+    /// The calendar, tick and lot are the market's rather than the caller's:
+    /// they are properties of this venue, and a symbol that traded on a
+    /// different grid to everything beside it would not be one of its
+    /// listings.
+    ///
+    /// # Errors
+    /// The first [`fehu::ConfigError`] in the requested config.
+    pub fn prepare_listing(
+        &self,
+        mut spec: SymbolSpec,
+        history_days: usize,
+        now: Timestamp,
+    ) -> Result<SymbolState, fehu::ConfigError> {
+        spec.config.start_ts = Timestamp(now.0 - history_days as i64 * DAY_MS);
+        spec.config.market_hours = self.options.market_hours;
+        spec.trading.rules = fehu::MarketRules {
+            tick_cents: self.options.tick_cents,
+            lot: self.options.lot,
+        };
+        let mut state = SymbolState::create(spec, self.options.max_bars, self.options.tape_len)?;
+        state.warm_up(history_days, now);
+        Ok(state)
+    }
+
+    /// The symbol table as the market last published it. A snapshot: a
+    /// symbol in it may be delisted a moment later, which its actor will
+    /// say.
+    pub fn listings(&self) -> Arc<Listings> {
+        self.listings.borrow().clone()
+    }
+
+    /// The listing for `ticker`, if there is one.
+    pub fn symbol(&self, ticker: &str) -> Option<Arc<Symbol>> {
+        self.listings.borrow().get(ticker).cloned()
+    }
+
+    /// The user `key` speaks for, if it is one of ours.
+    pub fn user_of(&self, key: &str) -> Option<UserId> {
+        self.directory.borrow().user_of(key)
+    }
+
+    /// The user `trader` belongs to, if the trader exists.
+    pub fn owner_of(&self, trader: TraderId) -> Option<UserId> {
+        self.directory.borrow().owner_of(trader)
+    }
+
+    /// Every symbol's quote, in listing order, each from its own actor.
+    pub async fn quotes(&self) -> Vec<Quote> {
+        let listings = self.listings();
+        let replies: Vec<_> = listings
+            .all()
+            .iter()
+            .map(|s| s.actor.request(|s| (!s.delisted).then(|| s.quote())))
+            .collect();
+        let mut quotes = Vec::with_capacity(replies.len());
+        for reply in replies {
+            if let Ok(Some(quote)) = reply.await {
+                quotes.push(quote);
+            }
+        }
+        quotes
+    }
+
+    /// Every symbol as a trader's records see it, in listing order, each
+    /// from its own actor.
+    pub async fn views(&self) -> Vec<SymbolView> {
+        let listings = self.listings();
+        let replies: Vec<_> = listings
+            .all()
+            .iter()
+            .map(|s| {
+                s.actor
+                    .request(|s| (!s.delisted).then(|| SymbolView::of(s)))
+            })
+            .collect();
+        let mut views = Vec::with_capacity(replies.len());
+        for reply in replies {
+            if let Ok(Some(view)) = reply.await {
+                views.push(view);
+            }
+        }
+        views
+    }
+
+    /// Every stop `trader` holds, across every symbol.
+    pub async fn stops_of(&self, trader: TraderId) -> Vec<StopOrder> {
+        self.views()
+            .await
+            .into_iter()
+            .flat_map(|v| v.stops)
+            .filter(|s| s.trader_id == trader.0)
+            .collect()
+    }
+
+    /// What a symbol's trading state is right now.
+    pub async fn status(&self, ticker: &str) -> Option<SymbolStatus> {
+        let (now, halts) = (self.clock.now(), self.halts);
+        self.symbol(ticker)?
+            .ask_listed(move |s| s.status(now, halts))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Everything the server would need to carry on after a restart.
+    pub async fn save(&self) -> Save {
+        self.market
+            .call_async(|m| Box::pin(m.snapshot()))
+            .await
+            .expect("the market actor is running")
+    }
+
+    /// Reconcile the whole market, from one consistent snapshot of it.
+    pub async fn reconcile(&self) -> crate::reconcile::Reconciliation {
+        crate::reconcile::reconcile(&self.save().await)
+    }
+
+    /// Append an event to the log and publish it.
+    pub async fn record(&self, rec: EventRecord) -> Result<EventRecord, Gone> {
+        self.market.call(move |m| m.record(rec)).await
+    }
+
+    /// Publish a message to every open stream.
+    pub fn publish(&self, message: StreamMessage) {
+        self.stream.publish(message);
+    }
+
+    /// Open a stream connection, optionally asking for everything after
+    /// `since`.
+    pub async fn subscribe(&self, since: Option<u64>) -> Result<Subscription, Gone> {
+        self.stream.subscribe(since).await
+    }
+
+    /// Spend one request's worth of a client's allowance for a request that
+    /// would change something. `who` is `None` for a request with no key,
+    /// which shares one bucket with every other.
+    ///
+    /// Timed off the wall clock rather than the simulated one: a limit is
+    /// about how fast requests actually arrive, and `FEHU_TIME_SCALE` must
+    /// not be able to buy a client more of them.
+    pub async fn allow(&self, who: Option<UserId>) -> Decision {
+        let since_start = self.started_at.elapsed().unwrap_or_default();
+        let at_ms = since_start.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.limits
+            .call(move |limits| limits.take(who, at_ms))
+            .await
+            .unwrap_or(Decision::Allowed)
+    }
+
+    /// Messages published to the stream since start-up.
+    pub async fn published(&self) -> u64 {
+        self.stream.published().await
+    }
+
+    /// A raw receiver on the live feed, with no replay and no filtering.
+    pub fn listen(&self) -> broadcast::Receiver<Sequenced> {
+        self.stream.listen()
+    }
+
+    /// Clients whose allowance the limiter is currently tracking.
+    pub async fn tracked_clients(&self) -> usize {
+        self.limits.call(|l| l.tracked()).await.unwrap_or(0)
+    }
 }
 
 /// Start-up options, all overridable through `FEHU_*` environment variables.
@@ -2238,6 +2395,15 @@ impl Options {
         }
     }
 
+    /// When a move halts a symbol, and for how long.
+    #[must_use]
+    pub fn halts(&self) -> HaltPolicy {
+        HaltPolicy {
+            price_limit_pct: self.price_limit_pct.max(0.0),
+            halt_secs: self.halt_secs,
+        }
+    }
+
     /// Defaults overridden by any `FEHU_*` variable that parses.
     pub fn from_env() -> Self {
         let d = Self::default();
@@ -2314,305 +2480,9 @@ fn clean(value: Option<String>, max: usize) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// How far `price` is from `band`, as a signed fraction. Zero when the band
-/// is not a price at all, so a symbol that has never traded cannot halt.
-fn band_move(band_cents: i64, price_cents: i64) -> f64 {
-    if band_cents <= 0 {
-        return 0.0;
-    }
-    price_cents as f64 / band_cents as f64 - 1.0
-}
-
 /// Milliseconds since the Unix epoch on the wall clock.
 pub fn wall_now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
-
-/// Shared application state.
-pub struct App {
-    pub options: Options,
-    pub clock: SimClock,
-    pub started_at: SystemTime,
-    pub market: Mutex<Market>,
-    /// Fan-out for the SSE stream. Sending with no subscribers is fine.
-    /// Publish through [`App::publish`] rather than sending here directly:
-    /// the sequence number and the replay buffer are assigned there.
-    pub tx: broadcast::Sender<Sequenced>,
-    /// The sequence counter and replay buffer. Held behind its own lock, and
-    /// never taken while the market lock is held.
-    stream: Mutex<StreamLog>,
-    /// How fast each client may change the market. Its own lock, held only
-    /// for the moment it takes to spend a token.
-    limits: Mutex<Limiter>,
-    /// Counters for `GET /api/health`. Atomics, so nothing waits on them.
-    pub metrics: Metrics,
-}
-
-impl App {
-    /// Build the market and warm every symbol up to "now". This runs the
-    /// simulators synchronously; with the defaults it is roughly a million
-    /// ticks in total, well under a second in a release build.
-    pub fn new(options: Options) -> Arc<Self> {
-        let now = Timestamp(options.now_ms.unwrap_or_else(wall_now_ms));
-        let fine_start =
-            Interval::D1.bucket(now - Duration::from_secs(options.warmup_hours * 3600));
-        let start_ts = Timestamp(fine_start.0 - options.history_days as i64 * DAY_MS);
-        let symbols = seeded_symbols(start_ts)
-            .into_iter()
-            .map(|mut spec| {
-                // Every symbol trades on the same calendar, if there is one,
-                // and in the same tick and lot. Both are properties of the
-                // listing, so a restored market keeps the ones it was saved
-                // with rather than whatever the environment now says.
-                spec.config.market_hours = options.market_hours;
-                spec.trading.rules = fehu::MarketRules {
-                    tick_cents: options.tick_cents,
-                    lot: options.lot,
-                };
-                let mut s = SymbolState::new(spec, options.max_bars, options.tape_len);
-                s.warm_up(options.history_days, now);
-                s
-            })
-            .collect();
-        let (tx, _) = broadcast::channel(4096);
-        let stream = Mutex::new(StreamLog::new(options.stream_replay));
-        let limits = Mutex::new(Limiter::new(Rate {
-            per_sec: options.rate_per_sec,
-            burst: options.rate_burst,
-        }));
-        Arc::new(Self {
-            clock: SimClock {
-                wall_epoch: Instant::now(),
-                sim_epoch: now,
-                scale: options.time_scale,
-            },
-            started_at: SystemTime::now(),
-            stream,
-            limits,
-            metrics: Metrics::default(),
-            market: Mutex::new(Market {
-                symbols,
-                events: VecDeque::new(),
-                event_cap: options.event_log.max(1),
-                next_event_id: 1,
-                users: BTreeMap::new(),
-                next_user_id: 1,
-                keys: Keyring::default(),
-                accounts: BTreeMap::new(),
-                next_account_id: 1,
-                traders: BTreeMap::new(),
-                next_trader_id: 1,
-                next_stop_id: 1,
-                order_id_floor: fehu::OrderId(1),
-                orders: BTreeMap::new(),
-                order_ids: VecDeque::new(),
-                client_order_ids: BTreeMap::new(),
-                fill_log: options.fill_log,
-                ledger_log: options.ledger_log,
-                order_log: options.order_log.max(1),
-                orders_placed: 0,
-                orders_refused: 0,
-                fills_booked: 0,
-                fees: options.fees(),
-                price_limit_pct: options.price_limit_pct.max(0.0),
-                halt_secs: options.halt_secs,
-            }),
-            tx,
-            options,
-        })
-    }
-
-    /// Build a listing from `spec` without touching the market.
-    ///
-    /// Warming a simulator up is the slow part of listing a symbol and none
-    /// of it needs the market lock, so it happens here and the finished
-    /// symbol is handed to [`Market::list`] afterwards. `history_days` days of
-    /// coarse daily bars are generated so the chart is not empty on the first
-    /// morning; `0` lists a company with no past, which is what an IPO is.
-    ///
-    /// The calendar, tick and lot are the market's rather than the caller's:
-    /// they are properties of this venue, and a symbol that traded on a
-    /// different grid to everything beside it would not be one of its
-    /// listings.
-    ///
-    /// # Errors
-    /// The first [`fehu::ConfigError`] in the requested config.
-    pub fn prepare_listing(
-        &self,
-        mut spec: SymbolSpec,
-        history_days: usize,
-        now: Timestamp,
-    ) -> Result<SymbolState, fehu::ConfigError> {
-        spec.config.start_ts = Timestamp(now.0 - history_days as i64 * DAY_MS);
-        spec.config.market_hours = self.options.market_hours;
-        spec.trading.rules = fehu::MarketRules {
-            tick_cents: self.options.tick_cents,
-            lot: self.options.lot,
-        };
-        let mut state = SymbolState::create(spec, self.options.max_bars, self.options.tape_len)?;
-        state.warm_up(history_days, now);
-        Ok(state)
-    }
-
-    /// Everything the server would need to carry on after a restart.
-    pub fn save(&self) -> Save {
-        let market = self.market();
-        // The furthest the market has reached: usually the clock, but an
-        // engine step can leave a symbol ahead of it, and starting up behind
-        // a symbol's own clock would freeze it until wall time caught up.
-        let sim_now_ms = market
-            .symbols
-            .iter()
-            .map(|s| s.exchange.clock().0)
-            .fold(self.clock.now().0, i64::max);
-        Save {
-            version: STATE_VERSION,
-            saved_at_ms: wall_now_ms(),
-            sim_now_ms,
-            symbols: market.symbols.iter().map(SymbolState::to_save).collect(),
-            market: market.to_save(),
-        }
-    }
-
-    /// Build the app from a save instead of warming up: the market carries on
-    /// from the simulated time it had reached, with the same books, bars,
-    /// users and money.
-    ///
-    /// The save's symbol list must be the build's — [`crate::save::read`]
-    /// checks that — and each symbol's metadata comes from the build.
-    pub fn restore(options: Options, save: Save) -> Arc<Self> {
-        let now = Timestamp(save.sim_now_ms);
-        let symbols = save
-            .symbols
-            .into_iter()
-            .filter_map(|mut s| {
-                // Every symbol in a save that `save::read` accepted carries
-                // its listing; one that does not cannot be rebuilt, and there
-                // is no build metadata left to guess it from.
-                let info = s.info.take()?;
-                Some(SymbolState::from_save(info, s, options.tape_len))
-            })
-            .collect();
-        let market = Market::from_save(symbols, save.market, &options);
-        let (tx, _) = broadcast::channel(4096);
-        let stream = Mutex::new(StreamLog::new(options.stream_replay));
-        let limits = Mutex::new(Limiter::new(Rate {
-            per_sec: options.rate_per_sec,
-            burst: options.rate_burst,
-        }));
-        Arc::new(Self {
-            clock: SimClock {
-                wall_epoch: Instant::now(),
-                sim_epoch: now,
-                scale: options.time_scale,
-            },
-            started_at: SystemTime::now(),
-            market: Mutex::new(market),
-            tx,
-            stream,
-            limits,
-            metrics: Metrics::default(),
-            options,
-        })
-    }
-
-    /// Publish a message to every open stream, numbering it and keeping it
-    /// in the replay buffer. Returns the number it was given.
-    ///
-    /// Nothing reaches a client any other way: the number is what lets a
-    /// reconnecting one tell "nothing happened" from "I missed something".
-    pub fn publish(&self, message: StreamMessage) -> u64 {
-        let sequenced = {
-            let mut log = self.stream.lock().unwrap_or_else(|e| e.into_inner());
-            let seq = log.next_seq;
-            log.next_seq += 1;
-            let sequenced = Sequenced { seq, message };
-            if log.cap > 0 {
-                while log.recent.len() >= log.cap {
-                    log.recent.pop_front();
-                }
-                log.recent.push_back(sequenced.clone());
-            }
-            sequenced
-        };
-        let seq = sequenced.seq;
-        // `Err` only means nobody is listening right now.
-        let _ = self.tx.send(sequenced);
-        seq
-    }
-
-    /// Open a stream connection, optionally asking for everything after
-    /// `since`.
-    ///
-    /// The subscription is taken while the sequence lock is held, so nothing
-    /// can slip between the replay and the live feed: every message is either
-    /// in `replay` or arrives on `rx`, exactly once, in order.
-    pub fn subscribe(&self, since: Option<u64>) -> Subscription {
-        let log = self.stream.lock().unwrap_or_else(|e| e.into_inner());
-        let rx = self.tx.subscribe();
-        let seq = log.next_seq.saturating_sub(1);
-        let oldest_seq = log.recent.front().map_or(log.next_seq, |m| m.seq);
-        let (replay, gap) = match since {
-            None => (Vec::new(), false),
-            Some(since) => (
-                log.recent
-                    .iter()
-                    .filter(|m| m.seq > since)
-                    .cloned()
-                    .collect(),
-                // The buffer starts after the first message they wanted, so
-                // whatever fell out of it is gone for good.
-                since + 1 < oldest_seq,
-            ),
-        };
-        Subscription {
-            rx,
-            seq,
-            oldest_seq,
-            replay,
-            gap,
-        }
-    }
-
-    /// Spend one request's worth of a client's allowance for a request that
-    /// would change something. `who` is `None` for a request with no key,
-    /// which shares one bucket with every other.
-    ///
-    /// Timed off the wall clock rather than the simulated one: a limit is
-    /// about how fast requests actually arrive, and `FEHU_TIME_SCALE` must
-    /// not be able to buy a client more of them.
-    pub fn allow(&self, who: Option<UserId>) -> Decision {
-        let since_start = self.started_at.elapsed().unwrap_or_default();
-        self.limits.lock().unwrap_or_else(|e| e.into_inner()).take(
-            who,
-            since_start.as_millis().min(u128::from(u64::MAX)) as u64,
-        )
-    }
-
-    /// Messages published to the stream since start-up.
-    #[must_use]
-    pub fn published(&self) -> u64 {
-        self.stream
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .next_seq
-            .saturating_sub(1)
-    }
-
-    /// Clients whose allowance the limiter is currently tracking.
-    #[must_use]
-    pub fn tracked_clients(&self) -> usize {
-        self.limits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .tracked()
-    }
-
-    /// Lock the market. A poisoned lock is recovered: the state is plain data
-    /// and every mutation is either complete or not started.
-    pub fn market(&self) -> MutexGuard<'_, Market> {
-        self.market.lock().unwrap_or_else(|e| e.into_inner())
-    }
 }

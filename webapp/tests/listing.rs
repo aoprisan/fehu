@@ -121,7 +121,7 @@ async fn a_listed_symbol_is_a_symbol_like_any_other() {
 
     // It ticks with the rest of the market, and it can be traded.
     assert_eq!(
-        engine::advance_to(&app, Timestamp(NOW_MS + 1_000)),
+        engine::advance_to(&app, Timestamp(NOW_MS + 1_000)).await,
         5,
         "every listed symbol steps, the new one included"
     );
@@ -207,7 +207,7 @@ async fn the_same_ticker_listed_twice_is_the_same_company_the_second_time() {
 async fn delisting_gives_back_everything_the_symbol_was_holding() {
     let app = test_app();
     post(&app, None, "/api/symbols", listing("WDGT")).await;
-    engine::advance_to(&app, Timestamp(NOW_MS + 1_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 1_000)).await;
     let player = sign_up(&app, "wanda").await;
     let key = Some(player.key.as_str());
     let trader = format!("/api/traders/{}", player.id);
@@ -336,7 +336,7 @@ async fn delisting_gives_back_everything_the_symbol_was_holding() {
 async fn a_company_can_turn_out_to_be_worth_nothing() {
     let app = test_app();
     post(&app, None, "/api/symbols", listing("WDGT")).await;
-    engine::advance_to(&app, Timestamp(NOW_MS + 1_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 1_000)).await;
     let player = sign_up(&app, "wanda").await;
     let key = Some(player.key.as_str());
     post(
@@ -386,7 +386,7 @@ async fn a_company_can_turn_out_to_be_worth_nothing() {
 async fn an_order_id_is_never_reissued_after_a_delisting() {
     let app = test_app();
     post(&app, None, "/api/symbols", listing("WDGT")).await;
-    engine::advance_to(&app, Timestamp(NOW_MS + 1_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 1_000)).await;
     let player = sign_up(&app, "wanda").await;
     let key = Some(player.key.as_str());
 

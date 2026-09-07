@@ -253,7 +253,7 @@ async fn game_event_moves_the_price() {
     assert_eq!(snap["snapshot"]["pending_events"], 4);
 
     // Tick ten seconds forward: the jump lands on the first tick.
-    let ticks = engine::advance_to(&app, Timestamp(NOW_MS + 10_000));
+    let ticks = engine::advance_to(&app, Timestamp(NOW_MS + 10_000)).await;
     assert_eq!(ticks, 40, "4 symbols × 10 one-second ticks");
     let after = get(&app, "/api/symbols/ACME").await.1;
     assert_eq!(after["snapshot"]["pending_events"], 0);
@@ -439,9 +439,9 @@ async fn engine_step_is_idempotent_within_a_second() {
     let app = test_app();
     // The sim clock is already at "now" after warm-up; stepping to the same
     // instant emits nothing.
-    assert_eq!(engine::advance_to(&app, Timestamp(NOW_MS)), 0);
-    assert_eq!(engine::advance_to(&app, Timestamp(NOW_MS + 999)), 0);
-    assert_eq!(engine::advance_to(&app, Timestamp(NOW_MS + 1000)), 4);
+    assert_eq!(engine::advance_to(&app, Timestamp(NOW_MS)).await, 0);
+    assert_eq!(engine::advance_to(&app, Timestamp(NOW_MS + 999)).await, 0);
+    assert_eq!(engine::advance_to(&app, Timestamp(NOW_MS + 1000)).await, 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -471,7 +471,7 @@ async fn book_and_tape_are_live() {
     // from the first live tick.
     let (_, body) = get(&app, "/api/symbols/ACME/trades?limit=5").await;
     assert!(body["trades"].as_array().unwrap().is_empty());
-    engine::advance_to(&app, Timestamp(NOW_MS + 5_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 5_000)).await;
     let (status, body) = get(&app, "/api/symbols/ACME/trades?limit=5").await;
     assert_eq!(status, StatusCode::OK);
     let trades = body["trades"].as_array().unwrap();
@@ -536,7 +536,7 @@ async fn market_order_fills_and_moves_the_price() {
     assert_eq!(b["pending_flow"], 20000);
 
     // The impact lands on the next tick and is a small positive move.
-    engine::advance_to(&app, Timestamp(NOW_MS + 1000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 1000)).await;
     let (_, b) = get(&alice, "/api/symbols/ACME/book").await;
     assert_eq!(b["pending_flow"], 0);
     let r1 = b["reference_cents"].as_i64().unwrap();
@@ -646,7 +646,7 @@ async fn resting_bid_fills_when_the_market_trades_through_it() {
     assert_eq!(body["status"], "resting");
     let mut filled = 0;
     for k in 1..=600 {
-        engine::advance_to(&app, Timestamp(NOW_MS + k * 1000));
+        engine::advance_to(&app, Timestamp(NOW_MS + k * 1000)).await;
         let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
         filled = p["positions"]
             .as_array()
@@ -1846,18 +1846,18 @@ async fn a_stop_waits_for_its_price_and_then_becomes_an_order() {
     );
 
     // A move that does not reach it leaves it alone.
-    engine::advance_to(&app, Timestamp(NOW_MS + 2_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 2_000)).await;
     let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
     assert_eq!(p["stops"].as_array().unwrap().len(), 1, "fired too early");
 
-    let mut rx = app.tx.subscribe();
+    let mut rx = app.listen();
     post(
         &app,
         "/api/symbols/ACME/events",
         json!({ "type": "jump", "pct": -0.10, "source": "test" }),
     )
     .await;
-    engine::advance_to(&app, Timestamp(NOW_MS + 12_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 12_000)).await;
 
     let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
     assert!(
@@ -2026,7 +2026,7 @@ async fn a_halted_symbol_holds_its_stops_until_trading_resumes() {
         json!({ "type": "jump", "pct": 0.10, "source": "test" }),
     )
     .await;
-    engine::advance_to(&app, Timestamp(NOW_MS + 10_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 10_000)).await;
     let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
     assert_eq!(
         p["stops"].as_array().unwrap().len(),
@@ -2037,7 +2037,7 @@ async fn a_halted_symbol_holds_its_stops_until_trading_resumes() {
 
     let (code, body) = post(&app, "/api/symbols/PXCO/resume", json!({})).await;
     assert_eq!(code, StatusCode::OK, "{body}");
-    engine::advance_to(&app, Timestamp(NOW_MS + 12_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 12_000)).await;
     let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
     assert_eq!(
         p["stops"].as_array().unwrap().len(),
@@ -2075,7 +2075,7 @@ async fn a_stop_the_money_no_longer_covers_is_refused_when_it_fires() {
     // The money leaves between the arming and the trigger. Nothing was
     // reserved for the stop, so this is allowed — and the second check is
     // what catches it.
-    let account = stop_account(&app, id);
+    let account = stop_account(&app, id).await;
     let (code, body) = post(
         &player,
         &format!("/api/accounts/{account}/withdraw"),
@@ -2084,14 +2084,14 @@ async fn a_stop_the_money_no_longer_covers_is_refused_when_it_fires() {
     .await;
     assert_eq!(code, StatusCode::OK, "{body}");
 
-    let mut rx = app.tx.subscribe();
+    let mut rx = app.listen();
     post(
         &app,
         "/api/symbols/NBLA/events",
         json!({ "type": "jump", "pct": 0.10, "source": "test" }),
     )
     .await;
-    engine::advance_to(&app, Timestamp(NOW_MS + 10_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 10_000)).await;
 
     let mut triggered = None;
     while let Ok(message) = rx.try_recv() {
@@ -2120,8 +2120,11 @@ async fn a_stop_the_money_no_longer_covers_is_refused_when_it_fires() {
 }
 
 /// The account a trader's cash lives in.
-fn stop_account(app: &Arc<App>, trader: u64) -> u64 {
-    app.market().traders[&fehu::TraderId(trader)].account_id.0
+async fn stop_account(app: &Arc<App>, trader: u64) -> u64 {
+    app.market
+        .call(move |m| m.traders[&fehu::TraderId(trader)].account_id.0)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -2148,7 +2151,7 @@ async fn a_big_move_halts_trading_and_the_halt_lifts_itself() {
         json!({ "type": "jump", "pct": 0.20, "source": "test" }),
     )
     .await;
-    engine::advance_to(&app, app.clock.now() + Duration::from_secs(2));
+    engine::advance_to(&app, app.clock.now() + Duration::from_secs(2)).await;
 
     let (_, status) = get(&app, "/api/symbols/ACME/status").await;
     assert_eq!(status["halted"], true, "{status}");
@@ -2186,7 +2189,7 @@ async fn a_big_move_halts_trading_and_the_halt_lifts_itself() {
     );
 
     // The halt lifts by itself, and the band is measured again from here.
-    engine::advance_to(&app, fehu::Timestamp(until + 1_000));
+    engine::advance_to(&app, fehu::Timestamp(until + 1_000)).await;
     let (_, status) = get(&app, "/api/symbols/ACME/status").await;
     assert_eq!(status["halted"], false, "{status}");
     assert_eq!(status["halt"], Value::Null);
@@ -2245,7 +2248,7 @@ async fn a_resting_order_survives_a_halt_and_can_be_cancelled() {
     assert_eq!(p["reserved_cents"], 0);
 
     // Time alone does not lift a manual halt.
-    engine::advance_to(&app, app.clock.now() + Duration::from_secs(3_600));
+    engine::advance_to(&app, app.clock.now() + Duration::from_secs(3_600)).await;
     let (_, status) = get(&app, "/api/symbols/PXCO/status").await;
     assert_eq!(status["halted"], true, "{status}");
     let (code, status) = post(&app, "/api/symbols/PXCO/resume", json!({})).await;
@@ -2280,7 +2283,7 @@ async fn a_halt_freezes_the_book_and_resuming_settles_the_backlog() {
 
     // Ten minutes of price moves with trading stopped. The reference keeps
     // ticking, but nothing may execute against the frozen book.
-    engine::advance_to(&app, Timestamp(NOW_MS + 600_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 600_000)).await;
     let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
     assert!(
         p["fills"].as_array().unwrap().is_empty(),
@@ -2323,7 +2326,7 @@ async fn a_halt_freezes_the_book_and_resuming_settles_the_backlog() {
             assert_eq!(p["cash_cents"], 10_000_000 - 50 * price);
             break;
         }
-        engine::advance_to(&app, Timestamp(NOW_MS + k * 1000));
+        engine::advance_to(&app, Timestamp(NOW_MS + k * 1000)).await;
     }
     assert_eq!(filled, 50, "the bid never filled after the resume");
     let (_, report) = get(&app, "/api/reconcile").await;
@@ -2689,19 +2692,23 @@ async fn reconciliation_checks_a_busy_market_and_detects_broken_reservations() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(report["valid"], true, "{report}");
     assert_eq!(report["resting_orders_checked"], 2);
-    let restored = App::restore(app.options.clone(), app.save());
-    assert!(restored.market().reconcile().valid);
-    {
-        let mut market = app.market();
-        let account_id = market.traders[&fehu::TraderId(player.trader)].account_id;
-        market.accounts.get_mut(&account_id).unwrap().reserve(1);
-        market
-            .traders
-            .get_mut(&fehu::TraderId(player.trader))
-            .unwrap()
-            .reserved_shares
-            .insert("ACME", 101);
-    }
+    let restored = App::restore(app.options.clone(), app.save().await);
+    assert!(restored.reconcile().await.valid);
+    // Behind the market's back, which is the only way to make it wrong.
+    let trader = fehu::TraderId(player.trader);
+    app.market
+        .call(move |market| {
+            let account_id = market.traders[&trader].account_id;
+            market.accounts.get_mut(&account_id).unwrap().reserve(1);
+            market
+                .traders
+                .get_mut(&trader)
+                .unwrap()
+                .reserved_shares
+                .insert("ACME", 101);
+        })
+        .await
+        .unwrap();
     let (_, report) = get(&app, "/api/reconcile").await;
     assert_eq!(report["valid"], false);
     let issues = report["issues"].to_string();
@@ -2760,7 +2767,7 @@ async fn order_ids_are_unique_across_symbols_and_survive_retries() {
         .map(|(_, _, r)| r["order_id"].as_u64().unwrap())
         .collect();
     assert_eq!(ids.len(), 4, "each symbol's order needs its own identity");
-    let restored = App::restore(app.options.clone(), app.save());
+    let restored = App::restore(app.options.clone(), app.save().await);
     let player = Player {
         app: restored,
         user: player.user,
@@ -2986,7 +2993,7 @@ async fn a_dividend_pays_the_holders_and_takes_the_price_ex() {
     assert_eq!(none["cash_cents"], 10_000_000);
 
     // And the price goes ex: the next tick opens about a dividend lower.
-    engine::advance_to(&app, Timestamp(NOW_MS + 1_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 1_000)).await;
     let price_after = get(&app, "/api/symbols/ACME/book").await.1["reference_cents"]
         .as_i64()
         .unwrap();
@@ -3079,8 +3086,8 @@ async fn an_order_with_a_date_is_withdrawn_when_it_passes() {
     .await;
     assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 
-    let mut rx = app.tx.subscribe();
-    engine::advance_to(&app, Timestamp(NOW_MS + 20_000));
+    let mut rx = app.listen();
+    engine::advance_to(&app, Timestamp(NOW_MS + 20_000)).await;
     let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
     assert_eq!(
         p["open_orders"].as_array().unwrap().len(),
@@ -3089,7 +3096,7 @@ async fn an_order_with_a_date_is_withdrawn_when_it_passes() {
     );
     assert!(p["reserved_cents"].as_i64().unwrap() > 0);
 
-    engine::advance_to(&app, Timestamp(NOW_MS + 40_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 40_000)).await;
     let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
     assert!(
         p["open_orders"].as_array().unwrap().is_empty(),
@@ -3164,7 +3171,7 @@ async fn a_day_order_lasts_until_the_session_closes() {
     .await;
     assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 
-    engine::advance_to(&app, Timestamp(close + 60_000));
+    engine::advance_to(&app, Timestamp(close + 60_000)).await;
     let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
     assert!(
         p["open_orders"].as_array().unwrap().is_empty(),
@@ -3462,7 +3469,7 @@ async fn a_symbol_quoted_in_ticks_and_traded_in_lots_refuses_anything_else() {
     assert_eq!(code, StatusCode::CREATED, "{body}");
 
     // The market keeps to the grid as it runs, and stays reconciled.
-    engine::advance_to(&app, Timestamp(NOW_MS + 60_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 60_000)).await;
     let (_, tape) = get(&app, "/api/symbols/ACME/trades?limit=50").await;
     let trades = tape["trades"].as_array().unwrap();
     assert!(!trades.is_empty(), "the market printed nothing: {tape}");
@@ -3516,7 +3523,7 @@ async fn health_reports_what_the_server_is_doing_and_how_long_it_takes() {
     )
     .await;
     assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
-    engine::advance_to(&app, Timestamp(NOW_MS + 2_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 2_000)).await;
 
     let (_, health) = get(&app, "/api/health").await;
     assert_eq!(health["orders_placed"], 1, "{health}");
@@ -3649,14 +3656,14 @@ async fn a_lagging_stream_disconnects_instead_of_silently_skipping_messages() {
     let mut body = response.into_body();
     let hello = body.frame().await.unwrap().unwrap().into_data().unwrap();
     assert!(std::str::from_utf8(&hello).unwrap().contains("hello"));
-    // Do not poll the body while overflowing its bounded receiver.
-    let status = app
-        .market()
-        .status(0, app.clock.now())
-        .expect("ACME exists");
+    // Overflow the bounded receiver before the body is polled again.
+    // Publishing is a job for the stream actor, so wait until every one of
+    // them has landed: `published` is answered behind them.
+    let status = app.status("ACME").await.expect("ACME exists");
     for _ in 0..8192 {
         app.publish(fehu_webapp::market::StreamMessage::Status(status));
     }
+    assert!(app.published().await >= 8192);
     let next = tokio::time::timeout(Duration::from_secs(1), body.frame())
         .await
         .expect("a gap must terminate promptly");
@@ -3705,7 +3712,7 @@ async fn a_reconnecting_stream_replays_what_it_missed() {
     assert_eq!(opened[0]["seq"], 0, "no messages yet: {}", opened[0]);
     assert_eq!(opened[0]["gap"], false);
 
-    engine::advance_to(&app, Timestamp(NOW_MS + 5_000));
+    engine::advance_to(&app, Timestamp(NOW_MS + 5_000)).await;
     let live = stream_frames(&app, "/api/stream", 1).await;
     let joined = live[0]["seq"].as_u64().unwrap();
     assert!(joined > 0, "the engine step published something: {live:?}");
@@ -3742,10 +3749,7 @@ async fn a_stream_says_so_when_the_replay_buffer_cannot_reach_back() {
         stream_replay: 2,
         ..Options::default()
     });
-    let status = app
-        .market()
-        .status(0, app.clock.now())
-        .expect("ACME exists");
+    let status = app.status("ACME").await.expect("ACME exists");
     for _ in 0..5 {
         app.publish(fehu_webapp::market::StreamMessage::Status(status));
     }

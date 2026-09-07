@@ -6,7 +6,7 @@
 - `tests/` holds library integration and property tests; `benches/ticks.rs` contains Criterion benchmarks; `examples/dump.rs` exports CSV data.
 - `webapp/src/` implements the Axum server; `webapp/tests/` covers API behavior, JSON contracts, and persistence.
 - `webapp/ui/src/` contains the framework-free TypeScript UI, with `panels/` and `chart/` modules. `webapp/static/` holds committed assets embedded in the server binary.
-- Read `README.md` for usage and `DESIGN.md` for model equations and architectural decisions.
+- Read `README.md` for usage; the module docs carry the model (`src/sim.rs`, `src/exchange.rs`) and the server's architecture (`webapp/src/market.rs`, `webapp/src/actor.rs`).
 
 ## Build, Test, and Development Commands
 
@@ -26,6 +26,8 @@ Run recipes from the repository root:
 Use Rust 2024 conventions: four-space indentation, `snake_case` functions/modules, and `PascalCase` types. Format with `cargo fmt --all`; document public APIs. The core library forbids unsafe code and must retain `no_std + alloc` support. Preserve seeded determinism: use existing RNG and `libm` paths rather than clocks or global randomness.
 
 Match TypeScript's two-space indentation, single quotes, semicolons, and strict compiler settings. Keep state mutations in `actions.ts` and rendering in subscribed panels.
+
+The web app has no locks: state lives in actors (`webapp/src/actor.rs`). Reads may be sent to a symbol's actor by anyone; anything that changes a book or money is a job on the market actor, and the market calls the symbols, never the other way round. Keep it that way — it is what makes the books and the accounts agree.
 
 ## Testing Guidelines
 

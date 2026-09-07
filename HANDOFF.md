@@ -1,18 +1,60 @@
 # Where this branch got to, and what is left
 
-Branch: `claude/remaining-work-2eywl4`, on top of `main` at `ec824d5`.
+Branch: `claude/tokio-exchange-orderbook-arch-x58w8p`, on top of `main` at
+`858a5a1`.
 
-The job was DESIGN.md §15 — "Not built yet". Ten passes landed on the
-previous branch and are summarised below; this one adds runtime listing and
-delisting, which was the second of the three items that branch left behind.
-Two are left, and the shape of both has changed: one is now smaller than it
-was, and the other is still the one I would not do.
+The job was the third of the three items the previous branch left behind:
+the one big market lock. It is gone — see below — and the two items the
+branch before left are still the two that are left. The section numbers in
+the tables refer to the old `DESIGN.md`, which this branch removed; the
+history is kept as it was written.
 
 ## What landed on this branch
 
+The web app has no locks any more. Each symbol is a tokio actor of its own
+(`webapp/src/symbol.rs` behind `webapp/src/actor.rs`), the market — users,
+accounts, traders, the order log, the symbol table — is one more, and the
+stream and the rate limiter are two small ones. Calls go one way: the market
+calls the symbols, the symbols call nobody, so nothing can deadlock. Every
+change to money or to a book is a job on the market, which calls the symbol
+for the book operation and books the money side before running anything
+else; the engine step is one such job that fans the advance out to every
+symbol at once. Reads go straight to the symbol. The four things the lock
+used to make correct are handled like this:
+
+- **reconciliation** and a **save** are one job on the market that asks
+  each symbol for a copy of itself, so nothing is halfway through a book;
+- **share supply** is checked in the same job that submits the order, and
+  nothing else moves a book between the check and the submit;
+- **order ids** come from the market's counter, taken as the larger of the
+  counter and the target book's own next id, with the book's counter folded
+  back afterwards and a delisted book's counter folded in as it leaves;
+- **listing and delisting** are jobs on the market; a request that had a
+  handle to a symbol just before it was delisted finds it marked and gets
+  "no such symbol".
+
+`webapp/tests/concurrency.rs` holds the promises to account: unique order
+ids under concurrent submissions across books, the books and the accounts
+agreeing while the engine steps under load, the delisting race, and market
+data served while the market actor is busy. The JSON contract and the save
+format are untouched.
+
+Verification, all green:
+
+```
+cargo test --all-features
+cargo test --no-default-features --tests
+cargo test -p fehu-webapp
+cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo fmt --all --check
+```
+
+## What landed on the branch before
+
 | Commit | §15 item | What it does |
 |---|---|---|
-| this one | 15.3 | Listing and delisting symbols while the server runs |
+| `fe99b9b` | 15.3 | Listing and delisting symbols while the server runs |
 
 `webapp/src/symbols.rs` is the new piece. The obstacle was never the
 endpoints: it was that `save::Symbol` is `&'static str`, which the ledger,
@@ -131,25 +173,14 @@ reconciliation already checks — held plus resting bids ≤ outstanding — so 
 buyback that retires more than it bought would fail the check rather than pass
 quietly, which is the right way round.
 
-### 3. Splitting the market lock per symbol (§15.4)
+### 3. The market lock (§15.4) — done, by removing it
 
-I would still think twice about this one. `Mutex<Market>` is not only a
-bottleneck; it is what currently makes four things correct:
-
-- **reconciliation** sees one consistent market-wide snapshot;
-- **share supply** (`held + resting bids ≤ shares_outstanding`) is checked
-  and acted on without anything moving in between;
-- **order ids** are allocated above every book's counter, and above the floor
-  a delisted book left, under one lock;
-- **listing and delisting** add and remove books while orders are being
-  placed against the others.
-
-Splitting it per symbol, with accounts still shared, means writing down an
-ordering discipline for those and a lock hierarchy that cannot deadlock — and
-the list grew by one this branch, which is the point: it is a design pass with
-a performance target attached, not a refactor to do speculatively. A game
-server with a handful of symbols and one engine step a second is nowhere near
-needing it.
+See the top of this file. What is still serialised is the money: every
+order goes through the market actor one at a time, which is what makes the
+accounts right, and the actor spends microseconds on each. If that ever
+shows up, the next split is the two-phase one — reserve on the market,
+match on the symbol, settle on the market — and the actors are already the
+shape that needs.
 
 ## Smaller things noticed along the way
 
