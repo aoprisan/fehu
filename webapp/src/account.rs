@@ -464,6 +464,42 @@ impl Account {
         issues
     }
 
+    /// Check the retained ledger's arithmetic and its link to the current
+    /// balance. Evicted history cannot be audited; its closing balance is
+    /// the opening anchor of the retained window.
+    pub fn ledger_issues(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        let Some(first) = self.ledger.front() else {
+            issues.push("ledger is empty".into());
+            return issues;
+        };
+        let mut balance = i128::from(first.balance_cents) - i128::from(first.amount_cents);
+        if first.id == 1 && balance != 0 {
+            issues.push("opening ledger balance is not zero".into());
+        }
+        let mut previous_id = first.id.checked_sub(1);
+        for entry in &self.ledger {
+            if previous_id.and_then(|id| id.checked_add(1)) != Some(entry.id) {
+                issues.push("ledger entry ids are not consecutive".into());
+            }
+            balance += i128::from(entry.amount_cents);
+            if balance != i128::from(entry.balance_cents) {
+                issues.push(format!(
+                    "ledger entry {} has an inconsistent balance",
+                    entry.id
+                ));
+            }
+            previous_id = Some(entry.id);
+        }
+        if previous_id != Some(self.entries_total) {
+            issues.push("ledger entry count does not match its last id".into());
+        }
+        if balance != i128::from(self.balance_cents) {
+            issues.push("ledger does not reconcile to the account balance".into());
+        }
+        issues
+    }
+
     /// Every invariant holds.
     pub fn is_valid(&self) -> bool {
         self.issues().is_empty()
@@ -824,6 +860,25 @@ mod tests {
         assert_eq!(ledger[0].id, 21, "newest first, opening entry included");
         assert_eq!(a.entries_total, 21);
         assert_eq!(a.balance_cents(), 2_000);
+    }
+
+    #[test]
+    fn ledger_audit_handles_eviction_and_detects_corruption() {
+        let mut a = account(100);
+        assert!(a.ledger_issues().is_empty());
+        for i in 1..=20 {
+            a.deposit(100, None, i).unwrap();
+        }
+        assert!(a.ledger_issues().is_empty());
+        let valid = a.clone();
+        a.ledger.back_mut().unwrap().amount_cents += 1;
+        assert!(!a.ledger_issues().is_empty());
+        a = valid.clone();
+        a.balance_cents += 1;
+        assert!(!a.ledger_issues().is_empty());
+        a = valid;
+        a.ledger.back_mut().unwrap().id += 1;
+        assert!(!a.ledger_issues().is_empty());
     }
 
     #[test]

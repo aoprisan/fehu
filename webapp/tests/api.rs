@@ -1919,6 +1919,83 @@ async fn a_resting_order_survives_a_halt_and_can_be_cancelled() {
 }
 
 #[tokio::test]
+async fn a_halt_freezes_the_book_and_resuming_settles_the_backlog() {
+    let app = test_app();
+    let player = sign_up(&app, "halina").await;
+    let id = player.trader;
+    let book = get(&player, "/api/symbols/NBLA/book").await.1;
+    let bid = book["bid_cents"].as_i64().unwrap();
+    let ask = book["ask_cents"].as_i64().unwrap();
+    // Inside the spread: with the market open the next synthetic print takes
+    // it, as `resting_bid_fills_when_the_market_trades_through_it` shows.
+    let price = (bid + ask) / 2;
+    let (code, order) = post(
+        &player,
+        "/api/symbols/NBLA/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 50, "type": "limit", "price_cents": price }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{order}");
+    assert_eq!(order["status"], "resting");
+    let resting = get(&player, "/api/symbols/NBLA/book").await.1;
+
+    let (code, status) = post(&app, "/api/symbols/NBLA/halt", json!({})).await;
+    assert_eq!(code, StatusCode::OK, "{status}");
+    assert_eq!(status["halted"], true);
+
+    // Ten minutes of price moves with trading stopped. The reference keeps
+    // ticking, but nothing may execute against the frozen book.
+    engine::advance_to(&app, Timestamp(NOW_MS + 600_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(
+        p["fills"].as_array().unwrap().is_empty(),
+        "a halted book filled an order: {p}"
+    );
+    assert_eq!(p["open_orders"][0]["order_id"], order["order_id"]);
+    assert_eq!(p["open_orders"][0]["remaining"], 50);
+    assert_eq!(p["cash_cents"], 10_000_000);
+    assert!(p["reserved_cents"].as_i64().unwrap() > 0);
+    let frozen = get(&player, "/api/symbols/NBLA/book").await.1;
+    assert_eq!(
+        (&frozen["bids"], &frozen["asks"]),
+        (&resting["bids"], &resting["asks"]),
+        "the book moved while the symbol was halted"
+    );
+    assert_ne!(
+        frozen["reference_cents"], resting["reference_cents"],
+        "the reference price should keep moving through a halt"
+    );
+
+    // Resuming requotes around wherever the price went, and whatever that
+    // crosses settles through the account like any other fill.
+    let (code, status) = post(&app, "/api/symbols/NBLA/resume", json!({})).await;
+    assert_eq!(code, StatusCode::OK, "{status}");
+    assert_eq!(status["tradable"], true);
+    let mut filled = 0;
+    for k in 601..=1_200 {
+        let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+        filled = p["positions"]
+            .as_array()
+            .unwrap()
+            .first()
+            .and_then(|q| q["qty"].as_i64())
+            .unwrap_or(0);
+        if filled == 50 {
+            assert_eq!(p["reserved_cents"], 0);
+            assert!(p["open_orders"].as_array().unwrap().is_empty());
+            assert_eq!(p["fills"][0]["liquidity"], "maker");
+            assert_eq!(p["fills"][0]["price_cents"], price);
+            assert_eq!(p["cash_cents"], 10_000_000 - 50 * price);
+            break;
+        }
+        engine::advance_to(&app, Timestamp(NOW_MS + k * 1000));
+    }
+    assert_eq!(filled, 50, "the bid never filled after the resume");
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
 async fn only_the_game_master_can_halt_a_symbol() {
     let app = app_with(Options {
         now_ms: Some(NOW_MS),
@@ -2258,4 +2335,150 @@ async fn an_order_can_be_amended_in_place() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "already replaced: {body}");
+}
+
+#[tokio::test]
+async fn reconciliation_checks_a_busy_market_and_detects_broken_reservations() {
+    let app = test_app();
+    let player = sign_up(&app, "audit").await;
+    for order in [
+        json!({"trader_id":player.trader,"type":"market","side":"buy","qty":100}),
+        json!({"trader_id":player.trader,"type":"limit","side":"buy","qty":10,"price_cents":1}),
+        json!({"trader_id":player.trader,"type":"limit","side":"sell","qty":10,"price_cents":1000000}),
+    ] {
+        let (status, body) = post(&player, "/api/symbols/ACME/orders", order).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    engine::step(&app);
+    let (status, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(report["valid"], true, "{report}");
+    assert_eq!(report["resting_orders_checked"], 2);
+    let restored = App::restore(app.options.clone(), app.save());
+    assert!(restored.market().reconcile().valid);
+    {
+        let mut market = app.market();
+        let account_id = market.traders[&fehu::TraderId(player.trader)].account_id;
+        market.accounts.get_mut(&account_id).unwrap().reserve(1);
+        market
+            .traders
+            .get_mut(&fehu::TraderId(player.trader))
+            .unwrap()
+            .reserved_shares
+            .insert("ACME", 101);
+    }
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], false);
+    let issues = report["issues"].to_string();
+    assert!(issues.contains("cash reservation"), "{report}");
+    assert!(issues.contains("share reservation"), "{report}");
+    assert!(issues.contains("exceed holdings"), "{report}");
+}
+
+#[tokio::test]
+async fn reconciliation_requires_the_configured_admin_key() {
+    let app = app_with(Options {
+        admin_key: Some("audit-secret".into()),
+        ..Options::default()
+    });
+    assert_eq!(
+        get(&app, "/api/reconcile").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let player = sign_up(&app, "player").await;
+    assert_eq!(
+        get(&player, "/api/reconcile").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let master = Player {
+        app,
+        user: 0,
+        trader: 0,
+        key: "audit-secret".into(),
+    };
+    assert_eq!(get(&master, "/api/reconcile").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn order_ids_are_unique_across_symbols_and_survive_retries() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        ..Options::default()
+    });
+    let player = sign_up(&app, "multi-symbol").await;
+    let mut orders = Vec::new();
+    for symbol in ["ACME", "NBLA", "HLIO", "PXCO"] {
+        let request = json!({"trader_id":player.trader,"side":"buy","type":"limit","price_cents":1,"qty":10,"client_order_id":symbol});
+        let (status, response) = post(
+            &player,
+            &format!("/api/symbols/{symbol}/orders"),
+            request.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        orders.push((symbol, request, response));
+    }
+    let ids: std::collections::BTreeSet<_> = orders
+        .iter()
+        .map(|(_, _, r)| r["order_id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 4, "each symbol's order needs its own identity");
+    let restored = App::restore(app.options.clone(), app.save());
+    let player = Player {
+        app: restored,
+        user: player.user,
+        trader: player.trader,
+        key: player.key,
+    };
+    let (status, new_order) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({"trader_id":player.trader,"side":"buy","type":"limit","price_cents":1,"qty":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(!ids.contains(&new_order["order_id"].as_u64().unwrap()));
+    for (symbol, request, response) in orders {
+        let (status, retry) =
+            post(&player, &format!("/api/symbols/{symbol}/orders"), request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(retry, response);
+        let (status, record) = get(&player, &format!("/api/orders/{}", response["order_id"])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(record["symbol"], symbol);
+    }
+}
+
+#[tokio::test]
+async fn a_lagging_stream_disconnects_instead_of_silently_skipping_messages() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        ..Options::default()
+    });
+    let response = router(Arc::clone(&app))
+        .oneshot(Request::get("/api/stream").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let hello = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert!(std::str::from_utf8(&hello).unwrap().contains("hello"));
+    // Do not poll the body while overflowing its bounded receiver.
+    for _ in 0..8192 {
+        app.tx
+            .send(fehu_webapp::market::StreamMessage::Hello {
+                sim_now_ms: NOW_MS,
+                time_scale: 1.0,
+                quotes: Vec::new(),
+            })
+            .unwrap();
+    }
+    let next = tokio::time::timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("a gap must terminate promptly");
+    assert!(next.is_none(), "later messages must not hide the gap");
 }

@@ -412,3 +412,37 @@ fn exchange_round_trips_through_serde() {
     bad["version"] = serde_json::json!(99);
     assert!(serde_json::from_value::<Exchange>(bad).is_err());
 }
+
+#[test]
+fn advancing_without_matching_preserves_resting_orders_until_resync() {
+    let mut ex = exchange(42);
+    let bid = ex.book().best_bid().unwrap() - 1;
+    let placement = ex
+        .submit(Order::limit(Owner::Trader(T), Side::Buy, bid, 10))
+        .unwrap();
+    assert_eq!(placement.status, OrderStatus::Resting);
+    let book = ex.book().clone();
+    let at = ex.clock();
+    ex.simulator_mut()
+        .push_event(fehu::Event {
+            at,
+            kind: fehu::EventKind::Jump(-0.5),
+        })
+        .unwrap();
+    let reports: Vec<_> = ex
+        .advance_without_matching(Duration::from_secs(10))
+        .collect();
+    assert!(!reports.is_empty());
+    assert!(
+        reports
+            .iter()
+            .all(|r| r.trades.is_empty() && r.tick.volume == 0)
+    );
+    assert!(reports.last().unwrap().tick.price_cents < bid);
+    assert_eq!(ex.book(), &book);
+    assert!(ex.advance_without_matching(Duration::ZERO).next().is_none());
+    let trades = ex.resync();
+    assert!(trades.iter().any(|t| t.maker.order == placement.id));
+    assert!(ex.book().get(placement.id).is_none());
+    assert_eq!(ex.book().validate_state(), Ok(()));
+}

@@ -6,14 +6,13 @@
 //! no key, but nothing that belongs to a user — their traders, orders,
 //! accounts or money — moves without one.
 //!
-//! The keys live in memory next to the rest of the state, as the keys
-//! themselves rather than as hashes: nothing here is persisted, so a store
-//! that could be stolen without the accounts beside it does not exist. A
-//! deployment that adds persistence must hash them before writing them down.
+//! Authentication and persistence retain SHA-256 digests. Newly issued keys
+//! are held only until the signup response takes them, and are never saved.
 
 use std::collections::BTreeMap;
 
 use crate::account::UserId;
+use sha2::{Digest, Sha256};
 
 /// Bytes of entropy behind a key: 128 bits, as 32 hex characters.
 const KEY_BYTES: usize = 16;
@@ -37,35 +36,60 @@ pub fn new_api_key() -> String {
 }
 
 /// The keys the server has issued, and the user each one speaks for.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Keyring {
     by_key: BTreeMap<String, UserId>,
     by_user: BTreeMap<UserId, String>,
+    issued: BTreeMap<UserId, String>,
+}
+
+/// Domain-separated SHA-256 of a randomly generated bearer credential.
+/// This is for high-entropy API keys, not user-chosen passwords.
+pub(crate) fn key_digest(key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fehu-api-key-v1\0");
+    hasher.update(key.as_bytes());
+    let mut digest = String::from("sha256:");
+    for byte in hasher.finalize() {
+        use std::fmt::Write as _;
+        let _ = write!(digest, "{byte:02x}");
+    }
+    digest
+}
+
+impl std::fmt::Debug for Keyring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keyring")
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Keyring {
     /// Issue `user` a key, replacing any earlier one.
     pub fn issue(&mut self, user: UserId) -> String {
         let key = new_api_key();
-        if let Some(old) = self.by_user.insert(user, key.clone()) {
+        let digest = key_digest(&key);
+        if let Some(old) = self.by_user.insert(user, digest.clone()) {
             self.by_key.remove(&old);
         }
-        self.by_key.insert(key.clone(), user);
+        self.by_key.insert(digest, user);
+        self.issued.insert(user, key.clone());
         key
     }
 
     /// The user `key` speaks for, if it is one of ours.
     pub fn user_of(&self, key: &str) -> Option<UserId> {
-        self.by_key.get(key).copied()
+        self.by_key.get(&key_digest(key)).copied()
     }
 
-    /// The key issued to `user`. Only ever handed back in the response that
-    /// created them.
-    pub fn key_of(&self, user: UserId) -> Option<&str> {
-        self.by_user.get(&user).map(String::as_str)
+    /// Take the newly issued key once for the signup response. Restored
+    /// keyrings contain only digests and cannot return the original key.
+    pub fn take_issued_key(&mut self, user: UserId) -> Option<String> {
+        self.issued.remove(&user)
     }
 
-    /// The keys as `(key, user id)` pairs, for a save file.
+    /// SHA-256 digests as `(digest, user id)` pairs, for a save file.
     pub fn pairs(&self) -> Vec<(String, u64)> {
         self.by_key.iter().map(|(k, u)| (k.clone(), u.0)).collect()
     }
@@ -76,7 +100,9 @@ impl Keyring {
         let mut keys = Self::default();
         for (key, user) in pairs {
             let user = UserId(user);
-            keys.by_user.insert(user, key.clone());
+            if let Some(old) = keys.by_user.insert(user, key.clone()) {
+                keys.by_key.remove(&old);
+            }
             keys.by_key.insert(key, user);
         }
         keys
@@ -113,7 +139,7 @@ mod tests {
         assert_eq!(keys.user_of(&one), Some(UserId(1)));
         assert_eq!(keys.user_of(&two), Some(UserId(2)));
         assert_eq!(keys.user_of("fehu_nope"), None);
-        assert_eq!(keys.key_of(UserId(2)).unwrap(), two);
+        assert_eq!(keys.take_issued_key(UserId(2)).unwrap(), two);
         assert_eq!(keys.len(), 2);
     }
 
@@ -122,11 +148,30 @@ mod tests {
         let mut keys = Keyring::default();
         let one = keys.issue(UserId(1));
         let two = keys.issue(UserId(7));
-        let back = Keyring::from_pairs(keys.pairs());
+        let mut back = Keyring::from_pairs(keys.pairs());
         assert_eq!(back.user_of(&one), Some(UserId(1)));
         assert_eq!(back.user_of(&two), Some(UserId(7)));
-        assert_eq!(back.key_of(UserId(7)).unwrap(), two);
+        assert_eq!(back.take_issued_key(UserId(7)), None);
         assert_eq!(back.len(), 2);
+    }
+
+    #[test]
+    fn credentials_are_handed_out_once_and_digests_are_not_credentials() {
+        let mut keys = Keyring::default();
+        let key = keys.issue(UserId(1));
+        let pairs = keys.pairs();
+        assert_ne!(pairs[0].0, key);
+        assert!(pairs[0].0.starts_with("sha256:"));
+        assert_eq!(keys.user_of(&pairs[0].0), None);
+        assert!(!format!("{keys:?}").contains(&key));
+        assert_eq!(keys.take_issued_key(UserId(1)), Some(key.clone()));
+        assert_eq!(keys.take_issued_key(UserId(1)), None);
+        assert_eq!(keys.user_of(&key), Some(UserId(1)));
+        let mut restored = Keyring::from_pairs(pairs);
+        let replacement = restored.issue(UserId(1));
+        assert_eq!(restored.user_of(&key), None);
+        assert_eq!(restored.user_of(&replacement), Some(UserId(1)));
+        assert_eq!(restored.len(), 1);
     }
 
     #[test]

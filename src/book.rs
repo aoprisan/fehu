@@ -190,6 +190,8 @@ pub enum OrderError {
     QuantityTooLarge,
     /// A limit price outside `[1, 10^15]`.
     BadPrice,
+    /// No further unique order ids can be assigned.
+    IdExhausted,
     /// Synthetic orders are managed by the exchange; give NPCs a `TraderId`.
     SyntheticOwner,
 }
@@ -200,6 +202,7 @@ impl fmt::Display for OrderError {
             Self::ZeroQuantity => "order quantity must be at least 1",
             Self::QuantityTooLarge => "order quantity is too large",
             Self::BadPrice => "limit price must be in [1, 10^15] cents",
+            Self::IdExhausted => "order id space is exhausted",
             Self::SyntheticOwner => "synthetic orders cannot be submitted directly",
         })
     }
@@ -397,7 +400,7 @@ pub(crate) fn notional(price_cents: i64, qty: u64) -> i64 {
 }
 
 /// The book. See the [module docs](self).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OrderBook {
     /// Keyed by price; the best bid is the last key.
@@ -407,6 +410,12 @@ pub struct OrderBook {
     /// Every resting order's side and price, for cancels and lookups.
     index: BTreeMap<OrderId, (Side, i64)>,
     next_id: u64,
+}
+
+impl Default for OrderBook {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OrderBook {
@@ -419,6 +428,70 @@ impl OrderBook {
             index: BTreeMap::new(),
             next_id: 1,
         }
+    }
+
+    /// The id that the next accepted submission will receive.
+    #[must_use]
+    pub fn next_order_id(&self) -> OrderId {
+        OrderId(self.next_id)
+    }
+
+    /// Skip unused ids below `minimum`. Never moves the counter backwards.
+    /// Coordinators can use this to allocate trader ids across several books.
+    pub fn advance_order_id(&mut self, minimum: OrderId) {
+        self.next_id = self.next_id.max(minimum.0);
+    }
+
+    /// Check structural invariants, including indexes, price queues, quantities
+    /// and the next id. Useful after deserializing a book from external storage.
+    /// Returns the first broken invariant without changing the book.
+    pub fn validate_state(&self) -> Result<(), &'static str> {
+        if self.next_id == 0 || self.next_id == u64::MAX {
+            return Err("next order id is zero or exhausted");
+        }
+        let mut expected = BTreeMap::new();
+        for (side, levels) in [(Side::Buy, &self.bids), (Side::Sell, &self.asks)] {
+            for (&price, queue) in levels {
+                if !(1..=MAX_PRICE_CENTS).contains(&price) || queue.is_empty() {
+                    return Err("price level is invalid or empty");
+                }
+                let mut previous = 0;
+                let mut total = 0u64;
+                for order in queue {
+                    if order.side != side || order.price_cents != price {
+                        return Err("resting order does not match its price level");
+                    }
+                    if order.id.0 <= previous || order.id.0 >= self.next_id {
+                        return Err("order ids violate queue priority or the next id");
+                    }
+                    previous = order.id.0;
+                    if order.qty == 0
+                        || order.qty > MAX_ORDER_QTY
+                        || order.remaining == 0
+                        || order.remaining > order.qty
+                    {
+                        return Err("resting order quantity is invalid");
+                    }
+                    total = total
+                        .checked_add(order.remaining)
+                        .ok_or("price level quantity overflows")?;
+                    if expected.insert(order.id, (side, price)).is_some() {
+                        return Err("resting order id is duplicated");
+                    }
+                }
+            }
+        }
+        if expected != self.index {
+            return Err("order index does not match resting orders");
+        }
+        if self
+            .best_bid()
+            .zip(self.best_ask())
+            .is_some_and(|(bid, ask)| bid >= ask)
+        {
+            return Err("resting bids and asks cross");
+        }
+        Ok(())
     }
 
     /// Validate an order without submitting it.
@@ -445,8 +518,12 @@ impl OrderBook {
     /// is what forbids them.
     pub fn submit(&mut self, order: Order, ts: Timestamp) -> Result<Placement, OrderError> {
         Self::validate(&order)?;
+        let next = self.next_id.checked_add(1).ok_or(OrderError::IdExhausted)?;
+        if self.next_id == 0 {
+            return Err(OrderError::IdExhausted);
+        }
         let id = OrderId(self.next_id);
-        self.next_id += 1;
+        self.next_id = next;
         let limit = match order.kind {
             OrderKind::Market => None,
             OrderKind::Limit { price_cents } => Some(price_cents),
@@ -887,6 +964,78 @@ mod tests {
             .unwrap();
         assert_eq!(done.notional_cents(), p.notional_cents);
         assert_eq!(b.preview(Side::Sell, 10, Some(9_885)).filled, 0);
+    }
+
+    #[test]
+    fn state_validation_detects_corrupted_books() {
+        let good = book_with_ladder();
+        assert_eq!(good.validate_state(), Ok(()));
+        let mut bad = good.clone();
+        bad.index.clear();
+        assert!(bad.validate_state().is_err());
+        let mut bad = good.clone();
+        bad.next_id = 1;
+        assert!(bad.validate_state().is_err());
+        let mut bad = good.clone();
+        bad.bids.first_entry().unwrap().get_mut()[0].remaining = 0;
+        assert!(bad.validate_state().is_err());
+        let mut bad = good.clone();
+        bad.asks.first_entry().unwrap().get_mut()[0].side = Side::Buy;
+        assert!(bad.validate_state().is_err());
+        let mut bad = good.clone();
+        bad.asks.insert(12345, VecDeque::new());
+        assert!(bad.validate_state().is_err());
+        let mut book = good;
+        book.submit(
+            Order::market(Owner::Trader(T), Side::Buy, 125),
+            Timestamp(1),
+        )
+        .unwrap();
+        assert_eq!(book.validate_state(), Ok(()));
+        book.cancel_all(Owner::Synthetic);
+        assert_eq!(book.validate_state(), Ok(()));
+    }
+
+    #[test]
+    fn advancing_ids_preserves_existing_orders_and_never_rewinds() {
+        let mut book = book_with_ladder();
+        let depth = book.depth(Side::Buy, 10);
+        book.advance_order_id(OrderId(100));
+        book.advance_order_id(OrderId(2));
+        assert_eq!(book.next_order_id(), OrderId(100));
+        assert_eq!(book.depth(Side::Buy, 10), depth);
+        let result = book
+            .submit(Order::market(Owner::Trader(T), Side::Buy, 1), Timestamp(0))
+            .unwrap();
+        assert_eq!(result.id, OrderId(100));
+        assert_eq!(book.validate_state(), Ok(()));
+    }
+
+    #[test]
+    fn exhausted_ids_reject_orders_without_mutating_the_book() {
+        let mut book = book_with_ladder();
+        book.next_id = u64::MAX;
+        let before = book.clone();
+        assert_eq!(
+            book.submit(Order::market(Owner::Trader(T), Side::Buy, 1), Timestamp(0)),
+            Err(OrderError::IdExhausted)
+        );
+        assert_eq!(book, before);
+    }
+
+    #[test]
+    fn default_book_never_assigns_the_hidden_order_id() {
+        let mut book = OrderBook::default();
+        assert_eq!(book, OrderBook::new());
+        let placed = book
+            .submit(
+                Order::limit(Owner::Trader(T), Side::Buy, 100, 1),
+                Timestamp(0),
+            )
+            .unwrap();
+        assert_eq!(placed.id, OrderId(1));
+        assert_ne!(placed.id, OrderId::HIDDEN);
+        assert_eq!(book.cancel(placed.id).unwrap().id, placed.id);
     }
 
     #[test]

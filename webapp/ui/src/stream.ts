@@ -33,7 +33,15 @@ export class MarketStream {
     this.#source = es;
     es.onopen = () => {
       this.#setConnection('live');
-      void this.#actions.loadBars();
+      // Reconnects can follow a server-side gap: recover snapshots even if
+      // there are no later ticks or fills to prompt another refresh.
+      void Promise.allSettled([
+        this.#actions.loadSymbols(),
+        this.#actions.loadBars(),
+        this.#actions.loadEvents(),
+        this.#actions.loadBookAndTape(),
+        this.#actions.refreshTrader(),
+      ]);
     };
     es.onerror = () => this.#setConnection('reconnecting');
     es.onmessage = (ev: MessageEvent<string>) => {

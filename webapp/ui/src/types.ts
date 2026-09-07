@@ -627,3 +627,13 @@ export type StreamMessage =
 export interface ApiErrorBody {
   error?: { code: string; message: string };
 }
+
+/** Game-master audit of one consistent market snapshot. */
+export interface Reconciliation {
+  valid: boolean;
+  accounts_checked: number;
+  traders_checked: number;
+  symbols_checked: number;
+  resting_orders_checked: number;
+  issues: string[];
+}

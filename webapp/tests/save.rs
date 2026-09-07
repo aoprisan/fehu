@@ -131,6 +131,11 @@ async fn a_saved_market_comes_back_whole() {
 
     save::write(&before, &path).expect("state written");
     assert!(path.exists(), "the save file is where it was asked for");
+    let saved_text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !saved_text.contains(&key),
+        "saves must not contain bearer credentials"
+    );
 
     // A brand-new process would do exactly this.
     let after = App::restore(options(Some(path.clone())), save::read(&path).unwrap());
@@ -339,4 +344,90 @@ mod tempdir_lite {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+}
+
+#[tokio::test]
+async fn version_two_keys_are_migrated_without_changing_player_credentials() {
+    let dir = TempDir::new("fehu-save-key-migration");
+    let path = dir.path().join("state.json");
+    let app = App::new(options(None));
+    let (id, key) = busy_market(&app).await;
+    let mut legacy = app.save();
+    legacy.version = 2;
+    let user = app.market().traders[&fehu::TraderId(id)].user_id.0;
+    legacy.market.api_keys = vec![(key.clone(), user)];
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let migrated = save::read(&path).unwrap();
+    assert_eq!(migrated.version, save::STATE_VERSION);
+    assert!(!serde_json::to_string(&migrated).unwrap().contains(&key));
+    let digest = migrated.market.api_keys[0].0.clone();
+    let restored = App::restore(options(None), migrated);
+    assert_eq!(
+        get(&restored, Some(&key), &format!("/api/traders/{id}"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get(&restored, Some(&digest), &format!("/api/traders/{id}"))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    save::write(&restored, &path).unwrap();
+    assert!(!std::fs::read_to_string(&path).unwrap().contains(&key));
+    let again = App::restore(options(None), save::read(&path).unwrap());
+    assert_eq!(
+        get(&again, Some(&key), &format!("/api/traders/{id}"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn inconsistent_accounting_and_identity_saves_are_refused() {
+    let dir = TempDir::new("fehu-save-invariants");
+    let path = dir.path().join("state.json");
+    let app = App::new(options(None));
+    busy_market(&app).await;
+    let good = serde_json::to_value(app.save()).unwrap();
+    let mut cases = Vec::new();
+    let mut bad = good.clone();
+    bad["symbols"][0]["exchange"]["book"]["index"] = json!({});
+    cases.push(("book index disagrees with resting orders", bad));
+    let mut bad = good.clone();
+    let duplicate = bad["market"]["users"][0].clone();
+    bad["market"]["users"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    cases.push(("duplicate user", bad));
+    let mut bad = good.clone();
+    bad["market"]["next_trader_id"] = json!(1);
+    cases.push(("counter overlaps live trader", bad));
+    let mut bad = good.clone();
+    bad["market"]["accounts"][0]["balance_cents"] = json!(0);
+    cases.push(("ledger does not match cash", bad));
+    let mut bad = good.clone();
+    bad["market"]["accounts"][0]["reserved_cents"] = json!(0);
+    cases.push(("reservation does not match book", bad));
+    let mut bad = good.clone();
+    bad["market"]["traders"][0]["account_id"] = json!(999999);
+    cases.push(("orphan trader", bad));
+    let mut bad = good.clone();
+    bad["market"]["api_keys"][0][1] = json!(999999);
+    cases.push(("orphan key", bad));
+    let mut bad = good.clone();
+    bad["market"]["api_keys"][0][0] = json!("fehu_plaintext");
+    cases.push(("plaintext in current format", bad));
+    for (name, value) in cases {
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            matches!(save::read(&path), Err(save::SaveError::Invalid(_))),
+            "{name}"
+        );
+    }
+    std::fs::write(&path, serde_json::to_vec(&good).unwrap()).unwrap();
+    assert!(save::read(&path).is_ok());
 }

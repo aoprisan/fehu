@@ -55,6 +55,7 @@ pub fn router(app: AppState) -> Router {
         .route("/assets/app.js", get(app_js))
         .route("/assets/app.css", get(app_css))
         .route("/api/health", get(health))
+        .route("/api/reconcile", get(reconcile))
         .route("/api/symbols", get(list_symbols))
         .route("/api/symbols/{symbol}", get(get_symbol))
         .route("/api/symbols/{symbol}/bars", get(get_bars))
@@ -463,6 +464,13 @@ struct Health {
     resting_orders: usize,
 }
 
+async fn reconcile(
+    State(app): State<AppState>,
+    _admin: Admin,
+) -> Json<crate::reconcile::Reconciliation> {
+    Json(app.market().reconcile())
+}
+
 async fn health(State(app): State<AppState>) -> Json<Health> {
     let market = app.market();
     Json(Health {
@@ -634,11 +642,17 @@ async fn resume_symbol(
     let idx = market
         .symbol_index(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
-    let status = market
+    let (status, fills) = market
         .resume(idx, now)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
     tracing::info!(symbol = status.symbol, "trading resumed");
     let _ = app.tx.send(StreamMessage::Status(status));
+    for fill in fills {
+        let _ = app.tx.send(StreamMessage::Fill {
+            trader_id: fill.trader_id,
+            fill,
+        });
+    }
     Ok(Json(status))
 }
 
@@ -1021,7 +1035,7 @@ async fn create_trader(
     let mut dto = portfolio(&market, id)?;
     if req.user_id.is_none() {
         // A new user was created for the trader: hand over their key, once.
-        dto.api_key = market.keys.key_of(UserId(dto.user_id)).map(str::to_owned);
+        dto.api_key = market.keys.take_issued_key(UserId(dto.user_id));
     }
     tracing::info!(
         trader = dto.id,
@@ -1297,6 +1311,16 @@ fn place_order(
     market.traders[&trader]
         .check(account, sym, order.side, order.qty, cost)
         .map_err(ApiError::refused)?;
+    // The log and retry index span all symbols. Allocate above every book's
+    // counter while holding the market lock, including ids used by synthetic
+    // flow since the last trader submission. Counters already persist in saves.
+    let next_id = market
+        .symbols
+        .iter()
+        .map(|s| s.exchange.book().next_order_id())
+        .max()
+        .unwrap_or(fehu::OrderId(1));
+    market.symbols[idx].exchange.advance_order_id(next_id);
     let placement = market.symbols[idx]
         .exchange
         .submit(order)
@@ -1557,7 +1581,7 @@ async fn amend_order(
                 cancelled.price_cents,
             );
         }
-        market.cancel_order_record(order_id, cancelled.remaining, now);
+        market.cancel_order_record(sym, order_id, cancelled.remaining, now);
 
         if req.post_only {
             check_post_only(&market.symbols[idx], &order)?;
@@ -1627,7 +1651,7 @@ async fn cancel_order(
         );
     }
     let now = market.symbols[idx].exchange.clock().0;
-    market.cancel_order_record(order_id, cancelled.remaining, now);
+    market.cancel_order_record(sym, order_id, cancelled.remaining, now);
     tracing::info!(
         trader = trader.0,
         symbol = sym,
@@ -1657,7 +1681,7 @@ async fn cancel_all(
             }
         }
         for o in &cancelled {
-            market.cancel_order_record(o.id.0, o.remaining, now);
+            market.cancel_order_record(sym, o.id.0, o.remaining, now);
         }
     }
     Ok(Json(out))
@@ -1680,7 +1704,7 @@ async fn create_user(
     tracing::info!(user = id.0, "user created");
     let mut dto = user_dto(&market, id)?;
     // The one and only time the key is handed out.
-    dto.api_key = market.keys.key_of(id).map(str::to_owned);
+    dto.api_key = market.keys.take_issued_key(id);
     Ok((StatusCode::CREATED, Json(dto)))
 }
 
@@ -2031,8 +2055,10 @@ async fn stream(
     // Ticks and events are public; a fill belongs to the trader that made it,
     // so it goes only to a stream that proved it speaks for that trader.
     let owner = Arc::clone(&app);
-    // A lagging client silently skips the messages it missed.
+    // A gap ends this connection: EventSource reconnects and clients reload
+    // snapshots. Never present later messages as an uninterrupted stream.
     let live = BroadcastStream::new(rx)
+        .take_while(Result::is_ok)
         .filter_map(Result::ok)
         .filter(move |m| match m {
             StreamMessage::Fill { trader_id, .. } => viewer.is_some_and(|user| {

@@ -369,6 +369,12 @@ impl Exchange {
         &self.book
     }
 
+    /// Skip unused order ids below `minimum`, without changing liquidity or
+    /// the price process. Used to coordinate trader ids across exchanges.
+    pub fn advance_order_id(&mut self, minimum: OrderId) {
+        self.book.advance_order_id(minimum);
+    }
+
     /// Wall time the exchange has been advanced to.
     #[must_use]
     pub fn clock(&self) -> Timestamp {
@@ -469,6 +475,32 @@ impl Exchange {
                 // requested wall time so a partial tick is not lost.
                 self.sim.set_clock(target);
                 r
+            })
+        })
+    }
+
+    /// Advance the reference process without matching or requoting the book.
+    /// Resting orders and their queue positions remain unchanged. Tick volume
+    /// includes only executions already submitted before this advance.
+    /// Call [`resync`](Self::resync) and settle its returned trades when
+    /// matching resumes, before accepting new orders against the old quotes.
+    pub fn advance_without_matching(
+        &mut self,
+        dur: Duration,
+    ) -> impl Iterator<Item = StepReport> + '_ {
+        let target = self.sim.clock() + dur;
+        core::iter::from_fn(move || {
+            (self.sim.next_tick_ts() <= target).then(|| {
+                let impact = self.apply_impact();
+                let tick = self.sim.step();
+                self.reference_cents = tick.price_cents;
+                let volume = core::mem::take(&mut self.interim_volume);
+                self.sim.set_clock(target);
+                StepReport {
+                    tick: Tick { volume, ..tick },
+                    trades: Vec::new(),
+                    impact,
+                }
             })
         })
     }

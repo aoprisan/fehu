@@ -121,6 +121,7 @@ read that portfolio, cancel those orders or move that money. The key is shown
 | `GET` | `/api/symbols/{sym}/book?depth=10` | Aggregated bids and asks, reference price, pending trader flow |
 | `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first |
 | `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and — for `?api_key=`, since `EventSource` cannot set headers — that player's `fill`s |
+| `GET` | `/api/reconcile` | Game master: check ownership, reservations, share supply and retained cash ledgers; returns `valid` and `issues` |
 | `GET` | `/api/health` | Uptime, simulated time, tick/trade counters |
 
 At start-up each symbol generates a year of daily bars in coarse mode and then
@@ -149,8 +150,8 @@ withdrawal cannot touch the cash a resting buy order has reserved, and an
 order is validated against its account before it reaches the exchange (the
 account must be active and its available balance must cover the worst-case
 cost). Fills settle through the account, so every cent that moves is on its
-ledger. Nothing is persisted: accounts start with cash, no shares, no margin
-and no shorting.
+ledger. New accounts start with cash, no shares, no margin and no shorting.
+Persistence is optional, as described below.
 
 The market can stop. Give it `FEHU_MARKET_HOURS` and orders outside the
 session are refused with `409 market_closed`; leave it unset and it trades
@@ -171,15 +172,20 @@ account, ledger, position, resting order and API key — every `FEHU_SAVE_SECS`
 seconds and once more on a clean shutdown, and read back at start-up in place
 of the warm-up, continuing from the simulated time it had reached. The write
 goes through a temporary file and a rename, so an interrupted save cannot
-destroy the last good one; a file from another format version, or one listing
+destroy the last good one; a file from an unsupported format version, or one listing
 different symbols, stops the server rather than starting a market without its
-accounts. Without the variable nothing is kept and every start warms up a
+accounts. The reader also refuses inconsistent account balances, retained
+ledgers, reservations, ownership links, identity counters and key ownership,
+and malformed book indexes, price queues or quantities.
+Without the variable nothing is kept and every start warms up a
 fresh market.
 
 Keys are the only credential: they are 128 bits of operating-system entropy,
-issued at sign-up and held in memory beside the accounts they open. Nothing
-is persisted, so there is no key store to steal separately — but a deployment
-that adds persistence must hash them before writing them down.
+issued once at sign-up. Authentication and saves retain domain-separated
+SHA-256 hashes; a stored hash cannot be used as a bearer key. Save format 3
+reads version-2 files by hashing their original keys, so players keep using
+the same credentials. The next save writes only hashes; any older backups
+still contain the original keys.
 
 Three rules shape what the book will take. A **post-only** order (`"post_only":true`)
 must rest: if its price would trade on arrival it is refused rather than
@@ -212,6 +218,10 @@ buy reserves cash, and a cancel gives them back. `GET /api/users/{id}/holdings`
 adds a user's positions up per symbol — owned, reserved and sellable — across
 every trader of theirs, and shares belong to the trader that bought them: one
 trader cannot sell another's, even under the same user.
+
+A stream client that falls behind is disconnected so it can reconnect and
+reload snapshots. The bundled UI refreshes market data and the portfolio on
+every connection. The stream does not yet replay missed messages.
 
 What is deliberately *not* built — stop orders, fees, corporate actions,
 sequence numbers on the stream — and the decisions behind what is, are listed

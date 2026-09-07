@@ -14,6 +14,7 @@ pub mod auth;
 pub mod engine;
 pub mod events;
 pub mod market;
+pub mod reconcile;
 pub mod save;
 pub mod trading;
 

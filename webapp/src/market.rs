@@ -450,7 +450,13 @@ impl SymbolState {
             tape_cap,
             ..
         } = self;
-        for report in exchange.advance(Duration::from_millis(dur as u64)) {
+        let dur = Duration::from_millis(dur as u64);
+        let reports: Box<dyn Iterator<Item = fehu::StepReport> + '_> = if self.halt.is_some() {
+            Box::new(exchange.advance_without_matching(dur))
+        } else {
+            Box::new(exchange.advance(dur))
+        };
+        for report in reports {
             let closed = candles.push(&report.tick);
             for (flag, c) in out.closed.iter_mut().zip(closed) {
                 *flag |= c.is_some();
@@ -724,7 +730,7 @@ impl Market {
 
     /// Register a user and issue their API key. `name` and `email` are
     /// trimmed and truncated; an empty name becomes `user-{id}`. The key is
-    /// read back once with [`crate::auth::Keyring::key_of`], for the response
+    /// read back once with [`crate::auth::Keyring::take_issued_key`], for the response
     /// that created them.
     pub fn create_user(
         &mut self,
@@ -961,8 +967,10 @@ impl Market {
     }
 
     /// Mark an order cancelled in the log.
-    pub fn cancel_order_record(&mut self, order_id: u64, remaining: u64, ts_ms: i64) {
-        if let Some(record) = self.orders.get_mut(&order_id) {
+    pub fn cancel_order_record(&mut self, symbol: &str, order_id: u64, remaining: u64, ts_ms: i64) {
+        if let Some(record) = self.orders.get_mut(&order_id)
+            && record.symbol == symbol
+        {
             record.cancel(remaining, ts_ms);
         }
     }
@@ -976,6 +984,7 @@ impl Market {
             for party in [&t.taker, &t.maker] {
                 if party.owner.trader().is_some()
                     && let Some(record) = self.orders.get_mut(&party.order.0)
+                    && record.symbol == sym
                 {
                     record.fill(t.qty, t.price_cents, t.ts.0);
                 }
@@ -1028,22 +1037,41 @@ impl Market {
     }
 
     /// Start trading again, whatever stopped it.
-    pub fn resume(&mut self, index: usize, now: Timestamp) -> Option<SymbolStatus> {
-        self.symbols.get_mut(index)?.resume();
-        self.status(index, now)
+    pub fn resume(
+        &mut self,
+        index: usize,
+        now: Timestamp,
+    ) -> Option<(SymbolStatus, Vec<FillRecord>)> {
+        let symbol = self.symbols.get_mut(index)?;
+        let was_halted = symbol.resume().is_some();
+        let trades = if was_halted && symbol.is_open(now) {
+            symbol.exchange.resync()
+        } else {
+            Vec::new()
+        };
+        symbol.record_trades(&trades);
+        let ticker = symbol.info.symbol;
+        let fills = self.apply_trades(ticker, &trades);
+        Some((self.status(index, now)?, fills))
     }
 
     /// Halt a symbol whose price has left the band the day opened with, and
     /// lift an automatic halt once its time is up. Returns the new state if
     /// it changed.
-    fn review_halt(&mut self, index: usize, now: Timestamp) -> Option<SymbolStatus> {
+    fn review_halt(
+        &mut self,
+        index: usize,
+        now: Timestamp,
+        fills: &mut Vec<FillRecord>,
+    ) -> Option<SymbolStatus> {
         let (limit_pct, halt_ms) = (self.price_limit_pct, self.halt_secs as i64 * 1000);
         let s = self.symbols.get_mut(index)?;
         if let Some(halt) = s.halt {
             // A manual halt has no end: only a resume lifts it.
             if halt.until_ms.is_some_and(|until| until <= now.0) {
-                s.resume();
-                return self.status(index, now);
+                let (status, resumed_fills) = self.resume(index, now)?;
+                fills.extend(resumed_fills);
+                return Some(status);
             }
             return None;
         }
@@ -1097,7 +1125,7 @@ impl Market {
             }
         }
         for i in 0..self.symbols.len() {
-            if let Some(status) = self.review_halt(i, target) {
+            if let Some(status) = self.review_halt(i, target, &mut fills) {
                 messages.push(StreamMessage::Status(status));
             }
         }

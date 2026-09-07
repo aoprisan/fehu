@@ -809,3 +809,22 @@ async fn ui_assets_are_served() {
         );
     }
 }
+
+#[tokio::test]
+async fn reconciliation_contract() {
+    let report = get(&test_app(), "/api/reconcile").await;
+    assert_keys(
+        "Reconciliation",
+        &report,
+        &[
+            "valid",
+            "accounts_checked",
+            "traders_checked",
+            "symbols_checked",
+            "resting_orders_checked",
+            "issues",
+        ],
+    );
+    assert_eq!(report["valid"], true);
+    assert!(report["issues"].as_array().unwrap().is_empty());
+}
