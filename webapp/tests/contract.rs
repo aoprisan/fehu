@@ -352,6 +352,32 @@ async fn trading_shapes() {
         ],
     );
 
+    let records = get(&app, &format!("/api/traders/{id}/orders")).await;
+    assert_keys(
+        "OrderRecord",
+        first("orders", &json!({ "orders": records }), "orders"),
+        &[
+            "order_id",
+            "client_order_id",
+            "trader_id",
+            "symbol",
+            "kind",
+            "price_cents",
+            "side",
+            "tif",
+            "qty",
+            "filled",
+            "remaining",
+            "status",
+            "notional_cents",
+            "avg_price_cents",
+            "submitted_at_ms",
+            "updated_at_ms",
+        ],
+    );
+    assert_eq!(records[0]["status"], "resting", "OrderStatus is lower-case");
+    assert_eq!(records[0]["tif"], "gtc", "TimeInForce is lower-case");
+
     let holdings = get(
         &app,
         &format!("/api/users/{}/holdings", portfolio["user_id"]),

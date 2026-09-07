@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 
 use crate::account::{Account, AccountId, MoneyError, User, UserId, notional_cents};
 use crate::events::EventRecord;
-use crate::trading::{BookDto, FillRecord, HoldingDto, TradeDto, Trader};
+use crate::trading::{BookDto, FillRecord, HoldingDto, OrderRecord, TradeDto, Trader};
 
 /// Milliseconds in one day.
 pub const DAY_MS: i64 = 86_400_000;
@@ -457,8 +457,15 @@ pub struct Market {
     next_account_id: u64,
     pub traders: BTreeMap<TraderId, Trader>,
     next_trader_id: u64,
+    /// Every order the log still holds, by order id.
+    orders: BTreeMap<u64, OrderRecord>,
+    /// Order ids in the order they were accepted, for eviction.
+    order_ids: VecDeque<u64>,
+    /// `(trader, client_order_id)` → order id, for idempotent submission.
+    client_order_ids: BTreeMap<(TraderId, String), u64>,
     fill_log: usize,
     ledger_log: usize,
+    order_log: usize,
 }
 
 impl Market {
@@ -651,11 +658,79 @@ impl Market {
             .fold(0, u64::saturating_add)
     }
 
+    /// One order by id, whatever became of it — as long as the log still
+    /// holds it.
+    pub fn order(&self, order_id: u64) -> Option<&OrderRecord> {
+        self.orders.get(&order_id)
+    }
+
+    /// A trader's orders, newest first.
+    pub fn orders_of(&self, trader: TraderId) -> impl Iterator<Item = &OrderRecord> {
+        self.order_ids
+            .iter()
+            .rev()
+            .filter_map(|id| self.orders.get(id))
+            .filter(move |o| o.trader_id == trader.0)
+    }
+
+    /// The order a `client_order_id` was already used for, if any. A repeat
+    /// submission is answered from this rather than sent to the book again.
+    pub fn order_by_client_id(&self, trader: TraderId, client_id: &str) -> Option<&OrderRecord> {
+        self.client_order_ids
+            .get(&(trader, client_id.to_string()))
+            .and_then(|id| self.orders.get(id))
+    }
+
+    /// Add an accepted order to the log, evicting the oldest finished ones
+    /// once it is over `order_log`. Live orders are never evicted.
+    pub fn record_order(&mut self, record: OrderRecord) {
+        let id = record.order_id;
+        if let Some(client_id) = record.client_order_id.clone() {
+            self.client_order_ids
+                .insert((TraderId(record.trader_id), client_id), id);
+        }
+        self.orders.insert(id, record);
+        self.order_ids.push_back(id);
+        while self.orders.len() > self.order_log {
+            let Some(pos) = self
+                .order_ids
+                .iter()
+                .position(|id| self.orders.get(id).is_some_and(|o| !o.is_live()))
+            else {
+                break; // Everything still in the log is live: keep it all.
+            };
+            let Some(id) = self.order_ids.remove(pos) else {
+                break;
+            };
+            if let Some(old) = self.orders.remove(&id)
+                && let Some(client_id) = old.client_order_id
+            {
+                self.client_order_ids
+                    .remove(&(TraderId(old.trader_id), client_id));
+            }
+        }
+    }
+
+    /// Mark an order cancelled in the log.
+    pub fn cancel_order_record(&mut self, order_id: u64, remaining: u64, ts_ms: i64) {
+        if let Some(record) = self.orders.get_mut(&order_id) {
+            record.cancel(remaining, ts_ms);
+        }
+    }
+
     /// Book every trade in `trades` (for symbol `sym`) to the traders
     /// involved. Returns the fills created, in order.
     pub fn apply_trades(&mut self, sym: &'static str, trades: &[Trade]) -> Vec<FillRecord> {
         let mut fills = Vec::new();
         for t in trades {
+            // A resting order that trades has moved on since it was accepted.
+            for party in [&t.taker, &t.maker] {
+                if party.owner.trader().is_some()
+                    && let Some(record) = self.orders.get_mut(&party.order.0)
+                {
+                    record.fill(t.qty, t.price_cents, t.ts.0);
+                }
+            }
             let mut parties = [t.taker.owner.trader(), t.maker.owner.trader()];
             if parties[0] == parties[1] {
                 parties[1] = None;
@@ -819,6 +894,9 @@ pub struct Options {
     pub fill_log: usize,
     /// Ledger entries retained per account. `FEHU_LEDGER_LOG`.
     pub ledger_log: usize,
+    /// Orders retained in the order log. Live orders are never dropped.
+    /// `FEHU_ORDER_LOG`.
+    pub order_log: usize,
     /// Cash a new account is opened with, in cents.
     /// `FEHU_STARTING_CASH_CENTS`.
     pub starting_cash_cents: i64,
@@ -836,6 +914,7 @@ impl Default for Options {
             tape_len: 2_000,
             fill_log: 500,
             ledger_log: 500,
+            order_log: 2_000,
             starting_cash_cents: 10_000_000,
         }
     }
@@ -857,6 +936,7 @@ impl Options {
             tape_len: env_parse("FEHU_TAPE", d.tape_len),
             fill_log: env_parse("FEHU_FILL_LOG", d.fill_log),
             ledger_log: env_parse("FEHU_LEDGER_LOG", d.ledger_log),
+            order_log: env_parse("FEHU_ORDER_LOG", d.order_log),
             starting_cash_cents: env_parse("FEHU_STARTING_CASH_CENTS", d.starting_cash_cents),
         }
     }
@@ -930,8 +1010,12 @@ impl App {
                 next_account_id: 1,
                 traders: BTreeMap::new(),
                 next_trader_id: 1,
+                orders: BTreeMap::new(),
+                order_ids: VecDeque::new(),
+                client_order_ids: BTreeMap::new(),
                 fill_log: options.fill_log,
                 ledger_log: options.ledger_log,
+                order_log: options.order_log.max(1),
             }),
             tx,
             options,

@@ -102,9 +102,11 @@ change and `just ui-dev` serves it with hot reload against a running backend.
 | `GET` | `/api/traders`, `/api/traders/{id}` | Traders; a portfolio with cash, positions marked to the reference price, open orders and fills |
 | `POST` | `/api/traders/{id}/deposit` | Add money to the trader's account: `{"amount_cents":250000}` |
 | `POST` | `/api/traders/{id}/cancel_all` | Cancel every resting order of a trader |
-| `POST` | `/api/symbols/{sym}/orders` | `{"trader_id":1,"side":"buy","qty":100,"type":"market"}` or `"type":"limit","price_cents":8400`, optional `"tif":"gtc\|ioc\|fok"`; responds with fills and status |
+| `POST` | `/api/symbols/{sym}/orders` | `{"trader_id":1,"side":"buy","qty":100,"type":"market"}` or `"type":"limit","price_cents":8400`, optional `"tif":"gtc\|ioc\|fok"` and `"client_order_id":"abc-1"`; responds with fills and status |
 | `GET` | `/api/symbols/{sym}/orders?trader_id=` | A trader's resting orders on that symbol |
 | `GET`/`DELETE` | `/api/symbols/{sym}/orders/{id}` | Look up / cancel (`?trader_id=`) a resting order |
+| `GET` | `/api/orders/{id}` | One order and what became of it — filled and cancelled ones included |
+| `GET` | `/api/traders/{id}/orders?status=resting\|filled\|cancelled&limit=100` | A trader's orders, newest first |
 | `GET` | `/api/symbols/{sym}/book?depth=10` | Aggregated bids and asks, reference price, pending trader flow |
 | `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first |
 | `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and `fill` |
@@ -114,8 +116,8 @@ At start-up each symbol generates a year of daily bars in coarse mode and then
 three days of 1 s ticks, so every interval has history before the first
 request. `FEHU_TIME_SCALE=60` runs the market at 60 simulated seconds per
 wall second; `FEHU_BIND`, `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`,
-`FEHU_STARTING_CASH_CENTS`, `FEHU_TAPE`, `FEHU_FILL_LOG` and
-`FEHU_LEDGER_LOG` are the other knobs. Same seeds and same events give the
+`FEHU_STARTING_CASH_CENTS`, `FEHU_TAPE`, `FEHU_FILL_LOG`, `FEHU_ORDER_LOG`
+and `FEHU_LEDGER_LOG` are the other knobs. Same seeds and same events give the
 same prices on every run; trading adds impact on top, so a market with no
 orders replays the bare simulation.
 
@@ -129,6 +131,14 @@ account must be active and its available balance must cover the worst-case
 cost). Fills settle through the account, so every cent that moves is on its
 ledger. Nothing is persisted: accounts start with cash, no shares, no margin
 and no shorting.
+
+Orders are remembered. The book only knows an order while it rests, so every
+submission is also written to an order log (`GET /api/orders/{id}`,
+`GET /api/traders/{id}/orders`) that follows it through its fills to `filled`
+or `cancelled`. Passing a `client_order_id` makes the submission idempotent:
+the same order sent twice — a retry after a timeout — is placed once, the
+first response is replayed with `200` instead of `201`, and re-using that id
+for a *different* order is refused with `409` rather than quietly obeyed.
 
 Shares are counted the same way. Every symbol has a fixed number of them
 (`shares_outstanding`: 240 M of ACME, 85 M of NBLA, 610 M of HLIO, 150 M of

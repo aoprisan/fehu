@@ -14,6 +14,7 @@ import type {
   Interval,
   LedgerResponse,
   OpenOrderDto,
+  OrderRecord,
   OrderRequest,
   OrderResponse,
   PortfolioDto,
@@ -117,6 +118,13 @@ export const api = {
 
   submitOrder: (symbol: string, body: OrderRequest): Promise<OrderResponse> =>
     send('POST', `/api/symbols/${enc(symbol)}/orders`, body),
+
+  /** One order by id, filled and cancelled ones included. */
+  order: (orderId: number): Promise<OrderRecord> => request(`/api/orders/${orderId}`),
+
+  /** A trader's orders, newest first. */
+  traderOrders: (traderId: number, limit: number): Promise<OrderRecord[]> =>
+    request(`/api/traders/${traderId}/orders?limit=${limit}`),
 
   cancelOrder: (symbol: string, orderId: number, traderId: number): Promise<OpenOrderDto> =>
     send('DELETE', `/api/symbols/${enc(symbol)}/orders/${orderId}?trader_id=${traderId}`),

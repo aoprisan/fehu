@@ -1000,7 +1000,27 @@ across every trader of theirs — owned, reserved, still sellable, cost, mark
 and P&L — behind `GET /api/users/{id}/holdings`, and `UserDto` carries the
 totals (`shares_owned`, `holdings_value_cents`) next to the cash balance.
 
-### 14.10 Tests
+### 14.10 Orders: the log, and sending one twice
+
+The book holds an order only while it rests: once it fills or is cancelled it
+is gone, which is no basis for a client that wants to know what happened.
+`Market` therefore keeps a bounded log (`FEHU_ORDER_LOG`, 2 000 by default) of
+`OrderRecord`s — the submission as it was accepted, plus `filled`,
+`remaining`, `status`, `notional_cents` and `updated_at_ms` as they move.
+`Market::apply_trades` is the one choke point where fills are booked, so a
+resting order's record follows it whether it is hit by another trader's order
+or by the engine's synthetic flow; cancels mark it from the two cancel paths.
+Eviction drops the oldest *finished* records first and never a live one.
+
+A submission may carry a `client_order_id` (≤ 64 characters, unique per
+trader), which makes it idempotent: a repeat with the same parameters is not
+sent to the book at all — the response the first one produced is stored on the
+record and replayed verbatim with `200` instead of `201` — and a repeat that
+asks for something else is refused with `409 duplicate_client_order_id`. That
+is what makes a retry after a timeout safe, which no amount of care on the
+client side can otherwise guarantee.
+
+### 14.11 Tests
 
 `tests/trading.rs`: book priority/partial fills/IOC/FOK/cancel/preview; the
 no-trader invariant against the bare simulator for 20 k ticks; ladder
@@ -1021,5 +1041,9 @@ refused with nothing owned, above what is owned, and above what resting sells
 leave free, and goes through again once they are cancelled; the per-symbol
 count splits into held, bid for and available, a buy beyond it is refused
 before the cash check, and a user's holdings add up across their traders
-while one trader still cannot sell another's shares. `webapp/tests/contract.rs`
+while one trader still cannot sell another's shares. Orders: a
+`client_order_id` replays the first response and refuses a mismatched reuse
+while staying per-trader, a filled or cancelled order is still readable from
+the log once the book has dropped it, the history filters by status, and a
+resting order's record follows its partial fills to `filled`. `webapp/tests/contract.rs`
 pins the JSON key sets the TypeScript UI is typed against.

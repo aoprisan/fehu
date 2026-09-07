@@ -1329,3 +1329,181 @@ async fn a_users_shares_are_the_sum_of_their_traders() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"]["code"], "unknown_user");
 }
+
+#[tokio::test]
+async fn a_client_order_id_makes_submission_idempotent() {
+    let app = test_app();
+    let id = new_trader(&app, "ida").await;
+    let order = json!({ "trader_id": id, "side": "buy", "qty": 25, "type": "market", "client_order_id": "abc-1" });
+
+    let (status, first) = post(&app, "/api/symbols/ACME/orders", order.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    assert_eq!(first["filled"], 25);
+
+    // The same order again: placed once, and the first answer comes back.
+    let (status, again) = post(&app, "/api/symbols/ACME/orders", order.clone()).await;
+    assert_eq!(status, StatusCode::OK, "a replay is not a new order");
+    assert_eq!(again, first, "the original response, verbatim");
+    let (_, p) = get(&app, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["positions"][0]["qty"], 25, "bought once, not twice");
+
+    // The same id for a different order is refused, not quietly obeyed.
+    let (status, body) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 50, "type": "market", "client_order_id": "abc-1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "duplicate_client_order_id");
+
+    // Ids are per trader, so somebody else may use the same one.
+    let other = new_trader(&app, "ivan").await;
+    let (status, body) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": other, "side": "buy", "qty": 25, "type": "market", "client_order_id": "abc-1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_ne!(body["order_id"], first["order_id"]);
+
+    // An empty id is no id at all, and an oversized one is refused.
+    for (value, expected) in [
+        (json!("   "), StatusCode::CREATED),
+        (json!("x".repeat(65)), StatusCode::BAD_REQUEST),
+    ] {
+        let (status, body) = post(
+            &app,
+            "/api/symbols/ACME/orders",
+            json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market", "client_order_id": value }),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn orders_can_be_looked_up_after_they_are_done() {
+    let app = test_app();
+    let id = new_trader(&app, "otto").await;
+
+    // One filled market order…
+    let (_, filled) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "market", "client_order_id": "m-1" }),
+    )
+    .await;
+    let filled_id = filled["order_id"].as_u64().unwrap();
+    // …and one resting limit, later cancelled.
+    let bid = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+    let (_, resting) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 5, "type": "limit", "price_cents": bid / 2 }),
+    )
+    .await;
+    let resting_id = resting["order_id"].as_u64().unwrap();
+
+    // The book has forgotten the filled order; the log has not.
+    let (status, _) = get(&app, &format!("/api/symbols/ACME/orders/{filled_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "not resting any more");
+    let (status, record) = get(&app, &format!("/api/orders/{filled_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(record["status"], "filled");
+    assert_eq!(record["client_order_id"], "m-1");
+    assert_eq!(record["kind"], "market");
+    assert_eq!(record["price_cents"], Value::Null);
+    assert_eq!(record["filled"], 10);
+    assert_eq!(record["remaining"], 0);
+    assert!(record["avg_price_cents"].as_f64().unwrap() > 0.0);
+    assert_eq!(record["submitted_at_ms"], record["updated_at_ms"]);
+
+    let (_, records) = get(&app, &format!("/api/traders/{id}/orders")).await;
+    assert_eq!(records.as_array().unwrap().len(), 2);
+    assert_eq!(records[0]["order_id"], resting_id, "newest first");
+    assert_eq!(records[0]["status"], "resting");
+    assert_eq!(records[0]["price_cents"], bid / 2);
+    assert_eq!(records[1]["order_id"], filled_id);
+
+    let (_, open) = get(&app, &format!("/api/traders/{id}/orders?status=resting")).await;
+    assert_eq!(open.as_array().unwrap().len(), 1);
+    assert_eq!(open[0]["order_id"], resting_id);
+    let (status, body) = get(&app, &format!("/api/traders/{id}/orders?status=nope")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Cancelling moves the record on.
+    delete(
+        &app,
+        &format!("/api/symbols/ACME/orders/{resting_id}?trader_id={id}"),
+    )
+    .await;
+    let (_, record) = get(&app, &format!("/api/orders/{resting_id}")).await;
+    assert_eq!(record["status"], "cancelled");
+    assert_eq!(record["filled"], 0);
+    assert_eq!(record["remaining"], 5);
+    let (_, cancelled) = get(&app, &format!("/api/traders/{id}/orders?status=cancelled")).await;
+    assert_eq!(cancelled.as_array().unwrap().len(), 1);
+
+    let (status, body) = get(&app, "/api/orders/9999").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "unknown_order");
+}
+
+#[tokio::test]
+async fn a_resting_order_record_follows_its_fills() {
+    let app = test_app();
+    let maker = new_trader(&app, "mae").await;
+    let taker = new_trader(&app, "tom").await;
+    let book = get(&app, "/api/symbols/HLIO/book").await.1;
+    let mid = (book["bid_cents"].as_i64().unwrap() + book["ask_cents"].as_i64().unwrap()) / 2;
+
+    let (_, resting) = post(
+        &app,
+        "/api/symbols/HLIO/orders",
+        json!({ "trader_id": maker, "side": "buy", "qty": 100, "type": "limit", "price_cents": mid }),
+    )
+    .await;
+    let order_id = resting["order_id"].as_u64().unwrap();
+    let (_, record) = get(&app, &format!("/api/orders/{order_id}")).await;
+    assert_eq!(record["status"], "resting");
+    assert_eq!(record["filled"], 0);
+
+    // Somebody sells into it: 40 of the 100 fill.
+    post(
+        &app,
+        "/api/symbols/HLIO/orders",
+        json!({ "trader_id": taker, "side": "buy", "qty": 400, "type": "market" }),
+    )
+    .await;
+    post(
+        &app,
+        "/api/symbols/HLIO/orders",
+        json!({ "trader_id": taker, "side": "sell", "qty": 40, "type": "limit", "price_cents": mid, "tif": "ioc" }),
+    )
+    .await;
+    let (_, record) = get(&app, &format!("/api/orders/{order_id}")).await;
+    assert_eq!(
+        record["filled"], 40,
+        "the maker's record moved with the fill"
+    );
+    assert_eq!(record["remaining"], 60);
+    assert_eq!(record["status"], "resting");
+    assert_eq!(record["avg_price_cents"], mid as f64);
+    assert!(record["updated_at_ms"].as_i64() >= record["submitted_at_ms"].as_i64());
+
+    // The rest fills: the record closes.
+    post(
+        &app,
+        "/api/symbols/HLIO/orders",
+        json!({ "trader_id": taker, "side": "sell", "qty": 60, "type": "limit", "price_cents": mid, "tif": "ioc" }),
+    )
+    .await;
+    let (_, record) = get(&app, &format!("/api/orders/{order_id}")).await;
+    assert_eq!(record["status"], "filled");
+    assert_eq!(record["remaining"], 0);
+    assert_eq!(record["notional_cents"], mid * 100);
+}
