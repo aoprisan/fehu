@@ -4,6 +4,7 @@
  * own, and each reconnect replays a `hello`.
  */
 
+import { currentApiKey } from './api.js';
 import type { Actions } from './actions.js';
 import { setOrderStatus } from './status.js';
 import type { Store } from './store.js';
@@ -24,7 +25,11 @@ export class MarketStream {
   }
 
   connect(): void {
-    const es = new EventSource('/api/stream');
+    // Ticks and events are public, but a fill belongs to the trader that made
+    // it, and `EventSource` cannot set headers — hence the key in the query.
+    const key = currentApiKey();
+    const url = key === null ? '/api/stream' : `/api/stream?api_key=${encodeURIComponent(key)}`;
+    const es = new EventSource(url);
     this.#source = es;
     es.onopen = () => {
       this.#setConnection('live');
@@ -77,6 +82,23 @@ export class MarketStream {
         );
         void this.#actions.refreshTrader();
         if (fill.symbol === state.symbol) this.#store.emit('bars');
+        break;
+      }
+      case 'status': {
+        const quote = state.quotes.get(message.symbol);
+        if (quote !== undefined) {
+          quote.halted = message.halted;
+          quote.market_open = message.market_open;
+          this.#store.emit('symbols');
+        }
+        if (message.symbol === state.symbol) {
+          setOrderStatus(
+            message.tradable
+              ? `${message.symbol}: trading resumed`
+              : `${message.symbol}: ${message.halted ? 'trading halted' : 'market closed'}`,
+            !message.tradable,
+          );
+        }
         break;
       }
       case 'event': {

@@ -10,9 +10,11 @@
 
 pub mod account;
 pub mod api;
+pub mod auth;
 pub mod engine;
 pub mod events;
 pub mod market;
+pub mod save;
 pub mod trading;
 
 pub use api::router;

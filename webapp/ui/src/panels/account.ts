@@ -67,12 +67,13 @@ export class AccountPanel {
     );
   }
 
+  /** One position. Reserved shares show as `free/held`: only free can be sold. */
   #positionRow(p: PositionDto): HTMLTableRowElement {
     const row = el(
       'tr',
       { style: 'cursor:pointer' },
       el('td', {}, el('b', {}, p.symbol)),
-      td('r', String(p.qty)),
+      td('r', p.reserved_shares === 0 ? String(p.qty) : `${p.free_shares}/${p.qty}`),
       td('r', `@ ${p.avg_cost_cents === null ? '—' : fmtPrice(p.avg_cost_cents)}`),
       td(`r ${trendClass(p.unrealised_pnl_cents)}`, fmtSignedPrice(p.unrealised_pnl_cents)),
     );

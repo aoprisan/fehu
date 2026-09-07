@@ -7,6 +7,8 @@ use std::time::Duration;
 use fehu::{Event, EventError, EventKind, Simulator, Timestamp};
 use serde::{Deserialize, Serialize};
 
+use crate::save::Symbol;
+
 /// A raw simulator event as accepted by `POST /api/symbols/{symbol}/events`.
 /// Mirrors [`fehu::EventKind`] with durations in seconds.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -441,7 +443,7 @@ pub struct CatalogEntry {
 }
 
 /// An accepted event, as stored in the log and pushed to the stream.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventRecord {
     pub id: u64,
     /// Wall-clock time the request was accepted.
@@ -449,7 +451,8 @@ pub struct EventRecord {
     /// Simulated time the event takes effect.
     pub at_ms: i64,
     /// Symbols affected.
-    pub symbols: Vec<&'static str>,
+    #[serde(with = "crate::save::symbol_vec")]
+    pub symbols: Vec<Symbol>,
     /// `"game:scandal"` or `"sim:jump"`.
     pub kind: String,
     pub source: String,

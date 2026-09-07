@@ -2,6 +2,8 @@
 
 import type {
   AccountCheck,
+  AmendRequest,
+  AmendResponse,
   AccountDto,
   ApiErrorBody,
   BarsResponse,
@@ -14,13 +16,17 @@ import type {
   Interval,
   LedgerResponse,
   OpenOrderDto,
+  OrderRecord,
   OrderRequest,
   OrderResponse,
   PortfolioDto,
   PushEventRequest,
+  SharesResponse,
+  SymbolStatus,
   SymbolsResponse,
   TradesResponse,
   TransferRequest,
+  UserHoldingsResponse,
 } from './types.js';
 
 /** A non-2xx response, carrying the server's `error.code` when it sent one. */
@@ -43,10 +49,31 @@ export function errorMessage(e: unknown): string {
   return String(e);
 }
 
+/**
+ * The key the server issued when this player was created. Everything that
+ * belongs to a user — their portfolio, orders, accounts and money — is sent
+ * with it; market data needs none.
+ */
+let apiKey: string | null = null;
+
+/** Send every following request as the holder of `key`. */
+export function setApiKey(key: string | null): void {
+  apiKey = key;
+}
+
+/** The key in use, for the one place that cannot set a header: the stream. */
+export function currentApiKey(): string | null {
+  return apiKey;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
+  const withKey: RequestInit =
+    apiKey === null
+      ? { ...init }
+      : { ...init, headers: { ...(init?.headers ?? {}), authorization: `Bearer ${apiKey}` } };
   try {
-    response = await fetch(path, init);
+    response = await fetch(path, withKey);
   } catch (cause) {
     throw new ApiError(0, 'network', cause instanceof Error ? cause.message : 'request failed');
   }
@@ -62,7 +89,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
-function send<T>(method: 'POST' | 'DELETE', path: string, body?: unknown): Promise<T> {
+function send<T>(method: 'POST' | 'PATCH' | 'DELETE', path: string, body?: unknown): Promise<T> {
   const init: RequestInit = { method };
   if (body !== undefined) {
     init.headers = { 'content-type': 'application/json' };
@@ -89,7 +116,19 @@ export const api = {
   trades: (symbol: string, limit: number): Promise<TradesResponse> =>
     request(`/api/symbols/${enc(symbol)}/trades?limit=${limit}`),
 
+  /** Where one symbol's shares are: outstanding, held, bid for, available. */
+  shares: (symbol: string): Promise<SharesResponse> =>
+    request(`/api/symbols/${enc(symbol)}/shares`),
+
+  /** Whether a symbol can be traded right now, and if not, why not. */
+  status: (symbol: string): Promise<SymbolStatus> =>
+    request(`/api/symbols/${enc(symbol)}/status`),
+
   trader: (id: number): Promise<PortfolioDto> => request(`/api/traders/${id}`),
+
+  /** Every share a user owns, per symbol, across all of their traders. */
+  holdings: (userId: number): Promise<UserHoldingsResponse> =>
+    request(`/api/users/${userId}/holdings`),
 
   createTrader: (body: CreateTraderRequest): Promise<PortfolioDto> =>
     send('POST', '/api/traders', body),
@@ -107,6 +146,17 @@ export const api = {
 
   submitOrder: (symbol: string, body: OrderRequest): Promise<OrderResponse> =>
     send('POST', `/api/symbols/${enc(symbol)}/orders`, body),
+
+  /** One order by id, filled and cancelled ones included. */
+  order: (orderId: number): Promise<OrderRecord> => request(`/api/orders/${orderId}`),
+
+  /** A trader's orders, newest first. */
+  traderOrders: (traderId: number, limit: number): Promise<OrderRecord[]> =>
+    request(`/api/traders/${traderId}/orders?limit=${limit}`),
+
+  /** Replace a resting order with another at a new price or quantity. */
+  amendOrder: (symbol: string, orderId: number, body: AmendRequest): Promise<AmendResponse> =>
+    send('PATCH', `/api/symbols/${enc(symbol)}/orders/${orderId}`, body),
 
   cancelOrder: (symbol: string, orderId: number, traderId: number): Promise<OpenOrderDto> =>
     send('DELETE', `/api/symbols/${enc(symbol)}/orders/${orderId}?trader_id=${traderId}`),

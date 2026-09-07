@@ -16,6 +16,8 @@ use std::collections::VecDeque;
 use fehu::Side;
 use serde::{Deserialize, Serialize};
 
+use crate::save::Symbol;
+
 /// Largest balance an account may hold: 10^15 cents, i.e. $10 trillion.
 /// Small enough that a balance times a book-sized quantity still fits an
 /// `i64`, large enough that no game will notice the ceiling.
@@ -35,7 +37,7 @@ pub struct UserId(pub u64);
 pub struct AccountId(pub u64);
 
 /// The person behind one or more accounts.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct User {
     pub id: UserId,
     pub name: String,
@@ -163,7 +165,7 @@ impl std::fmt::Display for MoneyError {
 impl std::error::Error for MoneyError {}
 
 /// What a ledger entry records.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LedgerKind {
     /// The account was opened, with its starting balance.
@@ -179,7 +181,10 @@ pub enum LedgerKind {
 }
 
 /// One movement of money, in the order it happened.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+// `symbol` is one of the build's tickers, interned on the way in rather than
+// borrowed from the input, so the derive needs no `'de: 'static`.
+#[serde(bound(deserialize = ""))]
 pub struct LedgerEntry {
     pub id: u64,
     pub ts_ms: i64,
@@ -189,14 +194,18 @@ pub struct LedgerEntry {
     /// The balance after this entry was applied.
     pub balance_cents: i64,
     /// Set on trade settlements.
-    pub symbol: Option<&'static str>,
+    #[serde(with = "crate::save::symbol_opt")]
+    pub symbol: Option<Symbol>,
     pub order_id: Option<u64>,
     pub memo: Option<String>,
 }
 
 /// A cash account: a balance, the part of it reserved for resting buy
 /// orders, and the ledger of everything that moved.
-#[derive(Clone, Debug)]
+///
+/// It serialises whole, private fields included: the save file has to carry
+/// the balance and the ledger, not a view of them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Account {
     pub id: AccountId,
     pub user_id: UserId,
@@ -568,6 +577,14 @@ pub struct UserDto {
     pub traders: Vec<u64>,
     /// Every account's balance added up.
     pub balance_cents: i64,
+    /// Shares owned across every symbol and every trader of the user.
+    pub shares_owned: u64,
+    /// Those shares at the reference prices.
+    pub holdings_value_cents: i64,
+    /// The key that proves a request speaks for this user, shown **once**:
+    /// in the response that created them, and `null` everywhere after. Send
+    /// it as `Authorization: Bearer <key>`.
+    pub api_key: Option<String>,
 }
 
 /// `GET /api/accounts/{id}`.

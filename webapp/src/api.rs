@@ -7,7 +7,8 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequestParts, OptionalFromRequestParts, Path, Query, State};
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -28,11 +29,13 @@ use crate::events::{
     PushEventRequest, Scope, SimEvent,
 };
 use crate::market::{
-    App, Market, Quote, SnapshotDto, StreamMessage, SymbolInfo, SymbolState, wall_now_ms,
+    App, Closed, Market, Quote, SnapshotDto, StreamMessage, SymbolInfo, SymbolState, SymbolStatus,
+    wall_now_ms,
 };
 use crate::trading::{
-    BookDto, CreateTraderRequest, OpenOrderDto, OrderRequest, OrderResponse, PortfolioDto,
-    PositionDto, Refused, TradeDto, TraderSummary,
+    AmendRequest, AmendResponse, BookDto, CreateTraderRequest, FillRecord, HolderDto,
+    MAX_CLIENT_ORDER_ID, OpenOrderDto, OrderRecord, OrderRequest, OrderResponse, PortfolioDto,
+    PositionDto, Refused, TradeDto, TraderSummary, UserHoldingsResponse,
 };
 
 type AppState = Arc<App>;
@@ -59,6 +62,10 @@ pub fn router(app: AppState) -> Router {
             "/api/symbols/{symbol}/events",
             get(list_symbol_events).post(push_sim_event),
         )
+        .route("/api/symbols/{symbol}/shares", get(get_shares))
+        .route("/api/symbols/{symbol}/status", get(get_status))
+        .route("/api/symbols/{symbol}/halt", post(halt_symbol))
+        .route("/api/symbols/{symbol}/resume", post(resume_symbol))
         .route("/api/symbols/{symbol}/book", get(get_book))
         .route("/api/symbols/{symbol}/trades", get(get_trades))
         .route(
@@ -67,14 +74,17 @@ pub fn router(app: AppState) -> Router {
         )
         .route(
             "/api/symbols/{symbol}/orders/{order_id}",
-            get(get_order).delete(cancel_order),
+            get(get_order).patch(amend_order).delete(cancel_order),
         )
         .route("/api/traders", get(list_traders).post(create_trader))
         .route("/api/traders/{trader_id}", get(get_trader))
+        .route("/api/traders/{trader_id}/orders", get(list_trader_orders))
+        .route("/api/orders/{order_id}", get(get_order_record))
         .route("/api/traders/{trader_id}/cancel_all", post(cancel_all))
         .route("/api/traders/{trader_id}/deposit", post(trader_deposit))
         .route("/api/users", get(list_users).post(create_user))
         .route("/api/users/{user_id}", get(get_user))
+        .route("/api/users/{user_id}/holdings", get(get_holdings))
         .route(
             "/api/users/{user_id}/accounts",
             get(list_user_accounts).post(open_account),
@@ -152,6 +162,42 @@ impl ApiError {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_order", message)
     }
 
+    /// The order would have traded with the trader's own resting order.
+    fn self_trade(crossing: &[u64]) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "self_trade",
+            format!(
+                "this would trade with your own resting order(s) {crossing:?}: \
+                 cancel or reprice them first"
+            ),
+        )
+    }
+
+    /// A post-only order that would have taken liquidity instead of adding it.
+    fn would_cross(price_cents: i64, best_cents: i64) -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "post_only_would_cross",
+            format!(
+                "a post-only order at {price_cents} would trade against {best_cents} \
+                 instead of resting"
+            ),
+        )
+    }
+
+    /// The `client_order_id` was used before, for a different order.
+    fn duplicate_client_order_id(client_order_id: &str, order_id: u64) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "duplicate_client_order_id",
+            format!(
+                "client_order_id {client_order_id:?} was already used for order {order_id}, \
+                 which asked for something else"
+            ),
+        )
+    }
+
     /// An order the trader's account would not fund.
     fn refused(e: Refused) -> Self {
         match e {
@@ -164,6 +210,43 @@ impl ApiError {
                 e.to_string(),
             ),
         }
+    }
+
+    /// No API key on a request that needs one.
+    fn unauthenticated() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "this endpoint needs the API key the user was created with: send it as \
+             `Authorization: Bearer <key>` or `X-Api-Key: <key>`",
+        )
+    }
+
+    /// A key that is not one the server issued.
+    fn invalid_api_key() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "that API key is not one this server issued",
+        )
+    }
+
+    /// A valid key, but for somebody else's property.
+    fn forbidden(what: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, "forbidden", what)
+    }
+
+    /// The market will not take an order for this symbol right now.
+    fn closed(symbol: &str, closed: Closed) -> Self {
+        let code = match closed {
+            Closed::Session { .. } => "market_closed",
+            Closed::Halted(_) => "symbol_halted",
+        };
+        Self::new(
+            StatusCode::CONFLICT,
+            code,
+            format!("{symbol}: {closed}. Orders already resting can still be cancelled."),
+        )
     }
 
     fn unknown_user(id: u64) -> Self {
@@ -206,6 +289,133 @@ impl IntoResponse for ApiError {
             "error": { "code": self.code, "message": self.message }
         });
         (self.status, Json(body)).into_response()
+    }
+}
+
+/// The API key on a request: `Authorization: Bearer <key>`, or `X-Api-Key`.
+fn api_key_of(parts: &Parts) -> Option<String> {
+    let bearer = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            let (scheme, key) = v.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then_some(key)
+        });
+    let key = bearer.or_else(|| parts.headers.get("x-api-key").and_then(|v| v.to_str().ok()))?;
+    let key = key.trim();
+    (!key.is_empty()).then(|| key.to_owned())
+}
+
+/// The user a request speaks for, proved by their API key.
+///
+/// Market data — quotes, bars, the book, the tape, the event log — needs no
+/// key. Everything that belongs to a user does, and a key only ever speaks
+/// for the user it was issued to: one player cannot read another's portfolio,
+/// move their money or trade on their account.
+#[derive(Clone, Copy, Debug)]
+pub struct Caller(pub UserId);
+
+impl FromRequestParts<AppState> for Caller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, ApiError> {
+        let key = api_key_of(parts).ok_or_else(ApiError::unauthenticated)?;
+        app.market()
+            .keys
+            .user_of(&key)
+            .map(Caller)
+            .ok_or_else(ApiError::invalid_api_key)
+    }
+}
+
+impl OptionalFromRequestParts<AppState> for Caller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        app: &AppState,
+    ) -> Result<Option<Self>, ApiError> {
+        let Some(key) = api_key_of(parts) else {
+            return Ok(None);
+        };
+        Ok(app.market().keys.user_of(&key).map(Caller))
+    }
+}
+
+/// The game master: whoever may push events into the simulation. Open unless
+/// `FEHU_ADMIN_KEY` is set, which is what a single-player game on localhost
+/// wants and a shared server does not.
+#[derive(Clone, Copy, Debug)]
+pub struct Admin;
+
+impl FromRequestParts<AppState> for Admin {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, ApiError> {
+        let Some(expected) = app.options.admin_key.as_deref() else {
+            return Ok(Self);
+        };
+        let key = api_key_of(parts).ok_or_else(ApiError::unauthenticated)?;
+        if constant_time_eq(&key, expected) {
+            Ok(Self)
+        } else {
+            Err(ApiError::invalid_api_key())
+        }
+    }
+}
+
+/// Compare two secrets without giving their common prefix away in the time
+/// taken.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The caller owns `trader`.
+fn owned_trader(market: &Market, caller: Caller, trader: TraderId) -> Result<(), ApiError> {
+    let held = market
+        .traders
+        .get(&trader)
+        .ok_or_else(|| ApiError::unknown_trader(trader.0))?;
+    if held.user_id == caller.0 {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(format!(
+            "trader {} belongs to another user",
+            trader.0
+        )))
+    }
+}
+
+/// The caller owns `account`.
+fn owned_account(market: &Market, caller: Caller, account: AccountId) -> Result<(), ApiError> {
+    let held = market
+        .accounts
+        .get(&account)
+        .ok_or_else(|| ApiError::unknown_account(account.0))?;
+    if held.user_id == caller.0 {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(format!(
+            "account {} belongs to another user",
+            account.0
+        )))
+    }
+}
+
+/// The caller is `user` themselves.
+fn owned_user(caller: Caller, user: UserId) -> Result<(), ApiError> {
+    if caller.0 == user {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(format!(
+            "user {} is somebody else",
+            user.0
+        )))
     }
 }
 
@@ -307,23 +517,141 @@ struct SymbolDetail {
     snapshot: SnapshotDto,
     config: Config,
     ticks_total: u64,
+    shares: SharesDto,
+    status: SymbolStatus,
+}
+
+/// `GET /api/symbols/{symbol}/shares`: where the symbol's shares are. The
+/// four numbers add up: `outstanding = held + bid_for + available`.
+#[derive(Serialize)]
+struct SharesDto {
+    symbol: &'static str,
+    /// Shares in existence.
+    shares_outstanding: u64,
+    /// Held by traders.
+    held_shares: u64,
+    /// Bid for by traders' resting buy orders.
+    bid_shares: u64,
+    /// Neither held nor bid for: what a buy can still be filled from.
+    available_shares: u64,
+    price_cents: i64,
+    /// `price × shares_outstanding`.
+    market_cap_cents: i64,
+    /// The caller's own traders holding shares, largest stake first. Who
+    /// else holds them is nobody's business: the totals above are public,
+    /// the names behind them are not.
+    holders: Vec<HolderDto>,
+}
+
+impl SharesDto {
+    fn new(market: &Market, s: &SymbolState, caller: Option<Caller>) -> Self {
+        let sym = s.info.symbol;
+        let mut holders: Vec<HolderDto> = market
+            .traders
+            .values()
+            .filter(|t| caller.is_some_and(|c| c.0 == t.user_id))
+            .filter_map(|t| HolderDto::new(t, sym))
+            .collect();
+        holders.sort_by_key(|h| (std::cmp::Reverse(h.qty), h.trader_id));
+        Self {
+            symbol: sym,
+            shares_outstanding: s.info.shares_outstanding,
+            held_shares: market.held_shares(sym),
+            bid_shares: market.bid_shares(sym),
+            available_shares: market.available_shares(sym),
+            price_cents: s.price_cents(),
+            market_cap_cents: s.market_cap_cents(),
+            holders,
+        }
+    }
 }
 
 async fn get_symbol(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
+    caller: Option<Caller>,
 ) -> Result<Json<SymbolDetail>, ApiError> {
     let market = app.market();
-    let s = market
-        .symbol(&symbol)
+    let idx = market
+        .symbol_index(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
+    let s = &market.symbols[idx];
     Ok(Json(SymbolDetail {
         info: s.info,
         quote: s.quote(),
         snapshot: s.sim().snapshot().into(),
         config: s.sim().config().clone(),
         ticks_total: s.ticks_total,
+        shares: SharesDto::new(&market, s, caller),
+        status: market
+            .status(idx, app.clock.now())
+            .ok_or_else(|| ApiError::not_found(&symbol))?,
     }))
+}
+
+/// Whether a symbol can be traded right now, and if not, why not.
+async fn get_status(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+) -> Result<Json<SymbolStatus>, ApiError> {
+    let market = app.market();
+    let idx = market
+        .symbol_index(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    market
+        .status(idx, app.clock.now())
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(&symbol))
+}
+
+/// Stop trading in a symbol. It stays stopped until it is resumed.
+async fn halt_symbol(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    _admin: Admin,
+) -> Result<Json<SymbolStatus>, ApiError> {
+    let now = app.clock.now();
+    let mut market = app.market();
+    let idx = market
+        .symbol_index(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    let status = market
+        .halt(idx, now)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    tracing::info!(symbol = status.symbol, "trading halted");
+    let _ = app.tx.send(StreamMessage::Status(status));
+    Ok(Json(status))
+}
+
+/// Start trading again, whatever stopped it.
+async fn resume_symbol(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    _admin: Admin,
+) -> Result<Json<SymbolStatus>, ApiError> {
+    let now = app.clock.now();
+    let mut market = app.market();
+    let idx = market
+        .symbol_index(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    let status = market
+        .resume(idx, now)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    tracing::info!(symbol = status.symbol, "trading resumed");
+    let _ = app.tx.send(StreamMessage::Status(status));
+    Ok(Json(status))
+}
+
+async fn get_shares(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    caller: Option<Caller>,
+) -> Result<Json<SharesDto>, ApiError> {
+    let market = app.market();
+    let s = market
+        .symbol(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    Ok(Json(SharesDto::new(&market, s, caller)))
 }
 
 #[derive(Deserialize)]
@@ -433,6 +761,7 @@ async fn list_symbol_events(
 async fn push_sim_event(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
+    _admin: Admin,
     payload: Result<Json<PushEventRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<EventRecord>), ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
@@ -483,6 +812,7 @@ fn sim_event_name(e: &SimEvent) -> &'static str {
 
 async fn push_game_event(
     State(app): State<AppState>,
+    _admin: Admin,
     payload: Result<Json<GameEventRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<EventRecord>), ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
@@ -639,6 +969,7 @@ async fn get_trades(
 /// that user, on an existing `account_id` or on a fresh account.
 async fn create_trader(
     State(app): State<AppState>,
+    caller: Option<Caller>,
     payload: Option<Json<CreateTraderRequest>>,
 ) -> Result<(StatusCode, Json<PortfolioDto>), ApiError> {
     let req = payload.map(|Json(r)| r).unwrap_or_default();
@@ -659,7 +990,9 @@ async fn create_trader(
             ));
         }
         (Some(user_id), account_id) => {
+            // Joining an existing user is that user's business alone.
             let user = UserId(user_id);
+            owned_user(caller.ok_or_else(ApiError::unauthenticated)?, user)?;
             if !market.users.contains_key(&user) {
                 return Err(ApiError::unknown_user(user_id));
             }
@@ -685,7 +1018,11 @@ async fn create_trader(
             market.create_trader(user, account, req.name, now)
         }
     };
-    let dto = portfolio(&market, id)?;
+    let mut dto = portfolio(&market, id)?;
+    if req.user_id.is_none() {
+        // A new user was created for the trader: hand over their key, once.
+        dto.api_key = market.keys.key_of(UserId(dto.user_id)).map(str::to_owned);
+    }
     tracing::info!(
         trader = dto.id,
         user = dto.user_id,
@@ -716,12 +1053,14 @@ fn check_email(email: Option<String>) -> Result<Option<String>, ApiError> {
     }
 }
 
-async fn list_traders(State(app): State<AppState>) -> Json<Vec<TraderSummary>> {
+/// The caller's own traders.
+async fn list_traders(State(app): State<AppState>, caller: Caller) -> Json<Vec<TraderSummary>> {
     let market = app.market();
     Json(
         market
             .traders
             .values()
+            .filter(|t| t.user_id == caller.0)
             .map(|t| {
                 let account = market.accounts.get(&t.account_id);
                 let cash = account.map_or(0, Account::balance_cents);
@@ -759,9 +1098,12 @@ async fn list_traders(State(app): State<AppState>) -> Json<Vec<TraderSummary>> {
 async fn get_trader(
     State(app): State<AppState>,
     Path(trader_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<PortfolioDto>, ApiError> {
     let market = app.market();
-    Ok(Json(portfolio(&market, TraderId(trader_id))?))
+    let trader = TraderId(trader_id);
+    owned_trader(&market, caller, trader)?;
+    Ok(Json(portfolio(&market, trader)?))
 }
 
 fn portfolio(market: &Market, id: TraderId) -> Result<PortfolioDto, ApiError> {
@@ -795,6 +1137,7 @@ fn portfolio(market: &Market, id: TraderId) -> Result<PortfolioDto, ApiError> {
             unrealised_pnl_cents: u,
             realised_pnl_cents: p.realised_pnl_cents,
             reserved_shares: t.reserved_shares.get(sym).copied().unwrap_or(0),
+            free_shares: t.free_shares(sym),
         });
     }
     let open_orders = market
@@ -823,12 +1166,15 @@ fn portfolio(market: &Market, id: TraderId) -> Result<PortfolioDto, ApiError> {
         positions,
         open_orders,
         fills: t.fills.iter().rev().cloned().collect(),
+        // Only the response that creates a user carries their key.
+        api_key: None,
     })
 }
 
 async fn submit_order(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
+    caller: Caller,
     payload: Result<Json<OrderRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<OrderResponse>), ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
@@ -841,53 +1187,48 @@ async fn submit_order(
         qty: req.qty,
     };
     fehu::OrderBook::validate(&order).map_err(|e| ApiError::invalid_order(e.to_string()))?;
+    let client_order_id = clean_client_order_id(req.client_order_id)?;
 
-    let (response, fills) = {
+    let (response, fills, replayed) = {
         let mut market = app.market();
         let idx = market
             .symbol_index(&symbol)
             .ok_or_else(|| ApiError::not_found(&symbol))?;
-        if !market.traders.contains_key(&trader) {
-            return Err(ApiError::unknown_trader(trader.0));
-        }
+        owned_trader(&market, caller, trader)?;
         let sym = market.symbols[idx].info.symbol;
-        // Worst-case cash a buy can consume.
-        let cost = match order.kind {
-            OrderKind::Limit { price_cents } => {
-                i64::try_from(i128::from(price_cents) * i128::from(order.qty)).unwrap_or(i64::MAX)
-            }
-            OrderKind::Market => {
-                market.symbols[idx]
-                    .exchange
-                    .preview_market(order.side, order.qty)
-                    .notional_cents
-            }
-        };
-        // Validate the order against the account that would fund it: it must
-        // be active, and a buy must have the cash available.
-        let account = market
-            .account_of(trader)
-            .ok_or_else(|| ApiError::unknown_trader(trader.0))?;
-        market.traders[&trader]
-            .check(account, sym, order.side, order.qty, cost)
-            .map_err(ApiError::refused)?;
-        let placement = market.symbols[idx]
-            .exchange
-            .submit(order)
-            .map_err(|e| ApiError::invalid_order(e.to_string()))?;
-        market.symbols[idx].record_trades(&placement.trades);
-        let fills = market.apply_trades(sym, &placement.trades);
-        if placement.status == fehu::OrderStatus::Resting
-            && let OrderKind::Limit { price_cents } = order.kind
-            && let Some((t, account)) = market.trader_and_account(trader)
-        {
-            t.reserve(account, sym, order.side, placement.remaining, price_cents);
+        // A closed session or a halt takes no new orders at all.
+        if let Some(closed) = market.symbols[idx].closed(app.clock.now()) {
+            return Err(ApiError::closed(sym, closed));
         }
-        (
-            OrderResponse::new(sym, trader, order.side, order.qty, &placement),
-            fills,
-        )
+        if req.post_only {
+            check_post_only(&market.symbols[idx], &order)?;
+        }
+        let crossing = self_crossing(&market.symbols[idx], &order);
+        if !crossing.is_empty() {
+            return Err(ApiError::self_trade(&crossing));
+        }
+        // The same order sent twice — a retry after a timeout, say — is
+        // placed once: the first response is replayed, and a re-used id that
+        // asks for something else is refused rather than quietly obeyed.
+        if let Some(id) = client_order_id.as_deref()
+            && let Some(record) = market.order_by_client_id(trader, id)
+        {
+            if !record.matches(&order, sym) {
+                return Err(ApiError::duplicate_client_order_id(id, record.order_id));
+            }
+            let Some(accepted) = record.accepted.clone() else {
+                return Err(ApiError::duplicate_client_order_id(id, record.order_id));
+            };
+            (accepted, Vec::new(), true)
+        } else {
+            let (response, fills) = place_order(&mut market, idx, trader, order, client_order_id)?;
+            (response, fills, false)
+        }
     };
+    if replayed {
+        // Same order, second delivery: nothing new happened.
+        return Ok((StatusCode::OK, Json(response)));
+    }
     tracing::info!(
         trader = trader.0,
         symbol = response.symbol,
@@ -912,12 +1253,220 @@ struct TraderQuery {
     trader_id: u64,
 }
 
+/// Send a validated order to the exchange and book everything that follows:
+/// the money check, the share checks, the fills, the reservation of what
+/// rests, and the order log. The caller holds the market lock and has already
+/// established who the trader is and that the symbol is open to them.
+fn place_order(
+    market: &mut Market,
+    idx: usize,
+    trader: TraderId,
+    order: Order,
+    client_order_id: Option<String>,
+) -> Result<(OrderResponse, Vec<FillRecord>), ApiError> {
+    let sym = market.symbols[idx].info.symbol;
+    // Worst-case cash a buy can consume.
+    let cost = match order.kind {
+        OrderKind::Limit { price_cents } => {
+            i64::try_from(i128::from(price_cents) * i128::from(order.qty)).unwrap_or(i64::MAX)
+        }
+        OrderKind::Market => {
+            market.symbols[idx]
+                .exchange
+                .preview_market(order.side, order.qty)
+                .notional_cents
+        }
+    };
+    // A symbol has a fixed number of shares: a buy can only be filled from the
+    // ones no trader holds or is already bidding for.
+    if order.side == fehu::Side::Buy {
+        let available = market.available_shares(sym);
+        if order.qty > available {
+            return Err(ApiError::refused(Refused::SupplyExhausted {
+                needed: order.qty,
+                available,
+            }));
+        }
+    }
+    // Validate the order against the account that would fund it: it must be
+    // active, a buy must have the cash available, and a sell the shares —
+    // nothing may be sold that the trader does not hold.
+    let account = market
+        .account_of(trader)
+        .ok_or_else(|| ApiError::unknown_trader(trader.0))?;
+    market.traders[&trader]
+        .check(account, sym, order.side, order.qty, cost)
+        .map_err(ApiError::refused)?;
+    let placement = market.symbols[idx]
+        .exchange
+        .submit(order)
+        .map_err(|e| ApiError::invalid_order(e.to_string()))?;
+    market.symbols[idx].record_trades(&placement.trades);
+    let fills = market.apply_trades(sym, &placement.trades);
+    if placement.status == fehu::OrderStatus::Resting
+        && let OrderKind::Limit { price_cents } = order.kind
+        && let Some((t, account)) = market.trader_and_account(trader)
+    {
+        t.reserve(account, sym, order.side, placement.remaining, price_cents);
+    }
+    let response = OrderResponse::new(sym, trader, order.side, order.qty, &placement);
+    let now = market.symbols[idx].exchange.clock().0;
+    market.record_order(OrderRecord::new(
+        client_order_id,
+        trader,
+        sym,
+        &order,
+        &placement,
+        response.clone(),
+        now,
+    ));
+    Ok((response, fills))
+}
+
+/// The price an order can reach: its limit, or for a market order the collar
+/// the exchange turns it into.
+fn reachable_price_cents(s: &SymbolState, order: &Order) -> i64 {
+    match order.kind {
+        OrderKind::Limit { price_cents } => price_cents,
+        OrderKind::Market => {
+            let collar = s.exchange.params().liquidity.market_collar;
+            let reference = s.exchange.reference_cents() as f64;
+            let price = match order.side {
+                fehu::Side::Buy => (reference * (1.0 + collar)).ceil(),
+                fehu::Side::Sell => (reference * (1.0 - collar)).floor(),
+            };
+            (price as i64).max(1)
+        }
+    }
+}
+
+/// The trader's own resting orders this one would trade with. Trading with
+/// yourself moves no shares and no money but does print on the tape and move
+/// the price, so it is refused rather than matched.
+///
+/// Only orders the incoming one would actually reach count: the book's own
+/// preview says how far down the other side it would walk, and anything
+/// past that is none of its business.
+fn self_crossing(s: &SymbolState, order: &Order) -> Vec<u64> {
+    let book = s.exchange.book();
+    let limit = reachable_price_cents(s, order);
+    let Some(worst) = book
+        .preview(order.side, order.qty, Some(limit))
+        .worst_price_cents
+    else {
+        return Vec::new(); // Nothing would trade at all.
+    };
+    book.orders_of(order.owner)
+        .filter(|resting| resting.side != order.side)
+        .filter(|resting| match order.side {
+            fehu::Side::Buy => resting.price_cents <= worst,
+            fehu::Side::Sell => resting.price_cents >= worst,
+        })
+        .map(|resting| resting.id.0)
+        .collect()
+}
+
+/// A post-only order must rest. It cannot if it is a market order, if it is
+/// not good-till-cancelled, or if its price is already tradable.
+fn check_post_only(s: &SymbolState, order: &Order) -> Result<(), ApiError> {
+    let OrderKind::Limit { price_cents } = order.kind else {
+        return Err(ApiError::invalid_order(
+            "a market order cannot be post-only: it exists to take liquidity",
+        ));
+    };
+    if order.tif != fehu::TimeInForce::Gtc {
+        return Err(ApiError::invalid_order(
+            "a post-only order must be `gtc`: the others are there to trade at once",
+        ));
+    }
+    let book = s.exchange.book();
+    let best = match order.side {
+        fehu::Side::Buy => book.best_ask().filter(|ask| *ask <= price_cents),
+        fehu::Side::Sell => book.best_bid().filter(|bid| *bid >= price_cents),
+    };
+    match best {
+        Some(best) => Err(ApiError::would_cross(price_cents, best)),
+        None => Ok(()),
+    }
+}
+
+/// Trim a caller-supplied `client_order_id`; an empty one counts as absent.
+fn clean_client_order_id(value: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(id) = value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
+    if id.chars().count() > MAX_CLIENT_ORDER_ID {
+        return Err(ApiError::bad_request(format!(
+            "client_order_id is longer than {MAX_CLIENT_ORDER_ID} characters"
+        )));
+    }
+    Ok(Some(id))
+}
+
+#[derive(Deserialize)]
+struct OrderHistoryQuery {
+    /// `resting`, `filled` or `cancelled`; omit for every order.
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+/// One order by id, whatever became of it — filled and cancelled orders
+/// included, for as long as the order log holds them.
+async fn get_order_record(
+    State(app): State<AppState>,
+    Path(order_id): Path<u64>,
+    caller: Caller,
+) -> Result<Json<OrderRecord>, ApiError> {
+    let market = app.market();
+    let record = market
+        .order(order_id)
+        .ok_or_else(|| ApiError::unknown_order(order_id))?;
+    owned_trader(&market, caller, TraderId(record.trader_id))?;
+    Ok(Json(record.clone()))
+}
+
+/// A trader's orders, newest first.
+async fn list_trader_orders(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    Query(q): Query<OrderHistoryQuery>,
+    caller: Caller,
+) -> Result<Json<Vec<OrderRecord>>, ApiError> {
+    let trader = TraderId(trader_id);
+    let status = match q.status.as_deref() {
+        None => None,
+        Some("resting" | "open" | "live") => Some(fehu::OrderStatus::Resting),
+        Some("filled") => Some(fehu::OrderStatus::Filled),
+        Some("cancelled" | "canceled") => Some(fehu::OrderStatus::Cancelled),
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "unknown status {other:?}: use resting, filled or cancelled"
+            )));
+        }
+    };
+    let market = app.market();
+    owned_trader(&market, caller, trader)?;
+    Ok(Json(
+        market
+            .orders_of(trader)
+            .filter(|o| status.is_none_or(|s| o.status == s))
+            .take(q.limit.unwrap_or(100).clamp(1, 1_000))
+            .cloned()
+            .collect(),
+    ))
+}
+
 async fn list_orders(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
     Query(q): Query<TraderQuery>,
+    caller: Caller,
 ) -> Result<Json<Vec<OpenOrderDto>>, ApiError> {
     let market = app.market();
+    owned_trader(&market, caller, TraderId(q.trader_id))?;
     let s = market
         .symbol(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
@@ -933,6 +1482,7 @@ async fn list_orders(
 async fn get_order(
     State(app): State<AppState>,
     Path((symbol, order_id)): Path<(String, u64)>,
+    caller: Caller,
 ) -> Result<Json<OpenOrderDto>, ApiError> {
     let market = app.market();
     let s = market
@@ -944,16 +1494,115 @@ async fn get_order(
         .get(fehu::OrderId(order_id))
         .filter(|o| o.owner != Owner::Synthetic)
         .ok_or_else(|| ApiError::unknown_order(order_id))?;
-    Ok(Json(OpenOrderDto::from_resting(s.info.symbol, o)))
+    let dto = OpenOrderDto::from_resting(s.info.symbol, o);
+    owned_trader(&market, caller, TraderId(dto.trader_id))?;
+    Ok(Json(dto))
+}
+
+/// Replace a resting order with another at a new price or quantity.
+///
+/// This is a cancel and a fresh order, in that order and under one lock: the
+/// replacement goes to the back of the queue at its price, and if it cannot
+/// be placed — no cash, no shares, a halt — the old order is already gone.
+/// The response says which order was withdrawn and how much of it had filled.
+async fn amend_order(
+    State(app): State<AppState>,
+    Path((symbol, order_id)): Path<(String, u64)>,
+    caller: Caller,
+    payload: Result<Json<AmendRequest>, JsonRejection>,
+) -> Result<Json<AmendResponse>, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let trader = TraderId(req.trader_id);
+    let client_order_id = clean_client_order_id(req.client_order_id)?;
+    let (response, fills, replaced_filled) = {
+        let mut market = app.market();
+        owned_trader(&market, caller, trader)?;
+        let idx = market
+            .symbol_index(&symbol)
+            .ok_or_else(|| ApiError::not_found(&symbol))?;
+        let sym = market.symbols[idx].info.symbol;
+        if let Some(closed) = market.symbols[idx].closed(app.clock.now()) {
+            return Err(ApiError::closed(sym, closed));
+        }
+        let resting = *market.symbols[idx]
+            .exchange
+            .book()
+            .get(fehu::OrderId(order_id))
+            .filter(|o| o.owner == Owner::Trader(trader))
+            .ok_or_else(|| ApiError::unknown_order(order_id))?;
+        let order = Order {
+            owner: Owner::Trader(trader),
+            side: resting.side,
+            kind: OrderKind::Limit {
+                price_cents: req.price_cents.unwrap_or(resting.price_cents),
+            },
+            tif: fehu::TimeInForce::Gtc,
+            qty: req.qty.unwrap_or(resting.remaining),
+        };
+        fehu::OrderBook::validate(&order).map_err(|e| ApiError::invalid_order(e.to_string()))?;
+
+        // Withdraw the old one first: it would otherwise be in the way of its
+        // own replacement, both as liquidity and as a reservation.
+        let cancelled = market.symbols[idx]
+            .exchange
+            .cancel(fehu::OrderId(order_id), trader)
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        let now = market.symbols[idx].exchange.clock().0;
+        if let Some((t, account)) = market.trader_and_account(trader) {
+            t.release(
+                account,
+                sym,
+                cancelled.side,
+                cancelled.remaining,
+                cancelled.price_cents,
+            );
+        }
+        market.cancel_order_record(order_id, cancelled.remaining, now);
+
+        if req.post_only {
+            check_post_only(&market.symbols[idx], &order)?;
+        }
+        let crossing = self_crossing(&market.symbols[idx], &order);
+        if !crossing.is_empty() {
+            return Err(ApiError::self_trade(&crossing));
+        }
+        let (response, fills) = place_order(&mut market, idx, trader, order, client_order_id)?;
+        (
+            response,
+            fills,
+            cancelled.qty.saturating_sub(cancelled.remaining),
+        )
+    };
+    tracing::info!(
+        trader = trader.0,
+        symbol = response.symbol,
+        replaced = order_id,
+        order = response.order_id,
+        qty = response.qty,
+        "order amended"
+    );
+    for fill in fills {
+        let _ = app.tx.send(StreamMessage::Fill {
+            trader_id: fill.trader_id,
+            fill,
+        });
+    }
+    Ok(Json(AmendResponse {
+        replaced_order_id: order_id,
+        replaced_filled,
+        order: response,
+    }))
 }
 
 async fn cancel_order(
     State(app): State<AppState>,
     Path((symbol, order_id)): Path<(String, u64)>,
     Query(q): Query<TraderQuery>,
+    caller: Caller,
 ) -> Result<Json<OpenOrderDto>, ApiError> {
     let trader = TraderId(q.trader_id);
     let mut market = app.market();
+    owned_trader(&market, caller, trader)?;
     let idx = market
         .symbol_index(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
@@ -977,6 +1626,8 @@ async fn cancel_order(
             cancelled.price_cents,
         );
     }
+    let now = market.symbols[idx].exchange.clock().0;
+    market.cancel_order_record(order_id, cancelled.remaining, now);
     tracing::info!(
         trader = trader.0,
         symbol = sym,
@@ -989,21 +1640,24 @@ async fn cancel_order(
 async fn cancel_all(
     State(app): State<AppState>,
     Path(trader_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<Vec<OpenOrderDto>>, ApiError> {
     let trader = TraderId(trader_id);
     let mut market = app.market();
-    if !market.traders.contains_key(&trader) {
-        return Err(ApiError::unknown_trader(trader_id));
-    }
+    owned_trader(&market, caller, trader)?;
     let mut out = Vec::new();
     for i in 0..market.symbols.len() {
         let sym = market.symbols[i].info.symbol;
+        let now = market.symbols[i].exchange.clock().0;
         let cancelled = market.symbols[i].exchange.cancel_all(trader);
         if let Some((t, account)) = market.trader_and_account(trader) {
             for o in &cancelled {
                 t.release(account, sym, o.side, o.remaining, o.price_cents);
                 out.push(OpenOrderDto::from_resting(sym, o));
             }
+        }
+        for o in &cancelled {
+            market.cancel_order_record(o.id.0, o.remaining, now);
         }
     }
     Ok(Json(out))
@@ -1024,37 +1678,58 @@ async fn create_user(
     let mut market = app.market();
     let id = market.create_user(req.name, email, wall_now_ms());
     tracing::info!(user = id.0, "user created");
-    Ok((StatusCode::CREATED, Json(user_dto(&market, id)?)))
+    let mut dto = user_dto(&market, id)?;
+    // The one and only time the key is handed out.
+    dto.api_key = market.keys.key_of(id).map(str::to_owned);
+    Ok((StatusCode::CREATED, Json(dto)))
 }
 
-async fn list_users(State(app): State<AppState>) -> Json<Vec<UserDto>> {
+/// The caller, as a list of one: a user is not told about the others.
+async fn list_users(State(app): State<AppState>, caller: Caller) -> Json<Vec<UserDto>> {
     let market = app.market();
-    Json(
-        market
-            .users
-            .keys()
-            .filter_map(|&id| user_dto(&market, id).ok())
-            .collect(),
-    )
+    Json(user_dto(&market, caller.0).into_iter().collect())
 }
 
 async fn get_user(
     State(app): State<AppState>,
     Path(user_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<UserDto>, ApiError> {
+    let user = UserId(user_id);
+    owned_user(caller, user)?;
     let market = app.market();
-    Ok(Json(user_dto(&market, UserId(user_id))?))
+    Ok(Json(user_dto(&market, user)?))
+}
+
+/// Every share the user owns, per symbol, across all of their traders.
+async fn get_holdings(
+    State(app): State<AppState>,
+    Path(user_id): Path<u64>,
+    caller: Caller,
+) -> Result<Json<UserHoldingsResponse>, ApiError> {
+    let user = UserId(user_id);
+    owned_user(caller, user)?;
+    let market = app.market();
+    if !market.users.contains_key(&user) {
+        return Err(ApiError::unknown_user(user_id));
+    }
+    Ok(Json(UserHoldingsResponse::new(
+        user_id,
+        market.user_holdings(user),
+    )))
 }
 
 /// Open another account for a user, with `cash_cents` paid in.
 async fn open_account(
     State(app): State<AppState>,
     Path(user_id): Path<u64>,
+    caller: Caller,
     payload: Option<Json<OpenAccountRequest>>,
 ) -> Result<(StatusCode, Json<AccountDto>), ApiError> {
     let req = payload.map(|Json(r)| r).unwrap_or_default();
     let cash = req.cash_cents.unwrap_or(app.options.starting_cash_cents);
     let user = UserId(user_id);
+    owned_user(caller, user)?;
     let mut market = app.market();
     if !market.users.contains_key(&user) {
         return Err(ApiError::unknown_user(user_id));
@@ -1069,8 +1744,10 @@ async fn open_account(
 async fn list_user_accounts(
     State(app): State<AppState>,
     Path(user_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<Vec<AccountDto>>, ApiError> {
     let user = UserId(user_id);
+    owned_user(caller, user)?;
     let market = app.market();
     if !market.users.contains_key(&user) {
         return Err(ApiError::unknown_user(user_id));
@@ -1085,12 +1762,14 @@ async fn list_user_accounts(
     ))
 }
 
-async fn list_accounts(State(app): State<AppState>) -> Json<Vec<AccountDto>> {
+/// The caller's own accounts.
+async fn list_accounts(State(app): State<AppState>, caller: Caller) -> Json<Vec<AccountDto>> {
     let market = app.market();
     Json(
         market
             .accounts
             .values()
+            .filter(|a| a.user_id == caller.0)
             .map(|a| account_view(&market, a))
             .collect(),
     )
@@ -1099,9 +1778,12 @@ async fn list_accounts(State(app): State<AppState>) -> Json<Vec<AccountDto>> {
 async fn get_account(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<AccountDto>, ApiError> {
     let market = app.market();
-    Ok(Json(account_dto(&market, AccountId(account_id))?))
+    let id = AccountId(account_id);
+    owned_account(&market, caller, id)?;
+    Ok(Json(account_dto(&market, id)?))
 }
 
 /// Add money: `{"amount_cents": 500000}`. The amount is a positive integer
@@ -1109,11 +1791,13 @@ async fn get_account(
 async fn deposit(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
+    caller: Caller,
     payload: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<Json<LedgerResponse>, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
     let mut market = app.market();
     let id = AccountId(account_id);
+    owned_account(&market, caller, id)?;
     let entry = market
         .accounts
         .get_mut(&id)
@@ -1137,11 +1821,13 @@ async fn deposit(
 async fn withdraw(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
+    caller: Caller,
     payload: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<Json<LedgerResponse>, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
     let mut market = app.market();
     let id = AccountId(account_id);
+    owned_account(&market, caller, id)?;
     let entry = market
         .accounts
         .get_mut(&id)
@@ -1164,11 +1850,13 @@ async fn withdraw(
 async fn set_status(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
+    caller: Caller,
     payload: Result<Json<StatusRequest>, JsonRejection>,
 ) -> Result<Json<AccountDto>, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
     let mut market = app.market();
     let id = AccountId(account_id);
+    owned_account(&market, caller, id)?;
     market
         .accounts
         .get_mut(&id)
@@ -1183,8 +1871,10 @@ async fn set_status(
 async fn validate_account(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<AccountCheck>, ApiError> {
     let market = app.market();
+    owned_account(&market, caller, AccountId(account_id))?;
     let account = market
         .accounts
         .get(&AccountId(account_id))
@@ -1197,6 +1887,7 @@ async fn get_ledger(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
     Query(q): Query<LimitQuery>,
+    caller: Caller,
 ) -> Result<Json<LedgerResponse>, ApiError> {
     let limit = q
         .limit
@@ -1204,6 +1895,7 @@ async fn get_ledger(
         .clamp(1, app.options.ledger_log.max(1));
     let market = app.market();
     let id = AccountId(account_id);
+    owned_account(&market, caller, id)?;
     let account = market
         .accounts
         .get(&id)
@@ -1219,11 +1911,13 @@ async fn get_ledger(
 async fn trader_deposit(
     State(app): State<AppState>,
     Path(trader_id): Path<u64>,
+    caller: Caller,
     payload: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<Json<PortfolioDto>, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
     let trader = TraderId(trader_id);
     let mut market = app.market();
+    owned_trader(&market, caller, trader)?;
     let account_id = market
         .traders
         .get(&trader)
@@ -1250,6 +1944,7 @@ fn user_dto(market: &Market, id: UserId) -> Result<UserDto, ApiError> {
         .users
         .get(&id)
         .ok_or_else(|| ApiError::unknown_user(id.0))?;
+    let holdings = market.user_holdings(id);
     Ok(UserDto {
         id: user.id.0,
         name: user.name.clone(),
@@ -1268,6 +1963,16 @@ fn user_dto(market: &Market, id: UserId) -> Result<UserDto, ApiError> {
             .filter_map(|a| market.accounts.get(a))
             .map(Account::balance_cents)
             .fold(0i64, i64::saturating_add),
+        shares_owned: holdings
+            .iter()
+            .map(|h| h.qty)
+            .fold(0u64, u64::saturating_add),
+        holdings_value_cents: holdings
+            .iter()
+            .map(|h| h.market_value_cents)
+            .fold(0i64, i64::saturating_add),
+        // Only the response that creates a user carries their key.
+        api_key: None,
     })
 }
 
@@ -1300,18 +2005,45 @@ async fn catalog() -> Json<Vec<CatalogEntry>> {
 
 /// Server-sent events: a `hello` with the current quotes, then every tick
 /// and every accepted event. Each message is JSON with a `type` field.
-async fn stream(State(app): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+#[derive(Deserialize)]
+struct StreamQuery {
+    /// `EventSource` cannot set headers, so the stream takes the key in the
+    /// query string. Without one the stream carries market data only.
+    api_key: Option<String>,
+}
+
+async fn stream(
+    State(app): State<AppState>,
+    Query(q): Query<StreamQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = app.tx.subscribe();
-    let hello = {
+    let (hello, viewer) = {
         let market = app.market();
-        StreamMessage::Hello {
-            sim_now_ms: app.clock.now().0,
-            time_scale: app.clock.scale,
-            quotes: market.symbols.iter().map(SymbolState::quote).collect(),
-        }
+        (
+            StreamMessage::Hello {
+                sim_now_ms: app.clock.now().0,
+                time_scale: app.clock.scale,
+                quotes: market.symbols.iter().map(SymbolState::quote).collect(),
+            },
+            q.api_key.as_deref().and_then(|k| market.keys.user_of(k)),
+        )
     };
+    // Ticks and events are public; a fill belongs to the trader that made it,
+    // so it goes only to a stream that proved it speaks for that trader.
+    let owner = Arc::clone(&app);
     // A lagging client silently skips the messages it missed.
-    let live = BroadcastStream::new(rx).filter_map(Result::ok);
+    let live = BroadcastStream::new(rx)
+        .filter_map(Result::ok)
+        .filter(move |m| match m {
+            StreamMessage::Fill { trader_id, .. } => viewer.is_some_and(|user| {
+                owner
+                    .market()
+                    .traders
+                    .get(&TraderId(*trader_id))
+                    .is_some_and(|t| t.user_id == user)
+            }),
+            _ => true,
+        });
     let all = tokio_stream::once(hello)
         .chain(live)
         .filter_map(|m| Event::default().json_data(&m).ok().map(Ok));

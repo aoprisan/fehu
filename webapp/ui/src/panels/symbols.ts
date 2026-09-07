@@ -61,12 +61,18 @@ export class SymbolList {
     const cls = trendClass(change);
     const price = el('span', { class: `p ${cls}` }, fmtPrice(q.price_cents));
     const changeEl = el('span', { class: `c ${cls}` }, change === null ? '' : fmtPct(change));
+    // A symbol nobody can trade says so where it is chosen.
+    const name = q.halted
+      ? el('span', { class: 'n' }, el('b', { class: 'stopped' }, 'halted'), ` · ${q.name}`)
+      : q.market_open
+        ? el('span', { class: 'n' }, `${q.name} · ${q.sector}`)
+        : el('span', { class: 'n' }, el('b', { class: 'stopped' }, 'closed'), ` · ${q.name}`);
     const root = el(
       'div',
       { class: active ? 'sym active' : 'sym', 'data-symbol': q.symbol },
       el('span', { class: 't' }, q.symbol),
       price,
-      el('span', { class: 'n' }, `${q.name} · ${q.sector}`),
+      name,
       changeEl,
     );
     root.addEventListener('click', () => this.#actions.selectSymbol(q.symbol));

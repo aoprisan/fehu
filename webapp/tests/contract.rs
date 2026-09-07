@@ -28,7 +28,14 @@ fn test_app() -> Arc<App> {
     })
 }
 
-async fn call(app: &Arc<App>, req: Request<Body>) -> (StatusCode, Value) {
+/// Send `req` as the holder of `key`, if there is one.
+async fn call_as(app: &Arc<App>, key: Option<&str>, mut req: Request<Body>) -> (StatusCode, Value) {
+    if let Some(key) = key {
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {key}").parse().unwrap(),
+        );
+    }
     let resp = router(Arc::clone(app)).oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -41,14 +48,24 @@ async fn call(app: &Arc<App>, req: Request<Body>) -> (StatusCode, Value) {
 }
 
 async fn get(app: &Arc<App>, uri: &str) -> Value {
-    let (status, body) = call(app, Request::get(uri).body(Body::empty()).unwrap()).await;
+    get_as(app, None, uri).await
+}
+
+/// `GET` as the holder of `key`: everything that belongs to a user needs one.
+async fn get_as(app: &Arc<App>, key: Option<&str>, uri: &str) -> Value {
+    let (status, body) = call_as(app, key, Request::get(uri).body(Body::empty()).unwrap()).await;
     assert!(status.is_success(), "GET {uri} → {status}: {body}");
     body
 }
 
 async fn post(app: &Arc<App>, uri: &str, body: Value) -> Value {
-    let (status, body) = call(
+    post_as(app, None, uri, body).await
+}
+
+async fn post_as(app: &Arc<App>, key: Option<&str>, uri: &str, body: Value) -> Value {
+    let (status, body) = call_as(
         app,
+        key,
         Request::post(uri)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
@@ -57,6 +74,29 @@ async fn post(app: &Arc<App>, uri: &str, body: Value) -> Value {
     .await;
     assert!(status.is_success(), "POST {uri} → {status}: {body}");
     body
+}
+
+async fn patch_as(app: &Arc<App>, key: Option<&str>, uri: &str, body: Value) -> Value {
+    let (status, body) = call_as(
+        app,
+        key,
+        Request::patch(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert!(status.is_success(), "PATCH {uri} → {status}: {body}");
+    body
+}
+
+/// The API key in a response that created a user, which is the only place it
+/// is ever shown.
+fn api_key_of(body: &Value) -> String {
+    body["api_key"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no api_key in {body}"))
+        .to_owned()
 }
 
 /// Assert that `value` is an object with exactly `expected` as its keys.
@@ -111,8 +151,75 @@ async fn market_data_shapes() {
             "pending_events",
             "bid_cents",
             "ask_cents",
+            "shares_outstanding",
+            "market_cap_cents",
+            "market_open",
+            "halted",
         ],
     );
+
+    let shares = get(&app, "/api/symbols/ACME/shares").await;
+    assert_keys(
+        "SharesDto",
+        &shares,
+        &[
+            "symbol",
+            "shares_outstanding",
+            "held_shares",
+            "bid_shares",
+            "available_shares",
+            "price_cents",
+            "market_cap_cents",
+            "holders",
+        ],
+    );
+
+    let status_keys = [
+        "symbol",
+        "ts_ms",
+        "market_open",
+        "halted",
+        "tradable",
+        "halt",
+        "next_open_ms",
+        "next_close_ms",
+        "band_cents",
+        "move_pct",
+        "limit_pct",
+    ];
+    let status = get(&app, "/api/symbols/ACME/status").await;
+    assert_keys("SymbolStatus", &status, &status_keys);
+    assert_eq!(status["tradable"], true);
+    assert_eq!(
+        status["halt"],
+        Value::Null,
+        "nothing is halted to begin with"
+    );
+
+    // Halting fills the `halt` in, and the game master is not locked out
+    // here because this app sets no admin key.
+    let halted = post(&app, "/api/symbols/ACME/halt", json!({})).await;
+    assert_keys("SymbolStatus", &halted, &status_keys);
+    assert_keys(
+        "Halt",
+        &halted["halt"],
+        &[
+            "reason",
+            "since_ms",
+            "until_ms",
+            "band_cents",
+            "price_cents",
+            "move_pct",
+        ],
+    );
+    assert_eq!(
+        halted["halt"]["reason"], "manual",
+        "HaltReason is snake_case"
+    );
+    assert_eq!(halted["tradable"], false);
+    let resumed = post(&app, "/api/symbols/ACME/resume", json!({})).await;
+    assert_eq!(resumed["halt"], Value::Null);
+    assert_eq!(resumed["tradable"], true);
 
     let bars = get(&app, "/api/symbols/ACME/bars?interval=M1&limit=5").await;
     assert_keys(
@@ -215,6 +322,8 @@ async fn trading_shapes() {
     let app = test_app();
 
     let trader = post(&app, "/api/traders", json!({ "name": "contract" })).await;
+    let key = api_key_of(&trader);
+    let key = Some(key.as_str());
     let portfolio_keys = [
         "id",
         "user_id",
@@ -231,14 +340,16 @@ async fn trading_shapes() {
         "positions",
         "open_orders",
         "fills",
+        "api_key",
     ];
     assert_keys("PortfolioDto", &trader, &portfolio_keys);
     let id = trader["id"].as_u64().unwrap();
 
     // A market buy fills against the synthetic ladder, giving a position,
     // a fill and prints on the tape.
-    let order = post(
+    let order = post_as(
         &app,
+        key,
         "/api/symbols/ACME/orders",
         json!({ "trader_id": id, "side": "buy", "type": "market", "qty": 50 }),
     )
@@ -279,14 +390,15 @@ async fn trading_shapes() {
     assert_eq!(order["side"], "buy", "Side serialises lower-case");
 
     // A far-from-the-market limit rests instead of filling.
-    post(
+    post_as(
         &app,
+        key,
         "/api/symbols/ACME/orders",
         json!({ "trader_id": id, "side": "buy", "type": "limit", "price_cents": 1, "qty": 1, "tif": "gtc" }),
     )
     .await;
 
-    let portfolio = get(&app, &format!("/api/traders/{id}")).await;
+    let portfolio = get_as(&app, key, &format!("/api/traders/{id}")).await;
     assert_keys("PortfolioDto", &portfolio, &portfolio_keys);
     assert_keys(
         "PositionDto",
@@ -300,6 +412,7 @@ async fn trading_shapes() {
             "unrealised_pnl_cents",
             "realised_pnl_cents",
             "reserved_shares",
+            "free_shares",
         ],
     );
     assert_keys(
@@ -333,6 +446,113 @@ async fn trading_shapes() {
         ],
     );
 
+    // Amending replaces one resting order with another; the response is an
+    // `OrderResponse` with the withdrawn order named alongside it.
+    let resting_id = portfolio["open_orders"][0]["order_id"].as_u64().unwrap();
+    let amended = patch_as(
+        &app,
+        key,
+        &format!("/api/symbols/ACME/orders/{resting_id}"),
+        json!({ "trader_id": id, "qty": 2 }),
+    )
+    .await;
+    assert_keys(
+        "AmendResponse",
+        &amended,
+        &[
+            "replaced_order_id",
+            "replaced_filled",
+            // OrderResponse is flattened into it.
+            "symbol",
+            "trader_id",
+            "order_id",
+            "side",
+            "qty",
+            "filled",
+            "remaining",
+            "status",
+            "avg_price_cents",
+            "notional_cents",
+            "trades",
+        ],
+    );
+    assert_eq!(amended["replaced_order_id"], resting_id);
+
+    let records = get_as(&app, key, &format!("/api/traders/{id}/orders")).await;
+    assert_keys(
+        "OrderRecord",
+        first("orders", &json!({ "orders": records }), "orders"),
+        &[
+            "order_id",
+            "client_order_id",
+            "trader_id",
+            "symbol",
+            "kind",
+            "price_cents",
+            "side",
+            "tif",
+            "qty",
+            "filled",
+            "remaining",
+            "status",
+            "notional_cents",
+            "avg_price_cents",
+            "submitted_at_ms",
+            "updated_at_ms",
+        ],
+    );
+    assert_eq!(records[0]["status"], "resting", "OrderStatus is lower-case");
+    assert_eq!(records[0]["tif"], "gtc", "TimeInForce is lower-case");
+
+    let holdings = get_as(
+        &app,
+        key,
+        &format!("/api/users/{}/holdings", portfolio["user_id"]),
+    )
+    .await;
+    assert_keys(
+        "UserHoldingsResponse",
+        &holdings,
+        &[
+            "user_id",
+            "shares_owned",
+            "reserved_shares",
+            "free_shares",
+            "market_value_cents",
+            "holdings",
+        ],
+    );
+    assert_keys(
+        "HoldingDto",
+        first("UserHoldingsResponse", &holdings, "holdings"),
+        &[
+            "symbol",
+            "qty",
+            "reserved_shares",
+            "free_shares",
+            "cost_cents",
+            "avg_cost_cents",
+            "mark_cents",
+            "market_value_cents",
+            "unrealised_pnl_cents",
+            "realised_pnl_cents",
+            "traders",
+        ],
+    );
+
+    let shares = get_as(&app, key, "/api/symbols/ACME/shares").await;
+    assert_keys(
+        "HolderDto",
+        first("SharesDto", &shares, "holders"),
+        &[
+            "trader_id",
+            "user_id",
+            "qty",
+            "reserved_shares",
+            "free_shares",
+        ],
+    );
+
     let trades = get(&app, "/api/symbols/ACME/trades?limit=5").await;
     assert_keys(
         "TradesResponse",
@@ -356,6 +576,8 @@ async fn account_shapes() {
         json!({ "name": "ada", "email": "ada@example.com" }),
     )
     .await;
+    let key = api_key_of(&user);
+    let key = Some(key.as_str());
     assert_keys(
         "UserDto",
         &user,
@@ -367,6 +589,9 @@ async fn account_shapes() {
             "accounts",
             "traders",
             "balance_cents",
+            "shares_owned",
+            "holdings_value_cents",
+            "api_key",
         ],
     );
     let user_id = user["id"].as_u64().unwrap();
@@ -386,8 +611,9 @@ async fn account_shapes() {
         "trader_id",
         "valid",
     ];
-    let account = post(
+    let account = post_as(
         &app,
+        key,
         &format!("/api/users/{user_id}/accounts"),
         json!({ "name": "main", "cash_cents": 250_000 }),
     )
@@ -396,8 +622,9 @@ async fn account_shapes() {
     assert_eq!(account["status"], "active", "AccountStatus is lower-case");
     let account_id = account["id"].as_u64().unwrap();
 
-    let ledger = post(
+    let ledger = post_as(
         &app,
+        key,
         &format!("/api/accounts/{account_id}/deposit"),
         json!({ "amount_cents": 1_000, "memo": "allowance" }),
     )
@@ -420,7 +647,7 @@ async fn account_shapes() {
     );
     assert_eq!(ledger["entries"][0]["kind"], "deposit");
 
-    let check = get(&app, &format!("/api/accounts/{account_id}/validate")).await;
+    let check = get_as(&app, key, &format!("/api/accounts/{account_id}/validate")).await;
     assert_keys(
         "AccountCheck",
         &check,
@@ -489,6 +716,33 @@ async fn stream_message_shapes() {
         }
     }
     assert!(saw_tick, "the engine step published no tick to check");
+
+    // `status` flattens the symbol's state next to the tag.
+    let status = serde_json::to_value(StreamMessage::Status(
+        app.market()
+            .status(0, app.clock.now())
+            .expect("ACME exists"),
+    ))
+    .unwrap();
+    assert_keys(
+        "StatusMessage",
+        &status,
+        &[
+            "type",
+            "symbol",
+            "ts_ms",
+            "market_open",
+            "halted",
+            "tradable",
+            "halt",
+            "next_open_ms",
+            "next_close_ms",
+            "band_cents",
+            "move_pct",
+            "limit_pct",
+        ],
+    );
+    assert_eq!(status["type"], "status");
 
     // `event` flattens the record next to the tag.
     let record = post(

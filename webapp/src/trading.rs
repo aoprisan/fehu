@@ -8,34 +8,64 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use fehu::{
-    Level, OrderId, OrderKind, OrderStatus, Owner, Placement, Position, Resting, Side, TimeInForce,
-    Trade, TraderId,
+    Level, Order, OrderId, OrderKind, OrderStatus, Owner, Placement, Position, Resting, Side,
+    TimeInForce, Trade, TraderId,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::account::{Account, AccountId, AccountStatus, MoneyError, UserId, notional_cents};
+use crate::save::Symbol;
+
+/// Which side of the book a fill came from: `maker` if the trader's order
+/// was resting when it traded, `taker` if it took what was there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Liquidity {
+    Maker,
+    Taker,
+}
+
+/// Who was on the other side of a fill: another trader, or the synthetic
+/// liquidity the exchange quotes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Counterparty {
+    Synthetic,
+    Trader,
+}
+
+/// How an order was priced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderStyle {
+    Market,
+    Limit,
+}
 
 /// One execution from a trader's point of view.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FillRecord {
     pub id: u64,
     pub trader_id: u64,
     pub ts_ms: i64,
-    pub symbol: &'static str,
+    #[serde(with = "crate::save::symbol")]
+    pub symbol: Symbol,
     pub order_id: u64,
     pub side: Side,
     pub qty: u64,
     pub price_cents: i64,
-    /// `"maker"` if the trader's order was resting, `"taker"` if it took.
-    pub liquidity: &'static str,
-    /// `"synthetic"` or `"trader"`.
-    pub counterparty: &'static str,
+    /// `maker` if the trader's order was resting, `taker` if it took.
+    pub liquidity: Liquidity,
+    pub counterparty: Counterparty,
 }
 
 /// A market participant. No margin, no shorting: buys need cash in the
 /// trader's account and sells need shares, and resting orders reserve both
 /// until they fill or cancel.
-#[derive(Clone, Debug)]
+///
+/// It serialises whole, private fields included: the save file has to carry
+/// the positions and the fill log, not a view of them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Trader {
     pub id: TraderId,
     /// The user this trader belongs to.
@@ -43,9 +73,11 @@ pub struct Trader {
     /// The account its cash moves through.
     pub account_id: AccountId,
     pub name: String,
-    pub positions: BTreeMap<&'static str, Position>,
+    #[serde(with = "crate::save::symbol_map")]
+    pub positions: BTreeMap<Symbol, Position>,
     /// Shares committed to resting sell orders, per symbol.
-    pub reserved_shares: BTreeMap<&'static str, u64>,
+    #[serde(with = "crate::save::symbol_map")]
+    pub reserved_shares: BTreeMap<Symbol, u64>,
     /// Most recent fills, oldest first.
     pub fills: VecDeque<FillRecord>,
     fill_cap: usize,
@@ -60,6 +92,9 @@ pub enum Refused {
     Account(MoneyError),
     /// Not enough free shares for the sell.
     InsufficientShares { needed: u64, available: u64 },
+    /// The buy asked for more shares than the symbol has left: every other
+    /// share of it is already held by a trader or bid for by a resting order.
+    SupplyExhausted { needed: u64, available: u64 },
 }
 
 impl std::fmt::Display for Refused {
@@ -70,6 +105,13 @@ impl std::fmt::Display for Refused {
                 write!(
                     f,
                     "insufficient shares: need {needed}, have {available} free"
+                )
+            }
+            Self::SupplyExhausted { needed, available } => {
+                write!(
+                    f,
+                    "not enough shares left: want {needed}, {available} of the \
+                     outstanding shares are unheld"
                 )
             }
         }
@@ -109,19 +151,28 @@ impl Trader {
         Owner::Trader(self.id)
     }
 
-    /// Shares of `symbol` not committed to resting sells.
-    pub fn free_shares(&self, symbol: &str) -> u64 {
-        let held = self
-            .positions
+    /// Shares of `symbol` the trader owns. Positions never go short — a sell
+    /// is refused unless the shares are already there — so a negative one
+    /// would be a broken invariant and counts as nothing.
+    pub fn held_shares(&self, symbol: &str) -> u64 {
+        self.positions
             .get(symbol)
-            .map_or(0, |p| u64::try_from(p.qty).unwrap_or(0));
-        held.saturating_sub(self.reserved_shares.get(symbol).copied().unwrap_or(0))
+            .map_or(0, |p| u64::try_from(p.qty).unwrap_or(0))
+    }
+
+    /// Shares of `symbol` the trader can still sell: what it holds, less what
+    /// its resting sells have already promised away.
+    pub fn free_shares(&self, symbol: &str) -> u64 {
+        self.held_shares(symbol)
+            .saturating_sub(self.reserved_shares.get(symbol).copied().unwrap_or(0))
     }
 
     /// Validate an order against the trader's account before it reaches the
     /// exchange. `cost_cents` is the worst-case cash a buy could consume
     /// (limit: `qty × price`; market: the preview). A sell needs no cash but
-    /// still needs an account that is allowed to trade.
+    /// needs an account that is allowed to trade and, above all, the shares:
+    /// there is no shorting, so `qty` may never exceed [`Trader::free_shares`]
+    /// — the position less whatever earlier resting sells already promised.
     pub fn check(
         &self,
         account: &Account,
@@ -211,7 +262,7 @@ impl Trader {
                 trade.taker.order,
                 trade.taker_side,
                 trade,
-                "taker",
+                Liquidity::Taker,
                 maker_is_trader,
             ));
         }
@@ -224,7 +275,7 @@ impl Trader {
                 trade.maker.order,
                 side,
                 trade,
-                "maker",
+                Liquidity::Maker,
                 taker_is_trader,
             ));
         }
@@ -254,7 +305,7 @@ impl Trader {
         order: OrderId,
         side: Side,
         trade: &Trade,
-        liquidity: &'static str,
+        liquidity: Liquidity,
         counterparty_is_trader: bool,
     ) -> FillRecord {
         let rec = FillRecord {
@@ -268,9 +319,9 @@ impl Trader {
             price_cents: trade.price_cents,
             liquidity,
             counterparty: if counterparty_is_trader {
-                "trader"
+                Counterparty::Trader
             } else {
-                "synthetic"
+                Counterparty::Synthetic
             },
         };
         self.next_fill_id += 1;
@@ -312,10 +363,184 @@ pub struct OrderRequest {
     pub kind: OrderKind,
     #[serde(default)]
     pub tif: TimeInForce,
+    /// Caller-chosen id, unique per trader, that makes the submission
+    /// idempotent: sending the same order twice — a retry after a timeout,
+    /// say — places it once. See [`OrderRecord`].
+    pub client_order_id: Option<String>,
+    /// The order must rest: if it would trade on arrival it is refused
+    /// instead. Only meaningful for a `gtc` limit order.
+    #[serde(default)]
+    pub post_only: bool,
+}
+
+/// Body of `PATCH /api/symbols/{symbol}/orders/{order_id}`: a new price, a
+/// new quantity, or both.
+///
+/// An amendment is a cancel and a fresh order, so the amended order goes to
+/// the back of the queue at its price — the same as anywhere else that does
+/// not have a true in-place amend.
+#[derive(Clone, Debug, Deserialize)]
+pub struct AmendRequest {
+    pub trader_id: u64,
+    /// New limit price; unchanged if absent.
+    pub price_cents: Option<i64>,
+    /// New quantity; what is still resting if absent.
+    pub qty: Option<u64>,
+    /// A `client_order_id` for the replacement order.
+    pub client_order_id: Option<String>,
+    /// The replacement must rest.
+    #[serde(default)]
+    pub post_only: bool,
+}
+
+/// Response to an amendment: the order that was withdrawn, and the one that
+/// took its place.
+#[derive(Clone, Debug, Serialize)]
+pub struct AmendResponse {
+    /// The order that was cancelled to make way.
+    pub replaced_order_id: u64,
+    /// Shares of the replaced order that had already filled.
+    pub replaced_filled: u64,
+    #[serde(flatten)]
+    pub order: OrderResponse,
+}
+
+impl OrderStyle {
+    /// How `order` is priced, and at what price if it says.
+    fn of(order: &Order) -> (Self, Option<i64>) {
+        match order.kind {
+            OrderKind::Market => (Self::Market, None),
+            OrderKind::Limit { price_cents } => (Self::Limit, Some(price_cents)),
+        }
+    }
+}
+
+/// Longest `client_order_id` the server keeps.
+pub const MAX_CLIENT_ORDER_ID: usize = 64;
+
+/// One submitted order for as long as the log keeps it: what was asked for,
+/// what has happened to it since, and the id the caller gave it.
+///
+/// The book itself only knows orders while they rest, so this is where an
+/// order that has filled or been cancelled can still be looked up
+/// (`GET /api/orders/{id}`, `GET /api/traders/{id}/orders`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OrderRecord {
+    pub order_id: u64,
+    /// The caller's own id for this order, if it gave one.
+    pub client_order_id: Option<String>,
+    pub trader_id: u64,
+    #[serde(with = "crate::save::symbol")]
+    pub symbol: Symbol,
+    pub side: Side,
+    pub kind: OrderStyle,
+    /// The limit price; `null` for a market order.
+    pub price_cents: Option<i64>,
+    pub tif: TimeInForce,
+    /// Shares asked for.
+    pub qty: u64,
+    /// Shares executed so far.
+    pub filled: u64,
+    /// Shares not executed: resting, or withdrawn when cancelled.
+    pub remaining: u64,
+    /// `resting` while it is live, then `filled` or `cancelled`.
+    pub status: OrderStatus,
+    /// Cash moved by the fills so far.
+    pub notional_cents: i64,
+    /// `notional_cents / filled`.
+    pub avg_price_cents: Option<f64>,
+    pub submitted_at_ms: i64,
+    pub updated_at_ms: i64,
+    /// The response the submission returned, replayed verbatim if the same
+    /// `client_order_id` arrives again. Not part of the record's own JSON,
+    /// but it is saved, so a retry across a restart still replays.
+    #[serde(skip_serializing, default)]
+    pub accepted: Option<OrderResponse>,
+}
+
+impl OrderRecord {
+    /// Record a just-accepted order and the response it produced.
+    pub fn new(
+        client_order_id: Option<String>,
+        trader: TraderId,
+        symbol: &'static str,
+        order: &Order,
+        placement: &Placement,
+        response: OrderResponse,
+        ts_ms: i64,
+    ) -> Self {
+        let (kind, price_cents) = OrderStyle::of(order);
+        Self {
+            order_id: placement.id.0,
+            client_order_id,
+            trader_id: trader.0,
+            symbol,
+            side: order.side,
+            kind,
+            price_cents,
+            tif: order.tif,
+            qty: order.qty,
+            filled: placement.filled,
+            remaining: placement.remaining,
+            status: placement.status,
+            notional_cents: placement.notional_cents(),
+            avg_price_cents: placement.avg_price_cents(),
+            submitted_at_ms: ts_ms,
+            updated_at_ms: ts_ms,
+            accepted: Some(response),
+        }
+    }
+
+    /// The order is neither filled nor cancelled: the book still has it.
+    pub fn is_live(&self) -> bool {
+        self.status == OrderStatus::Resting
+    }
+
+    /// Book an execution against a resting order. Fills of the submission
+    /// itself are already in the placement, so only later ones land here.
+    pub fn fill(&mut self, qty: u64, price_cents: i64, ts_ms: i64) {
+        if !self.is_live() {
+            return;
+        }
+        self.filled = self.filled.saturating_add(qty);
+        self.remaining = self.remaining.saturating_sub(qty);
+        self.notional_cents = self
+            .notional_cents
+            .saturating_add(notional_cents(price_cents, qty));
+        self.avg_price_cents =
+            (self.filled > 0).then(|| self.notional_cents as f64 / self.filled as f64);
+        if self.remaining == 0 {
+            self.status = OrderStatus::Filled;
+        }
+        self.updated_at_ms = ts_ms;
+    }
+
+    /// The remainder was withdrawn from the book.
+    pub fn cancel(&mut self, remaining: u64, ts_ms: i64) {
+        if !self.is_live() {
+            return;
+        }
+        self.remaining = remaining;
+        self.status = OrderStatus::Cancelled;
+        self.updated_at_ms = ts_ms;
+    }
+
+    /// The submission this order was accepted with matches `other` — the same
+    /// order, sent twice.
+    pub fn matches(&self, order: &Order, symbol: &str) -> bool {
+        let (kind, price_cents) = OrderStyle::of(order);
+        self.symbol == symbol
+            && self.trader_id == order.owner.trader().map_or(0, |t| t.0)
+            && self.side == order.side
+            && self.kind == kind
+            && self.price_cents == price_cents
+            && self.tif == order.tif
+            && self.qty == order.qty
+    }
 }
 
 /// One trade as it appears on the tape and in order responses.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct TradeDto {
     pub ts_ms: i64,
     pub price_cents: i64,
@@ -375,9 +600,10 @@ impl OpenOrderDto {
 }
 
 /// Response to a submitted order.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrderResponse {
-    pub symbol: &'static str,
+    #[serde(with = "crate::save::symbol")]
+    pub symbol: Symbol,
     pub trader_id: u64,
     pub order_id: u64,
     pub side: Side,
@@ -433,7 +659,146 @@ pub struct PositionDto {
     pub market_value_cents: i64,
     pub unrealised_pnl_cents: i64,
     pub realised_pnl_cents: i64,
+    /// Shares promised to resting sell orders.
     pub reserved_shares: u64,
+    /// `qty − reserved_shares`: the most this trader may still sell.
+    pub free_shares: u64,
+}
+
+/// What one user owns of one symbol: their traders' positions in it, added
+/// up. A user can never sell more of a symbol than `free_shares` here, and
+/// no single trader more than its own share of it.
+#[derive(Clone, Debug, Serialize)]
+pub struct HoldingDto {
+    pub symbol: &'static str,
+    /// Shares owned.
+    pub qty: u64,
+    /// Of those, promised to resting sell orders.
+    pub reserved_shares: u64,
+    /// `qty − reserved_shares`: what the user can still sell.
+    pub free_shares: u64,
+    /// Cost basis of the open position, in cents.
+    pub cost_cents: i64,
+    /// `cost_cents / qty`.
+    pub avg_cost_cents: Option<f64>,
+    /// The symbol's reference price.
+    pub mark_cents: i64,
+    pub market_value_cents: i64,
+    pub unrealised_pnl_cents: i64,
+    pub realised_pnl_cents: i64,
+    /// The user's traders holding this symbol, by id.
+    pub traders: Vec<u64>,
+}
+
+impl HoldingDto {
+    /// An empty holding of `symbol`, to be filled with [`HoldingDto::add`]
+    /// and closed off with [`HoldingDto::mark`].
+    pub fn empty(symbol: &'static str) -> Self {
+        Self {
+            symbol,
+            qty: 0,
+            reserved_shares: 0,
+            free_shares: 0,
+            cost_cents: 0,
+            avg_cost_cents: None,
+            mark_cents: 0,
+            market_value_cents: 0,
+            unrealised_pnl_cents: 0,
+            realised_pnl_cents: 0,
+            traders: Vec::new(),
+        }
+    }
+
+    /// Add what one trader holds of the symbol.
+    pub fn add(&mut self, trader: &Trader) {
+        let held = trader.held_shares(self.symbol);
+        let Some(position) = trader.positions.get(self.symbol) else {
+            return;
+        };
+        self.qty = self.qty.saturating_add(held);
+        self.reserved_shares = self
+            .reserved_shares
+            .saturating_add(held.saturating_sub(trader.free_shares(self.symbol)));
+        self.cost_cents = self.cost_cents.saturating_add(position.cost_cents);
+        self.realised_pnl_cents = self
+            .realised_pnl_cents
+            .saturating_add(position.realised_pnl_cents);
+        self.traders.push(trader.id.0);
+    }
+
+    /// Value the holding at `mark_cents` once every trader has been added.
+    pub fn mark(&mut self, mark_cents: i64) {
+        self.free_shares = self.qty.saturating_sub(self.reserved_shares);
+        self.mark_cents = mark_cents;
+        self.market_value_cents = notional_cents(mark_cents, self.qty);
+        self.unrealised_pnl_cents = self.market_value_cents.saturating_sub(self.cost_cents);
+        self.avg_cost_cents = (self.qty > 0).then(|| self.cost_cents as f64 / self.qty as f64);
+    }
+}
+
+/// `GET /api/users/{id}/holdings`: every share the user owns.
+#[derive(Clone, Debug, Serialize)]
+pub struct UserHoldingsResponse {
+    pub user_id: u64,
+    /// Shares owned across every symbol and every trader of the user.
+    pub shares_owned: u64,
+    /// Of those, promised to resting sell orders.
+    pub reserved_shares: u64,
+    /// What the user could sell right now.
+    pub free_shares: u64,
+    /// The holdings at the reference prices.
+    pub market_value_cents: i64,
+    /// One entry per symbol the user holds, by ticker.
+    pub holdings: Vec<HoldingDto>,
+}
+
+impl UserHoldingsResponse {
+    /// Total up `holdings` for one user.
+    pub fn new(user_id: u64, holdings: Vec<HoldingDto>) -> Self {
+        let mut out = Self {
+            user_id,
+            shares_owned: 0,
+            reserved_shares: 0,
+            free_shares: 0,
+            market_value_cents: 0,
+            holdings,
+        };
+        for h in &out.holdings {
+            out.shares_owned = out.shares_owned.saturating_add(h.qty);
+            out.reserved_shares = out.reserved_shares.saturating_add(h.reserved_shares);
+            out.free_shares = out.free_shares.saturating_add(h.free_shares);
+            out.market_value_cents = out.market_value_cents.saturating_add(h.market_value_cents);
+        }
+        out
+    }
+}
+
+/// One trader's stake in a symbol, for `GET /api/symbols/{sym}/shares`.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct HolderDto {
+    pub trader_id: u64,
+    pub user_id: u64,
+    pub qty: u64,
+    pub reserved_shares: u64,
+    pub free_shares: u64,
+}
+
+impl HolderDto {
+    /// `trader`'s stake in `symbol`, or `None` if it holds none of it.
+    pub fn new(trader: &Trader, symbol: &str) -> Option<Self> {
+        let qty = trader.held_shares(symbol);
+        if qty == 0 {
+            return None;
+        }
+        let free = trader.free_shares(symbol);
+        Some(Self {
+            trader_id: trader.id.0,
+            user_id: trader.user_id.0,
+            qty,
+            reserved_shares: qty.saturating_sub(free),
+            free_shares: free,
+        })
+    }
 }
 
 /// `GET /api/traders/{id}`.
@@ -457,6 +822,10 @@ pub struct PortfolioDto {
     pub open_orders: Vec<OpenOrderDto>,
     /// Newest first.
     pub fills: Vec<FillRecord>,
+    /// The key that proves a request speaks for the trader's user, shown **once**:
+    /// in the response that created them, and `null` everywhere after. Send
+    /// it as `Authorization: Bearer <key>`.
+    pub api_key: Option<String>,
 }
 
 /// `GET /api/traders` row.
@@ -524,7 +893,7 @@ mod tests {
             &trade(Owner::Synthetic, Owner::Trader(ME), Side::Sell, 5, 5_000),
         );
         assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].liquidity, "maker");
+        assert_eq!(fills[0].liquidity, Liquidity::Maker);
         assert_eq!(fills[0].side, Side::Buy);
         assert_eq!(a.balance_cents(), 75_000);
         assert_eq!(a.reserved_cents(), 25_000);
@@ -541,7 +910,7 @@ mod tests {
             "ACME",
             &trade(Owner::Trader(ME), Owner::Synthetic, Side::Sell, 3, 6_000),
         );
-        assert_eq!(fills[0].liquidity, "taker");
+        assert_eq!(fills[0].liquidity, Liquidity::Taker);
         assert_eq!(a.balance_cents(), 93_000);
         assert_eq!(t.positions["ACME"].qty, 2);
         assert_eq!(t.positions["ACME"].realised_pnl_cents, 3_000);
@@ -560,6 +929,76 @@ mod tests {
         // Every movement is on the ledger, and the account stays valid.
         assert!(a.is_valid());
         assert_eq!(a.ledger(100).len(), 5, "open + four settlements");
+    }
+
+    #[test]
+    fn a_sell_can_never_exceed_what_is_held() {
+        let (mut t, mut a) = trader(1_000_000);
+        // Buy 100 as taker.
+        t.apply_trade(
+            &mut a,
+            "ACME",
+            &trade(Owner::Trader(ME), Owner::Synthetic, Side::Buy, 100, 5_000),
+        );
+        assert_eq!(t.held_shares("ACME"), 100);
+        assert_eq!(t.free_shares("ACME"), 100);
+        assert!(t.check(&a, "ACME", Side::Sell, 101, 0).is_err());
+        t.check(&a, "ACME", Side::Sell, 100, 0).unwrap();
+        // 60 of them rest in a sell, so only 40 are still sellable.
+        t.reserve(&mut a, "ACME", Side::Sell, 60, 6_000);
+        assert_eq!(t.held_shares("ACME"), 100, "reserving sells nothing");
+        assert_eq!(t.free_shares("ACME"), 40);
+        assert_eq!(
+            t.check(&a, "ACME", Side::Sell, 41, 0).unwrap_err(),
+            Refused::InsufficientShares {
+                needed: 41,
+                available: 40,
+            }
+        );
+        t.check(&a, "ACME", Side::Sell, 40, 0).unwrap();
+        // Another symbol is a separate pot, empty here.
+        assert_eq!(t.free_shares("NBLA"), 0);
+        assert!(t.check(&a, "NBLA", Side::Sell, 1, 0).is_err());
+    }
+
+    #[test]
+    fn holdings_add_up_across_traders() {
+        let (mut one, mut a) = trader(1_000_000);
+        let mut two = Trader::new(TraderId(2), UserId(1), AccountId(1), "two".into(), 10, 0);
+        for t in [&mut one, &mut two] {
+            t.apply_trade(
+                &mut a,
+                "ACME",
+                &trade(Owner::Trader(t.id), Owner::Synthetic, Side::Buy, 50, 4_000),
+            );
+        }
+        two.reserve(&mut a, "ACME", Side::Sell, 20, 5_000);
+
+        let mut h = HoldingDto::empty("ACME");
+        h.add(&one);
+        h.add(&two);
+        h.mark(6_000);
+        assert_eq!(h.qty, 100);
+        assert_eq!(h.reserved_shares, 20);
+        assert_eq!(h.free_shares, 80, "what the user could sell right now");
+        assert_eq!(h.cost_cents, 400_000);
+        assert_eq!(h.avg_cost_cents, Some(4_000.0));
+        assert_eq!(h.market_value_cents, 600_000);
+        assert_eq!(h.unrealised_pnl_cents, 200_000);
+        assert_eq!(h.traders, vec![1, 2]);
+
+        let totals = UserHoldingsResponse::new(1, vec![h]);
+        assert_eq!(totals.shares_owned, 100);
+        assert_eq!(totals.free_shares, 80);
+        assert_eq!(totals.market_value_cents, 600_000);
+
+        // A trader holding nothing of the symbol is not a holder of it.
+        assert!(HolderDto::new(&one, "NBLA").is_none());
+        let holder = HolderDto::new(&two, "ACME").expect("two holds ACME");
+        assert_eq!(
+            (holder.qty, holder.reserved_shares, holder.free_shares),
+            (50, 20, 30)
+        );
     }
 
     #[test]

@@ -63,6 +63,74 @@ export interface Quote {
   pending_events: number;
   bid_cents: number | null;
   ask_cents: number | null;
+  /** Shares in existence for this symbol. */
+  shares_outstanding: number;
+  /** `price × shares_outstanding`. */
+  market_cap_cents: number;
+  /** A session is running. */
+  market_open: boolean;
+  /** Trading is stopped. */
+  halted: boolean;
+}
+
+/** `market::HaltReason`. */
+export type HaltReason = 'limit_move' | 'manual';
+
+/** `market::Halt` — trading in one symbol, stopped. */
+export interface Halt {
+  reason: HaltReason;
+  since_ms: number;
+  /** When an automatic halt lifts; `null` for a manual one. */
+  until_ms: number | null;
+  band_cents: number;
+  price_cents: number;
+  /** How far the price had moved from the band, as a fraction. */
+  move_pct: number;
+}
+
+/** `GET /api/symbols/{symbol}/status` (`market::SymbolStatus`). */
+export interface SymbolStatus {
+  symbol: string;
+  ts_ms: number;
+  market_open: boolean;
+  halted: boolean;
+  /** Orders are accepted: open, and not halted. */
+  tradable: boolean;
+  halt: Halt | null;
+  next_open_ms: number | null;
+  next_close_ms: number | null;
+  band_cents: number;
+  move_pct: number;
+  /** The move that stops trading; `0` when automatic halts are off. */
+  limit_pct: number;
+}
+
+/** `api::HolderDto` — one trader's stake in a symbol. */
+export interface HolderDto {
+  trader_id: number;
+  user_id: number;
+  qty: number;
+  reserved_shares: number;
+  free_shares: number;
+}
+
+/**
+ * `GET /api/symbols/{symbol}/shares` (`api::SharesDto`): where the symbol's
+ * shares are. The parts add up: `outstanding = held + bid_for + available`.
+ */
+export interface SharesResponse {
+  symbol: string;
+  shares_outstanding: number;
+  /** Held by traders. */
+  held_shares: number;
+  /** Bid for by traders' resting buy orders. */
+  bid_shares: number;
+  /** Neither held nor bid for: what a buy can still be filled from. */
+  available_shares: number;
+  price_cents: number;
+  market_cap_cents: number;
+  /** Largest stake first. */
+  holders: HolderDto[];
 }
 
 /** `GET /api/symbols`. */
@@ -221,6 +289,32 @@ export interface OpenOrderDto {
   ts_ms: number;
 }
 
+/**
+ * `trading::OrderRecord` — one submitted order and what became of it. The
+ * book forgets an order once it is filled or cancelled; this does not.
+ */
+export interface OrderRecord {
+  order_id: number;
+  /** The caller's own id for the order, if it gave one. */
+  client_order_id: string | null;
+  trader_id: number;
+  symbol: string;
+  side: Side;
+  kind: 'market' | 'limit';
+  /** The limit price; `null` for a market order. */
+  price_cents: number | null;
+  tif: TimeInForce;
+  qty: number;
+  filled: number;
+  /** Not executed: resting, or withdrawn when cancelled. */
+  remaining: number;
+  status: OrderStatus;
+  notional_cents: number;
+  avg_price_cents: number | null;
+  submitted_at_ms: number;
+  updated_at_ms: number;
+}
+
 /** `trading::FillRecord`. */
 export interface FillRecord {
   id: number;
@@ -245,7 +339,38 @@ export interface PositionDto {
   market_value_cents: number;
   unrealised_pnl_cents: number;
   realised_pnl_cents: number;
+  /** Shares promised to resting sell orders. */
   reserved_shares: number;
+  /** `qty − reserved_shares`: the most this trader may still sell. */
+  free_shares: number;
+}
+
+/** `trading::HoldingDto` — one user's shares in one symbol. */
+export interface HoldingDto {
+  symbol: string;
+  qty: number;
+  reserved_shares: number;
+  /** What the user can still sell. */
+  free_shares: number;
+  cost_cents: number;
+  avg_cost_cents: number | null;
+  mark_cents: number;
+  market_value_cents: number;
+  unrealised_pnl_cents: number;
+  realised_pnl_cents: number;
+  /** The user's traders holding this symbol. */
+  traders: number[];
+}
+
+/** `GET /api/users/{id}/holdings` (`trading::UserHoldingsResponse`). */
+export interface UserHoldingsResponse {
+  user_id: number;
+  shares_owned: number;
+  reserved_shares: number;
+  free_shares: number;
+  market_value_cents: number;
+  /** One entry per symbol the user holds, by ticker. */
+  holdings: HoldingDto[];
 }
 
 /** `GET /api/traders/{id}`. */
@@ -267,6 +392,12 @@ export interface PortfolioDto {
   open_orders: OpenOrderDto[];
   /** Newest first. */
   fills: FillRecord[];
+  /**
+   * The key that proves a request speaks for this user, shown **once**: in
+   * the response that created them, and `null` everywhere after. Send it as
+   * `Authorization: Bearer <key>`.
+   */
+  api_key: string | null;
 }
 
 /** Body of `POST /api/traders`. */
@@ -298,6 +429,16 @@ export interface UserDto {
   traders: number[];
   /** Every account's balance added up. */
   balance_cents: number;
+  /** Shares owned across every symbol and every trader of the user. */
+  shares_owned: number;
+  /** Those shares at the reference prices. */
+  holdings_value_cents: number;
+  /**
+   * The key that proves a request speaks for this user, shown **once**: in
+   * the response that created them, and `null` everywhere after. Send it as
+   * `Authorization: Bearer <key>`.
+   */
+  api_key: string | null;
 }
 
 /** `account::AccountDto`. Money is integer cents. */
@@ -387,6 +528,38 @@ export type OrderRequest = OrderKind & {
   side: Side;
   qty: number;
   tif: TimeInForce;
+  /**
+   * Caller-chosen id, unique per trader, that makes the submission
+   * idempotent: the same order sent twice is placed once and the first
+   * response replayed (`200` rather than `201`).
+   */
+  client_order_id?: string;
+  /**
+   * The order must rest: if it would trade on arrival it is refused. Only
+   * meaningful for a `gtc` limit order.
+   */
+  post_only?: boolean;
+};
+
+/** Body of `PATCH /api/symbols/{symbol}/orders/{id}`. */
+export interface AmendRequest {
+  trader_id: number;
+  /** New limit price; unchanged if absent. */
+  price_cents?: number;
+  /** New quantity; what is still resting if absent. */
+  qty?: number;
+  client_order_id?: string;
+  post_only?: boolean;
+}
+
+/**
+ * Response to an amendment. An amendment is a cancel and a fresh order, so
+ * the replacement is a new order at the back of the queue for its price.
+ */
+export type AmendResponse = OrderResponse & {
+  replaced_order_id: number;
+  /** Shares of the replaced order that had already filled. */
+  replaced_filled: number;
 };
 
 /** Response to a submitted order. */
@@ -440,7 +613,15 @@ export interface FillMessage {
   fill: FillRecord;
 }
 
-export type StreamMessage = HelloMessage | TickMessage | EventMessage | FillMessage;
+/** A symbol stopped trading, or started again. */
+export type StatusMessage = { type: 'status' } & SymbolStatus;
+
+export type StreamMessage =
+  | HelloMessage
+  | TickMessage
+  | EventMessage
+  | FillMessage
+  | StatusMessage;
 
 /** The server's error body: `{"error": {"code", "message"}}`. */
 export interface ApiErrorBody {
