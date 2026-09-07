@@ -125,7 +125,9 @@ three days of 1 s ticks, so every interval has history before the first
 request. `FEHU_TIME_SCALE=60` runs the market at 60 simulated seconds per
 wall second; `FEHU_BIND`, `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`,
 `FEHU_STARTING_CASH_CENTS`, `FEHU_TAPE`, `FEHU_FILL_LOG`, `FEHU_ORDER_LOG`
-and `FEHU_LEDGER_LOG` are the other knobs. `FEHU_ADMIN_KEY` locks the
+and `FEHU_LEDGER_LOG` are the other knobs. `FEHU_STATE_FILE` keeps the market
+across restarts (`FEHU_SAVE_SECS`, 30 by default, sets how often it is
+written). `FEHU_ADMIN_KEY` locks the
 game-master endpoints (`POST /api/game/events` and
 `POST /api/symbols/{sym}/events`, which move prices) behind a key of your
 choosing; unset, they stay open, which is what a single-player game on
@@ -143,6 +145,17 @@ account must be active and its available balance must cover the worst-case
 cost). Fills settle through the account, so every cent that moves is on its
 ledger. Nothing is persisted: accounts start with cash, no shares, no margin
 and no shorting.
+
+Set `FEHU_STATE_FILE` and the market survives a restart. The whole thing is
+written there — every symbol's simulator, book and bars, and every user,
+account, ledger, position, resting order and API key — every `FEHU_SAVE_SECS`
+seconds and once more on a clean shutdown, and read back at start-up in place
+of the warm-up, continuing from the simulated time it had reached. The write
+goes through a temporary file and a rename, so an interrupted save cannot
+destroy the last good one; a file from another format version, or one listing
+different symbols, stops the server rather than starting a market without its
+accounts. Without the variable nothing is kept and every start warms up a
+fresh market.
 
 Keys are the only credential: they are 128 bits of operating-system entropy,
 issued at sign-up and held in memory beside the accounts they open. Nothing

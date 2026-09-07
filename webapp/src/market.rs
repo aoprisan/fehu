@@ -15,6 +15,7 @@ use tokio::sync::broadcast;
 use crate::account::{Account, AccountId, MoneyError, User, UserId, notional_cents};
 use crate::auth::Keyring;
 use crate::events::EventRecord;
+use crate::save::{MarketSave, STATE_VERSION, Save, SymbolSave};
 use crate::trading::{BookDto, FillRecord, HoldingDto, OrderRecord, TradeDto, Trader};
 
 /// Milliseconds in one day.
@@ -46,6 +47,20 @@ pub struct SymbolSpec {
     pub info: SymbolInfo,
     pub config: Config,
     pub trading: TradingParams,
+}
+
+/// The listed tickers, in listing order. The symbol set is fixed at build
+/// time: it names the `&'static str`s the rest of the server uses, and a save
+/// file listing anything else is refused rather than guessed at.
+pub const TICKERS: [&str; 4] = ["ACME", "NBLA", "HLIO", "PXCO"];
+
+/// `ticker` as the `&'static str` the server uses for it, matched
+/// case-insensitively.
+pub fn intern(ticker: &str) -> Option<&'static str> {
+    TICKERS
+        .iter()
+        .find(|s| s.eq_ignore_ascii_case(ticker))
+        .copied()
 }
 
 /// The four hardcoded symbols. `start_ts` is the first tick's timestamp; the
@@ -394,6 +409,43 @@ impl SymbolState {
             v.drain(..v.len() - limit);
         }
         v
+    }
+
+    /// Everything about this symbol a restart needs: the exchange (simulator,
+    /// book and pending flow), the bars, and the tape.
+    pub fn to_save(&self) -> SymbolSave {
+        SymbolSave {
+            symbol: self.info.symbol.to_string(),
+            exchange: self.exchange.clone(),
+            candles: self.candles.clone(),
+            coarse_daily: self.coarse_daily.clone(),
+            last_tick: self.last_tick,
+            ticks_total: self.ticks_total,
+            tape: self.tape.iter().copied().collect(),
+            trades_total: self.trades_total,
+        }
+    }
+
+    /// Rebuild a symbol from a save. Its metadata (name, sector, share count,
+    /// seed) comes from the build rather than the file: the save carries only
+    /// what changed while the server ran.
+    fn from_save(info: SymbolInfo, save: SymbolSave, tape_cap: usize) -> Self {
+        let tape_cap = tape_cap.max(1);
+        let mut tape: VecDeque<Trade> = save.tape.into_iter().collect();
+        while tape.len() > tape_cap {
+            tape.pop_front();
+        }
+        Self {
+            info,
+            exchange: save.exchange,
+            candles: save.candles,
+            coarse_daily: save.coarse_daily,
+            last_tick: save.last_tick,
+            ticks_total: save.ticks_total,
+            tape,
+            tape_cap,
+            trades_total: save.trades_total,
+        }
     }
 
     /// The last traded price, or the simulator's reference before the first
@@ -805,6 +857,72 @@ impl Market {
             .find(|s| s.info.symbol.eq_ignore_ascii_case(ticker))
     }
 
+    /// The people, their money and every log, ready to be written out.
+    pub fn to_save(&self) -> MarketSave {
+        MarketSave {
+            users: self.users.values().cloned().collect(),
+            accounts: self.accounts.values().cloned().collect(),
+            traders: self.traders.values().cloned().collect(),
+            // Oldest first, so restoring in order rebuilds the same log.
+            orders: self
+                .order_ids
+                .iter()
+                .filter_map(|id| self.orders.get(id))
+                .cloned()
+                .collect(),
+            order_responses: self
+                .order_ids
+                .iter()
+                .filter_map(|id| {
+                    let record = self.orders.get(id)?;
+                    Some((*id, record.accepted.clone()?))
+                })
+                .collect(),
+            events: self.events.iter().cloned().collect(),
+            api_keys: self.keys.pairs(),
+            next_user_id: self.next_user_id,
+            next_account_id: self.next_account_id,
+            next_trader_id: self.next_trader_id,
+            next_event_id: self.next_event_id,
+        }
+    }
+
+    /// Put a saved market back: users, money, traders and every log, with the
+    /// id counters where they left off so nothing is ever handed out twice.
+    fn from_save(symbols: Vec<SymbolState>, save: MarketSave, options: &Options) -> Self {
+        let mut market = Self {
+            symbols,
+            events: save.events.into_iter().collect(),
+            event_cap: options.event_log.max(1),
+            next_event_id: save.next_event_id.max(1),
+            users: save.users.into_iter().map(|u| (u.id, u)).collect(),
+            next_user_id: save.next_user_id.max(1),
+            keys: Keyring::from_pairs(save.api_keys),
+            accounts: save.accounts.into_iter().map(|a| (a.id, a)).collect(),
+            next_account_id: save.next_account_id.max(1),
+            traders: save.traders.into_iter().map(|t| (t.id, t)).collect(),
+            next_trader_id: save.next_trader_id.max(1),
+            orders: BTreeMap::new(),
+            order_ids: VecDeque::new(),
+            client_order_ids: BTreeMap::new(),
+            fill_log: options.fill_log,
+            ledger_log: options.ledger_log,
+            order_log: options.order_log.max(1),
+        };
+        // Through the same door as a live order, so the client-id index and
+        // the eviction order come out the same.
+        let responses: BTreeMap<u64, crate::trading::OrderResponse> =
+            save.order_responses.into_iter().collect();
+        for mut record in save.orders {
+            record.accepted = responses.get(&record.order_id).cloned();
+            market.record_order(record);
+        }
+        while market.events.len() > market.event_cap {
+            market.events.pop_front();
+        }
+        market
+    }
+
     /// Assign the next id to `rec`, append it to the log and return it.
     pub fn record(&mut self, mut rec: EventRecord) -> EventRecord {
         rec.id = self.next_event_id;
@@ -910,6 +1028,12 @@ pub struct Options {
     /// require. `FEHU_ADMIN_KEY`; unset leaves them open, which is what a
     /// single-player game on localhost wants and a shared server does not.
     pub admin_key: Option<String>,
+    /// Where the market is saved, and read back from at start-up.
+    /// `FEHU_STATE_FILE`; unset means nothing is kept and every start warms
+    /// up a fresh market.
+    pub state_file: Option<std::path::PathBuf>,
+    /// Seconds between saves. `FEHU_SAVE_SECS`.
+    pub save_secs: u64,
 }
 
 impl Default for Options {
@@ -927,6 +1051,8 @@ impl Default for Options {
             order_log: 2_000,
             starting_cash_cents: 10_000_000,
             admin_key: None,
+            state_file: None,
+            save_secs: 30,
         }
     }
 }
@@ -953,6 +1079,10 @@ impl Options {
                 .ok()
                 .map(|k| k.trim().to_string())
                 .filter(|k| !k.is_empty()),
+            state_file: std::env::var_os("FEHU_STATE_FILE")
+                .map(std::path::PathBuf::from)
+                .filter(|p| !p.as_os_str().is_empty()),
+            save_secs: env_parse("FEHU_SAVE_SECS", d.save_secs).max(1),
         }
     }
 }
@@ -1033,6 +1163,61 @@ impl App {
                 ledger_log: options.ledger_log,
                 order_log: options.order_log.max(1),
             }),
+            tx,
+            options,
+        })
+    }
+
+    /// Everything the server would need to carry on after a restart.
+    pub fn save(&self) -> Save {
+        let market = self.market();
+        // The furthest the market has reached: usually the clock, but an
+        // engine step can leave a symbol ahead of it, and starting up behind
+        // a symbol's own clock would freeze it until wall time caught up.
+        let sim_now_ms = market
+            .symbols
+            .iter()
+            .map(|s| s.exchange.clock().0)
+            .fold(self.clock.now().0, i64::max);
+        Save {
+            version: STATE_VERSION,
+            saved_at_ms: wall_now_ms(),
+            sim_now_ms,
+            symbols: market.symbols.iter().map(SymbolState::to_save).collect(),
+            market: market.to_save(),
+        }
+    }
+
+    /// Build the app from a save instead of warming up: the market carries on
+    /// from the simulated time it had reached, with the same books, bars,
+    /// users and money.
+    ///
+    /// The save's symbol list must be the build's — [`crate::save::read`]
+    /// checks that — and each symbol's metadata comes from the build.
+    pub fn restore(options: Options, save: Save) -> Arc<Self> {
+        let now = Timestamp(save.sim_now_ms);
+        let specs: BTreeMap<&'static str, SymbolInfo> = seeded_symbols(now)
+            .into_iter()
+            .map(|spec| (spec.info.symbol, spec.info))
+            .collect();
+        let symbols = save
+            .symbols
+            .into_iter()
+            .filter_map(|s| {
+                let info = *specs.get(intern(&s.symbol)?)?;
+                Some(SymbolState::from_save(info, s, options.tape_len))
+            })
+            .collect();
+        let market = Market::from_save(symbols, save.market, &options);
+        let (tx, _) = broadcast::channel(4096);
+        Arc::new(Self {
+            clock: SimClock {
+                wall_epoch: Instant::now(),
+                sim_epoch: now,
+                scale: options.time_scale,
+            },
+            started_at: SystemTime::now(),
+            market: Mutex::new(market),
             tx,
             options,
         })

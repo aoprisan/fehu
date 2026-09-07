@@ -65,6 +65,23 @@ impl Keyring {
         self.by_user.get(&user).map(String::as_str)
     }
 
+    /// The keys as `(key, user id)` pairs, for a save file.
+    pub fn pairs(&self) -> Vec<(String, u64)> {
+        self.by_key.iter().map(|(k, u)| (k.clone(), u.0)).collect()
+    }
+
+    /// Rebuild a keyring from what [`Keyring::pairs`] wrote down, so a
+    /// player's key still opens their account after a restart.
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, u64)>) -> Self {
+        let mut keys = Self::default();
+        for (key, user) in pairs {
+            let user = UserId(user);
+            keys.by_user.insert(user, key.clone());
+            keys.by_key.insert(key, user);
+        }
+        keys
+    }
+
     /// Number of keys issued.
     pub fn len(&self) -> usize {
         self.by_key.len()
@@ -98,6 +115,18 @@ mod tests {
         assert_eq!(keys.user_of("fehu_nope"), None);
         assert_eq!(keys.key_of(UserId(2)).unwrap(), two);
         assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn a_keyring_round_trips_through_its_pairs() {
+        let mut keys = Keyring::default();
+        let one = keys.issue(UserId(1));
+        let two = keys.issue(UserId(7));
+        let back = Keyring::from_pairs(keys.pairs());
+        assert_eq!(back.user_of(&one), Some(UserId(1)));
+        assert_eq!(back.user_of(&two), Some(UserId(7)));
+        assert_eq!(back.key_of(UserId(7)).unwrap(), two);
+        assert_eq!(back.len(), 2);
     }
 
     #[test]

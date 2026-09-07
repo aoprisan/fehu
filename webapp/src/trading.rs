@@ -14,28 +14,58 @@ use fehu::{
 use serde::{Deserialize, Serialize};
 
 use crate::account::{Account, AccountId, AccountStatus, MoneyError, UserId, notional_cents};
+use crate::save::Symbol;
+
+/// Which side of the book a fill came from: `maker` if the trader's order
+/// was resting when it traded, `taker` if it took what was there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Liquidity {
+    Maker,
+    Taker,
+}
+
+/// Who was on the other side of a fill: another trader, or the synthetic
+/// liquidity the exchange quotes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Counterparty {
+    Synthetic,
+    Trader,
+}
+
+/// How an order was priced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderStyle {
+    Market,
+    Limit,
+}
 
 /// One execution from a trader's point of view.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FillRecord {
     pub id: u64,
     pub trader_id: u64,
     pub ts_ms: i64,
-    pub symbol: &'static str,
+    #[serde(with = "crate::save::symbol")]
+    pub symbol: Symbol,
     pub order_id: u64,
     pub side: Side,
     pub qty: u64,
     pub price_cents: i64,
-    /// `"maker"` if the trader's order was resting, `"taker"` if it took.
-    pub liquidity: &'static str,
-    /// `"synthetic"` or `"trader"`.
-    pub counterparty: &'static str,
+    /// `maker` if the trader's order was resting, `taker` if it took.
+    pub liquidity: Liquidity,
+    pub counterparty: Counterparty,
 }
 
 /// A market participant. No margin, no shorting: buys need cash in the
 /// trader's account and sells need shares, and resting orders reserve both
 /// until they fill or cancel.
-#[derive(Clone, Debug)]
+///
+/// It serialises whole, private fields included: the save file has to carry
+/// the positions and the fill log, not a view of them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Trader {
     pub id: TraderId,
     /// The user this trader belongs to.
@@ -43,9 +73,11 @@ pub struct Trader {
     /// The account its cash moves through.
     pub account_id: AccountId,
     pub name: String,
-    pub positions: BTreeMap<&'static str, Position>,
+    #[serde(with = "crate::save::symbol_map")]
+    pub positions: BTreeMap<Symbol, Position>,
     /// Shares committed to resting sell orders, per symbol.
-    pub reserved_shares: BTreeMap<&'static str, u64>,
+    #[serde(with = "crate::save::symbol_map")]
+    pub reserved_shares: BTreeMap<Symbol, u64>,
     /// Most recent fills, oldest first.
     pub fills: VecDeque<FillRecord>,
     fill_cap: usize,
@@ -230,7 +262,7 @@ impl Trader {
                 trade.taker.order,
                 trade.taker_side,
                 trade,
-                "taker",
+                Liquidity::Taker,
                 maker_is_trader,
             ));
         }
@@ -243,7 +275,7 @@ impl Trader {
                 trade.maker.order,
                 side,
                 trade,
-                "maker",
+                Liquidity::Maker,
                 taker_is_trader,
             ));
         }
@@ -273,7 +305,7 @@ impl Trader {
         order: OrderId,
         side: Side,
         trade: &Trade,
-        liquidity: &'static str,
+        liquidity: Liquidity,
         counterparty_is_trader: bool,
     ) -> FillRecord {
         let rec = FillRecord {
@@ -287,9 +319,9 @@ impl Trader {
             price_cents: trade.price_cents,
             liquidity,
             counterparty: if counterparty_is_trader {
-                "trader"
+                Counterparty::Trader
             } else {
-                "synthetic"
+                Counterparty::Synthetic
             },
         };
         self.next_fill_id += 1;
@@ -337,6 +369,16 @@ pub struct OrderRequest {
     pub client_order_id: Option<String>,
 }
 
+impl OrderStyle {
+    /// How `order` is priced, and at what price if it says.
+    fn of(order: &Order) -> (Self, Option<i64>) {
+        match order.kind {
+            OrderKind::Market => (Self::Market, None),
+            OrderKind::Limit { price_cents } => (Self::Limit, Some(price_cents)),
+        }
+    }
+}
+
 /// Longest `client_order_id` the server keeps.
 pub const MAX_CLIENT_ORDER_ID: usize = 64;
 
@@ -346,16 +388,16 @@ pub const MAX_CLIENT_ORDER_ID: usize = 64;
 /// The book itself only knows orders while they rest, so this is where an
 /// order that has filled or been cancelled can still be looked up
 /// (`GET /api/orders/{id}`, `GET /api/traders/{id}/orders`).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrderRecord {
     pub order_id: u64,
     /// The caller's own id for this order, if it gave one.
     pub client_order_id: Option<String>,
     pub trader_id: u64,
-    pub symbol: &'static str,
+    #[serde(with = "crate::save::symbol")]
+    pub symbol: Symbol,
     pub side: Side,
-    /// `"market"` or `"limit"`.
-    pub kind: &'static str,
+    pub kind: OrderStyle,
     /// The limit price; `null` for a market order.
     pub price_cents: Option<i64>,
     pub tif: TimeInForce,
@@ -374,8 +416,9 @@ pub struct OrderRecord {
     pub submitted_at_ms: i64,
     pub updated_at_ms: i64,
     /// The response the submission returned, replayed verbatim if the same
-    /// `client_order_id` arrives again. Not part of the record's own JSON.
-    #[serde(skip)]
+    /// `client_order_id` arrives again. Not part of the record's own JSON,
+    /// but it is saved, so a retry across a restart still replays.
+    #[serde(skip_serializing, default)]
     pub accepted: Option<OrderResponse>,
 }
 
@@ -390,10 +433,7 @@ impl OrderRecord {
         response: OrderResponse,
         ts_ms: i64,
     ) -> Self {
-        let (kind, price_cents) = match order.kind {
-            OrderKind::Market => ("market", None),
-            OrderKind::Limit { price_cents } => ("limit", Some(price_cents)),
-        };
+        let (kind, price_cents) = OrderStyle::of(order);
         Self {
             order_id: placement.id.0,
             client_order_id,
@@ -452,10 +492,7 @@ impl OrderRecord {
     /// The submission this order was accepted with matches `other` — the same
     /// order, sent twice.
     pub fn matches(&self, order: &Order, symbol: &str) -> bool {
-        let (kind, price_cents) = match order.kind {
-            OrderKind::Market => ("market", None),
-            OrderKind::Limit { price_cents } => ("limit", Some(price_cents)),
-        };
+        let (kind, price_cents) = OrderStyle::of(order);
         self.symbol == symbol
             && self.trader_id == order.owner.trader().map_or(0, |t| t.0)
             && self.side == order.side
@@ -467,7 +504,7 @@ impl OrderRecord {
 }
 
 /// One trade as it appears on the tape and in order responses.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct TradeDto {
     pub ts_ms: i64,
     pub price_cents: i64,
@@ -527,9 +564,10 @@ impl OpenOrderDto {
 }
 
 /// Response to a submitted order.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrderResponse {
-    pub symbol: &'static str,
+    #[serde(with = "crate::save::symbol")]
+    pub symbol: Symbol,
     pub trader_id: u64,
     pub order_id: u64,
     pub side: Side,
@@ -819,7 +857,7 @@ mod tests {
             &trade(Owner::Synthetic, Owner::Trader(ME), Side::Sell, 5, 5_000),
         );
         assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].liquidity, "maker");
+        assert_eq!(fills[0].liquidity, Liquidity::Maker);
         assert_eq!(fills[0].side, Side::Buy);
         assert_eq!(a.balance_cents(), 75_000);
         assert_eq!(a.reserved_cents(), 25_000);
@@ -836,7 +874,7 @@ mod tests {
             "ACME",
             &trade(Owner::Trader(ME), Owner::Synthetic, Side::Sell, 3, 6_000),
         );
-        assert_eq!(fills[0].liquidity, "taker");
+        assert_eq!(fills[0].liquidity, Liquidity::Taker);
         assert_eq!(a.balance_cents(), 93_000);
         assert_eq!(t.positions["ACME"].qty, 2);
         assert_eq!(t.positions["ACME"].realised_pnl_cents, 3_000);
