@@ -2011,3 +2011,251 @@ async fn a_closed_session_takes_no_orders() {
     .await;
     assert_eq!(code, StatusCode::CREATED, "{body}");
 }
+
+#[tokio::test]
+async fn a_trader_cannot_trade_with_itself() {
+    let app = test_app();
+    let me = sign_up(&app, "sol").await;
+    let other = sign_up(&app, "luna").await;
+    let id = me.trader;
+    let book = get(&app, "/api/symbols/PXCO/book").await.1;
+    let (bid, ask) = (
+        book["bid_cents"].as_i64().unwrap(),
+        book["ask_cents"].as_i64().unwrap(),
+    );
+
+    // Rest a buy at the top of the book, then try to sell into it.
+    let (status, resting) = post(
+        &me,
+        "/api/symbols/PXCO/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 40, "type": "limit", "price_cents": bid + 5 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{resting}");
+    let resting_id = resting["order_id"].as_u64().unwrap();
+
+    // Enough shares to sell, bought elsewhere so the sell is about the cross.
+    post(
+        &me,
+        "/api/symbols/PXCO/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "market" }),
+    )
+    .await;
+
+    let (status, body) = post(
+        &me,
+        "/api/symbols/PXCO/orders",
+        json!({ "trader_id": id, "side": "sell", "qty": 40, "type": "limit", "price_cents": bid }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "self_trade");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&resting_id.to_string()),
+        "the message names the order in the way: {body}"
+    );
+
+    // Somebody else's order at the same price is not a self-trade.
+    post(
+        &other,
+        "/api/symbols/PXCO/orders",
+        json!({ "trader_id": other.trader, "side": "buy", "qty": 50, "type": "market" }),
+    )
+    .await;
+    let (status, body) = post(
+        &other,
+        "/api/symbols/PXCO/orders",
+        json!({ "trader_id": other.trader, "side": "sell", "qty": 40, "type": "limit", "price_cents": bid }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["trades"][0]["maker_trader"], id, "it hit my bid");
+
+    // A sell that stops short of my own bid is fine.
+    let (status, body) = post(
+        &me,
+        "/api/symbols/PXCO/orders",
+        json!({ "trader_id": id, "side": "sell", "qty": 1, "type": "limit", "price_cents": ask * 2 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "resting well above: {body}");
+    let far = body["order_id"].as_u64().unwrap();
+
+    // And once the bid is out of the way, the crossing sell goes through.
+    delete(
+        &me,
+        &format!("/api/symbols/PXCO/orders/{resting_id}?trader_id={id}"),
+    )
+    .await;
+    delete(
+        &me,
+        &format!("/api/symbols/PXCO/orders/{far}?trader_id={id}"),
+    )
+    .await;
+    let (status, body) = post(
+        &me,
+        "/api/symbols/PXCO/orders",
+        json!({ "trader_id": id, "side": "sell", "qty": 40, "type": "market" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn a_post_only_order_must_rest() {
+    let app = test_app();
+    let player = sign_up(&app, "polly").await;
+    let id = player.trader;
+    let ask = get(&app, "/api/symbols/ACME/book").await.1["ask_cents"]
+        .as_i64()
+        .unwrap();
+
+    // A buy at the offer would trade, so post-only refuses it.
+    let (status, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit", "price_cents": ask, "post_only": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "post_only_would_cross");
+
+    // The same order without the flag trades, as it always did.
+    let (status, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit", "price_cents": ask }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["status"], "filled");
+
+    // Below the offer it rests, which is the whole point.
+    let (status, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit", "price_cents": ask / 2, "post_only": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["status"], "resting");
+
+    // Post-only makes no sense for orders that exist to take.
+    for order in [
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market", "post_only": true }),
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "limit", "price_cents": ask / 2, "tif": "ioc", "post_only": true }),
+    ] {
+        let (status, body) = post(&player, "/api/symbols/ACME/orders", order).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_order");
+    }
+}
+
+#[tokio::test]
+async fn an_order_can_be_amended_in_place() {
+    let app = test_app();
+    let maker = sign_up(&app, "ada").await;
+    let taker = sign_up(&app, "bo").await;
+    let id = maker.trader;
+    let book = get(&app, "/api/symbols/HLIO/book").await.1;
+    let mid = (book["bid_cents"].as_i64().unwrap() + book["ask_cents"].as_i64().unwrap()) / 2;
+
+    post(
+        &maker,
+        "/api/symbols/HLIO/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 200, "type": "market" }),
+    )
+    .await;
+    let (_, resting) = post(
+        &maker,
+        "/api/symbols/HLIO/orders",
+        json!({ "trader_id": id, "side": "sell", "qty": 100, "type": "limit", "price_cents": mid }),
+    )
+    .await;
+    let first = resting["order_id"].as_u64().unwrap();
+
+    // Somebody takes 40 of it, so the amendment starts from what is left.
+    post(
+        &taker,
+        "/api/symbols/HLIO/orders",
+        json!({ "trader_id": taker.trader, "side": "buy", "qty": 40, "type": "limit", "price_cents": mid, "tif": "ioc" }),
+    )
+    .await;
+
+    let (status, amended) = call(
+        &maker,
+        Request::patch(format!("/api/symbols/HLIO/orders/{first}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "trader_id": id, "price_cents": mid + 50 }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{amended}");
+    assert_eq!(amended["replaced_order_id"], first);
+    assert_eq!(amended["replaced_filled"], 40, "what had already traded");
+    assert_eq!(amended["qty"], 60, "the rest, unless another is asked for");
+    assert_eq!(amended["status"], "resting");
+    let second = amended["order_id"].as_u64().unwrap();
+    assert_ne!(second, first, "an amendment is a new order");
+
+    // The old one is gone from the book and closed in the log; the new one
+    // rests at its new price with the shares still reserved against it.
+    let (status, _) = get(&maker, &format!("/api/symbols/HLIO/orders/{first}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, record) = get(&maker, &format!("/api/orders/{first}")).await;
+    assert_eq!(record["status"], "cancelled");
+    assert_eq!(record["filled"], 40);
+    let (_, p) = get(&maker, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["open_orders"].as_array().unwrap().len(), 1);
+    assert_eq!(p["open_orders"][0]["order_id"], second);
+    assert_eq!(p["open_orders"][0]["price_cents"], mid + 50);
+    assert_eq!(p["positions"][0]["reserved_shares"], 60);
+
+    // Quantity alone can be amended too.
+    let (status, amended) = call(
+        &maker,
+        Request::patch(format!("/api/symbols/HLIO/orders/{second}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "trader_id": id, "qty": 25 }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{amended}");
+    assert_eq!(amended["qty"], 25);
+    assert_eq!(amended["replaced_filled"], 0);
+    let (_, p) = get(&maker, &format!("/api/traders/{id}")).await;
+    assert_eq!(
+        p["positions"][0]["reserved_shares"], 25,
+        "the rest is free again"
+    );
+
+    // Somebody else's order, and one that is not resting, cannot be amended.
+    let third = amended["order_id"].as_u64().unwrap();
+    let (status, body) = call(
+        &taker,
+        Request::patch(format!("/api/symbols/HLIO/orders/{third}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "trader_id": taker.trader, "qty": 1 }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "not theirs to amend: {body}");
+    let (status, body) = call(
+        &maker,
+        Request::patch(format!("/api/symbols/HLIO/orders/{first}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "trader_id": id, "qty": 1 }).to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "already replaced: {body}");
+}

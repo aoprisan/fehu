@@ -76,6 +76,20 @@ async fn post_as(app: &Arc<App>, key: Option<&str>, uri: &str, body: Value) -> V
     body
 }
 
+async fn patch_as(app: &Arc<App>, key: Option<&str>, uri: &str, body: Value) -> Value {
+    let (status, body) = call_as(
+        app,
+        key,
+        Request::patch(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert!(status.is_success(), "PATCH {uri} → {status}: {body}");
+    body
+}
+
 /// The API key in a response that created a user, which is the only place it
 /// is ever shown.
 fn api_key_of(body: &Value) -> String {
@@ -431,6 +445,38 @@ async fn trading_shapes() {
             "counterparty",
         ],
     );
+
+    // Amending replaces one resting order with another; the response is an
+    // `OrderResponse` with the withdrawn order named alongside it.
+    let resting_id = portfolio["open_orders"][0]["order_id"].as_u64().unwrap();
+    let amended = patch_as(
+        &app,
+        key,
+        &format!("/api/symbols/ACME/orders/{resting_id}"),
+        json!({ "trader_id": id, "qty": 2 }),
+    )
+    .await;
+    assert_keys(
+        "AmendResponse",
+        &amended,
+        &[
+            "replaced_order_id",
+            "replaced_filled",
+            // OrderResponse is flattened into it.
+            "symbol",
+            "trader_id",
+            "order_id",
+            "side",
+            "qty",
+            "filled",
+            "remaining",
+            "status",
+            "avg_price_cents",
+            "notional_cents",
+            "trades",
+        ],
+    );
+    assert_eq!(amended["replaced_order_id"], resting_id);
 
     let records = get_as(&app, key, &format!("/api/traders/{id}/orders")).await;
     assert_keys(

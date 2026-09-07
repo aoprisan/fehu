@@ -534,6 +534,32 @@ export type OrderRequest = OrderKind & {
    * response replayed (`200` rather than `201`).
    */
   client_order_id?: string;
+  /**
+   * The order must rest: if it would trade on arrival it is refused. Only
+   * meaningful for a `gtc` limit order.
+   */
+  post_only?: boolean;
+};
+
+/** Body of `PATCH /api/symbols/{symbol}/orders/{id}`. */
+export interface AmendRequest {
+  trader_id: number;
+  /** New limit price; unchanged if absent. */
+  price_cents?: number;
+  /** New quantity; what is still resting if absent. */
+  qty?: number;
+  client_order_id?: string;
+  post_only?: boolean;
+}
+
+/**
+ * Response to an amendment. An amendment is a cancel and a fresh order, so
+ * the replacement is a new order at the back of the queue for its price.
+ */
+export type AmendResponse = OrderResponse & {
+  replaced_order_id: number;
+  /** Shares of the replaced order that had already filled. */
+  replaced_filled: number;
 };
 
 /** Response to a submitted order. */

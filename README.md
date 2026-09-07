@@ -112,9 +112,10 @@ read that portfolio, cancel those orders or move that money. The key is shown
 | `GET` | `/api/traders`, `/api/traders/{id}` | Traders; a portfolio with cash, positions marked to the reference price, open orders and fills |
 | `POST` | `/api/traders/{id}/deposit` | Add money to the trader's account: `{"amount_cents":250000}` |
 | `POST` | `/api/traders/{id}/cancel_all` | Cancel every resting order of a trader |
-| `POST` | `/api/symbols/{sym}/orders` | `{"trader_id":1,"side":"buy","qty":100,"type":"market"}` or `"type":"limit","price_cents":8400`, optional `"tif":"gtc\|ioc\|fok"` and `"client_order_id":"abc-1"`; responds with fills and status |
+| `POST` | `/api/symbols/{sym}/orders` | `{"trader_id":1,"side":"buy","qty":100,"type":"market"}` or `"type":"limit","price_cents":8400`, optional `"tif":"gtc\|ioc\|fok"`, `"client_order_id":"abc-1"` and `"post_only":true`; responds with fills and status |
 | `GET` | `/api/symbols/{sym}/orders?trader_id=` | A trader's resting orders on that symbol |
 | `GET`/`DELETE` | `/api/symbols/{sym}/orders/{id}` | Look up / cancel (`?trader_id=`) a resting order |
+| `PATCH` | `/api/symbols/{sym}/orders/{id}` | Amend a resting order: `{"trader_id":1,"price_cents":8500,"qty":50}` — a cancel and a fresh order, so it loses queue position |
 | `GET` | `/api/orders/{id}` | One order and what became of it — filled and cancelled ones included |
 | `GET` | `/api/traders/{id}/orders?status=resting\|filled\|cancelled&limit=100` | A trader's orders, newest first |
 | `GET` | `/api/symbols/{sym}/book?depth=10` | Aggregated bids and asks, reference price, pending trader flow |
@@ -179,6 +180,17 @@ Keys are the only credential: they are 128 bits of operating-system entropy,
 issued at sign-up and held in memory beside the accounts they open. Nothing
 is persisted, so there is no key store to steal separately — but a deployment
 that adds persistence must hash them before writing them down.
+
+Three rules shape what the book will take. A **post-only** order (`"post_only":true`)
+must rest: if its price would trade on arrival it is refused rather than
+crossing, so a maker cannot become a taker by accident. A trader may not
+**trade with itself**: an order that would reach one of that trader's own
+resting orders is refused with `409 self_trade`, naming the orders in the way,
+because a self-trade moves nothing but still prints on the tape and moves the
+price. And an order can be **amended** (`PATCH`) to a new price or quantity —
+implemented as a cancel and a fresh order under one lock, so the replacement
+starts at the back of the queue for its price and the response says which
+order was withdrawn and how much of it had already filled.
 
 Orders are remembered. The book only knows an order while it rests, so every
 submission is also written to an order log (`GET /api/orders/{id}`,
