@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "hird": {
+      "command": "/Users/ao/.local/bin/hird",
+      "args": [
+        "mcp"
+      ],
+      "env": {
+        "HIRD_HARNESS": "claude-code"
+      }
+    }
+  }
+}
