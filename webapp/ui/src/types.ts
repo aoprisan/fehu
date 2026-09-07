@@ -253,6 +253,32 @@ export interface OpenOrderDto {
   ts_ms: number;
 }
 
+/**
+ * `trading::OrderRecord` — one submitted order and what became of it. The
+ * book forgets an order once it is filled or cancelled; this does not.
+ */
+export interface OrderRecord {
+  order_id: number;
+  /** The caller's own id for the order, if it gave one. */
+  client_order_id: string | null;
+  trader_id: number;
+  symbol: string;
+  side: Side;
+  kind: 'market' | 'limit';
+  /** The limit price; `null` for a market order. */
+  price_cents: number | null;
+  tif: TimeInForce;
+  qty: number;
+  filled: number;
+  /** Not executed: resting, or withdrawn when cancelled. */
+  remaining: number;
+  status: OrderStatus;
+  notional_cents: number;
+  avg_price_cents: number | null;
+  submitted_at_ms: number;
+  updated_at_ms: number;
+}
+
 /** `trading::FillRecord`. */
 export interface FillRecord {
   id: number;
@@ -454,6 +480,12 @@ export type OrderRequest = OrderKind & {
   side: Side;
   qty: number;
   tif: TimeInForce;
+  /**
+   * Caller-chosen id, unique per trader, that makes the submission
+   * idempotent: the same order sent twice is placed once and the first
+   * response replayed (`200` rather than `201`).
+   */
+  client_order_id?: string;
 };
 
 /** Response to a submitted order. */

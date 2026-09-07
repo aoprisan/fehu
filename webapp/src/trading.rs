@@ -8,8 +8,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use fehu::{
-    Level, OrderId, OrderKind, OrderStatus, Owner, Placement, Position, Resting, Side, TimeInForce,
-    Trade, TraderId,
+    Level, Order, OrderId, OrderKind, OrderStatus, Owner, Placement, Position, Resting, Side,
+    TimeInForce, Trade, TraderId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -331,6 +331,139 @@ pub struct OrderRequest {
     pub kind: OrderKind,
     #[serde(default)]
     pub tif: TimeInForce,
+    /// Caller-chosen id, unique per trader, that makes the submission
+    /// idempotent: sending the same order twice — a retry after a timeout,
+    /// say — places it once. See [`OrderRecord`].
+    pub client_order_id: Option<String>,
+}
+
+/// Longest `client_order_id` the server keeps.
+pub const MAX_CLIENT_ORDER_ID: usize = 64;
+
+/// One submitted order for as long as the log keeps it: what was asked for,
+/// what has happened to it since, and the id the caller gave it.
+///
+/// The book itself only knows orders while they rest, so this is where an
+/// order that has filled or been cancelled can still be looked up
+/// (`GET /api/orders/{id}`, `GET /api/traders/{id}/orders`).
+#[derive(Clone, Debug, Serialize)]
+pub struct OrderRecord {
+    pub order_id: u64,
+    /// The caller's own id for this order, if it gave one.
+    pub client_order_id: Option<String>,
+    pub trader_id: u64,
+    pub symbol: &'static str,
+    pub side: Side,
+    /// `"market"` or `"limit"`.
+    pub kind: &'static str,
+    /// The limit price; `null` for a market order.
+    pub price_cents: Option<i64>,
+    pub tif: TimeInForce,
+    /// Shares asked for.
+    pub qty: u64,
+    /// Shares executed so far.
+    pub filled: u64,
+    /// Shares not executed: resting, or withdrawn when cancelled.
+    pub remaining: u64,
+    /// `resting` while it is live, then `filled` or `cancelled`.
+    pub status: OrderStatus,
+    /// Cash moved by the fills so far.
+    pub notional_cents: i64,
+    /// `notional_cents / filled`.
+    pub avg_price_cents: Option<f64>,
+    pub submitted_at_ms: i64,
+    pub updated_at_ms: i64,
+    /// The response the submission returned, replayed verbatim if the same
+    /// `client_order_id` arrives again. Not part of the record's own JSON.
+    #[serde(skip)]
+    pub accepted: Option<OrderResponse>,
+}
+
+impl OrderRecord {
+    /// Record a just-accepted order and the response it produced.
+    pub fn new(
+        client_order_id: Option<String>,
+        trader: TraderId,
+        symbol: &'static str,
+        order: &Order,
+        placement: &Placement,
+        response: OrderResponse,
+        ts_ms: i64,
+    ) -> Self {
+        let (kind, price_cents) = match order.kind {
+            OrderKind::Market => ("market", None),
+            OrderKind::Limit { price_cents } => ("limit", Some(price_cents)),
+        };
+        Self {
+            order_id: placement.id.0,
+            client_order_id,
+            trader_id: trader.0,
+            symbol,
+            side: order.side,
+            kind,
+            price_cents,
+            tif: order.tif,
+            qty: order.qty,
+            filled: placement.filled,
+            remaining: placement.remaining,
+            status: placement.status,
+            notional_cents: placement.notional_cents(),
+            avg_price_cents: placement.avg_price_cents(),
+            submitted_at_ms: ts_ms,
+            updated_at_ms: ts_ms,
+            accepted: Some(response),
+        }
+    }
+
+    /// The order is neither filled nor cancelled: the book still has it.
+    pub fn is_live(&self) -> bool {
+        self.status == OrderStatus::Resting
+    }
+
+    /// Book an execution against a resting order. Fills of the submission
+    /// itself are already in the placement, so only later ones land here.
+    pub fn fill(&mut self, qty: u64, price_cents: i64, ts_ms: i64) {
+        if !self.is_live() {
+            return;
+        }
+        self.filled = self.filled.saturating_add(qty);
+        self.remaining = self.remaining.saturating_sub(qty);
+        self.notional_cents = self
+            .notional_cents
+            .saturating_add(notional_cents(price_cents, qty));
+        self.avg_price_cents =
+            (self.filled > 0).then(|| self.notional_cents as f64 / self.filled as f64);
+        if self.remaining == 0 {
+            self.status = OrderStatus::Filled;
+        }
+        self.updated_at_ms = ts_ms;
+    }
+
+    /// The remainder was withdrawn from the book.
+    pub fn cancel(&mut self, remaining: u64, ts_ms: i64) {
+        if !self.is_live() {
+            return;
+        }
+        self.remaining = remaining;
+        self.status = OrderStatus::Cancelled;
+        self.updated_at_ms = ts_ms;
+    }
+
+    /// The submission this order was accepted with matches `other` — the same
+    /// order, sent twice.
+    pub fn matches(&self, order: &Order, symbol: &str) -> bool {
+        let (kind, price_cents) = match order.kind {
+            OrderKind::Market => ("market", None),
+            OrderKind::Limit { price_cents } => ("limit", Some(price_cents)),
+        };
+        self.symbol == symbol
+            && self.trader_id == order.owner.trader().map_or(0, |t| t.0)
+            && self.side == order.side
+            && self.kind == kind
+            && self.price_cents == price_cents
+            && self.tif == order.tif
+            && self.qty == order.qty
+    }
 }
 
 /// One trade as it appears on the tape and in order responses.

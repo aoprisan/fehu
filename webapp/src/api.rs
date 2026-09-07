@@ -31,8 +31,9 @@ use crate::market::{
     App, Market, Quote, SnapshotDto, StreamMessage, SymbolInfo, SymbolState, wall_now_ms,
 };
 use crate::trading::{
-    BookDto, CreateTraderRequest, HolderDto, OpenOrderDto, OrderRequest, OrderResponse,
-    PortfolioDto, PositionDto, Refused, TradeDto, TraderSummary, UserHoldingsResponse,
+    BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID, OpenOrderDto, OrderRecord,
+    OrderRequest, OrderResponse, PortfolioDto, PositionDto, Refused, TradeDto, TraderSummary,
+    UserHoldingsResponse,
 };
 
 type AppState = Arc<App>;
@@ -72,6 +73,8 @@ pub fn router(app: AppState) -> Router {
         )
         .route("/api/traders", get(list_traders).post(create_trader))
         .route("/api/traders/{trader_id}", get(get_trader))
+        .route("/api/traders/{trader_id}/orders", get(list_trader_orders))
+        .route("/api/orders/{order_id}", get(get_order_record))
         .route("/api/traders/{trader_id}/cancel_all", post(cancel_all))
         .route("/api/traders/{trader_id}/deposit", post(trader_deposit))
         .route("/api/users", get(list_users).post(create_user))
@@ -152,6 +155,18 @@ impl ApiError {
 
     fn invalid_order(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_order", message)
+    }
+
+    /// The `client_order_id` was used before, for a different order.
+    fn duplicate_client_order_id(client_order_id: &str, order_id: u64) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "duplicate_client_order_id",
+            format!(
+                "client_order_id {client_order_id:?} was already used for order {order_id}, \
+                 which asked for something else"
+            ),
+        )
     }
 
     /// An order the trader's account would not fund.
@@ -899,8 +914,9 @@ async fn submit_order(
         qty: req.qty,
     };
     fehu::OrderBook::validate(&order).map_err(|e| ApiError::invalid_order(e.to_string()))?;
+    let client_order_id = clean_client_order_id(req.client_order_id)?;
 
-    let (response, fills) = {
+    let (response, fills, replayed) = {
         let mut market = app.market();
         let idx = market
             .symbol_index(&symbol)
@@ -909,55 +925,83 @@ async fn submit_order(
             return Err(ApiError::unknown_trader(trader.0));
         }
         let sym = market.symbols[idx].info.symbol;
-        // Worst-case cash a buy can consume.
-        let cost = match order.kind {
-            OrderKind::Limit { price_cents } => {
-                i64::try_from(i128::from(price_cents) * i128::from(order.qty)).unwrap_or(i64::MAX)
-            }
-            OrderKind::Market => {
-                market.symbols[idx]
-                    .exchange
-                    .preview_market(order.side, order.qty)
-                    .notional_cents
-            }
-        };
-        // A symbol has a fixed number of shares: a buy can only be filled
-        // from the ones no trader holds or is already bidding for.
-        if order.side == fehu::Side::Buy {
-            let available = market.available_shares(sym);
-            if order.qty > available {
-                return Err(ApiError::refused(Refused::SupplyExhausted {
-                    needed: order.qty,
-                    available,
-                }));
-            }
-        }
-        // Validate the order against the account that would fund it: it must
-        // be active, a buy must have the cash available, and a sell the
-        // shares — nothing may be sold that the trader does not hold.
-        let account = market
-            .account_of(trader)
-            .ok_or_else(|| ApiError::unknown_trader(trader.0))?;
-        market.traders[&trader]
-            .check(account, sym, order.side, order.qty, cost)
-            .map_err(ApiError::refused)?;
-        let placement = market.symbols[idx]
-            .exchange
-            .submit(order)
-            .map_err(|e| ApiError::invalid_order(e.to_string()))?;
-        market.symbols[idx].record_trades(&placement.trades);
-        let fills = market.apply_trades(sym, &placement.trades);
-        if placement.status == fehu::OrderStatus::Resting
-            && let OrderKind::Limit { price_cents } = order.kind
-            && let Some((t, account)) = market.trader_and_account(trader)
+        // The same order sent twice — a retry after a timeout, say — is
+        // placed once: the first response is replayed, and a re-used id that
+        // asks for something else is refused rather than quietly obeyed.
+        if let Some(id) = client_order_id.as_deref()
+            && let Some(record) = market.order_by_client_id(trader, id)
         {
-            t.reserve(account, sym, order.side, placement.remaining, price_cents);
+            if !record.matches(&order, sym) {
+                return Err(ApiError::duplicate_client_order_id(id, record.order_id));
+            }
+            let Some(accepted) = record.accepted.clone() else {
+                return Err(ApiError::duplicate_client_order_id(id, record.order_id));
+            };
+            (accepted, Vec::new(), true)
+        } else {
+            // Worst-case cash a buy can consume.
+            let cost = match order.kind {
+                OrderKind::Limit { price_cents } => {
+                    i64::try_from(i128::from(price_cents) * i128::from(order.qty))
+                        .unwrap_or(i64::MAX)
+                }
+                OrderKind::Market => {
+                    market.symbols[idx]
+                        .exchange
+                        .preview_market(order.side, order.qty)
+                        .notional_cents
+                }
+            };
+            // A symbol has a fixed number of shares: a buy can only be filled
+            // from the ones no trader holds or is already bidding for.
+            if order.side == fehu::Side::Buy {
+                let available = market.available_shares(sym);
+                if order.qty > available {
+                    return Err(ApiError::refused(Refused::SupplyExhausted {
+                        needed: order.qty,
+                        available,
+                    }));
+                }
+            }
+            // Validate the order against the account that would fund it: it must
+            // be active, a buy must have the cash available, and a sell the
+            // shares — nothing may be sold that the trader does not hold.
+            let account = market
+                .account_of(trader)
+                .ok_or_else(|| ApiError::unknown_trader(trader.0))?;
+            market.traders[&trader]
+                .check(account, sym, order.side, order.qty, cost)
+                .map_err(ApiError::refused)?;
+            let placement = market.symbols[idx]
+                .exchange
+                .submit(order)
+                .map_err(|e| ApiError::invalid_order(e.to_string()))?;
+            market.symbols[idx].record_trades(&placement.trades);
+            let fills = market.apply_trades(sym, &placement.trades);
+            if placement.status == fehu::OrderStatus::Resting
+                && let OrderKind::Limit { price_cents } = order.kind
+                && let Some((t, account)) = market.trader_and_account(trader)
+            {
+                t.reserve(account, sym, order.side, placement.remaining, price_cents);
+            }
+            let response = OrderResponse::new(sym, trader, order.side, order.qty, &placement);
+            let now = market.symbols[idx].exchange.clock().0;
+            market.record_order(OrderRecord::new(
+                client_order_id,
+                trader,
+                sym,
+                &order,
+                &placement,
+                response.clone(),
+                now,
+            ));
+            (response, fills, false)
         }
-        (
-            OrderResponse::new(sym, trader, order.side, order.qty, &placement),
-            fills,
-        )
     };
+    if replayed {
+        // Same order, second delivery: nothing new happened.
+        return Ok((StatusCode::OK, Json(response)));
+    }
     tracing::info!(
         trader = trader.0,
         symbol = response.symbol,
@@ -980,6 +1024,75 @@ async fn submit_order(
 #[derive(Deserialize)]
 struct TraderQuery {
     trader_id: u64,
+}
+
+/// Trim a caller-supplied `client_order_id`; an empty one counts as absent.
+fn clean_client_order_id(value: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(id) = value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
+    if id.chars().count() > MAX_CLIENT_ORDER_ID {
+        return Err(ApiError::bad_request(format!(
+            "client_order_id is longer than {MAX_CLIENT_ORDER_ID} characters"
+        )));
+    }
+    Ok(Some(id))
+}
+
+#[derive(Deserialize)]
+struct OrderHistoryQuery {
+    /// `resting`, `filled` or `cancelled`; omit for every order.
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+/// One order by id, whatever became of it — filled and cancelled orders
+/// included, for as long as the order log holds them.
+async fn get_order_record(
+    State(app): State<AppState>,
+    Path(order_id): Path<u64>,
+) -> Result<Json<OrderRecord>, ApiError> {
+    let market = app.market();
+    market
+        .order(order_id)
+        .cloned()
+        .map(Json)
+        .ok_or_else(|| ApiError::unknown_order(order_id))
+}
+
+/// A trader's orders, newest first.
+async fn list_trader_orders(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    Query(q): Query<OrderHistoryQuery>,
+) -> Result<Json<Vec<OrderRecord>>, ApiError> {
+    let trader = TraderId(trader_id);
+    let status = match q.status.as_deref() {
+        None => None,
+        Some("resting" | "open" | "live") => Some(fehu::OrderStatus::Resting),
+        Some("filled") => Some(fehu::OrderStatus::Filled),
+        Some("cancelled" | "canceled") => Some(fehu::OrderStatus::Cancelled),
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "unknown status {other:?}: use resting, filled or cancelled"
+            )));
+        }
+    };
+    let market = app.market();
+    if !market.traders.contains_key(&trader) {
+        return Err(ApiError::unknown_trader(trader_id));
+    }
+    Ok(Json(
+        market
+            .orders_of(trader)
+            .filter(|o| status.is_none_or(|s| o.status == s))
+            .take(q.limit.unwrap_or(100).clamp(1, 1_000))
+            .cloned()
+            .collect(),
+    ))
 }
 
 async fn list_orders(
@@ -1047,6 +1160,8 @@ async fn cancel_order(
             cancelled.price_cents,
         );
     }
+    let now = market.symbols[idx].exchange.clock().0;
+    market.cancel_order_record(order_id, cancelled.remaining, now);
     tracing::info!(
         trader = trader.0,
         symbol = sym,
@@ -1068,12 +1183,16 @@ async fn cancel_all(
     let mut out = Vec::new();
     for i in 0..market.symbols.len() {
         let sym = market.symbols[i].info.symbol;
+        let now = market.symbols[i].exchange.clock().0;
         let cancelled = market.symbols[i].exchange.cancel_all(trader);
         if let Some((t, account)) = market.trader_and_account(trader) {
             for o in &cancelled {
                 t.release(account, sym, o.side, o.remaining, o.price_cents);
                 out.push(OpenOrderDto::from_resting(sym, o));
             }
+        }
+        for o in &cancelled {
+            market.cancel_order_record(o.id.0, o.remaining, now);
         }
     }
     Ok(Json(out))
