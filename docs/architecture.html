@@ -1,0 +1,1255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fehu Order Flow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500;600&display=swap">
+<style>
+:root {
+  --ground:      #edf1f2;
+  --surface:     #ffffff;
+  --surface-2:   #f5f8f9;
+  --surface-3:   #e6ecee;
+  --ink:         #0f181e;
+  --ink-2:       #38474f;
+  --muted:       #6a7c86;
+  --line:        #c7d3d8;
+  --line-soft:   #dee7ea;
+  --accent:      #a2560f;
+  --accent-2:    #c9761f;
+  --accent-wash: #f4e6d4;
+  --buy:         #0e6a58;
+  --sell:        #a63a2f;
+  --engine:      #3a4bab;
+  --stream:      #7a4599;
+  --shadow:      0 1px 2px rgba(15, 24, 30, .06), 0 8px 24px -12px rgba(15, 24, 30, .18);
+
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+  --serif: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:      #0c1216;
+    --surface:     #131c22;
+    --surface-2:   #18242b;
+    --surface-3:   #1f2d35;
+    --ink:         #e3ecf0;
+    --ink-2:       #b0c1ca;
+    --muted:       #7d919c;
+    --line:        #2b3a43;
+    --line-soft:   #1e2a31;
+    --accent:      #e0994a;
+    --accent-2:    #f0b268;
+    --accent-wash: #35250f;
+    --buy:         #3cbb9c;
+    --sell:        #e97e6f;
+    --engine:      #8e9cf0;
+    --stream:      #c294e2;
+    --shadow:      0 1px 2px rgba(0, 0, 0, .4), 0 10px 30px -14px rgba(0, 0, 0, .7);
+  }
+}
+:root[data-theme="dark"] {
+  --ground:      #0c1216;
+  --surface:     #131c22;
+  --surface-2:   #18242b;
+  --surface-3:   #1f2d35;
+  --ink:         #e3ecf0;
+  --ink-2:       #b0c1ca;
+  --muted:       #7d919c;
+  --line:        #2b3a43;
+  --line-soft:   #1e2a31;
+  --accent:      #e0994a;
+  --accent-2:    #f0b268;
+  --accent-wash: #35250f;
+  --buy:         #3cbb9c;
+  --sell:        #e97e6f;
+  --engine:      #8e9cf0;
+  --stream:      #c294e2;
+  --shadow:      0 1px 2px rgba(0, 0, 0, .4), 0 10px 30px -14px rgba(0, 0, 0, .7);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 34px 22px 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+/* ---------- header ---------- */
+
+.masthead { display: flex; flex-direction: column; gap: 10px; }
+
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0;
+}
+
+h1 {
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: clamp(30px, 4.4vw, 46px);
+  line-height: 1.06;
+  letter-spacing: -.015em;
+  margin: 0;
+  text-wrap: balance;
+}
+
+.deck {
+  margin: 0;
+  max-width: 66ch;
+  color: var(--ink-2);
+  font-size: 16.5px;
+}
+
+.deck code, .rule code, .trace code, .note code { font-family: var(--mono); font-size: .88em; }
+
+.rule {
+  border-left: 3px solid var(--accent);
+  padding: 4px 0 4px 14px;
+  margin: 2px 0 0;
+  max-width: 72ch;
+  color: var(--ink-2);
+}
+.rule b { color: var(--ink); font-weight: 600; margin-right: 4px; }
+
+/* ---------- controls ---------- */
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 8px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+}
+
+.scenarios { display: flex; flex-wrap: wrap; gap: 6px; flex: 1 1 420px; }
+
+.chip {
+  appearance: none;
+  font: 500 12.5px/1 var(--sans);
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 8px 11px;
+  cursor: pointer;
+  transition: background .12s, color .12s, border-color .12s;
+}
+.chip:hover { border-color: var(--muted); color: var(--ink); }
+.chip[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--surface);
+}
+
+.transport { display: flex; align-items: center; gap: 6px; }
+
+.tbtn {
+  appearance: none;
+  font: 500 12.5px/1 var(--mono);
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 8px 12px;
+  min-width: 38px;
+  cursor: pointer;
+}
+.tbtn:hover { border-color: var(--muted); }
+.tbtn.primary { background: var(--ink); color: var(--surface); border-color: var(--ink); min-width: 74px; }
+.speed {
+  font: 500 12.5px/1 var(--mono);
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 8px 8px;
+}
+button:focus-visible, select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---------- board ---------- */
+
+.board {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  padding: 6px 6px 0;
+  margin: 0;
+  overflow-x: auto;
+}
+.board svg { display: block; width: 100%; height: auto; min-width: 860px; }
+.board figcaption {
+  border-top: 1px solid var(--line-soft);
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--muted);
+  min-width: 860px;
+}
+
+/* svg pieces */
+.n-box { fill: var(--surface-2); stroke: var(--line); stroke-width: 1.25; }
+.n-box.market, .n-box.symbol { fill: var(--surface-3); }
+.n-title { font: 600 13px var(--sans); fill: var(--ink); }
+.n-sub   { font: 400 10.5px var(--mono); fill: var(--muted); }
+.n-tick  { font: 600 14px var(--mono); fill: var(--ink); letter-spacing: .04em; }
+.e-line  { fill: none; stroke: var(--line); stroke-width: 1.6; }
+.e-line.dashed { stroke-dasharray: 5 4; }
+.e-label { font: 500 10.5px var(--mono); fill: var(--muted); }
+.slot    { fill: none; stroke: var(--line); stroke-width: 1; }
+.slot.on { fill: var(--accent); stroke: var(--accent); }
+.strip   { fill: var(--surface); stroke: var(--line); stroke-width: 1.25; }
+
+.n-box.lit { stroke: var(--accent); stroke-width: 2.25; fill: var(--accent-wash); }
+.n-box.lit-engine { stroke: var(--engine); stroke-width: 2.25; }
+.n-box.lit-stream { stroke: var(--stream); stroke-width: 2.25; }
+.n-box.lit-bad { stroke: var(--sell); stroke-width: 2.25; }
+.e-line.lit { stroke: var(--accent); stroke-width: 2.6; }
+.tok { fill: var(--accent); stroke: var(--surface); stroke-width: 1.5; }
+.tok.bad { fill: var(--sell); }
+.tok.engine { fill: var(--engine); }
+.tok.stream { fill: var(--stream); }
+.tok-hidden { opacity: 0; }
+
+/* ---------- panels ---------- */
+
+.panels {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+@media (max-width: 900px) { .panels { grid-template-columns: 1fr; } }
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--surface-2);
+}
+.panel-head h2 {
+  margin: 0;
+  font: 600 11.5px/1 var(--mono);
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+.panel-head .meta { font: 400 11.5px/1 var(--mono); color: var(--muted); }
+
+.trace { max-height: 460px; overflow-y: auto; }
+.trace ol { list-style: none; margin: 0; padding: 0; }
+.trace li {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 10px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  opacity: .5;
+  transition: opacity .2s, background .2s;
+}
+.trace li.done { opacity: 1; }
+.trace li.now { opacity: 1; background: var(--accent-wash); }
+.trace li:last-child { border-bottom: 0; }
+.trace .num { font: 500 11px/1.5 var(--mono); color: var(--muted); padding-top: 2px; font-variant-numeric: tabular-nums; }
+.trace li.now .num { color: var(--accent); }
+.trace .t { display: block; font: 600 13.5px/1.35 var(--sans); color: var(--ink); }
+.trace .b { display: block; font-size: 13px; color: var(--ink-2); margin-top: 3px; }
+.trace .r { display: block; font: 400 11px/1.5 var(--mono); color: var(--muted); margin-top: 5px; }
+.trace li.bad .t { color: var(--sell); }
+
+.state { padding: 14px; display: flex; flex-direction: column; gap: 16px; }
+
+.mailbox-row { display: flex; align-items: center; gap: 8px; }
+.mailbox-row .cells { display: flex; gap: 3px; }
+.cell { width: 15px; height: 15px; border: 1px solid var(--line); border-radius: 2px; background: var(--surface-2); }
+.cell.on { background: var(--accent); border-color: var(--accent); }
+.mailbox-row .cap { font: 400 11px var(--mono); color: var(--muted); }
+
+.kv { display: grid; grid-template-columns: 1fr auto; gap: 5px 10px; }
+.kv dt { font: 400 12px var(--sans); color: var(--muted); margin: 0; }
+.kv dd { margin: 0; font: 500 12.5px var(--mono); font-variant-numeric: tabular-nums; text-align: right; color: var(--ink); }
+.kv dd.hold { color: var(--accent); }
+.kv dd.pos  { color: var(--buy); }
+
+.sub { font: 600 10.5px/1 var(--mono); letter-spacing: .13em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
+
+.ladder { display: flex; flex-direction: column; gap: 1px; }
+.lrow {
+  display: grid;
+  grid-template-columns: 54px 46px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  font: 500 12px var(--mono);
+  font-variant-numeric: tabular-nums;
+  padding: 1px 0;
+}
+.lrow .p { text-align: right; }
+.lrow .q { text-align: right; color: var(--muted); }
+.lrow.ask .p { color: var(--sell); }
+.lrow.bid .p { color: var(--buy); }
+.bar { height: 9px; border-radius: 1px; background: var(--line-soft); }
+.lrow.ask .bar { background: color-mix(in srgb, var(--sell) 34%, transparent); }
+.lrow.bid .bar { background: color-mix(in srgb, var(--buy) 34%, transparent); }
+.lrow.mine { background: var(--accent-wash); }
+.lrow.mine .p { color: var(--accent); }
+.lrow.mine .bar { background: color-mix(in srgb, var(--accent) 50%, transparent); }
+.lrow.hit .q { color: var(--sell); text-decoration: line-through; }
+.spread {
+  display: flex; justify-content: space-between;
+  font: 400 10.5px var(--mono); color: var(--muted);
+  border-top: 1px dashed var(--line); border-bottom: 1px dashed var(--line);
+  padding: 4px 0; margin: 3px 0;
+}
+
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font: 500 11px var(--mono); letter-spacing: .04em;
+  padding: 4px 8px; border-radius: 3px;
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-2);
+}
+.pill.ok   { border-color: var(--buy);  color: var(--buy); }
+.pill.bad  { border-color: var(--sell); color: var(--sell); }
+.pill.live { border-color: var(--accent); color: var(--accent); }
+
+/* ---------- legend + notes ---------- */
+
+.legend {
+  display: flex; flex-wrap: wrap; gap: 6px 18px;
+  font: 400 12px var(--sans); color: var(--muted);
+  padding: 0 2px;
+}
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.swatch { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+
+.notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); gap: 16px; }
+.note { border-top: 2px solid var(--line); padding-top: 12px; }
+.note h3 { margin: 0 0 5px; font: 600 13.5px var(--sans); color: var(--ink); }
+.note p { margin: 0; font-size: 13px; color: var(--ink-2); }
+.note.a { border-top-color: var(--accent); }
+.note.e { border-top-color: var(--engine); }
+.note.s { border-top-color: var(--stream); }
+
+footer {
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+  font: 400 12px var(--mono);
+  color: var(--muted);
+  display: flex; flex-wrap: wrap; gap: 4px 16px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="masthead">
+    <p class="eyebrow">fehu · webapp · actor architecture</p>
+    <h1>Where an order goes</h1>
+    <p class="deck">
+      The fehu sample venue has no locks anywhere. Every piece of state — each symbol's simulator
+      and book, the market that holds everybody's money, the stream, the rate limiter — belongs to
+      exactly one tokio task, and anything that wants it sends that task a job. Pick a path below
+      and watch a request travel it.
+    </p>
+    <p class="rule">
+      <b>The one rule:</b>
+      calls go one way. The market calls the symbols; the symbols call nobody. With no cycle there
+      is nothing to deadlock, and everything that moves money queues single-file on one mailbox.
+    </p>
+  </header>
+
+  <div class="controls">
+    <div class="scenarios" id="scenarios" role="group" aria-label="Choose a path"></div>
+    <div class="transport">
+      <button class="tbtn" id="prev" title="Previous step" aria-label="Previous step">‹</button>
+      <button class="tbtn primary" id="play">Pause</button>
+      <button class="tbtn" id="next" title="Next step" aria-label="Next step">›</button>
+      <select class="speed" id="speed" aria-label="Speed">
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+      </select>
+    </div>
+  </div>
+
+  <figure class="board">
+    <svg id="map" viewBox="0 0 1100 634" role="img"
+         aria-label="Map of the fehu web app: clients call an axum router whose middleware counts requests and asks a rate-limiter actor; handlers post one job to the market actor, which is the only thing that calls the four symbol actors, each holding a simulator and an order book; the market publishes to a stream actor that feeds server-sent events back to the clients, while read-only requests go straight to a symbol."></svg>
+    <figcaption id="caption">Every arrow is a message. The market actor is the only path to a book; reads skip it entirely.</figcaption>
+  </figure>
+
+  <div class="legend">
+    <span><i class="swatch" style="background: var(--accent)"></i> order / job</span>
+    <span><i class="swatch" style="background: var(--engine)"></i> engine step</span>
+    <span><i class="swatch" style="background: var(--stream)"></i> published message</span>
+    <span><i class="swatch" style="background: var(--sell)"></i> refusal</span>
+    <span>dashed edge — a call that does not change a book</span>
+  </div>
+
+  <div class="panels">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Trace</h2>
+        <span class="meta" id="trace-meta">step 1 / 15</span>
+      </div>
+      <div class="trace" id="trace"><ol id="trace-list"></ol></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>State</h2>
+        <span class="meta" id="status-pill"></span>
+      </div>
+      <div class="state">
+        <div>
+          <p class="sub">Market mailbox</p>
+          <div class="mailbox-row">
+            <div class="cells" id="cells"></div>
+            <span class="cap" id="mailbox-cap">idle</span>
+          </div>
+        </div>
+
+        <div>
+          <p class="sub">Trader 7 · account 3</p>
+          <dl class="kv">
+            <dt>Cash</dt><dd id="v-cash">$50,000.00</dd>
+            <dt>Reserved for resting bids</dt><dd class="hold" id="v-res">$0.00</dd>
+            <dt>ACME held</dt><dd class="pos" id="v-pos">0</dd>
+            <dt>Shares reserved by asks</dt><dd id="v-resq">0</dd>
+          </dl>
+        </div>
+
+        <div>
+          <p class="sub">ACME book · depth 5</p>
+          <div class="ladder" id="ladder"></div>
+        </div>
+
+        <div>
+          <p class="sub">Stream</p>
+          <dl class="kv">
+            <dt>Last sequence</dt><dd id="v-seq">1041</dd>
+            <dt>Last message</dt><dd id="v-msg">—</dd>
+          </dl>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="notes">
+    <div class="note a">
+      <h3>Why the money is single-file</h3>
+      <p>
+        A buy is checked against shares outstanding minus what traders hold minus what is already
+        bid for. That subtraction is only true if nothing moves a book between the count and the
+        submit — so the count, the account check, the submit and the reservation are all one job on
+        one actor.
+      </p>
+    </div>
+    <div class="note e">
+      <h3>What runs in parallel</h3>
+      <p>
+        The expensive part. An engine step posts to all four symbol actors before waiting on any of
+        them, so the simulators advance at once; the market then joins them in listing order and
+        settles each one's fills, expiries and triggered stops.
+      </p>
+    </div>
+    <div class="note s">
+      <h3>What a client sees</h3>
+      <p>
+        Every published message takes the next sequence number, so a reconnecting client can ask for
+        what it missed with <code>?since=</code> — and is told plainly when the gap is older than the
+        replay buffer.
+      </p>
+    </div>
+  </div>
+
+  <footer>
+    <span>webapp/src/actor.rs · market.rs · symbol.rs · api.rs</span>
+    <span>src/exchange.rs · book.rs</span>
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+const SVGNS = "http://www.w3.org/2000/svg";
+const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ------------------------------------------------------------------ *
+ * The map: nodes and the edges between them.
+ * ------------------------------------------------------------------ */
+
+const NODES = {
+  ui:      { x: 44,  y: 64,  w: 146, h: 64,  title: "Browser UI",        sub: ["REST + SSE"] },
+  bot:     { x: 44,  y: 168, w: 146, h: 64,  title: "Trader client",     sub: ["Bearer key"] },
+  gm:      { x: 44,  y: 272, w: 146, h: 64,  title: "Game master",       sub: ["events · listings"] },
+
+  mwCount: { x: 236, y: 118, w: 170, h: 52,  title: "count",             sub: ["times every request"] },
+  mwRate:  { x: 236, y: 196, w: 170, h: 52,  title: "rate_limit_writes", sub: ["unsafe methods only"] },
+  handler: { x: 236, y: 274, w: 170, h: 52,  title: "handler + auth",    sub: ["watch: keys, listings"] },
+  limiter: { x: 236, y: 470, w: 170, h: 52,  title: "Limiter actor",     sub: ["token buckets"], kind: "actor" },
+
+  engine:  { x: 456, y: 48,  w: 248, h: 56,  title: "engine loop",       sub: ["advance_to(clock.now())"], kind: "engine" },
+  market:  { x: 456, y: 140, w: 248, h: 220, title: "Market actor",
+             sub: ["users · accounts · traders",
+                   "order log · event log",
+                   "symbol table · order-id counter",
+                   "",
+                   "the only thing that",
+                   "changes a book"], kind: "market" },
+  stream:  { x: 456, y: 470, w: 248, h: 70,  title: "Stream actor",
+             sub: ["seq · replay buffer · broadcast"], kind: "stream" },
+
+  s0: { x: 752, y: 92,  w: 300, h: 62, title: "ACME", sub: ["Exchange = Simulator + OrderBook"], kind: "symbol", ticker: true },
+  s1: { x: 752, y: 170, w: 300, h: 62, title: "NBLA", sub: ["bars · tape · halt · stops"],        kind: "symbol", ticker: true },
+  s2: { x: 752, y: 248, w: 300, h: 62, title: "HLIO", sub: ["one tokio task each"],                kind: "symbol", ticker: true },
+  s3: { x: 752, y: 326, w: 300, h: 62, title: "PXCO", sub: ["reads answered without the market"],  kind: "symbol", ticker: true }
+};
+
+const EDGES = {
+  ui_in:          { a: "ui", b: "mwCount", pts: [[190,96],[210,96],[210,144],[236,144]] },
+  bot_in:         { a: "bot", b: "mwCount", pts: [[190,200],[210,200],[210,144],[236,144]] },
+  gm_in:          { a: "gm", b: "mwCount", pts: [[190,304],[210,304],[210,144],[236,144]],
+                    label: { t: "REST", x: 204, y: 334, a: "end" } },
+  count_rate:     { a: "mwCount", b: "mwRate", pts: [[321,170],[321,196]] },
+  rate_lim:       { a: "mwRate", b: "limiter", pts: [[236,222],[218,222],[218,496],[236,496]], dashed: true,
+                    label: { t: "allow(user)", x: 212, y: 372, a: "end" } },
+  rate_handler:   { a: "mwRate", b: "handler", pts: [[321,248],[321,274]] },
+  handler_market: { a: "handler", b: "market", pts: [[406,300],[430,300],[430,250],[456,250]],
+                    label: { t: "job", x: 432, y: 214, a: "middle" } },
+  engine_market:  { a: "engine", b: "market", pts: [[640,104],[640,140]],
+                    label: { t: "every 250 ms", x: 652, y: 126, a: "start" } },
+  market_s0:      { a: "market", b: "s0", pts: [[704,250],[728,250],[728,123],[752,123]] },
+  market_s1:      { a: "market", b: "s1", pts: [[704,250],[728,250],[728,201],[752,201]] },
+  market_s2:      { a: "market", b: "s2", pts: [[704,250],[728,250],[728,279],[752,279]],
+                    label: { t: "prepare · submit · cancel · step", x: 900, y: 240, a: "middle" } },
+  market_s3:      { a: "market", b: "s3", pts: [[704,250],[728,250],[728,357],[752,357]] },
+  market_stream:  { a: "market", b: "stream", pts: [[580,360],[580,470]],
+                    label: { t: "publish", x: 592, y: 412, a: "start" } },
+  stream_ui:      { a: "stream", b: "ui", pts: [[580,540],[580,600],[24,600],[24,96],[44,96]],
+                    label: { t: "SSE /api/stream · every message numbered", x: 320, y: 590, a: "middle" } },
+  reads:          { a: "handler", b: "s0", pts: [[320,326],[320,430],[1076,430],[1076,123],[1052,123]], dashed: true,
+                    label: { t: "reads: quote · book · bars · tape", x: 872, y: 421, a: "middle" } }
+};
+
+/* ------------------------------------------------------------------ *
+ * Book and account state the panels show.
+ * ------------------------------------------------------------------ */
+
+const BASE_BOOK = {
+  asks: [ { p: 5013, q: 914 }, { p: 5011, q: 703 }, { p: 5008, q: 541 }, { p: 5006, q: 416 }, { p: 5003, q: 320 } ],
+  bids: [ { p: 4998, q: 320 }, { p: 4995, q: 416 }, { p: 4993, q: 541 }, { p: 4990, q: 703 }, { p: 4988, q: 914 } ]
+};
+
+const BASE_STATE = {
+  cash: 5000000, reserved: 0, pos: 0, resq: 0,
+  seq: 1041, msg: "—", mailbox: 0, mailboxCap: "idle",
+  status: "", statusKind: "",
+  book: BASE_BOOK
+};
+
+let S = clone(BASE_STATE);
+
+function clone(o) { return JSON.parse(JSON.stringify(o)); }
+function money(c) {
+  const neg = c < 0; c = Math.abs(c);
+  const s = (c / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (neg ? "-$" : "$") + s;
+}
+function cents(c) { return c.toLocaleString("en-US") + "¢"; }
+
+/* ------------------------------------------------------------------ *
+ * The paths a request can take.
+ * ------------------------------------------------------------------ */
+
+const AUTH_HOPS = [
+  { e: "count_rate", t: "Counted from the outside",
+    b: "The metrics layer wraps everything else, so it records what the client actually saw — a rate-limited refusal included.",
+    r: "api.rs · count" },
+  { e: "rate_lim", kind: "dim", t: "allow(user)",
+    b: "Only unsafe methods reach the limiter. The key names the user, the limiter actor answers Allowed or Limited { retry_after }, and a 429 carries an honest Retry-After.",
+    r: "api.rs · rate_limit_writes → limit.rs" },
+  { e: "rate_handler", t: "Who is asking",
+    b: "The handler reads the published key directory straight off a watch channel — no message sent — and refuses a key that does not own this trader.",
+    r: "api.rs · Caller, owned_trader" }
+];
+
+const SCENARIOS = [
+  {
+    id: "rest",
+    name: "Limit buy that rests",
+    caption: "A limit buy at 4 991¢ does not cross the 5 003¢ ask, so it joins the book — and the cash behind it is reserved in the same job.",
+    steps: [
+      { e: "bot_in", t: "POST /api/symbols/ACME/orders",
+        b: "buy 500 ACME, limit 4 991¢, good till cancelled, with an idempotency key of its own.",
+        r: "api.rs · submit_order",
+        fx: s => { s.status = "sent"; s.statusKind = "live"; } },
+      ...AUTH_HOPS,
+      { e: "handler_market", t: "One job on the mailbox",
+        b: "Everything that moves money or a book queues here, in arrival order, and the actor runs them one at a time.",
+        r: "market.rs · Market::place",
+        fx: s => { s.mailbox = 1; s.mailboxCap = "place(ACME, trader 7)"; } },
+      { e: "market_s0", t: "SymbolState::prepare",
+        b: "The symbol's word on the order: tick and lot size, the session, post-only, a self-cross against the trader's own resting orders, the expiry, and the worst case it could cost. Nothing changes yet.",
+        r: "symbol.rs · prepare" },
+      { n: "market", t: "Sent twice? Answered once",
+        b: "A client_order_id already on file replays the first response instead of placing a second order — and the same id asking for something else is refused rather than quietly obeyed.",
+        r: "market.rs · order_by_client_id" },
+      { n: "market", t: "Shares that actually exist",
+        b: "Outstanding 1 000 000, less what traders hold, less what their resting bids already claim. A buy can only be filled out of what is left.",
+        r: "market.rs · fund_and_send" },
+      { n: "market", t: "The account funds it",
+        b: "500 × 4 991¢ = " + money(2495500) + ", plus the taker fee (0 bps by default), checked against an active account with the cash free.",
+        r: "trading.rs · Trader::check" },
+      { n: "market", t: "An id no book repeats",
+        b: "max(the market's counter, this book's own next id) — order ids span every symbol, because the order log and the client-id index do.",
+        r: "market.rs · allocate_order_id" },
+      { e: "market_s0", t: "submit — the book changes",
+        b: "Price–time priority against the synthetic ladder and other traders. 4 991¢ is under the best ask, so nothing crosses: 500 rest between the 4 993 and 4 990 levels.",
+        r: "symbol.rs · submit → book.rs",
+        fx: s => {
+          s.book = clone(BASE_BOOK);
+          s.book.bids.splice(3, 0, { p: 4991, q: 500, mine: true });
+          s.book.bids.pop();
+          s.status = "resting"; s.statusKind = "ok";
+        } },
+      { n: "market", t: "Reserve exactly what rests",
+        b: "24 955 00¢ held against the account — the same number the book now shows. Reconciliation checks precisely this later.",
+        r: "market.rs · Trader::reserve",
+        fx: s => { s.reserved = 2495500; s.cash = 5000000 - 2495500; } },
+      { n: "market", t: "Into the order log",
+        b: "The record, and its client_order_id in the index. The log is bounded: the oldest order that is no longer live falls off the end.",
+        r: "market.rs · record_order",
+        fx: s => { s.mailbox = 0; s.mailboxCap = "idle"; } },
+      { e: "handler_market", d: -1, t: "201 Created",
+        b: "{ order_id: 1284, status: \"resting\", filled: 0, remaining: 500 }",
+        r: "trading.rs · OrderResponse" },
+      { e: "bot_in", d: -1, t: "Back to the client",
+        b: "The whole round trip touched one book, one account, and one actor's queue.",
+        r: "" }
+    ]
+  },
+
+  {
+    id: "cross",
+    name: "Market buy that fills",
+    caption: "A market order becomes an immediate-or-cancel limit at the collar, walks three levels of the ladder, and settles in the accounts before the actor takes its next job.",
+    steps: [
+      { e: "bot_in", t: "POST /api/symbols/ACME/orders",
+        b: "buy 800 ACME at market. No price: the exchange will price it at the collar.",
+        r: "api.rs · submit_order",
+        fx: s => { s.status = "sent"; s.statusKind = "live"; } },
+      ...AUTH_HOPS,
+      { e: "handler_market", t: "One job on the mailbox",
+        b: "Same queue as every other order, cancel, dividend, listing and engine step.",
+        r: "market.rs · Market::place",
+        fx: s => { s.mailbox = 2; s.mailboxCap = "place · 1 job waiting"; } },
+      { e: "market_s0", t: "prepare prices the worst case",
+        b: "preview_market walks the ladder within the 5 % collar: 320 at 5 003, 416 at 5 006, 64 at 5 008 — " + money(4003968) + " if it all trades.",
+        r: "symbol.rs · prepare → exchange.rs · preview_market" },
+      { n: "market", t: "The account funds it",
+        b: "The taker fee is charged the moment the order fills, so it is checked here with the notional rather than discovered afterwards.",
+        r: "market.rs · fund_and_send" },
+      { e: "market_s0", t: "submit — three levels taken",
+        b: "The exchange rewrites a market order as an IOC limit at the collar, so it can never sweep the book to nothing. 800 fill; there is no remainder to rest.",
+        r: "exchange.rs · submit → book.rs",
+        fx: s => {
+          s.book = clone(BASE_BOOK);
+          s.book.asks[4].q = 0; s.book.asks[4].hit = true;
+          s.book.asks[3].q = 0; s.book.asks[3].hit = true;
+          s.book.asks[2].q = 541 - 64; s.book.asks[2].hit = true;
+          s.status = "filled"; s.statusKind = "ok";
+        } },
+      { n: "market", t: "Book the fills",
+        b: "Each party's order record is marked filled, cash and shares move through the account, the fee is taken, and a fill record is written — all before the actor looks at its next job.",
+        r: "market.rs · book → trading.rs · apply_trade",
+        fx: s => { s.cash = 5000000 - 4003968; s.pos = 800; } },
+      { e: "market_stream", kind: "stream", t: "Publish the fills",
+        b: "One Fill message per trader per trade, each taking the next sequence number.",
+        r: "market.rs · StreamMessage::Fill",
+        fx: s => { s.seq += 3; s.msg = "fill"; } },
+      { e: "stream_ui", kind: "stream", t: "Down the open streams",
+        b: "Broadcast to every subscriber; the browser's blotter and position update without asking.",
+        r: "api.rs · stream" },
+      { n: "s0", t: "The trade becomes price impact",
+        b: "The signed flow is added to pending_flow. On the next tick it turns into a jump plus a permanent fundamental shift — buying pressure moves the price, which is the point of trading against a simulator.",
+        r: "exchange.rs · account, apply_impact",
+        fx: s => { s.mailbox = 1; s.mailboxCap = "1 job waiting"; } },
+      { e: "handler_market", d: -1, t: "201 Created",
+        b: "{ status: \"filled\", filled: 800, avg_price_cents: 5005 }",
+        r: "trading.rs · OrderResponse",
+        fx: s => { s.mailbox = 0; s.mailboxCap = "idle"; } },
+      { e: "bot_in", d: -1, t: "Back to the client", b: "", r: "" }
+    ]
+  },
+
+  {
+    id: "refused",
+    name: "Refused: no shares left",
+    caption: "The supply check subtracts numbers that cannot move under it — which is the whole reason the money is serialised on one actor.",
+    steps: [
+      { e: "bot_in", t: "POST /api/symbols/ACME/orders",
+        b: "buy 40 000 ACME at market, from a trader with the cash to do it.",
+        r: "api.rs · submit_order",
+        fx: s => { s.status = "sent"; s.statusKind = "live"; } },
+      ...AUTH_HOPS,
+      { e: "handler_market", t: "One job on the mailbox",
+        b: "The order joins the queue behind an engine step that is still settling.",
+        r: "market.rs · Market::place",
+        fx: s => { s.mailbox = 2; s.mailboxCap = "place · behind a step"; } },
+      { e: "market_s0", t: "prepare, then the count",
+        b: "The symbol reports how many shares its book's resting bids already claim, in the same job that will submit the order.",
+        r: "symbol.rs · prepare, bid_shares" },
+      { n: "market", kind: "bad", t: "SupplyExhausted",
+        b: "1 000 000 outstanding, less 968 400 held by traders, less 5 100 already bid for: 26 500 available against 40 000 asked. The order is refused and the counter of refusals ticks up.",
+        r: "market.rs · Refused::SupplyExhausted",
+        fx: s => { s.status = "refused"; s.statusKind = "bad"; s.mailbox = 0; s.mailboxCap = "idle"; } },
+      { n: "market", t: "Nothing was touched",
+        b: "No id was spent, no book changed, no cash was reserved. The check held because no other job could run between the count and the submit — a lock is not needed when there is only one queue.",
+        r: "market.rs · fund_and_send" },
+      { e: "handler_market", d: -1, kind: "bad", t: "422 Unprocessable Entity",
+        b: "{ error: { code: \"refused\", message: \"needs 40000 shares, 26500 available\" } }",
+        r: "api.rs · ApiError::place" },
+      { e: "bot_in", d: -1, kind: "bad", t: "Back to the client", b: "", r: "" }
+    ]
+  },
+
+  {
+    id: "step",
+    name: "Engine step",
+    caption: "One job on the market fans the advance out to every symbol at once, then settles them in listing order: ticks, fills, expiries, stops.",
+    steps: [
+      { e: "engine_market", kind: "engine", t: "The engine loop wakes",
+        b: "Every 250 ms of wall time it asks for the simulated now, and that whole advance is one job on the market actor.",
+        r: "engine.rs · advance_to",
+        fx: s => { s.mailbox = 1; s.mailboxCap = "step(now)"; s.status = "stepping"; s.statusKind = "live"; } },
+      { es: ["market_s0", "market_s1", "market_s2", "market_s3"], kind: "engine", t: "Posted to every symbol at once",
+        b: "request(), not call(): all four jobs are posted before any reply is waited on, so the simulators advance in parallel on four tasks.",
+        r: "market.rs · Market::step" },
+      { n: "s0", kind: "engine", t: "Inside each symbol",
+        b: "Pending trader flow becomes a price-impact event, the simulator steps, its tick volume is realised as synthetic prints against the book, and the maker ladder is re-quoted around the new reference.",
+        r: "exchange.rs · step, synthetic_flow, requote",
+        fx: s => {
+          s.book = { asks: [ { p: 5019, q: 902 }, { p: 5017, q: 694 }, { p: 5014, q: 528 }, { p: 5012, q: 402 }, { p: 5009, q: 311 } ],
+                     bids: [ { p: 5004, q: 311 }, { p: 5001, q: 402 }, { p: 4999, q: 528 }, { p: 4996, q: 694 }, { p: 4994, q: 902 } ] };
+        } },
+      { n: "s0", kind: "engine", t: "Bands and stops",
+        b: "A day that closed re-bands the limit move; a price outside the band halts the symbol; a stop whose trigger the price reached is handed back to the market — but only if trading is open.",
+        r: "symbol.rs · step, review_halt" },
+      { es: ["market_s0", "market_s1", "market_s2", "market_s3"], d: -1, kind: "engine", t: "Joined in listing order",
+        b: "The market takes the four results in a fixed order, so a step is as deterministic as the simulators under it.",
+        r: "market.rs · Market::step" },
+      { e: "market_stream", kind: "stream", t: "Publish the tick",
+        b: "Price, volume, which bar intervals closed, the top of the book and the newest prints — one message per symbol.",
+        r: "market.rs · settle",
+        fx: s => { s.seq += 4; s.msg = "tick"; } },
+      { n: "market", t: "Book what the prints ran into",
+        b: "A synthetic print that crossed a trader's resting order filled it. Those trades hit the accounts here, in the same job, before anything else sees the book.",
+        r: "market.rs · settle → book",
+        fx: s => { s.pos = 800; s.reserved = 0; } },
+      { n: "market", t: "Sweep the expired",
+        b: "Day orders and good-till-date orders whose deadline has passed come out of the book, their reservations released and an OrderExpired message published — halted symbols included, because a halt stops trading, not the clock.",
+        r: "market.rs · sweep_expired" },
+      { n: "market", t: "Stops that fired become orders",
+        b: "Each triggered stop goes back through Market::place from inside this same job — so it is funded, checked and reserved exactly like an order a client sent.",
+        r: "market.rs · settle",
+        fx: s => { s.seq += 1; s.msg = "stop_triggered"; } },
+      { e: "stream_ui", kind: "stream", t: "Out to every open stream",
+        b: "The chart extends, the tape scrolls, the book redraws. A client that dropped out asks for what it missed with ?since=.",
+        r: "api.rs · stream",
+        fx: s => { s.mailbox = 0; s.mailboxCap = "idle"; s.status = "stepped"; s.statusKind = "ok"; } }
+    ]
+  },
+
+  {
+    id: "cancel",
+    name: "Cancel",
+    caption: "Out of the book first, then the reservation comes back — exactly what it took, priced at the order's own price.",
+    steps: [
+      { e: "bot_in", t: "DELETE /api/symbols/ACME/orders/1284",
+        b: "The trader withdraws the resting buy from the first path.",
+        r: "api.rs · cancel_order",
+        fx: s => {
+          s.book = clone(BASE_BOOK);
+          s.book.bids.splice(3, 0, { p: 4991, q: 500, mine: true });
+          s.book.bids.pop();
+          s.reserved = 2495500; s.cash = 5000000 - 2495500;
+          s.status = "cancelling"; s.statusKind = "live";
+        } },
+      ...AUTH_HOPS,
+      { e: "handler_market", t: "One job on the mailbox",
+        b: "A cancel changes a book, so it queues with everything else that does.",
+        r: "market.rs · Market::cancel",
+        fx: s => { s.mailbox = 1; s.mailboxCap = "cancel(1284)"; } },
+      { e: "market_s0", t: "Out of the book",
+        b: "The symbol refuses an id that is not resting, and an order that belongs to someone else — a trader can only cancel their own.",
+        r: "symbol.rs · cancel → exchange.rs",
+        fx: s => { s.book = clone(BASE_BOOK); } },
+      { n: "market", t: "Release what it held",
+        b: "The outstanding quantity at the order's price, back on the account, and the record marked cancelled with the amount that never filled.",
+        r: "market.rs · release",
+        fx: s => { s.reserved = 0; s.cash = 5000000; s.status = "cancelled"; s.statusKind = "ok"; s.mailbox = 0; s.mailboxCap = "idle"; } },
+      { e: "handler_market", d: -1, t: "200 OK",
+        b: "{ order_id: 1284, cancelled: 500 }", r: "api.rs · cancel_order" },
+      { e: "bot_in", d: -1, t: "Back to the client", b: "", r: "" }
+    ]
+  },
+
+  {
+    id: "read",
+    name: "A read skips the market",
+    caption: "Market data goes straight to the symbol actor. The market could be mid-settlement and this still answers.",
+    steps: [
+      { e: "bot_in", t: "GET /api/symbols/ACME/book?depth=5",
+        b: "No key needed: quotes, bars, the book, the tape and the event log are open to anyone.",
+        r: "api.rs · get_book",
+        fx: s => { s.status = "reading"; s.statusKind = "live"; } },
+      { e: "count_rate", t: "Counted, never limited",
+        b: "The limiter only counts unsafe methods. Reads are cheap and idempotent; what is worth protecting is the actor every order goes through.",
+        r: "api.rs · rate_limit_writes" },
+      { e: "rate_handler", t: "Which symbols exist",
+        b: "The listing table is published on a watch channel as an immutable snapshot, so finding ACME sends no message at all.",
+        r: "market.rs · publish_listings" },
+      { e: "reads", t: "Straight to the symbol",
+        b: "The handler asks the symbol actor directly. The market is not in this path — it is not even told.",
+        r: "market.rs · Symbol::ask" },
+      { n: "s0", t: "A snapshot of the book",
+        b: "Aggregated levels, and an iceberg contributing only what it shows. Built inside the symbol's own job, so it is never half a book.",
+        r: "symbol.rs · book → trading.rs · BookDto",
+        fx: s => { s.book = clone(BASE_BOOK); } },
+      { e: "reads", d: -1, t: "200 OK",
+        b: "Answered while the market actor was busy settling an engine step — which is exactly what splitting them apart bought.",
+        r: "api.rs · get_book",
+        fx: s => { s.status = "served"; s.statusKind = "ok"; } },
+      { e: "bot_in", d: -1, t: "Back to the client", b: "", r: "" }
+    ]
+  }
+];
+
+/* ------------------------------------------------------------------ *
+ * Drawing the map.
+ * ------------------------------------------------------------------ */
+
+const svg = document.getElementById("map");
+const nodeEls = {};
+const edgeEls = {};
+
+function mk(tag, attrs, parent) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+function roundedPath(pts, r) {
+  let d = "M " + pts[0][0] + " " + pts[0][1];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const [px, py] = pts[i - 1], [cx, cy] = pts[i], [nx, ny] = pts[i + 1];
+    const d1 = Math.hypot(cx - px, cy - py), d2 = Math.hypot(nx - cx, ny - cy);
+    const r1 = Math.min(r, d1 / 2, d2 / 2);
+    const a = [cx + (px - cx) / d1 * r1, cy + (py - cy) / d1 * r1];
+    const b = [cx + (nx - cx) / d2 * r1, cy + (ny - cy) / d2 * r1];
+    d += " L " + a[0] + " " + a[1] + " Q " + cx + " " + cy + " " + b[0] + " " + b[1];
+  }
+  const last = pts[pts.length - 1];
+  d += " L " + last[0] + " " + last[1];
+  return d;
+}
+
+function edgeGeometry(pts) {
+  const segs = [];
+  let total = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const len = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+    segs.push({ a: pts[i - 1], b: pts[i], len });
+    total += len;
+  }
+  return { segs, total };
+}
+
+function pointAt(geo, t) {
+  let want = geo.total * Math.max(0, Math.min(1, t));
+  for (const s of geo.segs) {
+    if (want <= s.len || s === geo.segs[geo.segs.length - 1]) {
+      const k = s.len === 0 ? 0 : want / s.len;
+      return [s.a[0] + (s.b[0] - s.a[0]) * k, s.a[1] + (s.b[1] - s.a[1]) * k];
+    }
+    want -= s.len;
+  }
+  return geo.segs[0].a;
+}
+
+const layerEdges = mk("g", {}, svg);
+const layerNodes = mk("g", {}, svg);
+const layerLabels = mk("g", {}, svg);
+const layerTokens = mk("g", {}, svg);
+
+const defs = mk("defs", {}, svg);
+const MARKERS = {
+  line:   "var(--line)",
+  accent: "var(--accent)",
+  engine: "var(--engine)",
+  stream: "var(--stream)",
+  bad:    "var(--sell)"
+};
+for (const name in MARKERS) {
+  const m = mk("marker", {
+    id: "ah-" + name, viewBox: "0 0 10 10", refX: 9, refY: 5,
+    markerWidth: 6.5, markerHeight: 6.5, orient: "auto"
+  }, defs);
+  mk("polygon", { points: "0,1.5 10,5 0,8.5", fill: MARKERS[name] }, m);
+}
+
+for (const id in EDGES) {
+  const e = EDGES[id];
+  const p = mk("path", {
+    d: roundedPath(e.pts, 11),
+    class: "e-line" + (e.dashed ? " dashed" : ""),
+    "marker-end": "url(#ah-line)"
+  }, layerEdges);
+  e.geo = edgeGeometry(e.pts);
+  edgeEls[id] = p;
+  if (e.label) {
+    mk("text", { x: e.label.x, y: e.label.y, class: "e-label", "text-anchor": e.label.a }, layerLabels)
+      .textContent = e.label.t;
+  }
+}
+
+for (const id in NODES) {
+  const n = NODES[id];
+  const g = mk("g", {}, layerNodes);
+  const box = mk("rect", {
+    x: n.x, y: n.y, width: n.w, height: n.h, rx: 3,
+    class: "n-box" + (n.kind ? " " + n.kind : "")
+  }, g);
+  const padX = id === "market" ? 40 : 14;
+  mk("text", { x: n.x + padX, y: n.y + 23, class: n.ticker ? "n-tick" : "n-title" }, g).textContent = n.title;
+  n.sub.forEach((line, i) => {
+    if (!line) return;
+    const t = mk("text", { x: n.x + padX, y: n.y + (n.ticker ? 44 : 40) + i * 14, class: "n-sub" }, g);
+    t.textContent = line;
+  });
+  nodeEls[id] = box;
+}
+
+/* the market's mailbox strip */
+const strip = mk("g", {}, layerNodes);
+mk("rect", { x: 456, y: 140, width: 26, height: 220, rx: 3, class: "strip" }, strip);
+const slotEls = [];
+for (let i = 0; i < 6; i++) {
+  slotEls.push(mk("rect", { x: 461, y: 330 - i * 30, width: 16, height: 22, rx: 2, class: "slot" }, strip));
+}
+mk("text", { x: 456, y: 132, class: "e-label" }, layerLabels).textContent = "mailbox — one job at a time";
+
+/* the token that travels */
+const token = mk("circle", { r: 7, cx: -20, cy: -20, class: "tok tok-hidden" }, layerTokens);
+const extraTokens = [];
+for (let i = 0; i < 4; i++) {
+  extraTokens.push(mk("circle", { r: 6, cx: -20, cy: -20, class: "tok tok-hidden" }, layerTokens));
+}
+
+/* ------------------------------------------------------------------ *
+ * Panels.
+ * ------------------------------------------------------------------ */
+
+const cellsEl = document.getElementById("cells");
+const cellEls = [];
+for (let i = 0; i < 6; i++) {
+  const c = document.createElement("i");
+  c.className = "cell";
+  cellsEl.appendChild(c);
+  cellEls.push(c);
+}
+
+function renderState() {
+  document.getElementById("v-cash").textContent = money(S.cash);
+  document.getElementById("v-res").textContent = money(S.reserved);
+  document.getElementById("v-pos").textContent = S.pos.toLocaleString("en-US");
+  document.getElementById("v-resq").textContent = S.resq.toLocaleString("en-US");
+  document.getElementById("v-seq").textContent = S.seq.toLocaleString("en-US");
+  document.getElementById("v-msg").textContent = S.msg;
+  document.getElementById("mailbox-cap").textContent = S.mailboxCap;
+  cellEls.forEach((c, i) => c.classList.toggle("on", i < S.mailbox));
+  slotEls.forEach((s, i) => s.setAttribute("class", "slot" + (i < S.mailbox ? " on" : "")));
+
+  const pill = document.getElementById("status-pill");
+  pill.innerHTML = S.status
+    ? '<span class="pill ' + S.statusKind + '">' + S.status + "</span>"
+    : "";
+
+  const rows = [];
+  const all = S.book.asks.concat(S.book.bids);
+  const max = Math.max(1, ...all.map(l => l.q));
+  const line = (l, side) =>
+    '<div class="lrow ' + side + (l.mine ? " mine" : "") + (l.hit ? " hit" : "") + '">' +
+    '<span class="p">' + l.p.toLocaleString("en-US") + "</span>" +
+    '<span class="q">' + (l.q ? l.q.toLocaleString("en-US") : "0") + "</span>" +
+    '<span class="bar" style="width: ' + Math.round(6 + 94 * l.q / max) + '%"></span></div>';
+  S.book.asks.forEach(l => rows.push(line(l, "ask")));
+  const bestAsk = Math.min(...S.book.asks.filter(l => l.q > 0).map(l => l.p));
+  const bestBid = Math.max(...S.book.bids.filter(l => l.q > 0).map(l => l.p));
+  rows.push('<div class="spread"><span>spread</span><span>' +
+    (isFinite(bestAsk) && isFinite(bestBid) ? (bestAsk - bestBid) + "¢ · mid " + ((bestAsk + bestBid) / 2).toFixed(1) + "¢" : "—") +
+    "</span></div>");
+  S.book.bids.forEach(l => rows.push(line(l, "bid")));
+  document.getElementById("ladder").innerHTML = rows.join("");
+}
+
+/* ------------------------------------------------------------------ *
+ * Playback.
+ * ------------------------------------------------------------------ */
+
+let current = SCENARIOS[0];
+let idx = -1;
+let playing = !reduced;
+let speed = 1;
+let raf = 0, timer = 0;
+
+const traceList = document.getElementById("trace-list");
+const traceMeta = document.getElementById("trace-meta");
+const captionEl = document.getElementById("caption");
+
+function buildChips() {
+  const box = document.getElementById("scenarios");
+  SCENARIOS.forEach(sc => {
+    const b = document.createElement("button");
+    b.className = "chip";
+    b.type = "button";
+    b.textContent = sc.name;
+    b.setAttribute("aria-pressed", sc === current ? "true" : "false");
+    b.addEventListener("click", () => selectScenario(sc));
+    sc.chip = b;
+    box.appendChild(b);
+  });
+}
+
+function buildTrace() {
+  traceList.innerHTML = current.steps.map((s, i) =>
+    '<li data-i="' + i + '"' + (s.kind === "bad" ? ' class="bad"' : "") + '>' +
+    '<span class="num">' + String(i + 1).padStart(2, "0") + "</span>" +
+    '<span><span class="t">' + s.t + "</span>" +
+    (s.b ? '<span class="b">' + s.b + "</span>" : "") +
+    (s.r ? '<span class="r">' + s.r + "</span>" : "") +
+    "</span></li>"
+  ).join("");
+}
+
+function clearHighlights() {
+  for (const id in nodeEls) nodeEls[id].setAttribute("class", "n-box" + (NODES[id].kind ? " " + NODES[id].kind : ""));
+  for (const id in edgeEls) {
+    const e = EDGES[id];
+    edgeEls[id].setAttribute("class", "e-line" + (e.dashed ? " dashed" : ""));
+    edgeEls[id].style.color = "";
+    edgeEls[id].setAttribute("marker-end", "url(#ah-line)");
+  }
+  token.setAttribute("class", "tok tok-hidden");
+  extraTokens.forEach(t => t.setAttribute("class", "tok tok-hidden"));
+}
+
+function litClass(kind) {
+  if (kind === "engine") return " lit-engine";
+  if (kind === "stream") return " lit-stream";
+  if (kind === "bad") return " lit-bad";
+  return " lit";
+}
+function tokClass(kind) {
+  if (kind === "engine") return "tok engine";
+  if (kind === "stream") return "tok stream";
+  if (kind === "bad") return "tok bad";
+  return "tok";
+}
+function edgeColor(kind) {
+  if (kind === "engine") return "var(--engine)";
+  if (kind === "stream") return "var(--stream)";
+  if (kind === "bad") return "var(--sell)";
+  return "var(--accent)";
+}
+function markerFor(kind) {
+  if (kind === "engine") return "url(#ah-engine)";
+  if (kind === "stream") return "url(#ah-stream)";
+  if (kind === "bad") return "url(#ah-bad)";
+  return "url(#ah-accent)";
+}
+function lightNode(id, kind) {
+  if (!nodeEls[id]) return;
+  const n = NODES[id];
+  nodeEls[id].setAttribute("class", "n-box" + (n.kind ? " " + n.kind : "") + litClass(kind));
+}
+
+function applyState(upTo) {
+  S = clone(BASE_STATE);
+  for (let i = 0; i <= upTo; i++) {
+    const fx = current.steps[i] && current.steps[i].fx;
+    if (fx) fx(S);
+  }
+  renderState();
+}
+
+function markTrace() {
+  [...traceList.children].forEach((li, i) => {
+    li.classList.toggle("now", i === idx);
+    li.classList.toggle("done", i < idx);
+  });
+  const now = traceList.children[idx];
+  if (now) now.scrollIntoView({ block: "nearest", behavior: reduced ? "auto" : "smooth" });
+  traceMeta.textContent = "step " + (idx + 1) + " / " + current.steps.length;
+}
+
+function runStep(i, animate) {
+  cancelAnimationFrame(raf);
+  clearTimeout(timer);
+  idx = i;
+  const step = current.steps[i];
+  clearHighlights();
+  applyState(i);
+  markTrace();
+
+  const ids = step.es ? step.es : (step.e ? [step.e] : []);
+  const dir = step.d === -1 ? -1 : 1;
+  const kind = step.kind;
+
+  ids.forEach(id => {
+    edgeEls[id].setAttribute("class", "e-line lit" + (EDGES[id].dashed ? " dashed" : ""));
+    edgeEls[id].style.color = edgeColor(kind);
+    edgeEls[id].setAttribute("marker-end", markerFor(kind));
+  });
+  if (step.n) lightNode(step.n, kind);
+  ids.forEach(id => lightNode(dir === 1 ? EDGES[id].b : EDGES[id].a, kind));
+
+  const nodeDwell = 1500 / speed;
+  if (ids.length === 0) {
+    schedule(nodeDwell);
+    return;
+  }
+
+  const geos = ids.map(id => EDGES[id].geo);
+  const travel = Math.max(650, Math.min(1900, geos[0].total * 1.9)) / speed;
+  const toks = [token, ...extraTokens];
+  ids.forEach((id, k) => toks[k].setAttribute("class", tokClass(kind)));
+
+  if (!animate || reduced) {
+    ids.forEach((id, k) => {
+      const p = pointAt(geos[k], dir === 1 ? 1 : 0);
+      toks[k].setAttribute("cx", p[0]);
+      toks[k].setAttribute("cy", p[1]);
+    });
+    schedule(nodeDwell);
+    return;
+  }
+
+  const t0 = performance.now();
+  const frame = now => {
+    const t = Math.min(1, (now - t0) / travel);
+    const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    ids.forEach((id, k) => {
+      const p = pointAt(geos[k], dir === 1 ? eased : 1 - eased);
+      toks[k].setAttribute("cx", p[0]);
+      toks[k].setAttribute("cy", p[1]);
+    });
+    if (t < 1) raf = requestAnimationFrame(frame);
+    else schedule(700 / speed);
+  };
+  raf = requestAnimationFrame(frame);
+}
+
+function schedule(delay) {
+  if (!playing) return;
+  timer = setTimeout(() => {
+    if (idx + 1 < current.steps.length) runStep(idx + 1, true);
+    else {
+      const nextIdx = (SCENARIOS.indexOf(current) + 1) % SCENARIOS.length;
+      selectScenario(SCENARIOS[nextIdx]);
+    }
+  }, delay);
+}
+
+function selectScenario(sc) {
+  cancelAnimationFrame(raf);
+  clearTimeout(timer);
+  current = sc;
+  SCENARIOS.forEach(s => s.chip.setAttribute("aria-pressed", s === sc ? "true" : "false"));
+  captionEl.textContent = sc.caption;
+  buildTrace();
+  runStep(0, playing && !reduced);
+}
+
+function setPlaying(on) {
+  playing = on;
+  document.getElementById("play").textContent = on ? "Pause" : "Play";
+  if (on) schedule(300);
+  else { cancelAnimationFrame(raf); clearTimeout(timer); }
+}
+
+document.getElementById("play").addEventListener("click", () => setPlaying(!playing));
+document.getElementById("next").addEventListener("click", () => {
+  setPlaying(false);
+  runStep(Math.min(idx + 1, current.steps.length - 1), false);
+});
+document.getElementById("prev").addEventListener("click", () => {
+  setPlaying(false);
+  runStep(Math.max(idx - 1, 0), false);
+});
+document.getElementById("speed").addEventListener("change", e => { speed = parseFloat(e.target.value); });
+traceList.addEventListener("click", e => {
+  const li = e.target.closest("li");
+  if (!li) return;
+  setPlaying(false);
+  runStep(parseInt(li.dataset.i, 10), false);
+});
+document.addEventListener("keydown", e => {
+  if (e.key === " ") { e.preventDefault(); setPlaying(!playing); }
+  if (e.key === "ArrowRight") document.getElementById("next").click();
+  if (e.key === "ArrowLeft") document.getElementById("prev").click();
+});
+
+buildChips();
+renderState();
+selectScenario(SCENARIOS[0]);
+document.getElementById("play").textContent = playing ? "Pause" : "Play";
+if (!playing) runStep(0, false);
+</script>
+</body>
+</html>
