@@ -213,6 +213,10 @@ adds a user's positions up per symbol — owned, reserved and sellable — acros
 every trader of theirs, and shares belong to the trader that bought them: one
 trader cannot sell another's, even under the same user.
 
+What is deliberately *not* built — stop orders, fees, corporate actions,
+sequence numbers on the stream — and the decisions behind what is, are listed
+in [DESIGN.md §15](DESIGN.md#15-not-built-yet).
+
 ## License
 
 MIT OR Apache-2.0.
