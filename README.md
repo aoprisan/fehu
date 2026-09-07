@@ -86,6 +86,11 @@ job that fans the advance out to every symbol at once and joins them. Reads
 of a quote, a book or the bars go straight to the symbol and wait for
 nothing else. `webapp/src/market.rs` has the whole account.
 
+[`docs/architecture.html`](docs/architecture.html) draws that: open it in a
+browser and watch an order travel the actors — the middleware, the market's
+mailbox, the book, the fills and the stream — one step at a time, alongside an
+engine step, a cancel, a refusal and a read that never touches the market.
+
 The UI is TypeScript ([`webapp/ui/`](webapp/ui/README.md)) built with Vite.
 Its output is committed to `webapp/static/` and embedded into the binary, so
 the command above needs no Node toolchain; `just ui` rebuilds it after a
