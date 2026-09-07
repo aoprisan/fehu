@@ -7,9 +7,10 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRequestParts, OptionalFromRequestParts, Path, Query, State};
+use axum::extract::{FromRequestParts, OptionalFromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -28,6 +29,7 @@ use crate::events::{
     CatalogEntry, EventRecord, GameEventKind, GameEventRequest, MAX_MAGNITUDE, Prepared,
     PushEventRequest, Scope, SimEvent,
 };
+use crate::limit::Decision;
 use crate::market::{
     App, Closed, Market, PlaceError, Quote, Sequenced, SnapshotDto, StreamMessage, Subscription,
     SymbolInfo, SymbolState, SymbolStatus, wall_now_ms,
@@ -107,9 +109,37 @@ pub fn router(app: AppState) -> Router {
         .route("/api/game/events", get(list_events).post(push_game_event))
         .route("/api/events", get(list_events))
         .route("/api/stream", get(stream))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&app),
+            rate_limit_writes,
+        ))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(app)
+}
+
+/// Refuse a client that is changing the market faster than
+/// `FEHU_RATE_PER_SEC` allows.
+///
+/// Only unsafe methods are counted. Reads are cheap, idempotent and mostly
+/// public; what is worth protecting is the one market lock every order goes
+/// through, and a client that can open sockets faster than it can be told to
+/// stop.
+async fn rate_limit_writes(
+    State(app): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if request.method().is_safe() {
+        return Ok(next.run(request).await);
+    }
+    // Whoever the key says, or nobody — an unknown key shares the anonymous
+    // bucket, and the handler is left to refuse it properly.
+    let who = api_key_of_headers(request.headers()).and_then(|key| app.market().keys.user_of(&key));
+    match app.allow(who) {
+        Decision::Allowed => Ok(next.run(request).await),
+        Decision::Limited { retry_after } => Err(ApiError::rate_limited(retry_after)),
+    }
 }
 
 /// JSON error body: `{"error": {"code": ..., "message": ...}}`.
@@ -118,6 +148,8 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    /// Seconds for a `Retry-After` header, when the answer is "later".
+    retry_after_secs: Option<u64>,
 }
 
 impl ApiError {
@@ -126,6 +158,25 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    /// The client is changing things faster than the server will take.
+    fn rate_limited(retry_after: std::time::Duration) -> Self {
+        // Never advise waiting zero seconds: a client that obeys it would
+        // spin. The bucket refills continuously, so a second is honest.
+        let secs = retry_after.as_secs_f64().ceil().max(1.0) as u64;
+        Self {
+            retry_after_secs: Some(secs),
+            ..Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                format!(
+                    "too many requests: this server takes changes at \
+                     `FEHU_RATE_PER_SEC`. Try again in {secs}s"
+                ),
+            )
         }
     }
 
@@ -312,21 +363,32 @@ impl IntoResponse for ApiError {
         let body = serde_json::json!({
             "error": { "code": self.code, "message": self.message }
         });
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        if let Some(secs) = self.retry_after_secs
+            && let Ok(value) = secs.to_string().parse()
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 
 /// The API key on a request: `Authorization: Bearer <key>`, or `X-Api-Key`.
 fn api_key_of(parts: &Parts) -> Option<String> {
-    let bearer = parts
-        .headers
+    api_key_of_headers(&parts.headers)
+}
+
+/// The API key a request carries, as `Authorization: Bearer <key>` or
+/// `X-Api-Key`.
+fn api_key_of_headers(headers: &HeaderMap) -> Option<String> {
+    let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| {
             let (scheme, key) = v.split_once(' ')?;
             scheme.eq_ignore_ascii_case("bearer").then_some(key)
         });
-    let key = bearer.or_else(|| parts.headers.get("x-api-key").and_then(|v| v.to_str().ok()))?;
+    let key = bearer.or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))?;
     let key = key.trim();
     (!key.is_empty()).then(|| key.to_owned())
 }

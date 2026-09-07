@@ -1075,6 +1075,27 @@ that move prices, are gated by `FEHU_ADMIN_KEY` when it is set — compared in
 constant time — and open when it is not, which is what a single-player game on
 localhost wants and a shared server does not.
 
+The key is also what a rate limit is keyed on. `webapp/src/limit.rs` holds a
+token bucket per user, refilling at `FEHU_RATE_PER_SEC` with a burst of
+`FEHU_RATE_BURST`, and a middleware spends one token per request that would
+*change* something — every unsafe method. Reads are not limited: they are
+cheap, idempotent and mostly public, and a reverse proxy is the right place
+to shape them. What is worth protecting is the one market lock every order
+goes through.
+
+A key is the only thing the server can honestly identify a client by: it sees
+no addresses and would not trust a forwarded one it could not verify. So
+requests with no key share a single bucket — a blunt instrument, deliberately,
+because the only unauthenticated writes are signing up and, on a server with
+no `FEHU_ADMIN_KEY`, the game master's own endpoints. A refusal is `429
+rate_limited` with a `Retry-After` naming the second at which the missing
+token will have been earned. The bucket table is bounded: full buckets are
+swept first, since a bucket that has refilled says nothing a fresh one would
+not, and when every bucket is mid-burst a client there is no room for falls
+back to the shared one — stricter than its own allowance, never looser,
+because running out of memory must not become a way to buy requests.
+`FEHU_RATE_PER_SEC=0` turns all of it off.
+
 ### 14.12 Sessions and halts
 
 Two things stop trading, and they are not the same thing.
@@ -1355,8 +1376,11 @@ file and a story for what happens to a delisted symbol's positions.
   Synthetic quotes are replenished liquidity, not an independently tracked
   inventory, so the supply check is holdings plus resting bids ≤ outstanding.
   The report is read-only and does not repair inconsistent state.
-* **Rate limits.** There are none. One client can submit orders as fast as it
-  can open sockets.
+* **Rate limits (implemented, §14.11).** A token bucket per API key, spent
+  by every request that changes something and by nothing that only reads.
+  Requests with no key share one bucket. Still missing: anything per address
+  — the server sees none — and any limit on how much *work* a request makes
+  rather than how many arrive.
 * **One lock.** `Mutex<Market>` serialises every order across all four
   symbols. Splitting it per symbol — with the accounts still shared — is the
   first scaling step, and the point at which the ordering guarantees now

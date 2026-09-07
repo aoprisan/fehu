@@ -20,8 +20,19 @@ fn test_app() -> Arc<App> {
         history_days: 5,
         warmup_hours: 1,
         now_ms: Some(NOW_MS),
-        ..Options::default()
+        ..no_rate_limit()
     })
+}
+
+/// The defaults with rate limiting off. A test sends its requests as fast as
+/// the runtime will carry them, which is not what the limit is there for, and
+/// wall-clock timing has no place in an assertion. The limiter has its own
+/// tests.
+fn no_rate_limit() -> Options {
+    Options {
+        rate_per_sec: 0.0,
+        ..Options::default()
+    }
 }
 
 /// Whoever a request is sent as: the bare app is an anonymous caller, a
@@ -1785,6 +1796,7 @@ fn app_with(options: Options) -> Arc<App> {
     App::new(Options {
         history_days: 2,
         warmup_hours: 1,
+        rate_per_sec: 0.0,
         ..options
     })
 }
@@ -2771,6 +2783,96 @@ async fn order_ids_are_unique_across_symbols_and_survive_retries() {
         let (status, record) = get(&player, &format!("/api/orders/{}", response["order_id"])).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(record["symbol"], symbol);
+    }
+}
+
+#[tokio::test]
+async fn a_client_changing_the_market_too_fast_is_told_to_slow_down() {
+    // One request per second, two at once: the third write in a burst is
+    // refused.
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 1.0,
+        rate_burst: 2.0,
+        ..Options::default()
+    });
+    // Signing up is a write too, and spends the shared anonymous bucket.
+    let player = sign_up(&app, "rapid").await;
+    let second = sign_up(&app, "steady").await;
+    let id = player.trader;
+    let order = json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market" });
+
+    // Each player's own bucket is separate from that one, and starts full.
+    for i in 0..2 {
+        let (code, body) = post(&player, "/api/symbols/ACME/orders", order.clone()).await;
+        assert_eq!(code, StatusCode::CREATED, "order {i}: {body}");
+    }
+    let (code, body) = post(&player, "/api/symbols/ACME/orders", order.clone()).await;
+    assert_eq!(code, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["code"], "rate_limited");
+
+    // The refusal is a refusal: the order it carried never ran.
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["positions"][0]["qty"], 2, "only the first two: {p}");
+
+    // Reading is never limited, however fast.
+    for _ in 0..50 {
+        let (code, _) = get(&player, &format!("/api/traders/{id}")).await;
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    // And a refusal says when to come back.
+    let response = router(Arc::clone(&app))
+        .oneshot(
+            Request::post("/api/symbols/ACME/orders")
+                .header(header::AUTHORIZATION, format!("Bearer {}", player.key))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(order.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.headers()[header::RETRY_AFTER],
+        "1",
+        "a refusal must say when to come back"
+    );
+
+    // Another player is not held back by the first one's spending.
+    let (code, body) = post(
+        &second,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": second.trader, "side": "buy", "qty": 1, "type": "market" }),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::CREATED,
+        "one client's flood is not another's: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rate_limiting_can_be_turned_off() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "unlimited").await;
+    for i in 0..60 {
+        let (code, body) = post(
+            &player,
+            "/api/symbols/ACME/orders",
+            json!({ "trader_id": player.trader, "side": "buy", "qty": 1, "type": "market" }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "order {i}: {body}");
     }
 }
 

@@ -15,6 +15,7 @@ use tokio::sync::broadcast;
 use crate::account::{Account, AccountId, MoneyError, User, UserId, notional_cents};
 use crate::auth::Keyring;
 use crate::events::EventRecord;
+use crate::limit::{Decision, Limiter, Rate};
 use crate::save::{MarketSave, STATE_VERSION, Save, SymbolSave};
 use crate::trading::{
     BookDto, FillRecord, HoldingDto, MAX_STOPS_PER_TRADER, OrderRecord, OrderResponse, Refused,
@@ -1679,6 +1680,13 @@ pub struct Options {
     /// Stream messages kept for `?since=` replay. `FEHU_STREAM_REPLAY`; `0`
     /// keeps none, and every reconnect is then a gap.
     pub stream_replay: usize,
+    /// How fast one client may change the market, in requests per second.
+    /// `FEHU_RATE_PER_SEC`; `0` turns rate limiting off. Reads are never
+    /// limited.
+    pub rate_per_sec: f64,
+    /// Requests one client may send at once after a quiet spell.
+    /// `FEHU_RATE_BURST`.
+    pub rate_burst: f64,
 }
 
 impl Default for Options {
@@ -1702,6 +1710,8 @@ impl Default for Options {
             price_limit_pct: 0.10,
             halt_secs: 300,
             stream_replay: 1_024,
+            rate_per_sec: 20.0,
+            rate_burst: 40.0,
         }
     }
 }
@@ -1739,6 +1749,8 @@ impl Options {
             price_limit_pct: env_parse("FEHU_PRICE_LIMIT_PCT", d.price_limit_pct).max(0.0),
             halt_secs: env_parse("FEHU_HALT_SECS", d.halt_secs).max(1),
             stream_replay: env_parse("FEHU_STREAM_REPLAY", d.stream_replay),
+            rate_per_sec: env_parse("FEHU_RATE_PER_SEC", d.rate_per_sec).max(0.0),
+            rate_burst: env_parse("FEHU_RATE_BURST", d.rate_burst).max(0.0),
         }
     }
 }
@@ -1804,6 +1816,9 @@ pub struct App {
     /// The sequence counter and replay buffer. Held behind its own lock, and
     /// never taken while the market lock is held.
     stream: Mutex<StreamLog>,
+    /// How fast each client may change the market. Its own lock, held only
+    /// for the moment it takes to spend a token.
+    limits: Mutex<Limiter>,
 }
 
 impl App {
@@ -1827,6 +1842,10 @@ impl App {
             .collect();
         let (tx, _) = broadcast::channel(4096);
         let stream = Mutex::new(StreamLog::new(options.stream_replay));
+        let limits = Mutex::new(Limiter::new(Rate {
+            per_sec: options.rate_per_sec,
+            burst: options.rate_burst,
+        }));
         Arc::new(Self {
             clock: SimClock {
                 wall_epoch: Instant::now(),
@@ -1835,6 +1854,7 @@ impl App {
             },
             started_at: SystemTime::now(),
             stream,
+            limits,
             market: Mutex::new(Market {
                 symbols,
                 events: VecDeque::new(),
@@ -1905,6 +1925,10 @@ impl App {
         let market = Market::from_save(symbols, save.market, &options);
         let (tx, _) = broadcast::channel(4096);
         let stream = Mutex::new(StreamLog::new(options.stream_replay));
+        let limits = Mutex::new(Limiter::new(Rate {
+            per_sec: options.rate_per_sec,
+            burst: options.rate_burst,
+        }));
         Arc::new(Self {
             clock: SimClock {
                 wall_epoch: Instant::now(),
@@ -1915,6 +1939,7 @@ impl App {
             market: Mutex::new(market),
             tx,
             stream,
+            limits,
             options,
         })
     }
@@ -1975,6 +2000,30 @@ impl App {
             replay,
             gap,
         }
+    }
+
+    /// Spend one request's worth of a client's allowance for a request that
+    /// would change something. `who` is `None` for a request with no key,
+    /// which shares one bucket with every other.
+    ///
+    /// Timed off the wall clock rather than the simulated one: a limit is
+    /// about how fast requests actually arrive, and `FEHU_TIME_SCALE` must
+    /// not be able to buy a client more of them.
+    pub fn allow(&self, who: Option<UserId>) -> Decision {
+        let since_start = self.started_at.elapsed().unwrap_or_default();
+        self.limits.lock().unwrap_or_else(|e| e.into_inner()).take(
+            who,
+            since_start.as_millis().min(u128::from(u64::MAX)) as u64,
+        )
+    }
+
+    /// Clients whose allowance the limiter is currently tracking.
+    #[must_use]
+    pub fn tracked_clients(&self) -> usize {
+        self.limits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tracked()
     }
 
     /// Lock the market. A poisoned lock is recovered: the state is plain data

@@ -135,7 +135,10 @@ wall second; `FEHU_BIND`, `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`,
 and `FEHU_LEDGER_LOG` are the other knobs. `FEHU_MARKET_HOURS=09:30-16:00`
 gives the market a UTC weekday session (unset, it never closes);
 `FEHU_PRICE_LIMIT_PCT` (0.10) and `FEHU_HALT_SECS` (300) set the limit move
-that halts a symbol and how long the halt lasts. `FEHU_STATE_FILE` keeps the market
+that halts a symbol and how long the halt lasts. `FEHU_RATE_PER_SEC` (20) and
+`FEHU_RATE_BURST` (40) set how fast one client may change things, and
+`FEHU_STREAM_REPLAY` (1024) how many stream messages are kept for `?since=`.
+`FEHU_STATE_FILE` keeps the market
 across restarts (`FEHU_SAVE_SECS`, 30 by default, sets how often it is
 written). `FEHU_ADMIN_KEY` locks the
 game-master endpoints (`POST /api/game/events` and
@@ -231,6 +234,13 @@ account is checked for the second time, because the money may have moved
 since. A halted or closed symbol holds its triggers and fires them when
 trading resumes, and the owner is told either way with a `stop_triggered`
 message carrying the order it became or the reason it could not be placed.
+
+One client cannot flood the market. Every request that *changes* something —
+an order, an amendment, a cancel, a stop, money, an event — spends a token
+from a bucket kept per API key, refilling at `FEHU_RATE_PER_SEC` with a burst
+of `FEHU_RATE_BURST`; requests with no key share one bucket. Over the limit is
+`429 rate_limited` with a `Retry-After`. Reading is never limited, and
+`FEHU_RATE_PER_SEC=0` turns the whole thing off.
 
 Every stream message is numbered. `GET /api/stream` opens with a `hello`
 saying which sequence the connection joins at and how far back the server can

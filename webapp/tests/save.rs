@@ -26,6 +26,8 @@ fn options(state_file: Option<std::path::PathBuf>) -> Options {
         warmup_hours: 1,
         now_ms: Some(NOW_MS),
         state_file,
+        // Persistence, not timing: the limiter has its own tests.
+        rate_per_sec: 0.0,
         ..Options::default()
     }
 }

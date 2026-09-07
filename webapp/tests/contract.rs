@@ -24,6 +24,8 @@ fn test_app() -> Arc<App> {
         history_days: 2,
         warmup_hours: 1,
         now_ms: Some(NOW_MS),
+        // Shapes, not timing: the limiter has its own tests.
+        rate_per_sec: 0.0,
         ..Options::default()
     })
 }
