@@ -126,6 +126,14 @@ async fn audit(app: &Arc<App>, when: &str) -> i64 {
     let (status, report) = get(app, Some(OPERATOR), "/api/reconcile").await;
     assert_eq!(status, StatusCode::OK, "{when}: {report}");
     assert_eq!(report["valid"], true, "{when}: {report}");
+    // The guard for a whole class of bug: settlement runs after the book has
+    // traded and cannot be unwound, so a refusal there means shares moved and
+    // money did not. Two of these were found writing this suite.
+    let (_, health) = get(app, None, "/api/health").await;
+    assert_eq!(
+        health["settlement_failures"], 0,
+        "{when}: the ledger refused a fill the book had already made"
+    );
     supply["outstanding_cents"].as_i64().unwrap()
 }
 

@@ -650,6 +650,10 @@ struct Health {
     orders_refused: u64,
     /// Fills booked to traders' accounts since start-up.
     fills_booked: u64,
+    /// Fills the book made that the ledger then refused to settle. Zero in a
+    /// healthy market; anything else means shares moved and money did not,
+    /// and the market wants reconciling.
+    settlement_failures: u64,
     /// Messages published to the stream since start-up.
     stream_messages: u64,
     /// Streams currently connected.
@@ -687,6 +691,7 @@ async fn health(State(app): State<AppState>) -> Result<Json<Health>, ApiError> {
         orders_placed: market.orders_placed,
         orders_refused: market.orders_refused,
         fills_booked: market.fills_booked,
+        settlement_failures: market.settlement_failures,
         stream_messages: app.published().await,
         stream_subscribers: app.stream.subscribers(),
         tracked_clients: app.tracked_clients().await,

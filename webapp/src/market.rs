@@ -467,6 +467,12 @@ pub struct MarketHealth {
     pub orders_placed: u64,
     pub orders_refused: u64,
     pub fills_booked: u64,
+    /// Fills the book made that the ledger then refused to settle, since
+    /// start-up. Always zero in a healthy market: everything settlement
+    /// needs is made true before it is called, because by then the book has
+    /// already traded and cannot be unwound. A number above zero means
+    /// shares moved and money did not, and the market should be reconciled.
+    pub settlement_failures: u64,
     pub events_logged: usize,
 }
 
@@ -2183,6 +2189,7 @@ impl Market {
             orders_placed: self.orders_placed,
             orders_refused: self.orders_refused,
             fills_booked: self.fills_booked,
+            settlement_failures: self.settlement_failures,
             events_logged: self.events.len(),
             ..MarketHealth::default()
         };

@@ -147,7 +147,7 @@ read that portfolio, cancel those orders or move that money. The key is shown
 | `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and — for `?api_key=`, since `EventSource` cannot set headers — that player's `fill`s |
 | `GET` | `/api/supply` | How much currency exists and where it sits: minted, burned, outstanding, what the wallets actually hold, and whether the two agree |
 | `GET` | `/api/reconcile` | Game master: check ownership, reservations, share supply, retained cash ledgers **and that the currency adds up**; returns `valid` and `issues` |
-| `GET` | `/api/health` | Uptime, simulated time, tick/trade counters, orders placed and refused, stream and rate-limit state, and how long requests and engine steps are taking |
+| `GET` | `/api/health` | Uptime, simulated time, tick/trade counters, orders placed and refused, fills booked and any that failed to settle, stream and rate-limit state, and how long requests and engine steps are taking |
 
 At start-up each symbol generates a year of daily bars in coarse mode and then
 three days of 1 s ticks, so every interval has history before the first
