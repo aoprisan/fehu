@@ -16,7 +16,7 @@ Complete durable /api/v1 events and stream delivery, plus admin economy/reconcil
 
 ## Expected file scope
 
-webapp/tests/**, examples/**, docs/**, README.md, DESIGN.md, webapp/src/metrics.rs, webapp/src/reconcile.rs, OpenAPI and scenario/load fixtures.
+webapp/tests/**, examples/**, docs/** (including docs/architecture.html), README.md, webapp/src/metrics.rs, webapp/src/reconcile.rs, OpenAPI and scenario/load fixtures.
 
 These are expected locations; inspect the current tree and dependency results before selecting exact files.
 

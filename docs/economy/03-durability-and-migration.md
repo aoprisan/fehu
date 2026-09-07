@@ -8,7 +8,7 @@ Read the [economy architecture and HTTP contract](../../ECONOMY_PLAN.md) and the
 
 ## Objective and implementation
 
-Add storage module/migrations and wire `save.rs`, `engine.rs`, `main.rs`, API execution. Commit journal, receipt, outbox and recovery inputs together before success. Order clock/config commands with player commands. Import an existing v4 save once into GAME at one unit per cent; reconcile balances and inventory, record explicit genesis issuance rather than inventing historic postings, preserve credentials/IDs and archive original. Verify holds/open orders/stops and future counters; fail the whole import on inconsistency. Historical evicted entries remain explicitly unavailable. Use backup and restore procedures that include committed WAL state.
+Add storage module/migrations and wire `save.rs`, `engine.rs`, `main.rs`, API execution. Commit journal, receipt, outbox and recovery inputs together before success. Order clock/config commands with player commands. Import an existing save once (format 5; formats 2-4 pass through the existing migration to 5 first) into GAME at one unit per cent; reconcile balances and inventory, record explicit genesis issuance rather than inventing historic postings, preserve credentials/IDs and archive original. Verify holds/open orders/stops and future counters; fail the whole import on inconsistency. Historical evicted entries remain explicitly unavailable. Use backup and restore procedures that include committed WAL state.
 
 ## Required contract
 

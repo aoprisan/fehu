@@ -8,7 +8,7 @@ Read the [economy architecture and HTTP contract](../../ECONOMY_PLAN.md) and the
 
 ## Objective and implementation
 
-Touch `market.rs`, `trading.rs`, economy settlement and core exchange only where needed. Register stable market/asset IDs and migrate the four equities. Explicitly choose per market: pure player/NPC order flow, or simulated reference price with funded NPC quotes. In authoritative mode replace unbacked synthetic liquidity with inventory/cash-limited NPC orders; synthetic tape-only prints must never settle into player wealth. Quote volume, not only execution, must respect shared NPC holds. Route fees to fee wallet, rebates from funded budget, dividends from issuer treasury to all eligible holders atomically. Permit exhausted NPC liquidity; never silently top it up.
+Touch `market.rs`, `trading.rs`, economy settlement and core exchange only where needed. Register stable market/asset IDs and migrate every listed equity (the four seeded ones plus any listed at runtime). Explicitly choose per market: pure player/NPC order flow, or simulated reference price with funded NPC quotes. In authoritative mode replace unbacked synthetic liquidity with inventory/cash-limited NPC orders; synthetic tape-only prints must never settle into player wealth. Quote volume, not only execution, must respect shared NPC holds. Route fees to fee wallet, rebates from funded budget, dividends from issuer treasury to all eligible holders atomically. Permit exhausted NPC liquidity; never silently top it up.
 
 ## Required contract
 
