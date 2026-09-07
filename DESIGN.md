@@ -1176,3 +1176,113 @@ of time and only the game master can place or lift one, a resting order
 survives a halt and can still be cancelled, and a closed session refuses orders
 while an open one takes them. `webapp/tests/contract.rs`
 pins the JSON key sets the TypeScript UI is typed against.
+
+---
+
+## 15. Not built yet
+
+What follows is the work the trading layer still wants, in the order I would
+do it, and the decisions already taken that a real venue would revisit. It is
+here rather than in an issue tracker because each item is a design question
+first and a patch second.
+
+### 15.1 Orders the book will not take
+
+**Stop and stop-limit.** The one piece of the order-type work not done. A stop
+is not an order in the book: it is a trigger held aside until the price
+touches it, and only then submitted. That means a per-symbol store of
+untriggered stops (`stop_price_cents`, side, quantity, and either "market" or
+a limit price), evaluated at the end of every engine step against the last
+tick the way `review_halt` is (§14.12) — a buy stop triggers at or above its
+price, a sell stop at or below — then placed through `place_order` and logged
+like any other order. It needs its own listing and cancel endpoints, a
+`stop_triggered` stream message, cash or shares checked twice (once when
+accepted, once when triggered, because the balance may have moved in
+between), a decision about what a trigger does while a symbol is halted (hold
+it, most likely, and fire on resume), and a save-format bump to carry the
+untriggered stops. That last point is why it is a pass of its own rather than
+a corner of the amend work.
+
+**Iceberg, GTD and day orders.** Iceberg needs the book to re-post a slice as
+each one fills, which is `book.rs`, not the web app. GTD and day orders need
+an expiry sweep on the engine step, which is easy but pointless until sessions
+are the default rather than an option (§14.12).
+
+**Tick and lot size.** Prices are integer cents and quantities whole shares,
+and nothing else is enforced: a symbol cannot say "quote me in five-cent
+steps" or "trade me in lots of ten". `TradingParams` is where they would go,
+with the check in `OrderBook::validate` so the crate refuses them rather than
+the web app.
+
+### 15.2 What the stream does not promise
+
+A client that falls behind silently loses messages: `BroadcastStream` drops
+them, `api.rs` filters the error away, and nothing in the protocol lets the
+client notice. Every message wants a per-connection sequence number and the
+`hello` a "you are joining at sequence N" line, plus a `?since=` that replays
+what a reconnecting client missed from a bounded buffer. Until then a client
+that cares about correctness — rather than about drawing a chart — must poll
+`/api/traders/{id}` after anything it sent, which is what the bundled UI does.
+
+### 15.3 Money the market does not move
+
+**Fees.** Nothing is charged: no commission, no maker rebate, no exchange fee.
+They belong on the settlement path (`Trader::book_fill` → `Account::settle`)
+as a separate ledger entry per fill rather than as an adjustment to the price,
+so the tape stays the price and the ledger stays the money.
+
+**Corporate actions.** `shares_outstanding` never changes, so a split, a
+dividend and a buyback that retires stock are all unrepresentable — the
+`buyback` game event moves the price and nothing else. A split is the
+awkward one: it rewrites every position's quantity and average cost, every
+resting order's price and size, and the bar history, or the chart lies.
+Dividends are easier and would land as a ledger entry against holders of
+record.
+
+**Listing and delisting.** The symbol set is fixed at build time
+(`TICKERS`), which the save format depends on: a file listing other symbols is
+refused (§14.13). Adding symbols at runtime means a symbol table in the save
+file and a story for what happens to a delisted symbol's positions.
+
+### 15.4 Running it for more than a game
+
+* **Reconciliation.** `Account::issues` checks one account. Nothing checks the
+  market as a whole: that the traders' positions plus the synthetic book's
+  inventory add up to `shares_outstanding`, or that every account's ledger
+  sums to its balance. Both are cheap to compute and belong behind an endpoint
+  and a test that runs them after a busy market.
+* **Rate limits.** There are none. One client can submit orders as fast as it
+  can open sockets.
+* **One lock.** `Mutex<Market>` serialises every order across all four
+  symbols. Splitting it per symbol — with the accounts still shared — is the
+  first scaling step, and the point at which the ordering guarantees now
+  provided by "there is one lock" have to be written down.
+* **Metrics.** `/api/health` counts ticks, trades and users. There is nothing
+  on latency, order rates, or how long the engine step takes.
+
+### 15.5 Decisions a real venue would revisit
+
+These are deliberate, and each is a place where the game and an exchange part
+company.
+
+* **The game-master endpoints are open unless `FEHU_ADMIN_KEY` is set.** That
+  keeps the bundled UI's event panel working out of the box; on a shared
+  server it means anyone can move the prices until the variable is set.
+* **A halt stops orders, not the world** (§14.12). The simulator keeps moving
+  the reference while a symbol is halted, so it reopens gapped. A real halt
+  freezes the print; matching that would need the crate to advance a
+  simulator's clock without generating ticks.
+* **An amendment is a cancel and a fresh order** (§14.10). It loses queue
+  position, which a real in-place amend of quantity-down would not, and if the
+  replacement cannot be placed — no cash, no shares, a halt in between — the
+  original is already gone.
+* **API keys are held as keys, not hashes** (§14.11). Nothing is persisted
+  except the save file, which carries them in the clear; a deployment that
+  keeps that file anywhere but a private disk wants them hashed first.
+* **The stream takes its key in the query string**, because `EventSource`
+  cannot set headers. Keys can therefore reach access logs.
+* **A restore trusts the file.** The version and the symbol list are checked;
+  the balances, positions and ids inside are not re-validated against each
+  other, so a hand-edited save can produce a market that `Account::issues`
+  would have refused to create.
+
