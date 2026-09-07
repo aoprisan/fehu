@@ -2787,6 +2787,146 @@ async fn order_ids_are_unique_across_symbols_and_survive_retries() {
 }
 
 #[tokio::test]
+async fn an_iceberg_shows_a_slice_and_reserves_the_whole_thing() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let hider = sign_up(&app, "iris").await;
+    let seller = sign_up(&app, "sven").await;
+    let id = hider.trader;
+    let (_, book) = get(&app, "/api/symbols/ACME/book").await;
+    let bid = book["bid_cents"].as_i64().unwrap();
+    let ask = book["ask_cents"].as_i64().unwrap();
+    // Inside the spread, where the synthetic ladder has nothing: what shows
+    // at this price is this order and nothing else.
+    let price = bid + 1;
+    assert!(price < ask, "the spread has room: {book}");
+
+    let (code, body) = post(
+        &hider,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "limit",
+                "price_cents": price, "display_qty": 20 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["status"], "resting");
+    assert_eq!(body["remaining"], 100, "all of it is open");
+    let order_id = body["order_id"].as_u64().unwrap();
+
+    // The public book shows the slice and says nothing about the rest.
+    let (_, book) = get(&app, "/api/symbols/ACME/book").await;
+    assert_eq!(book["bid_cents"], price);
+    let top = book["bids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["price_cents"] == price)
+        .unwrap_or_else(|| panic!("no level at {price}: {book}"));
+    assert_eq!(top["qty"], 20, "only the slice is on show: {book}");
+    assert_eq!(top["orders"], 1);
+
+    // Its owner sees all of it — and pays for all of it. Hiding size does
+    // not make it free.
+    let (_, p) = get(&hider, &format!("/api/traders/{id}")).await;
+    let open = &p["open_orders"][0];
+    assert_eq!(open["remaining"], 100);
+    assert_eq!(open["shown_qty"], 20);
+    assert_eq!(open["display_qty"], 20);
+    assert_eq!(
+        p["reserved_cents"].as_i64().unwrap(),
+        price * 100,
+        "the hidden size is reserved too: {p}"
+    );
+
+    // Somebody sells into it: the slice fills and the next one is posted.
+    let (code, body) = post(
+        &seller,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": seller.trader, "side": "buy", "qty": 100, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let (code, body) = post(
+        &seller,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": seller.trader, "side": "sell", "qty": 20, "type": "limit",
+                "price_cents": price, "tif": "ioc" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["filled"], 20);
+
+    let (_, book) = get(&app, "/api/symbols/ACME/book").await;
+    let top = book["bids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["price_cents"] == price)
+        .unwrap_or_else(|| panic!("the next slice should be showing: {book}"));
+    assert_eq!(top["qty"], 20, "refreshed to a full slice: {book}");
+    let (_, p) = get(&hider, &format!("/api/traders/{id}")).await;
+    let open = &p["open_orders"][0];
+    assert_eq!(open["remaining"], 80, "twenty of it traded");
+    assert_eq!(open["shown_qty"], 20);
+    assert_eq!(p["positions"][0]["qty"], 20);
+    assert_eq!(p["reserved_cents"].as_i64().unwrap(), price * 80);
+
+    // Cancelling gives back everything, shown and hidden alike.
+    let (code, body) = delete(
+        &hider,
+        &format!("/api/symbols/ACME/orders/{order_id}?trader_id={id}"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["remaining"], 80);
+    let (_, p) = get(&hider, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["reserved_cents"], 0);
+    let (_, record) = get(&hider, &format!("/api/orders/{order_id}")).await;
+    assert_eq!(record["status"], "cancelled");
+    assert_eq!(record["filled"], 20);
+    assert_eq!(record["remaining"], 80);
+
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
+async fn an_iceberg_slice_has_to_make_sense() {
+    let app = test_app();
+    let player = sign_up(&app, "izzy").await;
+    let id = player.trader;
+    let bid = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+    let price = bid / 2;
+    for bad in [
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "limit",
+                "price_cents": price, "display_qty": 0 }),
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "limit",
+                "price_cents": price, "display_qty": 101 }),
+        // An order that cannot rest has nothing to hide.
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "limit",
+                "price_cents": price, "display_qty": 10, "tif": "ioc" }),
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "market",
+                "display_qty": 10 }),
+    ] {
+        let (code, body) = post(&player, "/api/symbols/ACME/orders", bad.clone()).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{bad} gave {body}");
+        assert_eq!(body["error"]["code"], "invalid_order");
+    }
+    // Nothing was placed by any of them.
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(p["open_orders"].as_array().unwrap().is_empty(), "{p}");
+    assert_eq!(p["reserved_cents"], 0);
+}
+
+#[tokio::test]
 async fn a_dividend_pays_the_holders_and_takes_the_price_ex() {
     let app = app_with(Options {
         now_ms: Some(NOW_MS),

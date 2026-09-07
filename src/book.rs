@@ -194,6 +194,9 @@ pub enum OrderError {
     BadPrice,
     /// A limit price that is not on the symbol's tick grid.
     OffTick,
+    /// The display slice of an iceberg is zero, larger than the order, not a
+    /// whole number of lots, or asked for on an order that cannot rest.
+    BadDisplay,
     /// No further unique order ids can be assigned.
     IdExhausted,
     /// Synthetic orders are managed by the exchange; give NPCs a `TraderId`.
@@ -208,6 +211,10 @@ impl fmt::Display for OrderError {
             Self::OddLot => "order quantity must be a whole number of lots",
             Self::BadPrice => "limit price must be in [1, 10^15] cents",
             Self::OffTick => "limit price must be a whole number of ticks",
+            Self::BadDisplay => {
+                "an iceberg's display quantity must be a whole number of lots between 1 and \
+                 its own size, on a gtc limit order"
+            }
             Self::IdExhausted => "order id space is exhausted",
             Self::SyntheticOwner => "synthetic orders cannot be submitted directly",
         })
@@ -322,12 +329,41 @@ pub struct Resting {
     pub side: Side,
     /// Limit price.
     pub price_cents: i64,
-    /// Original quantity.
+    /// Original quantity, hidden part included.
     pub qty: u64,
-    /// Quantity still open.
+    /// Quantity still open *and visible*: what can trade at this queue
+    /// position right now. For an ordinary order this is everything left;
+    /// for an iceberg it is the slice on show.
     pub remaining: u64,
-    /// When it was placed.
+    /// Quantity still open and not on show. Zero for an ordinary order.
+    /// Nothing in the book's depth, preview or available-quantity ever
+    /// counts it: that is what makes it hidden.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub hidden: u64,
+    /// The slice an iceberg shows at a time. Zero for an ordinary order.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub display: u64,
+    /// Queue priority within its price level: lower goes first. Separate
+    /// from the id because an iceberg keeps its identity when it refreshes
+    /// and loses its place, so the two cannot be the same number.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub seq: u64,
+    /// When it was placed, or last refreshed.
     pub ts: Timestamp,
+}
+
+impl Resting {
+    /// Everything still open: what is on show plus what is not.
+    #[must_use]
+    pub fn outstanding(&self) -> u64 {
+        self.remaining.saturating_add(self.hidden)
+    }
+
+    /// This order shows less than it is.
+    #[must_use]
+    pub fn is_iceberg(&self) -> bool {
+        self.display > 0
+    }
 }
 
 /// One side of a trade.
@@ -487,6 +523,11 @@ pub struct OrderBook {
     /// Every resting order's side and price, for cancels and lookups.
     index: BTreeMap<OrderId, (Side, i64)>,
     next_id: u64,
+    /// Queue priority, handed out on every post and every iceberg refresh.
+    /// Zero in a file written before icebergs existed, which is the signal
+    /// to seed it from the ids.
+    #[cfg_attr(feature = "serde", serde(default))]
+    next_seq: u64,
     /// The tick and lot this book enforces. Not serialised: the exchange
     /// owns the truth in its [`TradingParams`](crate::TradingParams) and
     /// sets it here whenever a book is assembled, so the two cannot drift.
@@ -509,6 +550,7 @@ impl OrderBook {
             asks: BTreeMap::new(),
             index: BTreeMap::new(),
             next_id: 1,
+            next_seq: 1,
             rules: MarketRules::default(),
         }
     }
@@ -544,16 +586,25 @@ impl OrderBook {
                     if order.side != side || order.price_cents != price {
                         return Err("resting order does not match its price level");
                     }
-                    if order.id.0 <= previous || order.id.0 >= self.next_id {
-                        return Err("order ids violate queue priority or the next id");
+                    if order.id.0 == 0 || order.id.0 >= self.next_id {
+                        return Err("order id is zero or beyond the next id");
                     }
-                    previous = order.id.0;
+                    if order.seq <= previous || order.seq >= self.next_seq {
+                        return Err("queue priority is out of order or beyond the next one");
+                    }
+                    previous = order.seq;
                     if order.qty == 0
                         || order.qty > MAX_ORDER_QTY
                         || order.remaining == 0
-                        || order.remaining > order.qty
+                        || order.outstanding() > order.qty
                     {
                         return Err("resting order quantity is invalid");
+                    }
+                    if order.hidden > 0 && order.display == 0 {
+                        return Err("hidden quantity without a display slice");
+                    }
+                    if order.display > 0 && order.remaining > order.display {
+                        return Err("an iceberg shows more than its slice");
                     }
                     total = total
                         .checked_add(order.remaining)
@@ -624,6 +675,46 @@ impl OrderBook {
     /// See [`OrderError`]. Synthetic owners are accepted here; the exchange
     /// is what forbids them.
     pub fn submit(&mut self, order: Order, ts: Timestamp) -> Result<Placement, OrderError> {
+        self.submit_with_display(order, None, ts)
+    }
+
+    /// Submit an iceberg: an order that shows `display_qty` at a time and
+    /// keeps the rest back, posting the next slice — at the back of the queue
+    /// for its price — as each one fills.
+    ///
+    /// Only a `Gtc` limit order can be one: the whole idea is a resting
+    /// order that does not advertise its size, and an order that cannot rest
+    /// has nothing to hide. It still *takes* with its whole quantity on
+    /// arrival — the slicing is about what it shows while resting, not about
+    /// how much of the far side it will lift.
+    ///
+    /// # Errors
+    /// [`OrderError::BadDisplay`] if the slice is zero, larger than the
+    /// order, not a whole number of lots, or asked for on an order that
+    /// cannot rest; otherwise as [`submit`](Self::submit).
+    pub fn submit_iceberg(
+        &mut self,
+        order: Order,
+        display_qty: u64,
+        ts: Timestamp,
+    ) -> Result<Placement, OrderError> {
+        if display_qty == 0
+            || display_qty > order.qty
+            || !self.rules.allows_qty(display_qty)
+            || order.tif != TimeInForce::Gtc
+            || !matches!(order.kind, OrderKind::Limit { .. })
+        {
+            return Err(OrderError::BadDisplay);
+        }
+        self.submit_with_display(order, Some(display_qty), ts)
+    }
+
+    fn submit_with_display(
+        &mut self,
+        order: Order,
+        display_qty: Option<u64>,
+        ts: Timestamp,
+    ) -> Result<Placement, OrderError> {
         self.validate(&order)?;
         let next = self.next_id.checked_add(1).ok_or(OrderError::IdExhausted)?;
         if self.next_id == 0 {
@@ -655,13 +746,25 @@ impl OrderBook {
         let status = if remaining == 0 {
             OrderStatus::Filled
         } else if let (Some(price_cents), TimeInForce::Gtc) = (limit, order.tif) {
+            // What rests is sliced only if this is an iceberg; what showed
+            // is what can trade, and the rest waits its turn.
+            let display = display_qty.unwrap_or(0);
+            let shown = if display == 0 {
+                remaining
+            } else {
+                display.min(remaining)
+            };
+            let seq = self.take_seq();
             self.rest(Resting {
                 id,
                 owner: order.owner,
                 side: order.side,
                 price_cents,
                 qty: order.qty,
-                remaining,
+                remaining: shown,
+                hidden: remaining - shown,
+                display,
+                seq,
                 ts,
             });
             OrderStatus::Resting
@@ -843,6 +946,9 @@ impl OrderBook {
         ts: Timestamp,
         out: &mut Vec<Trade>,
     ) -> u64 {
+        // A refreshing iceberg needs a new priority mid-match, and the level
+        // it is in borrows the book, so the counter travels with us.
+        let mut seq = self.next_seq.max(1);
         while qty > 0 {
             let opposite = self.side_mut(side.opposite());
             let Some((&price, level)) = (match side {
@@ -874,8 +980,23 @@ impl OrderBook {
                     },
                 });
                 if front.remaining == 0 {
-                    done_ids.push(front.id);
-                    level.pop_front();
+                    if front.hidden > 0 {
+                        // An iceberg shows its next slice — and gives up its
+                        // place for it, which is what stops a hidden order
+                        // from holding the front of a queue forever.
+                        let slice = front.display.max(1).min(front.hidden);
+                        front.remaining = slice;
+                        front.hidden -= slice;
+                        front.seq = seq;
+                        front.ts = ts;
+                        seq = seq.saturating_add(1);
+                        if let Some(refreshed) = level.pop_front() {
+                            level.push_back(refreshed);
+                        }
+                    } else {
+                        done_ids.push(front.id);
+                        level.pop_front();
+                    }
                 }
             }
             let empty = level.is_empty();
@@ -886,7 +1007,36 @@ impl OrderBook {
                 self.index.remove(&id);
             }
         }
+        self.next_seq = seq;
         qty
+    }
+
+    /// The next queue priority, and never zero: zero is the mark of a book
+    /// written before priority was its own number.
+    fn take_seq(&mut self) -> u64 {
+        let seq = self.next_seq.max(1);
+        self.next_seq = seq.saturating_add(1);
+        seq
+    }
+
+    /// Give every resting order a queue priority, if a file did not carry
+    /// one. Before icebergs, priority *was* the id, so the ids it was
+    /// written with are exactly the right seeds. A book that already has
+    /// priorities is left alone.
+    pub fn seed_priority(&mut self) {
+        if self.next_seq != 0 {
+            return;
+        }
+        let mut highest = 0;
+        for levels in [&mut self.bids, &mut self.asks] {
+            for level in levels.values_mut() {
+                for order in level.iter_mut() {
+                    order.seq = order.id.0;
+                    highest = highest.max(order.id.0);
+                }
+            }
+        }
+        self.next_seq = highest.saturating_add(1).max(self.next_id).max(1);
     }
 
     fn rest(&mut self, order: Resting) {

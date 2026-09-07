@@ -480,6 +480,159 @@ fn a_tick_and_lot_are_enforced_on_both_sides_of_the_book() {
 }
 
 #[test]
+fn an_iceberg_shows_a_slice_at_a_time_and_gives_up_its_place_for_the_next() {
+    let mut ex = exchange(11);
+    let bid = ex.book().best_bid().unwrap();
+    let ask = ex.book().best_ask().unwrap();
+    // Inside the spread, where the synthetic ladder has nothing: what shows
+    // at this price is only what these two orders show.
+    let price = bid + 1;
+    assert!(price < ask, "the spread has room: {bid}..{ask}");
+
+    // Somebody ordinary is already queued at that price, behind nothing.
+    let ahead = ex
+        .submit(Order::limit(Owner::Trader(OTHER), Side::Buy, price, 20))
+        .unwrap();
+    assert_eq!(ahead.status, OrderStatus::Resting);
+    // 100 shares, shown 20 at a time.
+    let iceberg = ex
+        .submit_iceberg(Order::limit(Owner::Trader(T), Side::Buy, price, 100), 20)
+        .unwrap();
+    assert_eq!(iceberg.status, OrderStatus::Resting);
+    assert_eq!(iceberg.remaining, 100, "all of it is still open");
+
+    let resting = ex.book().get(iceberg.id).unwrap();
+    assert_eq!(resting.remaining, 20, "only a slice is on show");
+    assert_eq!(resting.hidden, 80);
+    assert_eq!(resting.outstanding(), 100);
+    let shown = |ex: &Exchange| {
+        ex.book()
+            .depth(Side::Buy, 50)
+            .into_iter()
+            .find(|l| l.price_cents == price)
+            .map_or(0, |l| l.qty)
+    };
+    assert_eq!(shown(&ex), 40, "the book shows 20 + 20, not 120");
+
+    // A sell of 30 takes the order ahead and half the slice: the iceberg is
+    // not out of what it is showing, so it stays where it is.
+    let hit = ex
+        .submit(
+            Order::limit(Owner::Trader(OTHER), Side::Sell, price, 30).with_tif(TimeInForce::Ioc),
+        )
+        .unwrap();
+    assert_eq!(hit.filled, 30);
+    let resting = ex.book().get(iceberg.id).unwrap();
+    assert_eq!(resting.remaining, 10, "half the slice is left");
+    assert_eq!(resting.hidden, 80, "and nothing new has been shown");
+
+    // Ten more empties the slice, and the next one is posted at the back.
+    let hit = ex
+        .submit(
+            Order::limit(Owner::Trader(OTHER), Side::Sell, price, 10).with_tif(TimeInForce::Ioc),
+        )
+        .unwrap();
+    assert_eq!(hit.filled, 10);
+    let resting = ex.book().get(iceberg.id).unwrap();
+    assert_eq!(resting.remaining, 20, "refreshed to a full slice");
+    assert_eq!(resting.hidden, 60);
+    assert_eq!(resting.outstanding(), 80);
+    assert_eq!(shown(&ex), 20);
+
+    // A big sell walks through slice after slice until the whole thing is
+    // gone, and the price level with it.
+    let sweep = ex
+        .submit(
+            Order::limit(Owner::Trader(OTHER), Side::Sell, price, 80).with_tif(TimeInForce::Ioc),
+        )
+        .unwrap();
+    assert_eq!(sweep.filled, 80, "the hidden size is still real liquidity");
+    assert!(ex.book().get(iceberg.id).is_none(), "it is finished");
+    assert_eq!(shown(&ex), 0);
+    ex.book().validate_state().unwrap();
+}
+
+#[test]
+fn an_iceberg_keeps_its_size_to_itself() {
+    let mut ex = exchange(12);
+    let bid = ex.book().best_bid().unwrap();
+    let ask = ex.book().best_ask().unwrap();
+    let price = bid + 1;
+    assert!(price < ask, "the spread has room: {bid}..{ask}");
+    let iceberg = ex
+        .submit_iceberg(Order::limit(Owner::Trader(T), Side::Buy, price, 500), 10)
+        .unwrap();
+
+    // Neither the preview nor a fill-or-kill can see past the slice: the
+    // hidden size is not liquidity anybody is entitled to count on.
+    let preview = ex.book().preview(Side::Sell, 500, Some(price));
+    assert_eq!(preview.filled, 10, "only the slice is visible: {preview:?}");
+    let fok = ex
+        .submit(
+            Order::limit(Owner::Trader(OTHER), Side::Sell, price, 100).with_tif(TimeInForce::Fok),
+        )
+        .unwrap();
+    assert_eq!(fok.status, OrderStatus::Cancelled);
+    assert_eq!(fok.filled, 0, "a fill-or-kill measures what it can see");
+    assert_eq!(ex.book().get(iceberg.id).unwrap().outstanding(), 500);
+
+    // Cancelling gives back everything, shown and hidden alike.
+    let cancelled = ex.cancel(iceberg.id, T).unwrap();
+    assert_eq!(cancelled.outstanding(), 500);
+    assert_eq!(cancelled.remaining, 10);
+    assert_eq!(cancelled.hidden, 490);
+    ex.book().validate_state().unwrap();
+}
+
+#[test]
+fn an_iceberg_has_to_be_an_order_that_can_rest() {
+    let mut ex = exchange(13);
+    let price = ex.book().best_bid().unwrap() - 10;
+    let order = Order::limit(Owner::Trader(T), Side::Buy, price, 100);
+    for bad in [0, 101] {
+        assert_eq!(
+            ex.submit_iceberg(order, bad),
+            Err(OrderError::BadDisplay),
+            "display of {bad}"
+        );
+    }
+    assert_eq!(
+        ex.submit_iceberg(order.with_tif(TimeInForce::Ioc), 10),
+        Err(OrderError::BadDisplay),
+        "an order that cannot rest has nothing to hide"
+    );
+    assert_eq!(
+        ex.submit_iceberg(Order::market(Owner::Trader(T), Side::Buy, 100), 10),
+        Err(OrderError::BadDisplay)
+    );
+    assert_eq!(
+        ex.submit_iceberg(Order::limit(Owner::Synthetic, Side::Buy, price, 100), 10),
+        Err(OrderError::SyntheticOwner)
+    );
+    // The slice is in lots, like everything else.
+    let mut lots = Exchange::new(
+        Config::default(),
+        TradingParams {
+            rules: fehu::MarketRules {
+                tick_cents: 1,
+                lot: 10,
+            },
+            ..TradingParams::default()
+        },
+        13,
+    )
+    .unwrap();
+    let price = lots.book().best_bid().unwrap() - 10;
+    let order = Order::limit(Owner::Trader(T), Side::Buy, price, 100);
+    assert_eq!(
+        lots.submit_iceberg(order, 15),
+        Err(OrderError::BadDisplay),
+        "an odd-lot slice"
+    );
+    assert!(lots.submit_iceberg(order, 20).is_ok());
+}
+
+#[test]
 fn the_default_rules_constrain_nothing() {
     let rules = fehu::MarketRules::default();
     assert!(rules.allows_price(8_431));

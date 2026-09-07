@@ -457,6 +457,8 @@ async fn trading_shapes() {
             "price_cents",
             "qty",
             "remaining",
+            "display_qty",
+            "shown_qty",
             "ts_ms",
         ],
     );

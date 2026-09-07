@@ -325,6 +325,104 @@ async fn held_stops_survive_a_restart_and_still_fire() {
 }
 
 #[tokio::test]
+async fn an_iceberg_comes_back_with_what_it_was_hiding() {
+    let dir = TempDir::new("fehu-save-iceberg");
+    let path = dir.path().join("state.json");
+    let before = App::new(options(Some(path.clone())));
+    let (id, key) = busy_market(&before).await;
+    let (bid, ask) = {
+        let book = get(&before, None, "/api/symbols/ACME/book").await.1;
+        (
+            book["bid_cents"].as_i64().unwrap(),
+            book["ask_cents"].as_i64().unwrap(),
+        )
+    };
+    let price = bid + 1;
+    assert!(price < ask, "the spread has room");
+    let (status, body) = post(
+        &before,
+        Some(&key),
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 200, "type": "limit",
+                "price_cents": price, "display_qty": 25 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let order_id = body["order_id"].as_u64().unwrap();
+    let reserved = get(&before, Some(&key), &format!("/api/traders/{id}"))
+        .await
+        .1["reserved_cents"]
+        .as_i64()
+        .unwrap();
+    save::write(&before, &path).unwrap();
+
+    // A file whose books do not add up is refused, so getting this far is
+    // already most of the check.
+    let after = App::restore(options(Some(path.clone())), save::read(&path).unwrap());
+    let (_, p) = get(&after, Some(&key), &format!("/api/traders/{id}")).await;
+    let open = p["open_orders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["order_id"] == order_id)
+        .unwrap_or_else(|| panic!("the iceberg came back: {p}"));
+    assert_eq!(open["remaining"], 200, "hidden size and all");
+    assert_eq!(open["shown_qty"], 25);
+    assert_eq!(open["display_qty"], 25);
+    assert_eq!(
+        p["reserved_cents"].as_i64().unwrap(),
+        reserved,
+        "and it still reserves the whole thing"
+    );
+
+    // The book that came back shows the slice, and still refreshes.
+    let book = get(&after, None, "/api/symbols/ACME/book").await.1;
+    let top = book["bids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["price_cents"] == price)
+        .unwrap_or_else(|| panic!("no level at {price}: {book}"));
+    assert_eq!(top["qty"], 25, "only the slice is on show: {book}");
+    let (status, second) = post(
+        &after,
+        None,
+        "/api/traders",
+        json!({ "name": "restored-seller" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    let other = second["id"].as_u64().unwrap();
+    let other_key = second["api_key"].as_str().unwrap().to_owned();
+    post(
+        &after,
+        Some(&other_key),
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": other, "side": "buy", "qty": 50, "type": "market" }),
+    )
+    .await;
+    let (status, hit) = post(
+        &after,
+        Some(&other_key),
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": other, "side": "sell", "qty": 25, "type": "limit",
+                "price_cents": price, "tif": "ioc" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{hit}");
+    assert_eq!(hit["filled"], 25);
+    let book = get(&after, None, "/api/symbols/ACME/book").await.1;
+    let top = book["bids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["price_cents"] == price)
+        .unwrap_or_else(|| panic!("the next slice should be showing: {book}"));
+    assert_eq!(top["qty"], 25, "a restored iceberg still refreshes: {book}");
+    assert!(after.market().reconcile().valid);
+}
+
+#[tokio::test]
 async fn a_save_this_build_cannot_use_is_refused() {
     let dir = TempDir::new("fehu-save-bad");
     let path = dir.path().join("state.json");

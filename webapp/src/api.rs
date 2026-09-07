@@ -1326,7 +1326,7 @@ async fn submit_order(
         qty: req.qty,
     };
     let client_order_id = clean_client_order_id(req.client_order_id)?;
-    let (day, expires_at_ms) = (req.day, req.expires_at_ms);
+    let (day, expires_at_ms, display_qty) = (req.day, req.expires_at_ms, req.display_qty);
 
     let (response, fills, replayed) = {
         let mut market = app.market();
@@ -1369,7 +1369,14 @@ async fn submit_order(
             (accepted, Vec::new(), true)
         } else {
             let (response, fills) = market
-                .place_expiring(idx, trader, order, client_order_id, expires_at_ms)
+                .place_full(
+                    idx,
+                    trader,
+                    order,
+                    client_order_id,
+                    expires_at_ms,
+                    display_qty,
+                )
                 .map_err(ApiError::place)?;
             (response, fills, false)
         }
@@ -1843,7 +1850,7 @@ async fn amend_order(
                 price_cents: req.price_cents.unwrap_or(resting.price_cents),
             },
             tif: fehu::TimeInForce::Gtc,
-            qty: req.qty.unwrap_or(resting.remaining),
+            qty: req.qty.unwrap_or(resting.outstanding()),
         };
         market.symbols[idx]
             .exchange
@@ -1863,11 +1870,11 @@ async fn amend_order(
                 account,
                 sym,
                 cancelled.side,
-                cancelled.remaining,
+                cancelled.outstanding(),
                 cancelled.price_cents,
             );
         }
-        market.cancel_order_record(sym, order_id, cancelled.remaining, now);
+        market.cancel_order_record(sym, order_id, cancelled.outstanding(), now);
 
         if req.post_only {
             check_post_only(&market.symbols[idx], &order)?;
@@ -1882,7 +1889,7 @@ async fn amend_order(
         (
             response,
             fills,
-            cancelled.qty.saturating_sub(cancelled.remaining),
+            cancelled.qty.saturating_sub(cancelled.outstanding()),
         )
     };
     tracing::info!(
@@ -1934,12 +1941,12 @@ async fn cancel_order(
             account,
             sym,
             cancelled.side,
-            cancelled.remaining,
+            cancelled.outstanding(),
             cancelled.price_cents,
         );
     }
     let now = market.symbols[idx].exchange.clock().0;
-    market.cancel_order_record(sym, order_id, cancelled.remaining, now);
+    market.cancel_order_record(sym, order_id, cancelled.outstanding(), now);
     tracing::info!(
         trader = trader.0,
         symbol = sym,
@@ -1964,12 +1971,12 @@ async fn cancel_all(
         let cancelled = market.symbols[i].exchange.cancel_all(trader);
         if let Some((t, account)) = market.trader_and_account(trader) {
             for o in &cancelled {
-                t.release(account, sym, o.side, o.remaining, o.price_cents);
+                t.release(account, sym, o.side, o.outstanding(), o.price_cents);
                 out.push(OpenOrderDto::from_resting(sym, o));
             }
         }
         for o in &cancelled {
-            market.cancel_order_record(sym, o.id.0, o.remaining, now);
+            market.cancel_order_record(sym, o.id.0, o.outstanding(), now);
         }
     }
     Ok(Json(out))

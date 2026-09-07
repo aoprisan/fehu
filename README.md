@@ -113,7 +113,7 @@ read that portfolio, cancel those orders or move that money. The key is shown
 | `GET` | `/api/traders`, `/api/traders/{id}` | Traders; a portfolio with cash, positions marked to the reference price, open orders and fills |
 | `POST` | `/api/traders/{id}/deposit` | Add money to the trader's account: `{"amount_cents":250000}` |
 | `POST` | `/api/traders/{id}/cancel_all` | Cancel every resting order of a trader |
-| `POST` | `/api/symbols/{sym}/orders` | `{"trader_id":1,"side":"buy","qty":100,"type":"market"}` or `"type":"limit","price_cents":8400`, optional `"tif":"gtc\|ioc\|fok"`, `"client_order_id":"abc-1"`, `"post_only":true`, and `"expires_at_ms"` or `"day":true` to have the resting remainder withdrawn later; responds with fills and status |
+| `POST` | `/api/symbols/{sym}/orders` | `{"trader_id":1,"side":"buy","qty":100,"type":"market"}` or `"type":"limit","price_cents":8400`, optional `"tif":"gtc\|ioc\|fok"`, `"client_order_id":"abc-1"`, `"post_only":true`, `"display_qty":20` to show only a slice of a resting order at a time, and `"expires_at_ms"` or `"day":true` to have the resting remainder withdrawn later; responds with fills and status |
 | `GET` | `/api/symbols/{sym}/orders?trader_id=` | A trader's resting orders on that symbol |
 | `GET`/`DELETE` | `/api/symbols/{sym}/orders/{id}` | Look up / cancel (`?trader_id=`) a resting order |
 | `PATCH` | `/api/symbols/{sym}/orders/{id}` | Amend a resting order: `{"trader_id":1,"price_cents":8500,"qty":50}` — a cancel and a fresh order, so it loses queue position |

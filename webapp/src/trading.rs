@@ -457,6 +457,10 @@ pub struct OrderRequest {
     /// instead. Only meaningful for a `gtc` limit order.
     #[serde(default)]
     pub post_only: bool,
+    /// Show only this much at a time, keeping the rest back and posting the
+    /// next slice — at the back of the queue for its price — as each one
+    /// fills. Only a `gtc` limit order can hide anything.
+    pub display_qty: Option<u64>,
     /// Simulated time at which the order is withdrawn if it is still
     /// resting. Absent leaves it resting until it fills or is cancelled.
     pub expires_at_ms: Option<i64>,
@@ -777,7 +781,14 @@ pub struct OpenOrderDto {
     pub side: Side,
     pub price_cents: i64,
     pub qty: u64,
+    /// Everything still open: what is on show plus, for an iceberg, what is
+    /// not.
     pub remaining: u64,
+    /// The slice an iceberg shows at a time; `null` for an ordinary order.
+    pub display_qty: Option<u64>,
+    /// What is on show right now. Equal to `remaining` unless this is an
+    /// iceberg with something still held back.
+    pub shown_qty: u64,
     pub ts_ms: i64,
 }
 
@@ -790,7 +801,9 @@ impl OpenOrderDto {
             side: r.side,
             price_cents: r.price_cents,
             qty: r.qty,
-            remaining: r.remaining,
+            remaining: r.outstanding(),
+            display_qty: (r.display > 0).then_some(r.display),
+            shown_qty: r.remaining,
             ts_ms: r.ts.0,
         }
     }

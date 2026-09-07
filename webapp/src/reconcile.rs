@@ -49,7 +49,7 @@ impl Market {
                     ));
                     continue;
                 };
-                if order.remaining == 0 || order.remaining > order.qty {
+                if order.remaining == 0 || order.outstanding() > order.qty {
                     issues.push(format!(
                         "{ticker} order {} has invalid remaining quantity",
                         order.id.0
@@ -58,11 +58,11 @@ impl Market {
                 match order.side {
                     Side::Buy => {
                         *cash.entry(trader.account_id).or_default() +=
-                            i128::from(order.price_cents) * i128::from(order.remaining);
-                        bids += u128::from(order.remaining);
+                            i128::from(order.price_cents) * i128::from(order.outstanding());
+                        bids += u128::from(order.outstanding());
                     }
                     Side::Sell => {
-                        *sells.entry((id, ticker)).or_default() += u128::from(order.remaining)
+                        *sells.entry((id, ticker)).or_default() += u128::from(order.outstanding())
                     }
                 }
             }

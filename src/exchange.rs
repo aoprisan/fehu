@@ -324,6 +324,10 @@ impl Exchange {
         // order without asking. Setting it here covers both a fresh exchange
         // and one read back from a save.
         book.set_rules(params.rules);
+        // A book from a file written before icebergs has no queue priority
+        // of its own; back then priority was the id, so the ids are the
+        // seeds. A book that has one is left alone.
+        book.seed_priority();
         let cfg = sim.config();
         let days = cfg
             .market_hours
@@ -453,6 +457,35 @@ impl Exchange {
             OrderKind::Limit { .. } => order,
         };
         let placement = self.book.submit(order, self.sim.clock())?;
+        self.account(&placement.trades);
+        for t in &placement.trades {
+            self.interim_volume = self.interim_volume.saturating_add(t.qty);
+        }
+        Ok(placement)
+    }
+
+    /// Submit a trader's iceberg: a `Gtc` limit order that shows
+    /// `display_qty` at a time and posts the next slice, at the back of the
+    /// queue for its price, as each one fills.
+    ///
+    /// It still takes with its whole quantity on arrival. Only what rests is
+    /// sliced, and only what is on show ever appears in the depth, the
+    /// preview or the quantity a fill-or-kill measures itself against.
+    ///
+    /// # Errors
+    /// See [`OrderError`]. Synthetic owners are rejected.
+    pub fn submit_iceberg(
+        &mut self,
+        order: Order,
+        display_qty: u64,
+    ) -> Result<Placement, OrderError> {
+        if order.owner == Owner::Synthetic {
+            return Err(OrderError::SyntheticOwner);
+        }
+        self.book.validate(&order)?;
+        let placement = self
+            .book
+            .submit_iceberg(order, display_qty, self.sim.clock())?;
         self.account(&placement.trades);
         for t in &placement.trades {
             self.interim_volume = self.interim_volume.saturating_add(t.qty);

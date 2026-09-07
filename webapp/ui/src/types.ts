@@ -285,7 +285,12 @@ export interface OpenOrderDto {
   side: Side;
   price_cents: number;
   qty: number;
+  /** Everything still open: what is on show plus what an iceberg holds back. */
   remaining: number;
+  /** The slice an iceberg shows at a time; `null` for an ordinary order. */
+  display_qty: number | null;
+  /** What is on show right now. Equal to `remaining` unless it is an iceberg. */
+  shown_qty: number;
   ts_ms: number;
 }
 
@@ -593,6 +598,12 @@ export type OrderRequest = OrderKind & {
    * meaningful for a `gtc` limit order.
    */
   post_only?: boolean;
+  /**
+   * Show only this much at a time, keeping the rest back and posting the
+   * next slice — at the back of the queue for its price — as each one fills.
+   * Only a `gtc` limit order can hide anything.
+   */
+  display_qty?: number;
   /**
    * Simulated time at which the resting remainder is withdrawn. Absent
    * leaves it resting until it fills or is cancelled.

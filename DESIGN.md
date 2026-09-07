@@ -1232,7 +1232,10 @@ market-order collar; flow direction follows the return (> 70 % of volume);
 determinism with interleaved orders; a tick and lot enforced on both sides —
 every synthetic quote and print on the grid and in whole lots, an off-tick or
 odd-lot order refused, a market order's collar landing on the grid — and the
-default rules constraining nothing; serde round trip (JSON and postcard)
+default rules constraining nothing; an iceberg showing a slice, refreshing at
+the back of the queue, keeping its size out of the depth, the preview and a
+fill-or-kill, and giving everything back when cancelled, with a display slice
+that is zero, too big, off-lot or on an order that cannot rest refused; serde round trip (JSON and postcard)
 continuing identically for 2 k ticks. `webapp/tests/api.rs` covers the HTTP
 surface end to end, including reservations and rejections; users opening
 accounts and paying money in, the ledger adding up to the balance after a
@@ -1322,8 +1325,29 @@ come back when the market does. A `day` order without a trading calendar is
 refused rather than left to live forever, because there is no close for it to
 end at.
 
-**Iceberg.** Still unbuilt: it needs the book to re-post a slice as each one
-fills, which is `book.rs` and its queue priority, not the web app.
+**Iceberg (implemented).** `display_qty` on a `gtc` limit order shows a slice
+at a time and keeps the rest back; `OrderBook::submit_iceberg` posts the
+first slice and `match_incoming` posts the next one as each is exhausted —
+*at the back of the queue for its price*, which is what stops a hidden order
+from holding the front of a queue forever.
+
+That last point is why this needed the book rather than the web app. Priority
+used to be the order id: `validate_state` required ids to increase down a
+queue, so an order could never lose its place without losing its identity. A
+`Resting` now carries `seq` — priority, handed out on every post and every
+refresh — beside `id`, which is identity and never changes. A book from a
+file written before this has `next_seq == 0`, and `seed_priority` fills it in
+from the ids, which is exactly what priority was then.
+
+`Resting` also gains `hidden` (open but not on show) and `display` (the
+slice). Depth, `preview` and the quantity a fill-or-kill measures itself
+against all count `remaining` only, so hidden size is genuinely hidden: a FOK
+that cannot see enough is killed even when the liquidity is there. But it is
+still liquidity — a large enough market order walks slice after slice until
+the order is gone. Everything that asks "what is still owed" —
+reservations, cancels, amends, reconciliation, the order log — uses
+`Resting::outstanding()`, so hiding size never makes it free: a buy iceberg
+reserves cash for all of it, and cancelling gives all of it back.
 
 **Tick and lot size (implemented).** `MarketRules { tick_cents, lot }` lives
 in `TradingParams`, and the exchange copies it into the book whenever one is

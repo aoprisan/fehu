@@ -881,7 +881,7 @@ impl Market {
                 .book()
                 .orders()
                 .filter(|o| o.side == Side::Buy && o.owner.trader().is_some())
-                .map(|o| o.remaining)
+                .map(|o| o.outstanding())
                 .fold(0, u64::saturating_add)
         })
     }
@@ -1309,11 +1309,11 @@ impl Market {
                     account,
                     sym,
                     cancelled.side,
-                    cancelled.remaining,
+                    cancelled.outstanding(),
                     cancelled.price_cents,
                 );
             }
-            self.cancel_order_record(sym, order_id, cancelled.remaining, now_ms);
+            self.cancel_order_record(sym, order_id, cancelled.outstanding(), now_ms);
             if let Some(record) = self.orders.get(&order_id) {
                 messages.push(StreamMessage::OrderExpired {
                     trader_id: trader.0,
@@ -1611,6 +1611,20 @@ impl Market {
         client_order_id: Option<String>,
         expires_at_ms: Option<i64>,
     ) -> Result<(OrderResponse, Vec<FillRecord>), PlaceError> {
+        self.place_full(idx, trader, order, client_order_id, expires_at_ms, None)
+    }
+
+    /// [`place`](Self::place), for an order that may also hide most of its
+    /// size behind a `display_qty` slice.
+    pub fn place_full(
+        &mut self,
+        idx: usize,
+        trader: TraderId,
+        order: fehu::Order,
+        client_order_id: Option<String>,
+        expires_at_ms: Option<i64>,
+        display_qty: Option<u64>,
+    ) -> Result<(OrderResponse, Vec<FillRecord>), PlaceError> {
         let sym = self.symbols[idx].info.symbol;
         // Worst-case cash a buy can consume.
         let cost = match order.kind {
@@ -1661,7 +1675,11 @@ impl Market {
             .max()
             .unwrap_or(fehu::OrderId(1));
         self.symbols[idx].exchange.advance_order_id(next_id);
-        let placement = match self.symbols[idx].exchange.submit(order) {
+        let submitted = match display_qty {
+            None => self.symbols[idx].exchange.submit(order),
+            Some(display) => self.symbols[idx].exchange.submit_iceberg(order, display),
+        };
+        let placement = match submitted {
             Ok(placement) => placement,
             Err(e) => {
                 self.orders_refused = self.orders_refused.saturating_add(1);
