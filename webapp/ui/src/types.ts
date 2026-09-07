@@ -63,6 +63,38 @@ export interface Quote {
   pending_events: number;
   bid_cents: number | null;
   ask_cents: number | null;
+  /** Shares in existence for this symbol. */
+  shares_outstanding: number;
+  /** `price × shares_outstanding`. */
+  market_cap_cents: number;
+}
+
+/** `api::HolderDto` — one trader's stake in a symbol. */
+export interface HolderDto {
+  trader_id: number;
+  user_id: number;
+  qty: number;
+  reserved_shares: number;
+  free_shares: number;
+}
+
+/**
+ * `GET /api/symbols/{symbol}/shares` (`api::SharesDto`): where the symbol's
+ * shares are. The parts add up: `outstanding = held + bid_for + available`.
+ */
+export interface SharesResponse {
+  symbol: string;
+  shares_outstanding: number;
+  /** Held by traders. */
+  held_shares: number;
+  /** Bid for by traders' resting buy orders. */
+  bid_shares: number;
+  /** Neither held nor bid for: what a buy can still be filled from. */
+  available_shares: number;
+  price_cents: number;
+  market_cap_cents: number;
+  /** Largest stake first. */
+  holders: HolderDto[];
 }
 
 /** `GET /api/symbols`. */
@@ -245,7 +277,38 @@ export interface PositionDto {
   market_value_cents: number;
   unrealised_pnl_cents: number;
   realised_pnl_cents: number;
+  /** Shares promised to resting sell orders. */
   reserved_shares: number;
+  /** `qty − reserved_shares`: the most this trader may still sell. */
+  free_shares: number;
+}
+
+/** `trading::HoldingDto` — one user's shares in one symbol. */
+export interface HoldingDto {
+  symbol: string;
+  qty: number;
+  reserved_shares: number;
+  /** What the user can still sell. */
+  free_shares: number;
+  cost_cents: number;
+  avg_cost_cents: number | null;
+  mark_cents: number;
+  market_value_cents: number;
+  unrealised_pnl_cents: number;
+  realised_pnl_cents: number;
+  /** The user's traders holding this symbol. */
+  traders: number[];
+}
+
+/** `GET /api/users/{id}/holdings` (`trading::UserHoldingsResponse`). */
+export interface UserHoldingsResponse {
+  user_id: number;
+  shares_owned: number;
+  reserved_shares: number;
+  free_shares: number;
+  market_value_cents: number;
+  /** One entry per symbol the user holds, by ticker. */
+  holdings: HoldingDto[];
 }
 
 /** `GET /api/traders/{id}`. */
@@ -298,6 +361,10 @@ export interface UserDto {
   traders: number[];
   /** Every account's balance added up. */
   balance_cents: number;
+  /** Shares owned across every symbol and every trader of the user. */
+  shares_owned: number;
+  /** Those shares at the reference prices. */
+  holdings_value_cents: number;
 }
 
 /** `account::AccountDto`. Money is integer cents. */

@@ -81,14 +81,16 @@ change and `just ui-dev` serves it with hot reload against a running backend.
 | Method | Path | What |
 |---|---|---|
 | `GET` | `/api/symbols` | Quotes for every symbol |
-| `GET` | `/api/symbols/{sym}` | Quote, latent snapshot and config |
+| `GET` | `/api/symbols/{sym}` | Quote, latent snapshot, config and share count |
+| `GET` | `/api/symbols/{sym}/shares` | The symbol's shares: outstanding, held by traders, bid for, still available, and who holds them |
 | `GET` | `/api/symbols/{sym}/bars?interval=M1\|M5\|H1\|D1&limit=500` | OHLCV bars, oldest first, in-progress bar last |
 | `POST` | `/api/symbols/{sym}/events` | Raw simulator event: `{"type":"jump","pct":-0.1}`, `drift_shift`, `drift_for_total_move`, `vol_shift`, `fundamental_shift`, `fundamental_target`; optional `at_ms` / `delay_secs`, `source`, `note` |
 | `POST` | `/api/game/events` | Semantic game event: `{"kind":"scandal","symbol":"ACME","magnitude":1.5}`; market-wide kinds (`market_crash`, `rate_hike`, …) need no symbol |
 | `GET` | `/api/game/catalog` | Every game-event kind and the simulator events it expands to |
 | `GET` | `/api/events` | Audit log of accepted events, newest first (`?symbol=`, `?limit=`) |
 | `POST` | `/api/users` | Create a user: `{"name":"ada","email":"ada@example.com"}` (both optional) |
-| `GET` | `/api/users`, `/api/users/{id}` | Users, their accounts and traders |
+| `GET` | `/api/users`, `/api/users/{id}` | Users, their accounts, traders, cash and shares owned |
+| `GET` | `/api/users/{id}/holdings` | Shares the user owns per symbol, added up over their traders, with what is reserved and what is still sellable |
 | `POST` | `/api/users/{id}/accounts` | Open another account: `{"name":"main","cash_cents":10000000}` |
 | `GET` | `/api/users/{id}/accounts`, `/api/accounts`, `/api/accounts/{id}` | Accounts: balance, reserved, available, status |
 | `POST` | `/api/accounts/{id}/deposit` | Add money: `{"amount_cents":250000,"memo":"week 1"}` |
@@ -124,9 +126,22 @@ every amount is checked: deposits and withdrawals must be positive, a
 withdrawal cannot touch the cash a resting buy order has reserved, and an
 order is validated against its account before it reaches the exchange (the
 account must be active and its available balance must cover the worst-case
-cost; sells need free shares). Fills settle through the account, so every
-cent that moves is on its ledger. Nothing is persisted: accounts start with
-cash, no shares, no margin and no shorting.
+cost). Fills settle through the account, so every cent that moves is on its
+ledger. Nothing is persisted: accounts start with cash, no shares, no margin
+and no shorting.
+
+Shares are counted the same way. Every symbol has a fixed number of them
+(`shares_outstanding`: 240 M of ACME, 85 M of NBLA, 610 M of HLIO, 150 M of
+PXCO), and a buy can only be filled from the ones no trader holds or is
+already bidding for — `GET /api/symbols/{sym}/shares` shows the split. A sell
+is bounded from the other side: **a trader can only sell shares it holds**.
+The quantity must fit in its position less whatever earlier resting sells
+already promised away, so there is no shorting and no selling of shares a fill
+has not yet delivered; a resting sell reserves the shares exactly as a resting
+buy reserves cash, and a cancel gives them back. `GET /api/users/{id}/holdings`
+adds a user's positions up per symbol — owned, reserved and sellable — across
+every trader of theirs, and shares belong to the trader that bought them: one
+trader cannot sell another's, even under the same user.
 
 ## License
 

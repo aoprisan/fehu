@@ -1045,3 +1045,287 @@ async fn one_user_can_run_several_traders() {
     let (status, body) = post(&app, "/api/traders", json!({ "account_id": 1 })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
+
+#[tokio::test]
+async fn a_trader_can_only_sell_shares_it_holds() {
+    let app = test_app();
+    let id = new_trader(&app, "sam").await;
+
+    // Nothing owned yet: there is nothing to sell.
+    let (status, body) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "sell", "qty": 1, "type": "market" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "order_refused");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("insufficient shares"),
+        "{body}"
+    );
+
+    // Buy 200, and 201 is still one too many.
+    let (status, body) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 200, "type": "market" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["filled"], 200);
+    let (_, p) = get(&app, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["positions"][0]["qty"], 200);
+    assert_eq!(p["positions"][0]["free_shares"], 200);
+    assert_eq!(p["positions"][0]["reserved_shares"], 0);
+    let (status, body) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "sell", "qty": 201, "type": "market" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // A resting sell of 150 promises those shares away: only 50 stay free.
+    let ask = get(&app, "/api/symbols/ACME/book").await.1["ask_cents"]
+        .as_i64()
+        .unwrap();
+    let (status, body) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "sell", "qty": 150, "type": "limit", "price_cents": ask * 2 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["status"], "resting");
+    let order_id = body["order_id"].as_u64().unwrap();
+    let (_, p) = get(&app, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["positions"][0]["reserved_shares"], 150);
+    assert_eq!(p["positions"][0]["free_shares"], 50);
+
+    for (qty, expected) in [
+        (51, StatusCode::UNPROCESSABLE_ENTITY),
+        (50, StatusCode::CREATED),
+    ] {
+        let (status, body) = post(
+            &app,
+            "/api/symbols/ACME/orders",
+            json!({ "trader_id": id, "side": "sell", "qty": qty, "type": "market" }),
+        )
+        .await;
+        assert_eq!(status, expected, "selling {qty} of 50 free: {body}");
+    }
+    let (_, p) = get(&app, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["positions"][0]["qty"], 150, "sold the 50 that were free");
+    assert_eq!(p["positions"][0]["free_shares"], 0);
+
+    // Cancelling the resting sell frees them again, and then everything can go.
+    let (status, _) = delete(
+        &app,
+        &format!("/api/symbols/ACME/orders/{order_id}?trader_id={id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, p) = get(&app, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["positions"][0]["free_shares"], 150);
+    let (status, body) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "sell", "qty": 150, "type": "market" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (_, p) = get(&app, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["positions"][0]["qty"], 0);
+    let (status, _) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "sell", "qty": 1, "type": "market" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "flat again");
+}
+
+#[tokio::test]
+async fn every_symbol_has_a_finite_number_of_shares() {
+    let app = test_app();
+    let (status, shares) = get(&app, "/api/symbols/ACME/shares").await;
+    assert_eq!(status, StatusCode::OK);
+    let outstanding = shares["shares_outstanding"].as_u64().unwrap();
+    assert_eq!(outstanding, 240_000_000);
+    assert_eq!(shares["held_shares"], 0);
+    assert_eq!(shares["bid_shares"], 0);
+    assert_eq!(shares["available_shares"], outstanding);
+    assert!(shares["holders"].as_array().unwrap().is_empty());
+
+    // The quote carries the count and the market cap it implies.
+    let (_, symbols) = get(&app, "/api/symbols").await;
+    let acme = &symbols["symbols"][0];
+    assert_eq!(acme["shares_outstanding"], outstanding);
+    assert_eq!(
+        acme["market_cap_cents"].as_i64().unwrap(),
+        acme["price_cents"].as_i64().unwrap() * outstanding as i64
+    );
+
+    // Buying takes shares out of circulation; a resting bid spoken for them.
+    let id = new_trader(&app, "tara").await;
+    post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 500, "type": "market" }),
+    )
+    .await;
+    let bid = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+    post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 40, "type": "limit", "price_cents": bid / 2 }),
+    )
+    .await;
+    let (_, shares) = get(&app, "/api/symbols/ACME/shares").await;
+    assert_eq!(shares["held_shares"], 500);
+    assert_eq!(shares["bid_shares"], 40);
+    assert_eq!(shares["available_shares"], outstanding - 540);
+    assert_eq!(shares["holders"][0]["trader_id"], id);
+    assert_eq!(shares["holders"][0]["qty"], 500);
+    assert_eq!(shares["holders"][0]["free_shares"], 500);
+    let (_, detail) = get(&app, "/api/symbols/ACME").await;
+    assert_eq!(detail["info"]["shares_outstanding"], outstanding);
+    assert_eq!(detail["shares"]["held_shares"], 500);
+
+    // Nobody can buy shares that do not exist — checked before the money is.
+    let (status, body) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": outstanding, "type": "market" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "order_refused");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not enough shares left"),
+        "{body}"
+    );
+
+    // Other symbols have their own counts and are unaffected.
+    let (_, nbla) = get(&app, "/api/symbols/NBLA/shares").await;
+    assert_eq!(nbla["shares_outstanding"], 85_000_000);
+    assert_eq!(nbla["available_shares"], 85_000_000);
+}
+
+#[tokio::test]
+async fn a_users_shares_are_the_sum_of_their_traders() {
+    let app = test_app();
+    post(&app, "/api/users", json!({ "name": "nina" })).await;
+    let mut ids = Vec::new();
+    for name in ["alpha", "beta"] {
+        let (status, body) = post(
+            &app,
+            "/api/traders",
+            json!({ "name": name, "user_id": 1, "cash_cents": 5_000_000 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        ids.push(body["id"].as_u64().unwrap());
+    }
+    let (alpha, beta) = (ids[0], ids[1]);
+
+    for (trader, qty) in [(alpha, 100), (beta, 40)] {
+        let (status, body) = post(
+            &app,
+            "/api/symbols/ACME/orders",
+            json!({ "trader_id": trader, "side": "buy", "qty": qty, "type": "market" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, body) = post(
+        &app,
+        "/api/symbols/HLIO/orders",
+        json!({ "trader_id": beta, "side": "buy", "qty": 300, "type": "market" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, holdings) = get(&app, "/api/users/1/holdings").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(holdings["user_id"], 1);
+    assert_eq!(holdings["shares_owned"], 440);
+    assert_eq!(holdings["free_shares"], 440);
+    assert_eq!(holdings["reserved_shares"], 0);
+    let acme = &holdings["holdings"][0];
+    assert_eq!(acme["symbol"], "ACME");
+    assert_eq!(acme["qty"], 140, "both traders' ACME, added up");
+    assert_eq!(acme["traders"], json!([alpha, beta]));
+    assert!(acme["avg_cost_cents"].as_f64().unwrap() > 0.0);
+    assert_eq!(
+        acme["market_value_cents"].as_i64().unwrap(),
+        acme["mark_cents"].as_i64().unwrap() * 140
+    );
+    assert_eq!(holdings["holdings"][1]["symbol"], "HLIO");
+    assert_eq!(holdings["holdings"][1]["qty"], 300);
+    assert_eq!(
+        holdings["market_value_cents"].as_i64().unwrap(),
+        acme["market_value_cents"].as_i64().unwrap()
+            + holdings["holdings"][1]["market_value_cents"]
+                .as_i64()
+                .unwrap()
+    );
+
+    // The user's own row agrees with the holdings.
+    let (_, user) = get(&app, "/api/users/1").await;
+    assert_eq!(user["shares_owned"], 440);
+    assert_eq!(user["holdings_value_cents"], holdings["market_value_cents"]);
+
+    // Shares belong to the trader that bought them: alpha cannot sell beta's.
+    let (status, body) = post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": alpha, "side": "sell", "qty": 140, "type": "market" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("have 100 free"),
+        "{body}"
+    );
+    // And beta cannot sell HLIO it does not hold in that symbol.
+    let (status, body) = post(
+        &app,
+        "/api/symbols/HLIO/orders",
+        json!({ "trader_id": alpha, "side": "sell", "qty": 1, "type": "market" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // A resting sell shows up as reserved for the whole user.
+    let ask = get(&app, "/api/symbols/ACME/book").await.1["ask_cents"]
+        .as_i64()
+        .unwrap();
+    post(
+        &app,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": alpha, "side": "sell", "qty": 60, "type": "limit", "price_cents": ask * 2 }),
+    )
+    .await;
+    let (_, holdings) = get(&app, "/api/users/1/holdings").await;
+    assert_eq!(holdings["holdings"][0]["reserved_shares"], 60);
+    assert_eq!(holdings["holdings"][0]["free_shares"], 80);
+    assert_eq!(holdings["shares_owned"], 440, "reserving sells nothing");
+    assert_eq!(holdings["free_shares"], 380);
+
+    let (status, body) = get(&app, "/api/users/99/holdings").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "unknown_user");
+}

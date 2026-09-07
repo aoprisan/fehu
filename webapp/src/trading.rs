@@ -60,6 +60,9 @@ pub enum Refused {
     Account(MoneyError),
     /// Not enough free shares for the sell.
     InsufficientShares { needed: u64, available: u64 },
+    /// The buy asked for more shares than the symbol has left: every other
+    /// share of it is already held by a trader or bid for by a resting order.
+    SupplyExhausted { needed: u64, available: u64 },
 }
 
 impl std::fmt::Display for Refused {
@@ -70,6 +73,13 @@ impl std::fmt::Display for Refused {
                 write!(
                     f,
                     "insufficient shares: need {needed}, have {available} free"
+                )
+            }
+            Self::SupplyExhausted { needed, available } => {
+                write!(
+                    f,
+                    "not enough shares left: want {needed}, {available} of the \
+                     outstanding shares are unheld"
                 )
             }
         }
@@ -109,19 +119,28 @@ impl Trader {
         Owner::Trader(self.id)
     }
 
-    /// Shares of `symbol` not committed to resting sells.
-    pub fn free_shares(&self, symbol: &str) -> u64 {
-        let held = self
-            .positions
+    /// Shares of `symbol` the trader owns. Positions never go short — a sell
+    /// is refused unless the shares are already there — so a negative one
+    /// would be a broken invariant and counts as nothing.
+    pub fn held_shares(&self, symbol: &str) -> u64 {
+        self.positions
             .get(symbol)
-            .map_or(0, |p| u64::try_from(p.qty).unwrap_or(0));
-        held.saturating_sub(self.reserved_shares.get(symbol).copied().unwrap_or(0))
+            .map_or(0, |p| u64::try_from(p.qty).unwrap_or(0))
+    }
+
+    /// Shares of `symbol` the trader can still sell: what it holds, less what
+    /// its resting sells have already promised away.
+    pub fn free_shares(&self, symbol: &str) -> u64 {
+        self.held_shares(symbol)
+            .saturating_sub(self.reserved_shares.get(symbol).copied().unwrap_or(0))
     }
 
     /// Validate an order against the trader's account before it reaches the
     /// exchange. `cost_cents` is the worst-case cash a buy could consume
     /// (limit: `qty × price`; market: the preview). A sell needs no cash but
-    /// still needs an account that is allowed to trade.
+    /// needs an account that is allowed to trade and, above all, the shares:
+    /// there is no shorting, so `qty` may never exceed [`Trader::free_shares`]
+    /// — the position less whatever earlier resting sells already promised.
     pub fn check(
         &self,
         account: &Account,
@@ -433,7 +452,146 @@ pub struct PositionDto {
     pub market_value_cents: i64,
     pub unrealised_pnl_cents: i64,
     pub realised_pnl_cents: i64,
+    /// Shares promised to resting sell orders.
     pub reserved_shares: u64,
+    /// `qty − reserved_shares`: the most this trader may still sell.
+    pub free_shares: u64,
+}
+
+/// What one user owns of one symbol: their traders' positions in it, added
+/// up. A user can never sell more of a symbol than `free_shares` here, and
+/// no single trader more than its own share of it.
+#[derive(Clone, Debug, Serialize)]
+pub struct HoldingDto {
+    pub symbol: &'static str,
+    /// Shares owned.
+    pub qty: u64,
+    /// Of those, promised to resting sell orders.
+    pub reserved_shares: u64,
+    /// `qty − reserved_shares`: what the user can still sell.
+    pub free_shares: u64,
+    /// Cost basis of the open position, in cents.
+    pub cost_cents: i64,
+    /// `cost_cents / qty`.
+    pub avg_cost_cents: Option<f64>,
+    /// The symbol's reference price.
+    pub mark_cents: i64,
+    pub market_value_cents: i64,
+    pub unrealised_pnl_cents: i64,
+    pub realised_pnl_cents: i64,
+    /// The user's traders holding this symbol, by id.
+    pub traders: Vec<u64>,
+}
+
+impl HoldingDto {
+    /// An empty holding of `symbol`, to be filled with [`HoldingDto::add`]
+    /// and closed off with [`HoldingDto::mark`].
+    pub fn empty(symbol: &'static str) -> Self {
+        Self {
+            symbol,
+            qty: 0,
+            reserved_shares: 0,
+            free_shares: 0,
+            cost_cents: 0,
+            avg_cost_cents: None,
+            mark_cents: 0,
+            market_value_cents: 0,
+            unrealised_pnl_cents: 0,
+            realised_pnl_cents: 0,
+            traders: Vec::new(),
+        }
+    }
+
+    /// Add what one trader holds of the symbol.
+    pub fn add(&mut self, trader: &Trader) {
+        let held = trader.held_shares(self.symbol);
+        let Some(position) = trader.positions.get(self.symbol) else {
+            return;
+        };
+        self.qty = self.qty.saturating_add(held);
+        self.reserved_shares = self
+            .reserved_shares
+            .saturating_add(held.saturating_sub(trader.free_shares(self.symbol)));
+        self.cost_cents = self.cost_cents.saturating_add(position.cost_cents);
+        self.realised_pnl_cents = self
+            .realised_pnl_cents
+            .saturating_add(position.realised_pnl_cents);
+        self.traders.push(trader.id.0);
+    }
+
+    /// Value the holding at `mark_cents` once every trader has been added.
+    pub fn mark(&mut self, mark_cents: i64) {
+        self.free_shares = self.qty.saturating_sub(self.reserved_shares);
+        self.mark_cents = mark_cents;
+        self.market_value_cents = notional_cents(mark_cents, self.qty);
+        self.unrealised_pnl_cents = self.market_value_cents.saturating_sub(self.cost_cents);
+        self.avg_cost_cents = (self.qty > 0).then(|| self.cost_cents as f64 / self.qty as f64);
+    }
+}
+
+/// `GET /api/users/{id}/holdings`: every share the user owns.
+#[derive(Clone, Debug, Serialize)]
+pub struct UserHoldingsResponse {
+    pub user_id: u64,
+    /// Shares owned across every symbol and every trader of the user.
+    pub shares_owned: u64,
+    /// Of those, promised to resting sell orders.
+    pub reserved_shares: u64,
+    /// What the user could sell right now.
+    pub free_shares: u64,
+    /// The holdings at the reference prices.
+    pub market_value_cents: i64,
+    /// One entry per symbol the user holds, by ticker.
+    pub holdings: Vec<HoldingDto>,
+}
+
+impl UserHoldingsResponse {
+    /// Total up `holdings` for one user.
+    pub fn new(user_id: u64, holdings: Vec<HoldingDto>) -> Self {
+        let mut out = Self {
+            user_id,
+            shares_owned: 0,
+            reserved_shares: 0,
+            free_shares: 0,
+            market_value_cents: 0,
+            holdings,
+        };
+        for h in &out.holdings {
+            out.shares_owned = out.shares_owned.saturating_add(h.qty);
+            out.reserved_shares = out.reserved_shares.saturating_add(h.reserved_shares);
+            out.free_shares = out.free_shares.saturating_add(h.free_shares);
+            out.market_value_cents = out.market_value_cents.saturating_add(h.market_value_cents);
+        }
+        out
+    }
+}
+
+/// One trader's stake in a symbol, for `GET /api/symbols/{sym}/shares`.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct HolderDto {
+    pub trader_id: u64,
+    pub user_id: u64,
+    pub qty: u64,
+    pub reserved_shares: u64,
+    pub free_shares: u64,
+}
+
+impl HolderDto {
+    /// `trader`'s stake in `symbol`, or `None` if it holds none of it.
+    pub fn new(trader: &Trader, symbol: &str) -> Option<Self> {
+        let qty = trader.held_shares(symbol);
+        if qty == 0 {
+            return None;
+        }
+        let free = trader.free_shares(symbol);
+        Some(Self {
+            trader_id: trader.id.0,
+            user_id: trader.user_id.0,
+            qty,
+            reserved_shares: qty.saturating_sub(free),
+            free_shares: free,
+        })
+    }
 }
 
 /// `GET /api/traders/{id}`.
@@ -560,6 +718,76 @@ mod tests {
         // Every movement is on the ledger, and the account stays valid.
         assert!(a.is_valid());
         assert_eq!(a.ledger(100).len(), 5, "open + four settlements");
+    }
+
+    #[test]
+    fn a_sell_can_never_exceed_what_is_held() {
+        let (mut t, mut a) = trader(1_000_000);
+        // Buy 100 as taker.
+        t.apply_trade(
+            &mut a,
+            "ACME",
+            &trade(Owner::Trader(ME), Owner::Synthetic, Side::Buy, 100, 5_000),
+        );
+        assert_eq!(t.held_shares("ACME"), 100);
+        assert_eq!(t.free_shares("ACME"), 100);
+        assert!(t.check(&a, "ACME", Side::Sell, 101, 0).is_err());
+        t.check(&a, "ACME", Side::Sell, 100, 0).unwrap();
+        // 60 of them rest in a sell, so only 40 are still sellable.
+        t.reserve(&mut a, "ACME", Side::Sell, 60, 6_000);
+        assert_eq!(t.held_shares("ACME"), 100, "reserving sells nothing");
+        assert_eq!(t.free_shares("ACME"), 40);
+        assert_eq!(
+            t.check(&a, "ACME", Side::Sell, 41, 0).unwrap_err(),
+            Refused::InsufficientShares {
+                needed: 41,
+                available: 40,
+            }
+        );
+        t.check(&a, "ACME", Side::Sell, 40, 0).unwrap();
+        // Another symbol is a separate pot, empty here.
+        assert_eq!(t.free_shares("NBLA"), 0);
+        assert!(t.check(&a, "NBLA", Side::Sell, 1, 0).is_err());
+    }
+
+    #[test]
+    fn holdings_add_up_across_traders() {
+        let (mut one, mut a) = trader(1_000_000);
+        let mut two = Trader::new(TraderId(2), UserId(1), AccountId(1), "two".into(), 10, 0);
+        for t in [&mut one, &mut two] {
+            t.apply_trade(
+                &mut a,
+                "ACME",
+                &trade(Owner::Trader(t.id), Owner::Synthetic, Side::Buy, 50, 4_000),
+            );
+        }
+        two.reserve(&mut a, "ACME", Side::Sell, 20, 5_000);
+
+        let mut h = HoldingDto::empty("ACME");
+        h.add(&one);
+        h.add(&two);
+        h.mark(6_000);
+        assert_eq!(h.qty, 100);
+        assert_eq!(h.reserved_shares, 20);
+        assert_eq!(h.free_shares, 80, "what the user could sell right now");
+        assert_eq!(h.cost_cents, 400_000);
+        assert_eq!(h.avg_cost_cents, Some(4_000.0));
+        assert_eq!(h.market_value_cents, 600_000);
+        assert_eq!(h.unrealised_pnl_cents, 200_000);
+        assert_eq!(h.traders, vec![1, 2]);
+
+        let totals = UserHoldingsResponse::new(1, vec![h]);
+        assert_eq!(totals.shares_owned, 100);
+        assert_eq!(totals.free_shares, 80);
+        assert_eq!(totals.market_value_cents, 600_000);
+
+        // A trader holding nothing of the symbol is not a holder of it.
+        assert!(HolderDto::new(&one, "NBLA").is_none());
+        let holder = HolderDto::new(&two, "ACME").expect("two holds ACME");
+        assert_eq!(
+            (holder.qty, holder.reserved_shares, holder.free_shares),
+            (50, 20, 30)
+        );
     }
 
     #[test]

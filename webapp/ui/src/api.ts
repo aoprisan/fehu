@@ -18,9 +18,11 @@ import type {
   OrderResponse,
   PortfolioDto,
   PushEventRequest,
+  SharesResponse,
   SymbolsResponse,
   TradesResponse,
   TransferRequest,
+  UserHoldingsResponse,
 } from './types.js';
 
 /** A non-2xx response, carrying the server's `error.code` when it sent one. */
@@ -89,7 +91,15 @@ export const api = {
   trades: (symbol: string, limit: number): Promise<TradesResponse> =>
     request(`/api/symbols/${enc(symbol)}/trades?limit=${limit}`),
 
+  /** Where one symbol's shares are: outstanding, held, bid for, available. */
+  shares: (symbol: string): Promise<SharesResponse> =>
+    request(`/api/symbols/${enc(symbol)}/shares`),
+
   trader: (id: number): Promise<PortfolioDto> => request(`/api/traders/${id}`),
+
+  /** Every share a user owns, per symbol, across all of their traders. */
+  holdings: (userId: number): Promise<UserHoldingsResponse> =>
+    request(`/api/users/${userId}/holdings`),
 
   createTrader: (body: CreateTraderRequest): Promise<PortfolioDto> =>
     send('POST', '/api/traders', body),

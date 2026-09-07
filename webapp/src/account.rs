@@ -568,6 +568,10 @@ pub struct UserDto {
     pub traders: Vec<u64>,
     /// Every account's balance added up.
     pub balance_cents: i64,
+    /// Shares owned across every symbol and every trader of the user.
+    pub shares_owned: u64,
+    /// Those shares at the reference prices.
+    pub holdings_value_cents: i64,
 }
 
 /// `GET /api/accounts/{id}`.
