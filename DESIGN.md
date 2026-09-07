@@ -1269,7 +1269,11 @@ the price moves through it and the resume settles what the new quotes cross,
 and a closed session refuses orders while an open one takes them. Fees: a
 taker pays and a maker is paid, each as its own ledger entry beside the trade
 it belongs to, and a buy that could afford the shares but not the fee is
-refused rather than overdrawn. Expiry: an order with a date is withdrawn when
+refused rather than overdrawn. Dividends: holders are paid into the account
+each trader trades on, as their own ledger entry, somebody holding none of it
+is paid nothing, the price goes ex by about the dividend, the share count is
+untouched, and one bigger than the company or from anybody but the game master
+is refused. Expiry: an order with a date is withdrawn when
 it passes and its reservation comes back, a date already gone is refused
 rather than silently cancelled, a day order ends with its session, and a day
 order without a calendar is refused. Stops: a
@@ -1400,13 +1404,29 @@ reserving the fee as well and releasing exactly that much back across every
 partial fill and cancel, and the rounding makes that a piece of work of its
 own rather than a corner of this one.
 
-**Corporate actions.** `shares_outstanding` never changes, so a split, a
-dividend and a buyback that retires stock are all unrepresentable — the
-`buyback` game event moves the price and nothing else. A split is the
-awkward one: it rewrites every position's quantity and average cost, every
-resting order's price and size, and the bar history, or the chart lies.
-Dividends are easier and would land as a ledger entry against holders of
-record.
+**Dividends (implemented).** `POST /api/symbols/{s}/dividend` pays
+`cents_per_share` on every share a trader holds, as its own
+`LedgerKind::Dividend` entry against the account each trader trades on, and
+takes the price ex in the same breath: a `Jump` of `−d/p` on the reference and
+a `FundamentalShift` of `ln(1 − d/p)` on what the price reverts to. Both
+halves are the point. Paying without the price falling would be money from
+nothing — hold over the declaration, collect, sell — and dropping only the
+reference would let mean reversion pay it back. A frozen account is still paid:
+it owns its shares. Nothing is created or destroyed, so `shares_outstanding`
+is untouched, and the whole thing is recorded in the event log as
+`corporate:dividend`.
+
+**Splits and buybacks that retire stock.** Still unbuilt, and each is blocked
+on something specific rather than merely unwritten. A split rewrites every
+position's quantity and average cost, every resting order's price and size,
+the reservations behind them, the simulator's price and fundamental, and the
+whole bar history and tape — or the chart lies. Most of that is inside the
+crate (`Simulator`, `Candles`, `OrderBook` all lack any way to rescale) and
+the rounding is not free: two book levels can collide when prices are divided,
+and a resting buy's reservation no longer matches `price × qty` afterwards. A
+buyback that retires stock needs `shares_outstanding` to change, and that is
+build metadata which the save file deliberately does not carry — the same
+question as listing, below, and it should be answered once for both.
 
 **Listing and delisting.** The symbol set is fixed at build time
 (`TICKERS`), which the save format depends on: a file listing other symbols is

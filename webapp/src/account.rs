@@ -182,6 +182,8 @@ pub enum LedgerKind {
     /// liquidity. Always its own entry: the tape stays the price and the
     /// ledger stays the money.
     Fee,
+    /// A dividend paid on shares held when it was declared.
+    Dividend,
 }
 
 /// One movement of money, in the order it happened.
@@ -443,6 +445,36 @@ impl Account {
             Some(symbol),
             Some(order_id),
             None,
+        ))
+    }
+
+    /// Pay a dividend into the account. Like a fee, this is money the market
+    /// moves rather than money the holder asked to move: it is credited
+    /// whatever the account's status, because a frozen account still owns its
+    /// shares and a dividend is theirs.
+    pub fn pay_dividend(
+        &mut self,
+        amount_cents: i64,
+        symbol: &'static str,
+        memo: Option<String>,
+        ts_ms: i64,
+    ) -> Option<LedgerEntry> {
+        if amount_cents <= 0 {
+            return None;
+        }
+        let room = MAX_BALANCE_CENTS.saturating_sub(self.balance_cents);
+        let amount = amount_cents.min(room.max(0));
+        if amount == 0 {
+            return None;
+        }
+        self.balance_cents = self.balance_cents.saturating_add(amount);
+        Some(self.write(
+            LedgerKind::Dividend,
+            amount,
+            ts_ms,
+            Some(symbol),
+            None,
+            memo,
         ))
     }
 

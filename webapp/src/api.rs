@@ -66,6 +66,7 @@ pub fn router(app: AppState) -> Router {
             get(list_symbol_events).post(push_sim_event),
         )
         .route("/api/symbols/{symbol}/shares", get(get_shares))
+        .route("/api/symbols/{symbol}/dividend", post(pay_dividend))
         .route("/api/symbols/{symbol}/status", get(get_status))
         .route("/api/symbols/{symbol}/halt", post(halt_symbol))
         .route("/api/symbols/{symbol}/resume", post(resume_symbol))
@@ -1399,6 +1400,104 @@ async fn submit_order(
 #[derive(Deserialize)]
 struct TraderQuery {
     trader_id: u64,
+}
+
+/// Body of `POST /api/symbols/{symbol}/dividend`.
+#[derive(Deserialize)]
+struct DividendRequest {
+    /// Paid on every share held, in cents. Must be positive and below the
+    /// price: a company cannot pay out more than it is worth.
+    cents_per_share: i64,
+    note: Option<String>,
+    source: Option<String>,
+}
+
+/// Declare a dividend: pay every holder, and take the price ex.
+///
+/// The money and the price move together. Paying without the price falling
+/// would be money from nothing — hold over the record, collect, sell — so the
+/// reference and the fundamental both drop by the dividend. The shares
+/// themselves are untouched: nothing is created or destroyed.
+async fn pay_dividend(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    _admin: Admin,
+    payload: Result<Json<DividendRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<DividendResponse>), ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let now = app.clock.now();
+    let (paid, record) = {
+        let mut market = app.market();
+        let idx = market
+            .symbol_index(&symbol)
+            .ok_or_else(|| ApiError::not_found(&symbol))?;
+        let price = market.symbols[idx].price_cents();
+        let paid = market
+            .pay_dividend(idx, req.cents_per_share, req.note.clone(), now.0)
+            .ok_or_else(|| {
+                ApiError::invalid_event(format!(
+                    "a dividend must be between 1 and {} cents a share, one less than the \
+                     price it is declared against",
+                    price - 1
+                ))
+            })?;
+        // Going ex: the price drops by the dividend, and so does what the
+        // price reverts to, or the market would simply pay it back.
+        let ratio = paid.cents_per_share as f64 / paid.price_cents as f64;
+        let effects = vec![
+            SimEvent::Jump { pct: -ratio },
+            SimEvent::FundamentalShift {
+                delta: (1.0 - ratio).ln(),
+            },
+        ];
+        let symbols = market.symbols[idx].info.symbol;
+        for event in &effects {
+            let prepared = event
+                .prepare()
+                .map_err(|e| ApiError::invalid_event(e.to_string()))?;
+            prepared
+                .apply(market.symbols[idx].exchange.simulator_mut(), now)
+                .map_err(|e| ApiError::invalid_event(e.to_string()))?;
+        }
+        let record = market.record(EventRecord {
+            id: 0,
+            received_at_ms: wall_now_ms(),
+            at_ms: now.0,
+            symbols: vec![symbols],
+            kind: "corporate:dividend".into(),
+            source: req.source.unwrap_or_else(|| "api".into()),
+            note: req.note,
+            magnitude: Some(paid.cents_per_share as f64 / 100.0),
+            effects,
+            summary: vec![format!(
+                "dividend of {} cents a share on {} shares, {} cents to {} account(s)",
+                paid.cents_per_share, paid.shares_paid, paid.total_cents, paid.accounts_paid
+            )],
+        });
+        (paid, record)
+    };
+    tracing::info!(
+        symbol = paid.symbol,
+        cents_per_share = paid.cents_per_share,
+        total_cents = paid.total_cents,
+        accounts = paid.accounts_paid,
+        "dividend paid"
+    );
+    app.publish(StreamMessage::Event(record.clone()));
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(DividendResponse {
+            dividend: paid,
+            event: record,
+        }),
+    ))
+}
+
+/// What a dividend paid, and the event it was recorded as.
+#[derive(Serialize)]
+struct DividendResponse {
+    dividend: crate::market::Dividend,
+    event: EventRecord,
 }
 
 /// Arm a stop: a trigger the engine watches, not an order in the book.

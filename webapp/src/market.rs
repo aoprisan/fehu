@@ -1061,6 +1061,61 @@ impl Market {
         self.status(index, now)
     }
 
+    /// Pay `cents_per_share` on every share of `index` a trader holds, and
+    /// drop the price by the same amount.
+    ///
+    /// Both halves matter. Paying without the price move would be money from
+    /// nothing — buy the day before, collect, sell the day after — so the
+    /// reference and the fundamental both fall by the dividend, which is what
+    /// going ex-dividend means. The shares themselves do not move: nothing is
+    /// created or destroyed, so `shares_outstanding` is untouched.
+    ///
+    /// A frozen account is paid too: it still owns its shares.
+    pub fn pay_dividend(
+        &mut self,
+        index: usize,
+        cents_per_share: i64,
+        note: Option<String>,
+        now_ms: i64,
+    ) -> Option<Dividend> {
+        let symbol = self.symbols.get(index)?;
+        let sym = symbol.info.symbol;
+        let price_cents = symbol.price_cents();
+        if cents_per_share <= 0 || cents_per_share >= price_cents {
+            return None;
+        }
+        let owed: Vec<(AccountId, i64, u64)> = self
+            .traders
+            .values()
+            .filter_map(|t| {
+                let qty = u64::try_from(t.positions.get(sym).map_or(0, |p| p.qty)).ok()?;
+                (qty > 0).then(|| (t.account_id, notional_cents(cents_per_share, qty), qty))
+            })
+            .collect();
+        let mut paid = Dividend {
+            symbol: sym,
+            cents_per_share,
+            price_cents,
+            shares_paid: 0,
+            accounts_paid: 0,
+            total_cents: 0,
+        };
+        for (account_id, amount, qty) in owed {
+            let Some(account) = self.accounts.get_mut(&account_id) else {
+                continue;
+            };
+            if account
+                .pay_dividend(amount, sym, note.clone(), now_ms)
+                .is_some()
+            {
+                paid.accounts_paid += 1;
+                paid.shares_paid = paid.shares_paid.saturating_add(qty);
+                paid.total_cents = paid.total_cents.saturating_add(amount);
+            }
+        }
+        Some(paid)
+    }
+
     /// Hold a stop until the price reaches it.
     ///
     /// The account is checked here so an obviously unfundable trigger is
@@ -1692,6 +1747,20 @@ pub enum StreamMessage {
         order: Option<OrderResponse>,
         refused: Option<String>,
     },
+}
+
+/// What a dividend paid, and the price it went ex at.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Dividend {
+    pub symbol: &'static str,
+    pub cents_per_share: i64,
+    /// The price the dividend was declared against, before it went ex.
+    pub price_cents: i64,
+    pub shares_paid: u64,
+    /// Accounts credited. A user with two traders holding the same symbol is
+    /// paid once per trader, into whichever account each trades on.
+    pub accounts_paid: usize,
+    pub total_cents: i64,
 }
 
 /// A stream message with its place in the stream.

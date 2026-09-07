@@ -464,7 +464,14 @@ export interface CreateTraderRequest {
 export type AccountStatus = 'active' | 'frozen' | 'closed';
 
 /** `account::LedgerKind`. */
-export type LedgerKind = 'open' | 'deposit' | 'withdrawal' | 'buy' | 'sell' | 'fee';
+export type LedgerKind =
+  | 'open'
+  | 'deposit'
+  | 'withdrawal'
+  | 'buy'
+  | 'sell'
+  | 'fee'
+  | 'dividend';
 
 /** `account::UserDto`. */
 export interface UserDto {

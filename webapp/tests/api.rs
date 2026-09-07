@@ -2787,6 +2787,124 @@ async fn order_ids_are_unique_across_symbols_and_survive_retries() {
 }
 
 #[tokio::test]
+async fn a_dividend_pays_the_holders_and_takes_the_price_ex() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let holder = sign_up(&app, "hilary").await;
+    let bystander = sign_up(&app, "bruce").await;
+    let id = holder.trader;
+    let (code, body) = post(
+        &holder,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let (_, before) = get(&holder, &format!("/api/traders/{id}")).await;
+    let cash_before = before["cash_cents"].as_i64().unwrap();
+    let price_before = get(&app, "/api/symbols/ACME/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+
+    let (code, body) = post(
+        &app,
+        "/api/symbols/ACME/dividend",
+        json!({ "cents_per_share": 50, "note": "Q3" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["dividend"]["cents_per_share"], 50);
+    assert_eq!(body["dividend"]["shares_paid"], 100);
+    assert_eq!(body["dividend"]["accounts_paid"], 1);
+    assert_eq!(body["dividend"]["total_cents"], 5_000);
+    assert_eq!(body["event"]["kind"], "corporate:dividend");
+
+    // The holder is paid, and it is its own ledger entry.
+    let (_, after) = get(&holder, &format!("/api/traders/{id}")).await;
+    assert_eq!(after["cash_cents"].as_i64().unwrap(), cash_before + 5_000);
+    assert_eq!(
+        after["positions"][0]["qty"], 100,
+        "a dividend moves money, not shares"
+    );
+    let account = after["account_id"].as_u64().unwrap();
+    let (_, ledger) = get(&holder, &format!("/api/accounts/{account}/ledger?limit=5")).await;
+    let entry = ledger["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "dividend")
+        .unwrap_or_else(|| panic!("no dividend entry: {ledger}"));
+    assert_eq!(entry["amount_cents"], 5_000);
+    assert_eq!(entry["symbol"], "ACME");
+    assert_eq!(entry["memo"], "Q3");
+
+    // Somebody holding none of it gets nothing.
+    let (_, none) = get(&bystander, &format!("/api/traders/{}", bystander.trader)).await;
+    assert_eq!(none["cash_cents"], 10_000_000);
+
+    // And the price goes ex: the next tick opens about a dividend lower.
+    engine::advance_to(&app, Timestamp(NOW_MS + 1_000));
+    let price_after = get(&app, "/api/symbols/ACME/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    assert!(
+        price_after < price_before,
+        "the price must drop by the dividend, or it is money from nothing: \
+         {price_before} -> {price_after}"
+    );
+    let drop = price_before - price_after;
+    assert!(
+        (drop - 50).abs() <= 5,
+        "about the dividend, give or take a tick of noise: dropped {drop}"
+    );
+
+    // Nothing was created or destroyed, and the books still balance.
+    let (_, shares) = get(&app, "/api/symbols/ACME/shares").await;
+    assert_eq!(shares["held_shares"], 100);
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
+async fn a_dividend_bigger_than_the_company_is_refused() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        admin_key: Some("chairman".into()),
+        ..Options::default()
+    });
+    let price = get(&app, "/api/symbols/ACME/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    let master = Player {
+        app: Arc::clone(&app),
+        user: 0,
+        trader: 0,
+        key: "chairman".into(),
+    };
+    for bad in [0, -1, price, price * 2] {
+        let (code, body) = post(
+            &master,
+            "/api/symbols/ACME/dividend",
+            json!({ "cents_per_share": bad }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {body}");
+    }
+    // And only the game master may declare one at all.
+    let player = sign_up(&app, "shareholder").await;
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/dividend",
+        json!({ "cents_per_share": 10 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+#[tokio::test]
 async fn an_order_with_a_date_is_withdrawn_when_it_passes() {
     let app = app_with(Options {
         now_ms: Some(NOW_MS),
