@@ -46,10 +46,31 @@ export function errorMessage(e: unknown): string {
   return String(e);
 }
 
+/**
+ * The key the server issued when this player was created. Everything that
+ * belongs to a user — their portfolio, orders, accounts and money — is sent
+ * with it; market data needs none.
+ */
+let apiKey: string | null = null;
+
+/** Send every following request as the holder of `key`. */
+export function setApiKey(key: string | null): void {
+  apiKey = key;
+}
+
+/** The key in use, for the one place that cannot set a header: the stream. */
+export function currentApiKey(): string | null {
+  return apiKey;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
+  const withKey: RequestInit =
+    apiKey === null
+      ? { ...init }
+      : { ...init, headers: { ...(init?.headers ?? {}), authorization: `Bearer ${apiKey}` } };
   try {
-    response = await fetch(path, init);
+    response = await fetch(path, withKey);
   } catch (cause) {
     throw new ApiError(0, 'network', cause instanceof Error ? cause.message : 'request failed');
   }

@@ -356,6 +356,12 @@ export interface PortfolioDto {
   open_orders: OpenOrderDto[];
   /** Newest first. */
   fills: FillRecord[];
+  /**
+   * The key that proves a request speaks for this user, shown **once**: in
+   * the response that created them, and `null` everywhere after. Send it as
+   * `Authorization: Bearer <key>`.
+   */
+  api_key: string | null;
 }
 
 /** Body of `POST /api/traders`. */
@@ -391,6 +397,12 @@ export interface UserDto {
   shares_owned: number;
   /** Those shares at the reference prices. */
   holdings_value_cents: number;
+  /**
+   * The key that proves a request speaks for this user, shown **once**: in
+   * the response that created them, and `null` everywhere after. Send it as
+   * `Authorization: Bearer <key>`.
+   */
+  api_key: string | null;
 }
 
 /** `account::AccountDto`. Money is integer cents. */

@@ -748,6 +748,10 @@ pub struct PortfolioDto {
     pub open_orders: Vec<OpenOrderDto>,
     /// Newest first.
     pub fills: Vec<FillRecord>,
+    /// The key that proves a request speaks for the trader's user, shown **once**:
+    /// in the response that created them, and `null` everywhere after. Send
+    /// it as `Authorization: Bearer <key>`.
+    pub api_key: Option<String>,
 }
 
 /// `GET /api/traders` row.

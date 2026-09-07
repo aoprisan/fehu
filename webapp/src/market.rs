@@ -13,6 +13,7 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::account::{Account, AccountId, MoneyError, User, UserId, notional_cents};
+use crate::auth::Keyring;
 use crate::events::EventRecord;
 use crate::trading::{BookDto, FillRecord, HoldingDto, OrderRecord, TradeDto, Trader};
 
@@ -453,6 +454,8 @@ pub struct Market {
     next_event_id: u64,
     pub users: BTreeMap<UserId, User>,
     next_user_id: u64,
+    /// The API keys issued to those users.
+    pub keys: Keyring,
     pub accounts: BTreeMap<AccountId, Account>,
     next_account_id: u64,
     pub traders: BTreeMap<TraderId, Trader>,
@@ -476,8 +479,10 @@ impl Market {
             .position(|s| s.info.symbol.eq_ignore_ascii_case(ticker))
     }
 
-    /// Register a user. `name` and `email` are trimmed and truncated; an
-    /// empty name becomes `user-{id}`.
+    /// Register a user and issue their API key. `name` and `email` are
+    /// trimmed and truncated; an empty name becomes `user-{id}`. The key is
+    /// read back once with [`crate::auth::Keyring::key_of`], for the response
+    /// that created them.
     pub fn create_user(
         &mut self,
         name: Option<String>,
@@ -494,6 +499,7 @@ impl Market {
             accounts: Vec::new(),
         };
         self.users.insert(id, user);
+        self.keys.issue(id);
         id
     }
 
@@ -900,6 +906,10 @@ pub struct Options {
     /// Cash a new account is opened with, in cents.
     /// `FEHU_STARTING_CASH_CENTS`.
     pub starting_cash_cents: i64,
+    /// Key the game-master endpoints (pushing events into the simulation)
+    /// require. `FEHU_ADMIN_KEY`; unset leaves them open, which is what a
+    /// single-player game on localhost wants and a shared server does not.
+    pub admin_key: Option<String>,
 }
 
 impl Default for Options {
@@ -916,6 +926,7 @@ impl Default for Options {
             ledger_log: 500,
             order_log: 2_000,
             starting_cash_cents: 10_000_000,
+            admin_key: None,
         }
     }
 }
@@ -938,6 +949,10 @@ impl Options {
             ledger_log: env_parse("FEHU_LEDGER_LOG", d.ledger_log),
             order_log: env_parse("FEHU_ORDER_LOG", d.order_log),
             starting_cash_cents: env_parse("FEHU_STARTING_CASH_CENTS", d.starting_cash_cents),
+            admin_key: std::env::var("FEHU_ADMIN_KEY")
+                .ok()
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty()),
         }
     }
 }
@@ -1006,6 +1021,7 @@ impl App {
                 next_event_id: 1,
                 users: BTreeMap::new(),
                 next_user_id: 1,
+                keys: Keyring::default(),
                 accounts: BTreeMap::new(),
                 next_account_id: 1,
                 traders: BTreeMap::new(),

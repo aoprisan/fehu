@@ -78,6 +78,14 @@ Its output is committed to `webapp/static/` and embedded into the binary, so
 the command above needs no Node toolchain; `just ui` rebuilds it after a
 change and `just ui-dev` serves it with hot reload against a running backend.
 
+Market data — quotes, bars, the book, the tape, the event log — is open to
+anyone. Everything that belongs to a player needs the API key they were
+issued when they signed up, as `Authorization: Bearer <key>` (or
+`X-Api-Key`), and a key only ever speaks for its own user: nobody else can
+read that portfolio, cancel those orders or move that money. The key is shown
+**once**, in the response that created the user — `POST /api/users` or
+`POST /api/traders` — and is `null` in every response after.
+
 | Method | Path | What |
 |---|---|---|
 | `GET` | `/api/symbols` | Quotes for every symbol |
@@ -88,8 +96,8 @@ change and `just ui-dev` serves it with hot reload against a running backend.
 | `POST` | `/api/game/events` | Semantic game event: `{"kind":"scandal","symbol":"ACME","magnitude":1.5}`; market-wide kinds (`market_crash`, `rate_hike`, …) need no symbol |
 | `GET` | `/api/game/catalog` | Every game-event kind and the simulator events it expands to |
 | `GET` | `/api/events` | Audit log of accepted events, newest first (`?symbol=`, `?limit=`) |
-| `POST` | `/api/users` | Create a user: `{"name":"ada","email":"ada@example.com"}` (both optional) |
-| `GET` | `/api/users`, `/api/users/{id}` | Users, their accounts, traders, cash and shares owned |
+| `POST` | `/api/users` | Create a user: `{"name":"ada","email":"ada@example.com"}` (both optional). The response carries their `api_key`, once |
+| `GET` | `/api/users`, `/api/users/{id}` | The caller themselves: accounts, traders, cash and shares owned |
 | `GET` | `/api/users/{id}/holdings` | Shares the user owns per symbol, added up over their traders, with what is reserved and what is still sellable |
 | `POST` | `/api/users/{id}/accounts` | Open another account: `{"name":"main","cash_cents":10000000}` |
 | `GET` | `/api/users/{id}/accounts`, `/api/accounts`, `/api/accounts/{id}` | Accounts: balance, reserved, available, status |
@@ -98,7 +106,7 @@ change and `just ui-dev` serves it with hot reload against a running backend.
 | `POST` | `/api/accounts/{id}/status` | `{"status":"active\|frozen\|closed"}` |
 | `GET` | `/api/accounts/{id}/ledger?limit=100` | Every movement of money, newest first |
 | `GET` | `/api/accounts/{id}/validate` | Status, what the account may do, and any broken invariant |
-| `POST` | `/api/traders` | Create a trader, with a user and a funded account: `{"name":"alice","cash_cents":10000000}` (both optional); `user_id` and `account_id` join existing ones |
+| `POST` | `/api/traders` | Create a trader, with a user and a funded account: `{"name":"alice","cash_cents":10000000}` (both optional), and hand over the new user's `api_key`; `user_id` and `account_id` join existing ones, which needs that user's key |
 | `GET` | `/api/traders`, `/api/traders/{id}` | Traders; a portfolio with cash, positions marked to the reference price, open orders and fills |
 | `POST` | `/api/traders/{id}/deposit` | Add money to the trader's account: `{"amount_cents":250000}` |
 | `POST` | `/api/traders/{id}/cancel_all` | Cancel every resting order of a trader |
@@ -109,7 +117,7 @@ change and `just ui-dev` serves it with hot reload against a running backend.
 | `GET` | `/api/traders/{id}/orders?status=resting\|filled\|cancelled&limit=100` | A trader's orders, newest first |
 | `GET` | `/api/symbols/{sym}/book?depth=10` | Aggregated bids and asks, reference price, pending trader flow |
 | `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first |
-| `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and `fill` |
+| `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and — for `?api_key=`, since `EventSource` cannot set headers — that player's `fill`s |
 | `GET` | `/api/health` | Uptime, simulated time, tick/trade counters |
 
 At start-up each symbol generates a year of daily bars in coarse mode and then
@@ -117,7 +125,11 @@ three days of 1 s ticks, so every interval has history before the first
 request. `FEHU_TIME_SCALE=60` runs the market at 60 simulated seconds per
 wall second; `FEHU_BIND`, `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`,
 `FEHU_STARTING_CASH_CENTS`, `FEHU_TAPE`, `FEHU_FILL_LOG`, `FEHU_ORDER_LOG`
-and `FEHU_LEDGER_LOG` are the other knobs. Same seeds and same events give the
+and `FEHU_LEDGER_LOG` are the other knobs. `FEHU_ADMIN_KEY` locks the
+game-master endpoints (`POST /api/game/events` and
+`POST /api/symbols/{sym}/events`, which move prices) behind a key of your
+choosing; unset, they stay open, which is what a single-player game on
+localhost wants and a shared server does not. Same seeds and same events give the
 same prices on every run; trading adds impact on top, so a market with no
 orders replays the bare simulation.
 
@@ -131,6 +143,11 @@ account must be active and its available balance must cover the worst-case
 cost). Fills settle through the account, so every cent that moves is on its
 ledger. Nothing is persisted: accounts start with cash, no shares, no margin
 and no shorting.
+
+Keys are the only credential: they are 128 bits of operating-system entropy,
+issued at sign-up and held in memory beside the accounts they open. Nothing
+is persisted, so there is no key store to steal separately — but a deployment
+that adds persistence must hash them before writing them down.
 
 Orders are remembered. The book only knows an order while it rests, so every
 submission is also written to an order log (`GET /api/orders/{id}`,
