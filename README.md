@@ -125,7 +125,7 @@ read that portfolio, cancel those orders or move that money. The key is shown
 | `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first |
 | `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and — for `?api_key=`, since `EventSource` cannot set headers — that player's `fill`s |
 | `GET` | `/api/reconcile` | Game master: check ownership, reservations, share supply and retained cash ledgers; returns `valid` and `issues` |
-| `GET` | `/api/health` | Uptime, simulated time, tick/trade counters |
+| `GET` | `/api/health` | Uptime, simulated time, tick/trade counters, orders placed and refused, stream and rate-limit state, and how long requests and engine steps are taking |
 
 At start-up each symbol generates a year of daily bars in coarse mode and then
 three days of 1 s ticks, so every interval has history before the first

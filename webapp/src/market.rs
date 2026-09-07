@@ -16,6 +16,7 @@ use crate::account::{Account, AccountId, MoneyError, User, UserId, notional_cent
 use crate::auth::Keyring;
 use crate::events::EventRecord;
 use crate::limit::{Decision, Limiter, Rate};
+use crate::metrics::Metrics;
 use crate::save::{MarketSave, STATE_VERSION, Save, SymbolSave};
 use crate::trading::{
     BookDto, FillRecord, HoldingDto, MAX_STOPS_PER_TRADER, OrderRecord, OrderResponse, Refused,
@@ -727,6 +728,13 @@ pub struct Market {
     fill_log: usize,
     ledger_log: usize,
     order_log: usize,
+    /// Orders sent to a book since start-up, and submissions turned away
+    /// before they got there. Counters, not state: they are not saved, and a
+    /// restart begins them again.
+    pub orders_placed: u64,
+    pub orders_refused: u64,
+    /// Fills booked to traders' accounts since start-up.
+    pub fills_booked: u64,
     /// A move this far from the band halts a symbol; `0` turns that off.
     price_limit_pct: f64,
     /// How long an automatic halt lasts, in simulated seconds.
@@ -1012,6 +1020,7 @@ impl Market {
                 }
             }
         }
+        self.fills_booked = self.fills_booked.saturating_add(fills.len() as u64);
         fills
     }
 
@@ -1361,6 +1370,9 @@ impl Market {
             fill_log: options.fill_log,
             ledger_log: options.ledger_log,
             order_log: options.order_log.max(1),
+            orders_placed: 0,
+            orders_refused: 0,
+            fills_booked: 0,
             price_limit_pct: options.price_limit_pct.max(0.0),
             halt_secs: options.halt_secs,
         };
@@ -1470,6 +1482,7 @@ impl Market {
         if order.side == Side::Buy {
             let available = self.available_shares(sym);
             if order.qty > available {
+                self.orders_refused = self.orders_refused.saturating_add(1);
                 return Err(PlaceError::Refused(Refused::SupplyExhausted {
                     needed: order.qty,
                     available,
@@ -1482,9 +1495,10 @@ impl Market {
         let account = self
             .account_of(trader)
             .ok_or(PlaceError::UnknownTrader(trader.0))?;
-        self.traders[&trader]
-            .check(account, sym, order.side, order.qty, cost)
-            .map_err(PlaceError::Refused)?;
+        if let Err(e) = self.traders[&trader].check(account, sym, order.side, order.qty, cost) {
+            self.orders_refused = self.orders_refused.saturating_add(1);
+            return Err(PlaceError::Refused(e));
+        }
         // The log and retry index span all symbols. Allocate above every
         // book's counter while holding the market lock, including ids used by
         // synthetic flow since the last trader submission. Counters already
@@ -1496,10 +1510,14 @@ impl Market {
             .max()
             .unwrap_or(fehu::OrderId(1));
         self.symbols[idx].exchange.advance_order_id(next_id);
-        let placement = self.symbols[idx]
-            .exchange
-            .submit(order)
-            .map_err(|e| PlaceError::Invalid(e.to_string()))?;
+        let placement = match self.symbols[idx].exchange.submit(order) {
+            Ok(placement) => placement,
+            Err(e) => {
+                self.orders_refused = self.orders_refused.saturating_add(1);
+                return Err(PlaceError::Invalid(e.to_string()));
+            }
+        };
+        self.orders_placed = self.orders_placed.saturating_add(1);
         self.symbols[idx].record_trades(&placement.trades);
         let fills = self.apply_trades(sym, &placement.trades);
         if placement.status == fehu::OrderStatus::Resting
@@ -1819,6 +1837,8 @@ pub struct App {
     /// How fast each client may change the market. Its own lock, held only
     /// for the moment it takes to spend a token.
     limits: Mutex<Limiter>,
+    /// Counters for `GET /api/health`. Atomics, so nothing waits on them.
+    pub metrics: Metrics,
 }
 
 impl App {
@@ -1855,6 +1875,7 @@ impl App {
             started_at: SystemTime::now(),
             stream,
             limits,
+            metrics: Metrics::default(),
             market: Mutex::new(Market {
                 symbols,
                 events: VecDeque::new(),
@@ -1874,6 +1895,9 @@ impl App {
                 fill_log: options.fill_log,
                 ledger_log: options.ledger_log,
                 order_log: options.order_log.max(1),
+                orders_placed: 0,
+                orders_refused: 0,
+                fills_booked: 0,
                 price_limit_pct: options.price_limit_pct.max(0.0),
                 halt_secs: options.halt_secs,
             }),
@@ -1940,6 +1964,7 @@ impl App {
             tx,
             stream,
             limits,
+            metrics: Metrics::default(),
             options,
         })
     }
@@ -2015,6 +2040,16 @@ impl App {
             who,
             since_start.as_millis().min(u128::from(u64::MAX)) as u64,
         )
+    }
+
+    /// Messages published to the stream since start-up.
+    #[must_use]
+    pub fn published(&self) -> u64 {
+        self.stream
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_seq
+            .saturating_sub(1)
     }
 
     /// Clients whose allowance the limiter is currently tracking.

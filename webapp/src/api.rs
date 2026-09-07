@@ -113,9 +113,23 @@ pub fn router(app: AppState) -> Router {
             Arc::clone(&app),
             rate_limit_writes,
         ))
+        .layer(middleware::from_fn_with_state(Arc::clone(&app), count))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(app)
+}
+
+/// Time every request and count how it ended.
+///
+/// Outermost, so it sees what the client saw — the rate limiter's refusals
+/// included, which is the point: a server turning requests away is exactly
+/// what `/api/health` should be able to say.
+async fn count(State(app): State<AppState>, request: Request, next: Next) -> Response {
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    app.metrics
+        .request(started.elapsed(), response.status().as_u16());
+    response
 }
 
 /// Refuse a client that is changing the market faster than
@@ -547,6 +561,22 @@ struct Health {
     cash_cents: i64,
     /// Traders' orders resting across every book.
     resting_orders: usize,
+    /// Stops held across every symbol, waiting for a price.
+    stops_held: usize,
+    /// Orders sent to a book since start-up, and submissions turned away
+    /// before they got there.
+    orders_placed: u64,
+    orders_refused: u64,
+    /// Fills booked to traders' accounts since start-up.
+    fills_booked: u64,
+    /// Messages published to the stream since start-up.
+    stream_messages: u64,
+    /// Streams currently connected.
+    stream_subscribers: usize,
+    /// Clients whose rate-limit allowance is being tracked.
+    tracked_clients: usize,
+    /// Request and engine-step timings since start-up.
+    metrics: crate::metrics::MetricsDto,
 }
 
 async fn reconcile(
@@ -586,6 +616,14 @@ async fn health(State(app): State<AppState>) -> Json<Health> {
                     .count()
             })
             .sum(),
+        stops_held: market.symbols.iter().map(|s| s.stops.len()).sum(),
+        orders_placed: market.orders_placed,
+        orders_refused: market.orders_refused,
+        fills_booked: market.fills_booked,
+        stream_messages: app.published(),
+        stream_subscribers: app.tx.receiver_count(),
+        tracked_clients: app.tracked_clients(),
+        metrics: app.metrics.snapshot(),
     })
 }
 

@@ -1385,8 +1385,15 @@ file and a story for what happens to a delisted symbol's positions.
   symbols. Splitting it per symbol — with the accounts still shared — is the
   first scaling step, and the point at which the ordering guarantees now
   provided by "there is one lock" have to be written down.
-* **Metrics.** `/api/health` counts ticks, trades and users. There is nothing
-  on latency, order rates, or how long the engine step takes.
+* **Metrics (implemented).** `GET /api/health` now also reports orders
+  placed and refused, fills booked, stops held, stream messages published and
+  subscribers, clients being rate-limited, and timings — count, last, mean and
+  high-water mark — for every HTTP request and every engine step, the latter
+  measured around the market lock and the fan-out rather than the simulators
+  alone, because what matters is how long the market is unavailable to
+  everybody else. They are counters and running maxima since start-up, not a
+  time series: no window, no percentile, no history. A deployment that wants
+  those should scrape this into something that keeps them.
 
 ### 15.5 Decisions a real venue would revisit
 

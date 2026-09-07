@@ -2787,6 +2787,76 @@ async fn order_ids_are_unique_across_symbols_and_survive_retries() {
 }
 
 #[tokio::test]
+async fn health_reports_what_the_server_is_doing_and_how_long_it_takes() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 1.0,
+        rate_burst: 2.0,
+        ..Options::default()
+    });
+    let (_, before) = get(&app, "/api/health").await;
+    assert_eq!(before["orders_placed"], 0);
+    assert_eq!(before["metrics"]["engine_step"]["count"], 0);
+    assert_eq!(
+        before["metrics"]["requests"]["micros_mean"], 0,
+        "no requests is not a division by zero: {before}"
+    );
+
+    let player = sign_up(&app, "watched").await;
+    let id = player.trader;
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 5, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    // A sell with nothing to sell: refused before it reaches a book.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/NBLA/orders",
+        json!({ "trader_id": id, "side": "sell", "qty": 5, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    // And one refused by the rate limiter rather than by the market.
+    let (code, _) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+    engine::advance_to(&app, Timestamp(NOW_MS + 2_000));
+
+    let (_, health) = get(&app, "/api/health").await;
+    assert_eq!(health["orders_placed"], 1, "{health}");
+    assert_eq!(health["orders_refused"], 1);
+    assert!(health["fills_booked"].as_u64().unwrap() >= 1);
+    assert_eq!(health["stops_held"], 0);
+    assert!(
+        health["stream_messages"].as_u64().unwrap() > 0,
+        "the engine step published something: {health}"
+    );
+    assert_eq!(health["tracked_clients"], 1, "one client has a bucket");
+    let metrics = &health["metrics"];
+    assert_eq!(metrics["requests_limited"], 1);
+    assert!(
+        metrics["requests_failed"].as_u64().unwrap() >= 2,
+        "the refused order and the limited one: {metrics}"
+    );
+    assert_eq!(metrics["engine_step"]["count"], 1);
+    assert!(
+        metrics["engine_step"]["micros_max"].as_u64().unwrap()
+            >= metrics["engine_step"]["micros_mean"].as_u64().unwrap(),
+        "the worst is at least the mean: {metrics}"
+    );
+    assert!(metrics["requests"]["count"].as_u64().unwrap() >= 5);
+}
+
+#[tokio::test]
 async fn a_client_changing_the_market_too_fast_is_told_to_slow_down() {
     // One request per second, two at once: the third write in a burst is
     // refused.
