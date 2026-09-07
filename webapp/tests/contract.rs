@@ -28,7 +28,14 @@ fn test_app() -> Arc<App> {
     })
 }
 
-async fn call(app: &Arc<App>, req: Request<Body>) -> (StatusCode, Value) {
+/// Send `req` as the holder of `key`, if there is one.
+async fn call_as(app: &Arc<App>, key: Option<&str>, mut req: Request<Body>) -> (StatusCode, Value) {
+    if let Some(key) = key {
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {key}").parse().unwrap(),
+        );
+    }
     let resp = router(Arc::clone(app)).oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -41,14 +48,24 @@ async fn call(app: &Arc<App>, req: Request<Body>) -> (StatusCode, Value) {
 }
 
 async fn get(app: &Arc<App>, uri: &str) -> Value {
-    let (status, body) = call(app, Request::get(uri).body(Body::empty()).unwrap()).await;
+    get_as(app, None, uri).await
+}
+
+/// `GET` as the holder of `key`: everything that belongs to a user needs one.
+async fn get_as(app: &Arc<App>, key: Option<&str>, uri: &str) -> Value {
+    let (status, body) = call_as(app, key, Request::get(uri).body(Body::empty()).unwrap()).await;
     assert!(status.is_success(), "GET {uri} → {status}: {body}");
     body
 }
 
 async fn post(app: &Arc<App>, uri: &str, body: Value) -> Value {
-    let (status, body) = call(
+    post_as(app, None, uri, body).await
+}
+
+async fn post_as(app: &Arc<App>, key: Option<&str>, uri: &str, body: Value) -> Value {
+    let (status, body) = call_as(
         app,
+        key,
         Request::post(uri)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
@@ -57,6 +74,15 @@ async fn post(app: &Arc<App>, uri: &str, body: Value) -> Value {
     .await;
     assert!(status.is_success(), "POST {uri} → {status}: {body}");
     body
+}
+
+/// The API key in a response that created a user, which is the only place it
+/// is ever shown.
+fn api_key_of(body: &Value) -> String {
+    body["api_key"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no api_key in {body}"))
+        .to_owned()
 }
 
 /// Assert that `value` is an object with exactly `expected` as its keys.
@@ -233,6 +259,8 @@ async fn trading_shapes() {
     let app = test_app();
 
     let trader = post(&app, "/api/traders", json!({ "name": "contract" })).await;
+    let key = api_key_of(&trader);
+    let key = Some(key.as_str());
     let portfolio_keys = [
         "id",
         "user_id",
@@ -249,14 +277,16 @@ async fn trading_shapes() {
         "positions",
         "open_orders",
         "fills",
+        "api_key",
     ];
     assert_keys("PortfolioDto", &trader, &portfolio_keys);
     let id = trader["id"].as_u64().unwrap();
 
     // A market buy fills against the synthetic ladder, giving a position,
     // a fill and prints on the tape.
-    let order = post(
+    let order = post_as(
         &app,
+        key,
         "/api/symbols/ACME/orders",
         json!({ "trader_id": id, "side": "buy", "type": "market", "qty": 50 }),
     )
@@ -297,14 +327,15 @@ async fn trading_shapes() {
     assert_eq!(order["side"], "buy", "Side serialises lower-case");
 
     // A far-from-the-market limit rests instead of filling.
-    post(
+    post_as(
         &app,
+        key,
         "/api/symbols/ACME/orders",
         json!({ "trader_id": id, "side": "buy", "type": "limit", "price_cents": 1, "qty": 1, "tif": "gtc" }),
     )
     .await;
 
-    let portfolio = get(&app, &format!("/api/traders/{id}")).await;
+    let portfolio = get_as(&app, key, &format!("/api/traders/{id}")).await;
     assert_keys("PortfolioDto", &portfolio, &portfolio_keys);
     assert_keys(
         "PositionDto",
@@ -352,7 +383,7 @@ async fn trading_shapes() {
         ],
     );
 
-    let records = get(&app, &format!("/api/traders/{id}/orders")).await;
+    let records = get_as(&app, key, &format!("/api/traders/{id}/orders")).await;
     assert_keys(
         "OrderRecord",
         first("orders", &json!({ "orders": records }), "orders"),
@@ -378,8 +409,9 @@ async fn trading_shapes() {
     assert_eq!(records[0]["status"], "resting", "OrderStatus is lower-case");
     assert_eq!(records[0]["tif"], "gtc", "TimeInForce is lower-case");
 
-    let holdings = get(
+    let holdings = get_as(
         &app,
+        key,
         &format!("/api/users/{}/holdings", portfolio["user_id"]),
     )
     .await;
@@ -413,7 +445,7 @@ async fn trading_shapes() {
         ],
     );
 
-    let shares = get(&app, "/api/symbols/ACME/shares").await;
+    let shares = get_as(&app, key, "/api/symbols/ACME/shares").await;
     assert_keys(
         "HolderDto",
         first("SharesDto", &shares, "holders"),
@@ -449,6 +481,8 @@ async fn account_shapes() {
         json!({ "name": "ada", "email": "ada@example.com" }),
     )
     .await;
+    let key = api_key_of(&user);
+    let key = Some(key.as_str());
     assert_keys(
         "UserDto",
         &user,
@@ -462,6 +496,7 @@ async fn account_shapes() {
             "balance_cents",
             "shares_owned",
             "holdings_value_cents",
+            "api_key",
         ],
     );
     let user_id = user["id"].as_u64().unwrap();
@@ -481,8 +516,9 @@ async fn account_shapes() {
         "trader_id",
         "valid",
     ];
-    let account = post(
+    let account = post_as(
         &app,
+        key,
         &format!("/api/users/{user_id}/accounts"),
         json!({ "name": "main", "cash_cents": 250_000 }),
     )
@@ -491,8 +527,9 @@ async fn account_shapes() {
     assert_eq!(account["status"], "active", "AccountStatus is lower-case");
     let account_id = account["id"].as_u64().unwrap();
 
-    let ledger = post(
+    let ledger = post_as(
         &app,
+        key,
         &format!("/api/accounts/{account_id}/deposit"),
         json!({ "amount_cents": 1_000, "memo": "allowance" }),
     )
@@ -515,7 +552,7 @@ async fn account_shapes() {
     );
     assert_eq!(ledger["entries"][0]["kind"], "deposit");
 
-    let check = get(&app, &format!("/api/accounts/{account_id}/validate")).await;
+    let check = get_as(&app, key, &format!("/api/accounts/{account_id}/validate")).await;
     assert_keys(
         "AccountCheck",
         &check,

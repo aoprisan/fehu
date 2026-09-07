@@ -3,7 +3,7 @@
  * user-initiated commands. Panels call these; nothing else mutates state.
  */
 
-import { api, errorMessage } from './api.js';
+import { api, errorMessage, setApiKey } from './api.js';
 import { fmtPrice } from './format.js';
 import { bucketOf } from './intervals.js';
 import { setOrderStatus, setStatus } from './status.js';
@@ -24,24 +24,32 @@ const EVENT_LIMIT = MAX_EVENTS;
 const BOOK_DEPTH = 8;
 const TAPE_LIMIT = 40;
 const TRADER_STORAGE_KEY = 'fehu.trader_id';
+const KEY_STORAGE_KEY = 'fehu.api_key';
 
 /** `localStorage` is unavailable in some privacy modes; degrade, don't crash. */
-function readStoredTraderId(): number | null {
+function readStored(key: string): string | null {
   try {
-    const raw = localStorage.getItem(TRADER_STORAGE_KEY);
-    if (raw === null) return null;
-    const id = Number.parseInt(raw, 10);
-    return Number.isSafeInteger(id) ? id : null;
+    return localStorage.getItem(key);
   } catch {
     return null;
   }
 }
 
-function storeTraderId(id: number): void {
+function storeIdentity(id: number, apiKey: string | null): void {
   try {
     localStorage.setItem(TRADER_STORAGE_KEY, String(id));
+    if (apiKey !== null) localStorage.setItem(KEY_STORAGE_KEY, apiKey);
   } catch {
     // Not fatal: the session just will not survive a reload.
+  }
+}
+
+function forgetIdentity(): void {
+  try {
+    localStorage.removeItem(TRADER_STORAGE_KEY);
+    localStorage.removeItem(KEY_STORAGE_KEY);
+  } catch {
+    // Nothing was stored in the first place.
   }
 }
 
@@ -93,19 +101,31 @@ export class Actions {
     this.#store.emit('catalog');
   }
 
-  /** Reuse the trader from a previous visit, or open a fresh account. */
+  /**
+   * Reuse the trader from a previous visit, or sign a new one up. The API key
+   * that came with the sign-up is what proves the account is ours; without a
+   * stored one — or with a stale one the server no longer knows — there is
+   * nothing to come back to, so we start again.
+   */
   async loadTrader(): Promise<void> {
-    const id = readStoredTraderId();
-    if (id !== null) {
+    const stored = Number.parseInt(readStored(TRADER_STORAGE_KEY) ?? '', 10);
+    const key = readStored(KEY_STORAGE_KEY);
+    if (Number.isSafeInteger(stored) && key !== null) {
+      setApiKey(key);
       try {
-        this.#state.trader = await api.trader(id);
+        this.#state.trader = await api.trader(stored);
       } catch {
-        this.#state.trader = null; // Server restarted: the id is stale.
+        // Server restarted, or the key no longer opens this trader.
+        this.#state.trader = null;
+        setApiKey(null);
+        forgetIdentity();
       }
     }
     if (this.#state.trader === null) {
-      this.#state.trader = await api.createTrader({ name: 'player' });
-      storeTraderId(this.#state.trader.id);
+      const trader = await api.createTrader({ name: 'player' });
+      setApiKey(trader.api_key);
+      storeIdentity(trader.id, trader.api_key);
+      this.#state.trader = trader;
     }
     this.#store.emit('trader', 'book');
   }

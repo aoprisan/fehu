@@ -7,7 +7,8 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequestParts, OptionalFromRequestParts, Path, Query, State};
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -183,6 +184,30 @@ impl ApiError {
         }
     }
 
+    /// No API key on a request that needs one.
+    fn unauthenticated() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "this endpoint needs the API key the user was created with: send it as \
+             `Authorization: Bearer <key>` or `X-Api-Key: <key>`",
+        )
+    }
+
+    /// A key that is not one the server issued.
+    fn invalid_api_key() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "that API key is not one this server issued",
+        )
+    }
+
+    /// A valid key, but for somebody else's property.
+    fn forbidden(what: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, "forbidden", what)
+    }
+
     fn unknown_user(id: u64) -> Self {
         Self::new(
             StatusCode::NOT_FOUND,
@@ -223,6 +248,133 @@ impl IntoResponse for ApiError {
             "error": { "code": self.code, "message": self.message }
         });
         (self.status, Json(body)).into_response()
+    }
+}
+
+/// The API key on a request: `Authorization: Bearer <key>`, or `X-Api-Key`.
+fn api_key_of(parts: &Parts) -> Option<String> {
+    let bearer = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            let (scheme, key) = v.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then_some(key)
+        });
+    let key = bearer.or_else(|| parts.headers.get("x-api-key").and_then(|v| v.to_str().ok()))?;
+    let key = key.trim();
+    (!key.is_empty()).then(|| key.to_owned())
+}
+
+/// The user a request speaks for, proved by their API key.
+///
+/// Market data — quotes, bars, the book, the tape, the event log — needs no
+/// key. Everything that belongs to a user does, and a key only ever speaks
+/// for the user it was issued to: one player cannot read another's portfolio,
+/// move their money or trade on their account.
+#[derive(Clone, Copy, Debug)]
+pub struct Caller(pub UserId);
+
+impl FromRequestParts<AppState> for Caller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, ApiError> {
+        let key = api_key_of(parts).ok_or_else(ApiError::unauthenticated)?;
+        app.market()
+            .keys
+            .user_of(&key)
+            .map(Caller)
+            .ok_or_else(ApiError::invalid_api_key)
+    }
+}
+
+impl OptionalFromRequestParts<AppState> for Caller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        app: &AppState,
+    ) -> Result<Option<Self>, ApiError> {
+        let Some(key) = api_key_of(parts) else {
+            return Ok(None);
+        };
+        Ok(app.market().keys.user_of(&key).map(Caller))
+    }
+}
+
+/// The game master: whoever may push events into the simulation. Open unless
+/// `FEHU_ADMIN_KEY` is set, which is what a single-player game on localhost
+/// wants and a shared server does not.
+#[derive(Clone, Copy, Debug)]
+pub struct Admin;
+
+impl FromRequestParts<AppState> for Admin {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, ApiError> {
+        let Some(expected) = app.options.admin_key.as_deref() else {
+            return Ok(Self);
+        };
+        let key = api_key_of(parts).ok_or_else(ApiError::unauthenticated)?;
+        if constant_time_eq(&key, expected) {
+            Ok(Self)
+        } else {
+            Err(ApiError::invalid_api_key())
+        }
+    }
+}
+
+/// Compare two secrets without giving their common prefix away in the time
+/// taken.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The caller owns `trader`.
+fn owned_trader(market: &Market, caller: Caller, trader: TraderId) -> Result<(), ApiError> {
+    let held = market
+        .traders
+        .get(&trader)
+        .ok_or_else(|| ApiError::unknown_trader(trader.0))?;
+    if held.user_id == caller.0 {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(format!(
+            "trader {} belongs to another user",
+            trader.0
+        )))
+    }
+}
+
+/// The caller owns `account`.
+fn owned_account(market: &Market, caller: Caller, account: AccountId) -> Result<(), ApiError> {
+    let held = market
+        .accounts
+        .get(&account)
+        .ok_or_else(|| ApiError::unknown_account(account.0))?;
+    if held.user_id == caller.0 {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(format!(
+            "account {} belongs to another user",
+            account.0
+        )))
+    }
+}
+
+/// The caller is `user` themselves.
+fn owned_user(caller: Caller, user: UserId) -> Result<(), ApiError> {
+    if caller.0 == user {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(format!(
+            "user {} is somebody else",
+            user.0
+        )))
     }
 }
 
@@ -343,16 +495,19 @@ struct SharesDto {
     price_cents: i64,
     /// `price × shares_outstanding`.
     market_cap_cents: i64,
-    /// Every trader holding shares, largest stake first.
+    /// The caller's own traders holding shares, largest stake first. Who
+    /// else holds them is nobody's business: the totals above are public,
+    /// the names behind them are not.
     holders: Vec<HolderDto>,
 }
 
 impl SharesDto {
-    fn new(market: &Market, s: &SymbolState) -> Self {
+    fn new(market: &Market, s: &SymbolState, caller: Option<Caller>) -> Self {
         let sym = s.info.symbol;
         let mut holders: Vec<HolderDto> = market
             .traders
             .values()
+            .filter(|t| caller.is_some_and(|c| c.0 == t.user_id))
             .filter_map(|t| HolderDto::new(t, sym))
             .collect();
         holders.sort_by_key(|h| (std::cmp::Reverse(h.qty), h.trader_id));
@@ -372,6 +527,7 @@ impl SharesDto {
 async fn get_symbol(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
+    caller: Option<Caller>,
 ) -> Result<Json<SymbolDetail>, ApiError> {
     let market = app.market();
     let s = market
@@ -383,19 +539,20 @@ async fn get_symbol(
         snapshot: s.sim().snapshot().into(),
         config: s.sim().config().clone(),
         ticks_total: s.ticks_total,
-        shares: SharesDto::new(&market, s),
+        shares: SharesDto::new(&market, s, caller),
     }))
 }
 
 async fn get_shares(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
+    caller: Option<Caller>,
 ) -> Result<Json<SharesDto>, ApiError> {
     let market = app.market();
     let s = market
         .symbol(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
-    Ok(Json(SharesDto::new(&market, s)))
+    Ok(Json(SharesDto::new(&market, s, caller)))
 }
 
 #[derive(Deserialize)]
@@ -505,6 +662,7 @@ async fn list_symbol_events(
 async fn push_sim_event(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
+    _admin: Admin,
     payload: Result<Json<PushEventRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<EventRecord>), ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
@@ -555,6 +713,7 @@ fn sim_event_name(e: &SimEvent) -> &'static str {
 
 async fn push_game_event(
     State(app): State<AppState>,
+    _admin: Admin,
     payload: Result<Json<GameEventRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<EventRecord>), ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
@@ -711,6 +870,7 @@ async fn get_trades(
 /// that user, on an existing `account_id` or on a fresh account.
 async fn create_trader(
     State(app): State<AppState>,
+    caller: Option<Caller>,
     payload: Option<Json<CreateTraderRequest>>,
 ) -> Result<(StatusCode, Json<PortfolioDto>), ApiError> {
     let req = payload.map(|Json(r)| r).unwrap_or_default();
@@ -731,7 +891,9 @@ async fn create_trader(
             ));
         }
         (Some(user_id), account_id) => {
+            // Joining an existing user is that user's business alone.
             let user = UserId(user_id);
+            owned_user(caller.ok_or_else(ApiError::unauthenticated)?, user)?;
             if !market.users.contains_key(&user) {
                 return Err(ApiError::unknown_user(user_id));
             }
@@ -757,7 +919,11 @@ async fn create_trader(
             market.create_trader(user, account, req.name, now)
         }
     };
-    let dto = portfolio(&market, id)?;
+    let mut dto = portfolio(&market, id)?;
+    if req.user_id.is_none() {
+        // A new user was created for the trader: hand over their key, once.
+        dto.api_key = market.keys.key_of(UserId(dto.user_id)).map(str::to_owned);
+    }
     tracing::info!(
         trader = dto.id,
         user = dto.user_id,
@@ -788,12 +954,14 @@ fn check_email(email: Option<String>) -> Result<Option<String>, ApiError> {
     }
 }
 
-async fn list_traders(State(app): State<AppState>) -> Json<Vec<TraderSummary>> {
+/// The caller's own traders.
+async fn list_traders(State(app): State<AppState>, caller: Caller) -> Json<Vec<TraderSummary>> {
     let market = app.market();
     Json(
         market
             .traders
             .values()
+            .filter(|t| t.user_id == caller.0)
             .map(|t| {
                 let account = market.accounts.get(&t.account_id);
                 let cash = account.map_or(0, Account::balance_cents);
@@ -831,9 +999,12 @@ async fn list_traders(State(app): State<AppState>) -> Json<Vec<TraderSummary>> {
 async fn get_trader(
     State(app): State<AppState>,
     Path(trader_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<PortfolioDto>, ApiError> {
     let market = app.market();
-    Ok(Json(portfolio(&market, TraderId(trader_id))?))
+    let trader = TraderId(trader_id);
+    owned_trader(&market, caller, trader)?;
+    Ok(Json(portfolio(&market, trader)?))
 }
 
 fn portfolio(market: &Market, id: TraderId) -> Result<PortfolioDto, ApiError> {
@@ -896,12 +1067,15 @@ fn portfolio(market: &Market, id: TraderId) -> Result<PortfolioDto, ApiError> {
         positions,
         open_orders,
         fills: t.fills.iter().rev().cloned().collect(),
+        // Only the response that creates a user carries their key.
+        api_key: None,
     })
 }
 
 async fn submit_order(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
+    caller: Caller,
     payload: Result<Json<OrderRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<OrderResponse>), ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
@@ -921,9 +1095,7 @@ async fn submit_order(
         let idx = market
             .symbol_index(&symbol)
             .ok_or_else(|| ApiError::not_found(&symbol))?;
-        if !market.traders.contains_key(&trader) {
-            return Err(ApiError::unknown_trader(trader.0));
-        }
+        owned_trader(&market, caller, trader)?;
         let sym = market.symbols[idx].info.symbol;
         // The same order sent twice — a retry after a timeout, say — is
         // placed once: the first response is replayed, and a re-used id that
@@ -1054,13 +1226,14 @@ struct OrderHistoryQuery {
 async fn get_order_record(
     State(app): State<AppState>,
     Path(order_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<OrderRecord>, ApiError> {
     let market = app.market();
-    market
+    let record = market
         .order(order_id)
-        .cloned()
-        .map(Json)
-        .ok_or_else(|| ApiError::unknown_order(order_id))
+        .ok_or_else(|| ApiError::unknown_order(order_id))?;
+    owned_trader(&market, caller, TraderId(record.trader_id))?;
+    Ok(Json(record.clone()))
 }
 
 /// A trader's orders, newest first.
@@ -1068,6 +1241,7 @@ async fn list_trader_orders(
     State(app): State<AppState>,
     Path(trader_id): Path<u64>,
     Query(q): Query<OrderHistoryQuery>,
+    caller: Caller,
 ) -> Result<Json<Vec<OrderRecord>>, ApiError> {
     let trader = TraderId(trader_id);
     let status = match q.status.as_deref() {
@@ -1082,9 +1256,7 @@ async fn list_trader_orders(
         }
     };
     let market = app.market();
-    if !market.traders.contains_key(&trader) {
-        return Err(ApiError::unknown_trader(trader_id));
-    }
+    owned_trader(&market, caller, trader)?;
     Ok(Json(
         market
             .orders_of(trader)
@@ -1099,8 +1271,10 @@ async fn list_orders(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
     Query(q): Query<TraderQuery>,
+    caller: Caller,
 ) -> Result<Json<Vec<OpenOrderDto>>, ApiError> {
     let market = app.market();
+    owned_trader(&market, caller, TraderId(q.trader_id))?;
     let s = market
         .symbol(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
@@ -1116,6 +1290,7 @@ async fn list_orders(
 async fn get_order(
     State(app): State<AppState>,
     Path((symbol, order_id)): Path<(String, u64)>,
+    caller: Caller,
 ) -> Result<Json<OpenOrderDto>, ApiError> {
     let market = app.market();
     let s = market
@@ -1127,16 +1302,20 @@ async fn get_order(
         .get(fehu::OrderId(order_id))
         .filter(|o| o.owner != Owner::Synthetic)
         .ok_or_else(|| ApiError::unknown_order(order_id))?;
-    Ok(Json(OpenOrderDto::from_resting(s.info.symbol, o)))
+    let dto = OpenOrderDto::from_resting(s.info.symbol, o);
+    owned_trader(&market, caller, TraderId(dto.trader_id))?;
+    Ok(Json(dto))
 }
 
 async fn cancel_order(
     State(app): State<AppState>,
     Path((symbol, order_id)): Path<(String, u64)>,
     Query(q): Query<TraderQuery>,
+    caller: Caller,
 ) -> Result<Json<OpenOrderDto>, ApiError> {
     let trader = TraderId(q.trader_id);
     let mut market = app.market();
+    owned_trader(&market, caller, trader)?;
     let idx = market
         .symbol_index(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
@@ -1174,12 +1353,11 @@ async fn cancel_order(
 async fn cancel_all(
     State(app): State<AppState>,
     Path(trader_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<Vec<OpenOrderDto>>, ApiError> {
     let trader = TraderId(trader_id);
     let mut market = app.market();
-    if !market.traders.contains_key(&trader) {
-        return Err(ApiError::unknown_trader(trader_id));
-    }
+    owned_trader(&market, caller, trader)?;
     let mut out = Vec::new();
     for i in 0..market.symbols.len() {
         let sym = market.symbols[i].info.symbol;
@@ -1213,34 +1391,37 @@ async fn create_user(
     let mut market = app.market();
     let id = market.create_user(req.name, email, wall_now_ms());
     tracing::info!(user = id.0, "user created");
-    Ok((StatusCode::CREATED, Json(user_dto(&market, id)?)))
+    let mut dto = user_dto(&market, id)?;
+    // The one and only time the key is handed out.
+    dto.api_key = market.keys.key_of(id).map(str::to_owned);
+    Ok((StatusCode::CREATED, Json(dto)))
 }
 
-async fn list_users(State(app): State<AppState>) -> Json<Vec<UserDto>> {
+/// The caller, as a list of one: a user is not told about the others.
+async fn list_users(State(app): State<AppState>, caller: Caller) -> Json<Vec<UserDto>> {
     let market = app.market();
-    Json(
-        market
-            .users
-            .keys()
-            .filter_map(|&id| user_dto(&market, id).ok())
-            .collect(),
-    )
+    Json(user_dto(&market, caller.0).into_iter().collect())
 }
 
 async fn get_user(
     State(app): State<AppState>,
     Path(user_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<UserDto>, ApiError> {
+    let user = UserId(user_id);
+    owned_user(caller, user)?;
     let market = app.market();
-    Ok(Json(user_dto(&market, UserId(user_id))?))
+    Ok(Json(user_dto(&market, user)?))
 }
 
 /// Every share the user owns, per symbol, across all of their traders.
 async fn get_holdings(
     State(app): State<AppState>,
     Path(user_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<UserHoldingsResponse>, ApiError> {
     let user = UserId(user_id);
+    owned_user(caller, user)?;
     let market = app.market();
     if !market.users.contains_key(&user) {
         return Err(ApiError::unknown_user(user_id));
@@ -1255,11 +1436,13 @@ async fn get_holdings(
 async fn open_account(
     State(app): State<AppState>,
     Path(user_id): Path<u64>,
+    caller: Caller,
     payload: Option<Json<OpenAccountRequest>>,
 ) -> Result<(StatusCode, Json<AccountDto>), ApiError> {
     let req = payload.map(|Json(r)| r).unwrap_or_default();
     let cash = req.cash_cents.unwrap_or(app.options.starting_cash_cents);
     let user = UserId(user_id);
+    owned_user(caller, user)?;
     let mut market = app.market();
     if !market.users.contains_key(&user) {
         return Err(ApiError::unknown_user(user_id));
@@ -1274,8 +1457,10 @@ async fn open_account(
 async fn list_user_accounts(
     State(app): State<AppState>,
     Path(user_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<Vec<AccountDto>>, ApiError> {
     let user = UserId(user_id);
+    owned_user(caller, user)?;
     let market = app.market();
     if !market.users.contains_key(&user) {
         return Err(ApiError::unknown_user(user_id));
@@ -1290,12 +1475,14 @@ async fn list_user_accounts(
     ))
 }
 
-async fn list_accounts(State(app): State<AppState>) -> Json<Vec<AccountDto>> {
+/// The caller's own accounts.
+async fn list_accounts(State(app): State<AppState>, caller: Caller) -> Json<Vec<AccountDto>> {
     let market = app.market();
     Json(
         market
             .accounts
             .values()
+            .filter(|a| a.user_id == caller.0)
             .map(|a| account_view(&market, a))
             .collect(),
     )
@@ -1304,9 +1491,12 @@ async fn list_accounts(State(app): State<AppState>) -> Json<Vec<AccountDto>> {
 async fn get_account(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<AccountDto>, ApiError> {
     let market = app.market();
-    Ok(Json(account_dto(&market, AccountId(account_id))?))
+    let id = AccountId(account_id);
+    owned_account(&market, caller, id)?;
+    Ok(Json(account_dto(&market, id)?))
 }
 
 /// Add money: `{"amount_cents": 500000}`. The amount is a positive integer
@@ -1314,11 +1504,13 @@ async fn get_account(
 async fn deposit(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
+    caller: Caller,
     payload: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<Json<LedgerResponse>, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
     let mut market = app.market();
     let id = AccountId(account_id);
+    owned_account(&market, caller, id)?;
     let entry = market
         .accounts
         .get_mut(&id)
@@ -1342,11 +1534,13 @@ async fn deposit(
 async fn withdraw(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
+    caller: Caller,
     payload: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<Json<LedgerResponse>, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
     let mut market = app.market();
     let id = AccountId(account_id);
+    owned_account(&market, caller, id)?;
     let entry = market
         .accounts
         .get_mut(&id)
@@ -1369,11 +1563,13 @@ async fn withdraw(
 async fn set_status(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
+    caller: Caller,
     payload: Result<Json<StatusRequest>, JsonRejection>,
 ) -> Result<Json<AccountDto>, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
     let mut market = app.market();
     let id = AccountId(account_id);
+    owned_account(&market, caller, id)?;
     market
         .accounts
         .get_mut(&id)
@@ -1388,8 +1584,10 @@ async fn set_status(
 async fn validate_account(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
+    caller: Caller,
 ) -> Result<Json<AccountCheck>, ApiError> {
     let market = app.market();
+    owned_account(&market, caller, AccountId(account_id))?;
     let account = market
         .accounts
         .get(&AccountId(account_id))
@@ -1402,6 +1600,7 @@ async fn get_ledger(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
     Query(q): Query<LimitQuery>,
+    caller: Caller,
 ) -> Result<Json<LedgerResponse>, ApiError> {
     let limit = q
         .limit
@@ -1409,6 +1608,7 @@ async fn get_ledger(
         .clamp(1, app.options.ledger_log.max(1));
     let market = app.market();
     let id = AccountId(account_id);
+    owned_account(&market, caller, id)?;
     let account = market
         .accounts
         .get(&id)
@@ -1424,11 +1624,13 @@ async fn get_ledger(
 async fn trader_deposit(
     State(app): State<AppState>,
     Path(trader_id): Path<u64>,
+    caller: Caller,
     payload: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<Json<PortfolioDto>, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
     let trader = TraderId(trader_id);
     let mut market = app.market();
+    owned_trader(&market, caller, trader)?;
     let account_id = market
         .traders
         .get(&trader)
@@ -1482,6 +1684,8 @@ fn user_dto(market: &Market, id: UserId) -> Result<UserDto, ApiError> {
             .iter()
             .map(|h| h.market_value_cents)
             .fold(0i64, i64::saturating_add),
+        // Only the response that creates a user carries their key.
+        api_key: None,
     })
 }
 
@@ -1514,18 +1718,45 @@ async fn catalog() -> Json<Vec<CatalogEntry>> {
 
 /// Server-sent events: a `hello` with the current quotes, then every tick
 /// and every accepted event. Each message is JSON with a `type` field.
-async fn stream(State(app): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+#[derive(Deserialize)]
+struct StreamQuery {
+    /// `EventSource` cannot set headers, so the stream takes the key in the
+    /// query string. Without one the stream carries market data only.
+    api_key: Option<String>,
+}
+
+async fn stream(
+    State(app): State<AppState>,
+    Query(q): Query<StreamQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = app.tx.subscribe();
-    let hello = {
+    let (hello, viewer) = {
         let market = app.market();
-        StreamMessage::Hello {
-            sim_now_ms: app.clock.now().0,
-            time_scale: app.clock.scale,
-            quotes: market.symbols.iter().map(SymbolState::quote).collect(),
-        }
+        (
+            StreamMessage::Hello {
+                sim_now_ms: app.clock.now().0,
+                time_scale: app.clock.scale,
+                quotes: market.symbols.iter().map(SymbolState::quote).collect(),
+            },
+            q.api_key.as_deref().and_then(|k| market.keys.user_of(k)),
+        )
     };
+    // Ticks and events are public; a fill belongs to the trader that made it,
+    // so it goes only to a stream that proved it speaks for that trader.
+    let owner = Arc::clone(&app);
     // A lagging client silently skips the messages it missed.
-    let live = BroadcastStream::new(rx).filter_map(Result::ok);
+    let live = BroadcastStream::new(rx)
+        .filter_map(Result::ok)
+        .filter(move |m| match m {
+            StreamMessage::Fill { trader_id, .. } => viewer.is_some_and(|user| {
+                owner
+                    .market()
+                    .traders
+                    .get(&TraderId(*trader_id))
+                    .is_some_and(|t| t.user_id == user)
+            }),
+            _ => true,
+        });
     let all = tokio_stream::once(hello)
         .chain(live)
         .filter_map(|m| Event::default().json_data(&m).ok().map(Ok));

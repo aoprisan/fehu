@@ -1020,7 +1020,35 @@ asks for something else is refused with `409 duplicate_client_order_id`. That
 is what makes a retry after a timeout safe, which no amount of care on the
 client side can otherwise guarantee.
 
-### 14.11 Tests
+### 14.11 Who a request speaks for
+
+Market data is public; everything a user owns is not. Each user is issued one
+API key when they are created (`webapp/src/auth.rs`: 128 bits of
+operating-system entropy behind a `fehu_` prefix), returned **once** — in the
+response that created them — and held in the `Keyring` beside the accounts it
+opens. Nothing is persisted, so there is no separate key store to steal; a
+deployment that adds persistence must hash the keys before writing them down.
+
+A request presents it as `Authorization: Bearer <key>` or `X-Api-Key`, and the
+`Caller` extractor turns that into a `UserId` — 401 with no key or an unknown
+one. Handlers then check ownership rather than trusting the ids in the path:
+`owned_trader`, `owned_account` and `owned_user` refuse somebody else's
+property with 403, listings (`/api/traders`, `/api/users`, `/api/accounts`)
+return only the caller's own, and the holder list on
+`GET /api/symbols/{s}/shares` names only the caller's traders — the totals are
+public, the names behind them are not. Sign-up itself (`POST /api/users`, and
+`POST /api/traders` with no `user_id`) is the one unauthenticated write;
+joining an existing user needs that user's key.
+
+Two places take the key differently. The SSE stream carries fills, which
+belong to the trader that made them, but `EventSource` cannot set headers, so
+`/api/stream?api_key=` filters them: a stream with no key, or an unknown one,
+gets ticks and events only. And the game-master endpoints, which push events
+that move prices, are gated by `FEHU_ADMIN_KEY` when it is set — compared in
+constant time — and open when it is not, which is what a single-player game on
+localhost wants and a shared server does not.
+
+### 14.12 Tests
 
 `tests/trading.rs`: book priority/partial fills/IOC/FOK/cancel/preview; the
 no-trader invariant against the bare simulator for 20 k ticks; ladder
@@ -1045,5 +1073,9 @@ while one trader still cannot sell another's shares. Orders: a
 `client_order_id` replays the first response and refuses a mismatched reuse
 while staying per-trader, a filled or cancelled order is still readable from
 the log once the book has dropped it, the history filters by status, and a
-resting order's record follows its partial fills to `filled`. `webapp/tests/contract.rs`
+resting order's record follows its partial fills to `filled`. Keys: every
+private endpoint answers 401 without one and 403 with somebody else's, having
+moved nothing; a forged key is refused; listings show the caller their own
+only; market data stays open; and `FEHU_ADMIN_KEY` locks the game-master
+endpoints while leaving the event log readable. `webapp/tests/contract.rs`
 pins the JSON key sets the TypeScript UI is typed against.

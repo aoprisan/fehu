@@ -572,6 +572,10 @@ pub struct UserDto {
     pub shares_owned: u64,
     /// Those shares at the reference prices.
     pub holdings_value_cents: i64,
+    /// The key that proves a request speaks for this user, shown **once**:
+    /// in the response that created them, and `null` everywhere after. Send
+    /// it as `Authorization: Bearer <key>`.
+    pub api_key: Option<String>,
 }
 
 /// `GET /api/accounts/{id}`.
