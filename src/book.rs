@@ -188,8 +188,12 @@ pub enum OrderError {
     ZeroQuantity,
     /// `qty` exceeds [`MAX_ORDER_QTY`].
     QuantityTooLarge,
+    /// `qty` is not a whole number of the symbol's lots.
+    OddLot,
     /// A limit price outside `[1, 10^15]`.
     BadPrice,
+    /// A limit price that is not on the symbol's tick grid.
+    OffTick,
     /// No further unique order ids can be assigned.
     IdExhausted,
     /// Synthetic orders are managed by the exchange; give NPCs a `TraderId`.
@@ -201,7 +205,9 @@ impl fmt::Display for OrderError {
         f.write_str(match self {
             Self::ZeroQuantity => "order quantity must be at least 1",
             Self::QuantityTooLarge => "order quantity is too large",
+            Self::OddLot => "order quantity must be a whole number of lots",
             Self::BadPrice => "limit price must be in [1, 10^15] cents",
+            Self::OffTick => "limit price must be a whole number of ticks",
             Self::IdExhausted => "order id space is exhausted",
             Self::SyntheticOwner => "synthetic orders cannot be submitted directly",
         })
@@ -210,6 +216,77 @@ impl fmt::Display for OrderError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for OrderError {}
+
+/// What a symbol will quote and trade in.
+///
+/// A real venue does not accept every price and every size: it quotes in
+/// ticks and trades in lots, so that the book has a manageable number of
+/// price levels and a size means something. Both default to the finest
+/// possible — one cent, one share — which constrains nothing and is what the
+/// sample market runs with unless it is told otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MarketRules {
+    /// Prices must be a whole number of these cents. `1` allows every cent.
+    pub tick_cents: i64,
+    /// Quantities must be a whole number of these shares. `1` allows every
+    /// share.
+    pub lot: u64,
+}
+
+impl Default for MarketRules {
+    fn default() -> Self {
+        Self {
+            tick_cents: 1,
+            lot: 1,
+        }
+    }
+}
+
+impl MarketRules {
+    /// Whether `price_cents` sits on the tick grid.
+    #[must_use]
+    pub fn allows_price(&self, price_cents: i64) -> bool {
+        self.tick_cents <= 1 || price_cents % self.tick_cents == 0
+    }
+
+    /// Whether `qty` is a whole number of lots.
+    #[must_use]
+    pub fn allows_qty(&self, qty: u64) -> bool {
+        self.lot <= 1 || qty.is_multiple_of(self.lot)
+    }
+
+    /// `price_cents` rounded down to the tick, never below one tick: a price
+    /// of zero is not a price.
+    #[must_use]
+    pub fn floor_price(&self, price_cents: i64) -> i64 {
+        if self.tick_cents <= 1 {
+            return price_cents;
+        }
+        let floored = price_cents - price_cents.rem_euclid(self.tick_cents);
+        floored.max(self.tick_cents)
+    }
+
+    /// `price_cents` rounded up to the tick.
+    #[must_use]
+    pub fn ceil_price(&self, price_cents: i64) -> i64 {
+        if self.tick_cents <= 1 {
+            return price_cents;
+        }
+        let up = price_cents.saturating_add(self.tick_cents - 1);
+        self.floor_price(up)
+    }
+
+    /// `qty` rounded down to whole lots. Zero when it does not reach one:
+    /// the caller decides whether that means "skip" or "refuse".
+    #[must_use]
+    pub fn floor_qty(&self, qty: u64) -> u64 {
+        if self.lot <= 1 {
+            return qty;
+        }
+        qty - qty % self.lot
+    }
+}
 
 /// Why a cancel failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -410,6 +487,11 @@ pub struct OrderBook {
     /// Every resting order's side and price, for cancels and lookups.
     index: BTreeMap<OrderId, (Side, i64)>,
     next_id: u64,
+    /// The tick and lot this book enforces. Not serialised: the exchange
+    /// owns the truth in its [`TradingParams`](crate::TradingParams) and
+    /// sets it here whenever a book is assembled, so the two cannot drift.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    rules: MarketRules,
 }
 
 impl Default for OrderBook {
@@ -427,6 +509,7 @@ impl OrderBook {
             asks: BTreeMap::new(),
             index: BTreeMap::new(),
             next_id: 1,
+            rules: MarketRules::default(),
         }
     }
 
@@ -494,18 +577,42 @@ impl OrderBook {
         Ok(())
     }
 
-    /// Validate an order without submitting it.
-    pub fn validate(order: &Order) -> Result<(), OrderError> {
+    /// The tick and lot this book enforces.
+    #[must_use]
+    pub fn rules(&self) -> MarketRules {
+        self.rules
+    }
+
+    /// Set the tick and lot. The exchange does this when it assembles a
+    /// book; nothing already resting is re-checked, because the rules a book
+    /// is loaded with are the ones it was written with.
+    pub fn set_rules(&mut self, rules: MarketRules) {
+        self.rules = rules;
+    }
+
+    /// Validate an order without submitting it, against this book's rules.
+    pub fn validate(&self, order: &Order) -> Result<(), OrderError> {
+        Self::validate_with(order, self.rules)
+    }
+
+    /// Validate an order against `rules`, without a book to hand.
+    pub fn validate_with(order: &Order, rules: MarketRules) -> Result<(), OrderError> {
         if order.qty == 0 {
             return Err(OrderError::ZeroQuantity);
         }
         if order.qty > MAX_ORDER_QTY {
             return Err(OrderError::QuantityTooLarge);
         }
-        if let OrderKind::Limit { price_cents } = order.kind
-            && !(1..=MAX_PRICE_CENTS).contains(&price_cents)
-        {
-            return Err(OrderError::BadPrice);
+        if !rules.allows_qty(order.qty) {
+            return Err(OrderError::OddLot);
+        }
+        if let OrderKind::Limit { price_cents } = order.kind {
+            if !(1..=MAX_PRICE_CENTS).contains(&price_cents) {
+                return Err(OrderError::BadPrice);
+            }
+            if !rules.allows_price(price_cents) {
+                return Err(OrderError::OffTick);
+            }
         }
         Ok(())
     }
@@ -517,7 +624,7 @@ impl OrderBook {
     /// See [`OrderError`]. Synthetic owners are accepted here; the exchange
     /// is what forbids them.
     pub fn submit(&mut self, order: Order, ts: Timestamp) -> Result<Placement, OrderError> {
-        Self::validate(&order)?;
+        self.validate(&order)?;
         let next = self.next_id.checked_add(1).ok_or(OrderError::IdExhausted)?;
         if self.next_id == 0 {
             return Err(OrderError::IdExhausted);

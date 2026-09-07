@@ -1229,7 +1229,10 @@ round-trip cost against a seed-matched control; permanent fraction lands on
 the fundamental; resting bids/asks fill when the market trades through them;
 trader-to-trader trades leave the reference alone; ownership on cancel;
 market-order collar; flow direction follows the return (> 70 % of volume);
-determinism with interleaved orders; serde round trip (JSON and postcard)
+determinism with interleaved orders; a tick and lot enforced on both sides —
+every synthetic quote and print on the grid and in whole lots, an off-tick or
+odd-lot order refused, a market order's collar landing on the grid — and the
+default rules constraining nothing; serde round trip (JSON and postcard)
 continuing identically for 2 k ticks. `webapp/tests/api.rs` covers the HTTP
 surface end to end, including reservations and rejections; users opening
 accounts and paying money in, the ledger adding up to the balance after a
@@ -1301,11 +1304,27 @@ each one fills, which is `book.rs`, not the web app. GTD and day orders need
 an expiry sweep on the engine step, which is easy but pointless until sessions
 are the default rather than an option (§14.12).
 
-**Tick and lot size.** Prices are integer cents and quantities whole shares,
-and nothing else is enforced: a symbol cannot say "quote me in five-cent
-steps" or "trade me in lots of ten". `TradingParams` is where they would go,
-with the check in `OrderBook::validate` so the crate refuses them rather than
-the web app.
+**Tick and lot size (implemented).** `MarketRules { tick_cents, lot }` lives
+in `TradingParams`, and the exchange copies it into the book whenever one is
+assembled — from `new` or from a save — so the two cannot drift and the book
+can refuse an order without asking anybody. `OrderBook::validate` is where
+the refusal happens (`OffTick`, `OddLot`), which means the crate refuses them
+and the web app only reports it.
+
+The rules bind both sides. The synthetic ladder quotes on the tick grid,
+rounding its best bid down and its best ask up so a tick can never collapse
+the spread the model asked for, and sizes each level in whole lots with a
+floor of one. Synthetic prints are in lots too, since a print is a trade at
+this venue; whatever is left below a lot goes unprinted. A trader's market
+order is converted to a collar limit rounded *into* the collar — down for a
+buy, up for a sell — because the far side's quotes are themselves on the
+grid, so rounding the other way would allow a price the collar did not.
+
+`FEHU_TICK_CENTS` and `FEHU_LOT` set them for every symbol at start-up. Both
+default to 1, which constrains nothing and leaves every price and size the
+market produced before unchanged. They are a property of the listing, so a
+restored market keeps the ones it was saved with rather than whatever the
+environment now says.
 
 ### 15.2 What the stream promises (implemented)
 

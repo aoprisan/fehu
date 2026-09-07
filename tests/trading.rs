@@ -3,8 +3,8 @@
 
 use core::time::Duration;
 use fehu::{
-    Config, Exchange, ImpactParams, Order, OrderId, OrderStatus, Owner, Side, Simulator,
-    TimeInForce, Trade, TraderId, TradingParams,
+    Config, Exchange, ImpactParams, Order, OrderError, OrderId, OrderStatus, Owner, Side,
+    Simulator, TimeInForce, Trade, TraderId, TradingParams,
 };
 
 const T: TraderId = TraderId(7);
@@ -411,6 +411,116 @@ fn exchange_round_trips_through_serde() {
     let mut bad: serde_json::Value = serde_json::from_str(&json).unwrap();
     bad["version"] = serde_json::json!(99);
     assert!(serde_json::from_value::<Exchange>(bad).is_err());
+}
+
+#[test]
+fn a_tick_and_lot_are_enforced_on_both_sides_of_the_book() {
+    let params = TradingParams {
+        rules: fehu::MarketRules {
+            tick_cents: 25,
+            lot: 10,
+        },
+        ..TradingParams::default()
+    };
+    let mut ex = Exchange::new(Config::default(), params, 9).unwrap();
+
+    // Every synthetic quote is on the grid and in whole lots.
+    for level in ex.book().orders() {
+        assert_eq!(
+            level.price_cents % 25,
+            0,
+            "synthetic quote off the tick: {level:?}"
+        );
+        assert_eq!(
+            level.qty % 10,
+            0,
+            "synthetic quote in an odd lot: {level:?}"
+        );
+    }
+    let bid = ex.book().best_bid().unwrap();
+    let ask = ex.book().best_ask().unwrap();
+    assert!(bid < ask, "the tick must not collapse the spread");
+
+    // A trader's order has to be on the grid too, and in whole lots.
+    let off_tick = Order::limit(Owner::Trader(T), Side::Buy, bid - 1, 10);
+    assert_eq!(ex.submit(off_tick), Err(OrderError::OffTick));
+    let odd_lot = Order::limit(Owner::Trader(T), Side::Buy, bid - 25, 15);
+    assert_eq!(ex.submit(odd_lot), Err(OrderError::OddLot));
+    let good = Order::limit(Owner::Trader(T), Side::Buy, bid - 25, 20);
+    assert_eq!(ex.submit(good).unwrap().status, OrderStatus::Resting);
+
+    // Market orders are converted to a collar limit, which lands on the grid.
+    let placement = ex
+        .submit(Order::market(Owner::Trader(OTHER), Side::Buy, 10))
+        .unwrap();
+    assert!(placement.filled > 0, "{placement:?}");
+    for trade in &placement.trades {
+        assert_eq!(trade.price_cents % 25, 0, "print off the tick: {trade:?}");
+    }
+
+    // And the ladder stays on the grid as the price moves.
+    for report in ex.advance(Duration::from_secs(120)) {
+        for trade in &report.trades {
+            assert_eq!(
+                trade.price_cents % 25,
+                0,
+                "synthetic print off the tick: {trade:?}"
+            );
+            assert_eq!(
+                trade.qty % 10,
+                0,
+                "synthetic print in an odd lot: {trade:?}"
+            );
+        }
+    }
+    for level in ex.book().orders().filter(|o| o.owner == Owner::Synthetic) {
+        assert_eq!(level.price_cents % 25, 0);
+        assert_eq!(level.qty % 10, 0);
+    }
+}
+
+#[test]
+fn the_default_rules_constrain_nothing() {
+    let rules = fehu::MarketRules::default();
+    assert!(rules.allows_price(8_431));
+    assert!(rules.allows_qty(7));
+    assert_eq!(rules.floor_price(8_431), 8_431);
+    assert_eq!(rules.ceil_price(8_431), 8_431);
+    assert_eq!(rules.floor_qty(7), 7);
+
+    let rules = fehu::MarketRules {
+        tick_cents: 25,
+        lot: 10,
+    };
+    assert!(!rules.allows_price(8_431));
+    assert!(rules.allows_price(8_425));
+    assert_eq!(rules.floor_price(8_431), 8_425);
+    assert_eq!(rules.ceil_price(8_431), 8_450);
+    assert_eq!(rules.ceil_price(8_425), 8_425, "already on the grid");
+    assert_eq!(rules.floor_price(3), 25, "a price is never rounded to zero");
+    assert_eq!(rules.floor_qty(17), 10);
+    assert_eq!(rules.floor_qty(7), 0, "the caller decides what that means");
+
+    // Out of range is a configuration error, not a silent clamp.
+    for bad in [
+        fehu::MarketRules {
+            tick_cents: 0,
+            lot: 1,
+        },
+        fehu::MarketRules {
+            tick_cents: 1,
+            lot: 0,
+        },
+    ] {
+        let params = TradingParams {
+            rules: bad,
+            ..TradingParams::default()
+        };
+        assert!(
+            Exchange::new(Config::default(), params, 1).is_err(),
+            "{bad:?}"
+        );
+    }
 }
 
 #[test]

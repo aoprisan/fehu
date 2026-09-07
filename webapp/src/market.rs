@@ -1072,13 +1072,20 @@ impl Market {
     ) -> Result<StopOrder, PlaceError> {
         let trader = TraderId(req.trader_id);
         let sym = self.symbols[idx].info.symbol;
-        if req.qty == 0 {
-            return Err(PlaceError::Invalid("a stop must be for some shares".into()));
-        }
-        if req.stop_price_cents <= 0 || req.limit_price_cents.is_some_and(|p| p <= 0) {
+        let rules = self.symbols[idx].exchange.book().rules();
+        if req.stop_price_cents <= 0 {
             return Err(PlaceError::Invalid(
-                "a stop's prices must be above zero".into(),
+                "a stop price must be above zero".into(),
             ));
+        }
+        // The trigger is a price like any other on this symbol, so it sits on
+        // the same grid: a stop at a price the market cannot print at is a
+        // trigger that may never be reached exactly.
+        if !rules.allows_price(req.stop_price_cents) {
+            return Err(PlaceError::Invalid(format!(
+                "a stop price must be a whole number of {}-cent ticks",
+                rules.tick_cents
+            )));
         }
         // A trigger the market has already passed is not a trigger: it is a
         // market order with extra steps, and almost certainly a mistake.
@@ -1114,6 +1121,13 @@ impl Market {
             client_order_id: req.client_order_id.clone(),
             created_at_ms: now_ms,
         };
+        // The order it will become has to be one the book would take, or the
+        // trigger is armed to fail.
+        self.symbols[idx]
+            .exchange
+            .book()
+            .validate(&stop.order())
+            .map_err(|e| PlaceError::Invalid(e.to_string()))?;
         let account = self
             .account_of(trader)
             .ok_or(PlaceError::UnknownTrader(trader.0))?;
@@ -1705,6 +1719,12 @@ pub struct Options {
     /// Requests one client may send at once after a quiet spell.
     /// `FEHU_RATE_BURST`.
     pub rate_burst: f64,
+    /// The price step every symbol quotes and trades in, in cents.
+    /// `FEHU_TICK_CENTS`; `1` allows every cent, which is the default.
+    pub tick_cents: i64,
+    /// The share lot every symbol trades in. `FEHU_LOT`; `1` allows every
+    /// share, which is the default.
+    pub lot: u64,
 }
 
 impl Default for Options {
@@ -1730,6 +1750,8 @@ impl Default for Options {
             stream_replay: 1_024,
             rate_per_sec: 20.0,
             rate_burst: 40.0,
+            tick_cents: 1,
+            lot: 1,
         }
     }
 }
@@ -1769,6 +1791,8 @@ impl Options {
             stream_replay: env_parse("FEHU_STREAM_REPLAY", d.stream_replay),
             rate_per_sec: env_parse("FEHU_RATE_PER_SEC", d.rate_per_sec).max(0.0),
             rate_burst: env_parse("FEHU_RATE_BURST", d.rate_burst).max(0.0),
+            tick_cents: env_parse("FEHU_TICK_CENTS", d.tick_cents).clamp(1, 1_000_000),
+            lot: env_parse("FEHU_LOT", d.lot).clamp(1, 1_000_000),
         }
     }
 }
@@ -1853,8 +1877,15 @@ impl App {
         let symbols = seeded_symbols(start_ts)
             .into_iter()
             .map(|mut spec| {
-                // Every symbol trades on the same calendar, if there is one.
+                // Every symbol trades on the same calendar, if there is one,
+                // and in the same tick and lot. Both are properties of the
+                // listing, so a restored market keeps the ones it was saved
+                // with rather than whatever the environment now says.
                 spec.config.market_hours = options.market_hours;
+                spec.trading.rules = fehu::MarketRules {
+                    tick_cents: options.tick_cents,
+                    lot: options.lot,
+                };
                 let mut s = SymbolState::new(spec, options.max_bars, options.tape_len);
                 s.warm_up(options.history_days, now);
                 s

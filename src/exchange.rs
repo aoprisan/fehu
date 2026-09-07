@@ -23,8 +23,8 @@ use rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
 
 use crate::book::{
-    CancelError, Order, OrderBook, OrderError, OrderId, OrderKind, Owner, Party, Placement,
-    Preview, Resting, Side, TimeInForce, Trade, TraderId, notional,
+    CancelError, MarketRules, Order, OrderBook, OrderError, OrderId, OrderKind, Owner, Party,
+    Placement, Preview, Resting, Side, TimeInForce, Trade, TraderId, notional,
 };
 use crate::config::{Config, ConfigError, check_finite, check_range};
 use crate::event::{Event, EventKind};
@@ -135,11 +135,27 @@ pub struct TradingParams {
     pub flow: FlowParams,
     /// Traders' price impact.
     pub impact: ImpactParams,
+    /// What the symbol quotes and trades in. The synthetic ladder and prints
+    /// obey these too, so a book with a five-cent tick has five-cent levels.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub rules: MarketRules,
 }
 
 impl TradingParams {
     /// Check every field against its documented range.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=1_000_000).contains(&self.rules.tick_cents) {
+            return Err(ConfigError::OutOfRange {
+                field: "trading.rules.tick_cents",
+                reason: "must be in [1, 10^6]",
+            });
+        }
+        if !(1..=1_000_000).contains(&self.rules.lot) {
+            return Err(ConfigError::OutOfRange {
+                field: "trading.rules.lot",
+                reason: "must be in [1, 10^6]",
+            });
+        }
         let l = &self.liquidity;
         check_range(
             "trading.liquidity.half_spread",
@@ -299,11 +315,15 @@ impl Exchange {
     fn assemble(
         sim: Simulator,
         params: TradingParams,
-        book: OrderBook,
+        mut book: OrderBook,
         flow_rng: Xoshiro256PlusPlus,
         pending_flow: i64,
         interim_volume: u64,
     ) -> Self {
+        // The params are the truth; the book holds a copy so it can refuse an
+        // order without asking. Setting it here covers both a fresh exchange
+        // and one read back from a save.
+        book.set_rules(params.rules);
         let cfg = sim.config();
         let days = cfg
             .market_hours
@@ -405,14 +425,19 @@ impl Exchange {
         if order.owner == Owner::Synthetic {
             return Err(OrderError::SyntheticOwner);
         }
-        OrderBook::validate(&order)?;
+        self.book.validate(&order)?;
         let order = match order.kind {
             OrderKind::Market => {
                 let collar = self.params.liquidity.market_collar;
                 let r = self.reference_cents as f64;
+                // Rounded *into* the collar, not out of it: the far side's
+                // quotes sit on the tick grid, so a buy limit rounded down
+                // still reaches every ask the collar allowed, and rounding it
+                // up would allow one it did not.
+                let rules = self.params.rules;
                 let price_cents = match order.side {
-                    Side::Buy => libm::ceil(r * (1.0 + collar)) as i64,
-                    Side::Sell => libm::floor(r * (1.0 - collar)) as i64,
+                    Side::Buy => rules.floor_price(libm::ceil(r * (1.0 + collar)) as i64),
+                    Side::Sell => rules.ceil_price(libm::floor(r * (1.0 - collar)) as i64),
                 }
                 .clamp(1, crate::book::MAX_PRICE_CENTS);
                 let tif = match order.tif {
@@ -458,9 +483,10 @@ impl Exchange {
     pub fn preview_market(&self, side: Side, qty: u64) -> Preview {
         let collar = self.params.liquidity.market_collar;
         let r = self.reference_cents as f64;
+        let rules = self.params.rules;
         let limit = match side {
-            Side::Buy => libm::ceil(r * (1.0 + collar)) as i64,
-            Side::Sell => libm::floor(r * (1.0 - collar)) as i64,
+            Side::Buy => rules.floor_price(libm::ceil(r * (1.0 + collar)) as i64),
+            Side::Sell => rules.ceil_price(libm::floor(r * (1.0 - collar)) as i64),
         };
         self.book.preview(side, qty, Some(limit))
     }
@@ -597,6 +623,7 @@ impl Exchange {
             weights.push(w);
             total += w;
         }
+        let rules = self.params.rules;
         let mut left = v;
         for (k, w) in weights.iter().enumerate() {
             let qty = if k + 1 == n {
@@ -606,6 +633,9 @@ impl Exchange {
                 let q = if q < 1.0 { 1 } else { q as u64 };
                 q.min(left)
             };
+            // Prints are trades at this venue, so they are in lots too.
+            // Whatever is left over below one lot goes unprinted.
+            let qty = rules.floor_qty(qty);
             let side = if math::uniform(&mut self.flow_rng) < p_buy {
                 Side::Buy
             } else {
@@ -663,9 +693,15 @@ impl Exchange {
             1.0
         };
         let hs = l.half_spread * regime;
-        let bid1 = (libm::floor(rf * (1.0 - hs)) as i64).min(r - 1);
-        let ask1 = (libm::ceil(rf * (1.0 + hs)) as i64).max(r + 1);
-        let step = (round(rf * l.level_step) as i64).max(1);
+        // The ladder is quoted on the tick grid, away from the reference on
+        // both sides, so the spread a tick rule produces is never tighter
+        // than the model asked for.
+        let rules = self.params.rules;
+        let bid1 = rules.floor_price((libm::floor(rf * (1.0 - hs)) as i64).min(r - 1));
+        let ask1 = rules.ceil_price((libm::ceil(rf * (1.0 + hs)) as i64).max(r + 1));
+        let step = rules
+            .ceil_price((round(rf * l.level_step) as i64).max(1))
+            .max(rules.tick_cents);
         let touch = l.touch_depth * cfg.volume.base_per_day;
         let ts = self.sim.clock();
         let mut growth = 1.0;
@@ -681,6 +717,9 @@ impl Exchange {
                 } else {
                     qty as u64
                 };
+                // Whole lots, and at least one: a level too small to be a
+                // lot is quoted as one rather than left empty.
+                let qty = rules.floor_qty(qty).max(rules.lot);
                 let price = match side {
                     Side::Buy => bid1 - offset,
                     Side::Sell => ask1.saturating_add(offset),

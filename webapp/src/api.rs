@@ -1324,7 +1324,6 @@ async fn submit_order(
         tif: req.tif,
         qty: req.qty,
     };
-    fehu::OrderBook::validate(&order).map_err(|e| ApiError::invalid_order(e.to_string()))?;
     let client_order_id = clean_client_order_id(req.client_order_id)?;
 
     let (response, fills, replayed) = {
@@ -1333,6 +1332,13 @@ async fn submit_order(
             .symbol_index(&symbol)
             .ok_or_else(|| ApiError::not_found(&symbol))?;
         owned_trader(&market, caller, trader)?;
+        // Validated against this symbol's own book: the tick and lot are a
+        // property of the listing, not of orders in general.
+        market.symbols[idx]
+            .exchange
+            .book()
+            .validate(&order)
+            .map_err(|e| ApiError::invalid_order(e.to_string()))?;
         let sym = market.symbols[idx].info.symbol;
         // A closed session or a halt takes no new orders at all.
         if let Some(closed) = market.symbols[idx].closed(app.clock.now()) {
@@ -1702,7 +1708,11 @@ async fn amend_order(
             tif: fehu::TimeInForce::Gtc,
             qty: req.qty.unwrap_or(resting.remaining),
         };
-        fehu::OrderBook::validate(&order).map_err(|e| ApiError::invalid_order(e.to_string()))?;
+        market.symbols[idx]
+            .exchange
+            .book()
+            .validate(&order)
+            .map_err(|e| ApiError::invalid_order(e.to_string()))?;
 
         // Withdraw the old one first: it would otherwise be in the way of its
         // own replacement, both as liquidity and as a reservation.

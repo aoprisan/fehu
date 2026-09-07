@@ -2787,6 +2787,120 @@ async fn order_ids_are_unique_across_symbols_and_survive_retries() {
 }
 
 #[tokio::test]
+async fn a_symbol_quoted_in_ticks_and_traded_in_lots_refuses_anything_else() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        tick_cents: 25,
+        lot: 10,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "tessa").await;
+    let id = player.trader;
+    let (_, book) = get(&app, "/api/symbols/ACME/book").await;
+    let bid = book["bid_cents"].as_i64().unwrap();
+    assert_eq!(bid % 25, 0, "the quotes are on the grid: {book}");
+    for level in book["bids"].as_array().unwrap() {
+        assert_eq!(level["price_cents"].as_i64().unwrap() % 25, 0, "{level}");
+        assert_eq!(level["qty"].as_u64().unwrap() % 10, 0, "{level}");
+    }
+
+    // Off the tick, and in an odd lot: both refused before anything moves.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit",
+                "price_cents": bid - 1 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_order");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("tick"),
+        "{body}"
+    );
+
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 15, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("lot"),
+        "{body}"
+    );
+
+    // On the grid and in whole lots: taken, and it prints on the grid.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 20, "type": "limit",
+                "price_cents": bid - 25 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["status"], "resting");
+
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 30, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    assert_eq!(body["filled"], 30);
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    for fill in p["fills"].as_array().unwrap() {
+        assert_eq!(fill["price_cents"].as_i64().unwrap() % 25, 0, "{fill}");
+    }
+
+    // A stop is priced on the same grid and fires an order in whole lots.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "sell", "qty": 10,
+                "stop_price_cents": bid - 26 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("tick"),
+        "{body}"
+    );
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "sell", "qty": 15,
+                "stop_price_cents": bid - 50 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "an odd lot: {body}");
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "sell", "qty": 10,
+                "stop_price_cents": bid - 50 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+
+    // The market keeps to the grid as it runs, and stays reconciled.
+    engine::advance_to(&app, Timestamp(NOW_MS + 60_000));
+    let (_, tape) = get(&app, "/api/symbols/ACME/trades?limit=50").await;
+    let trades = tape["trades"].as_array().unwrap();
+    assert!(!trades.is_empty(), "the market printed nothing: {tape}");
+    for trade in trades {
+        assert_eq!(trade["price_cents"].as_i64().unwrap() % 25, 0, "{trade}");
+    }
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
 async fn health_reports_what_the_server_is_doing_and_how_long_it_takes() {
     let app = App::new(Options {
         history_days: 0,
