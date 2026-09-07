@@ -251,8 +251,12 @@ export interface PositionDto {
 /** `GET /api/traders/{id}`. */
 export interface PortfolioDto {
   id: number;
+  user_id: number;
+  account_id: number;
   name: string;
   created_at_ms: number;
+  account_status: AccountStatus;
+  /** The account's balance. */
   cash_cents: number;
   reserved_cents: number;
   free_cash_cents: number;
@@ -269,6 +273,109 @@ export interface PortfolioDto {
 export interface CreateTraderRequest {
   name?: string;
   cash_cents?: number;
+  /** Attach to an existing user instead of creating one. */
+  user_id?: number;
+  /** Trade on an existing account of `user_id`. */
+  account_id?: number;
+  email?: string;
+}
+
+// --- webapp/src/account.rs -------------------------------------------------
+
+/** `account::AccountStatus`. */
+export type AccountStatus = 'active' | 'frozen' | 'closed';
+
+/** `account::LedgerKind`. */
+export type LedgerKind = 'open' | 'deposit' | 'withdrawal' | 'buy' | 'sell';
+
+/** `account::UserDto`. */
+export interface UserDto {
+  id: number;
+  name: string;
+  email: string | null;
+  created_at_ms: number;
+  accounts: number[];
+  traders: number[];
+  /** Every account's balance added up. */
+  balance_cents: number;
+}
+
+/** `account::AccountDto`. Money is integer cents. */
+export interface AccountDto {
+  id: number;
+  user_id: number;
+  name: string;
+  status: AccountStatus;
+  opened_at_ms: number;
+  balance_cents: number;
+  /** Held against resting buy orders. */
+  reserved_cents: number;
+  /** `balance − reserved`: what an order or a withdrawal can use. */
+  available_cents: number;
+  deposited_cents: number;
+  withdrawn_cents: number;
+  entries_total: number;
+  trader_id: number | null;
+  valid: boolean;
+}
+
+/** `account::LedgerEntry` — one movement of money. */
+export interface LedgerEntry {
+  id: number;
+  ts_ms: number;
+  kind: LedgerKind;
+  /** Signed: positive credits the account, negative debits it. */
+  amount_cents: number;
+  /** The balance after this entry. */
+  balance_cents: number;
+  symbol: string | null;
+  order_id: number | null;
+  memo: string | null;
+}
+
+/** `GET /api/accounts/{id}/ledger`, and the reply to a deposit. */
+export interface LedgerResponse {
+  account: AccountDto;
+  /** Newest first. */
+  entries: LedgerEntry[];
+}
+
+/** `GET /api/accounts/{id}/validate`. */
+export interface AccountCheck {
+  account_id: number;
+  status: AccountStatus;
+  valid: boolean;
+  issues: string[];
+  balance_cents: number;
+  reserved_cents: number;
+  available_cents: number;
+  can_trade: boolean;
+  can_deposit: boolean;
+  can_withdraw: boolean;
+}
+
+/** Body of `POST /api/accounts/{id}/deposit` and `.../withdraw`. */
+export interface TransferRequest {
+  /** A positive integer number of cents. */
+  amount_cents: number;
+  memo?: string;
+}
+
+/** Body of `POST /api/users`. */
+export interface CreateUserRequest {
+  name?: string;
+  email?: string;
+}
+
+/** Body of `POST /api/users/{id}/accounts`. */
+export interface OpenAccountRequest {
+  name?: string;
+  cash_cents?: number;
+}
+
+/** Body of `POST /api/accounts/{id}/status`. */
+export interface StatusRequest {
+  status: AccountStatus;
 }
 
 /** `fehu::OrderKind`, internally tagged on `type`. */

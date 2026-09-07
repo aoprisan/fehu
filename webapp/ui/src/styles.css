@@ -86,6 +86,9 @@ table.tape tr.mine td { background: var(--selected); }
 .ticket button.submit { font-weight: 600; }
 .acct { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 6px 0; }
 .acct b { color: var(--text); font-variant-numeric: tabular-nums; }
+.deposit { display: flex; gap: 6px; margin: 6px 0; }
+.deposit input { flex: 1; min-width: 0; }
+.deposit.closed { display: none; }
 #orders li { display: flex; gap: 6px; align-items: center; font-size: 12px; padding: 2px 0; }
 #orders li span { flex: 1; font-variant-numeric: tabular-nums; }
 #orders button { padding: 1px 6px; font-size: 11px; }

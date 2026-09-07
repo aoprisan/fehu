@@ -1,5 +1,9 @@
-//! Traders: cash, positions, reservations for resting orders, and the JSON
-//! shapes of orders, trades and the book.
+//! Traders: positions, reservations for resting orders, and the JSON shapes
+//! of orders, trades and the book.
+//!
+//! A trader is a market-facing identity, not a wallet: its cash lives in the
+//! [`Account`](crate::account::Account) it trades on, so every method that
+//! touches money takes that account and books the movement through it.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -9,8 +13,7 @@ use fehu::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Largest cash balance a trader can be created with, in cents.
-pub const MAX_CASH_CENTS: i64 = 1_000_000_000_000_000;
+use crate::account::{Account, AccountId, AccountStatus, MoneyError, UserId, notional_cents};
 
 /// One execution from a trader's point of view.
 #[derive(Clone, Debug, Serialize)]
@@ -29,15 +32,17 @@ pub struct FillRecord {
     pub counterparty: &'static str,
 }
 
-/// A trader's account. No margin, no shorting: buys need cash and sells
-/// need shares, and resting orders reserve them until they fill or cancel.
+/// A market participant. No margin, no shorting: buys need cash in the
+/// trader's account and sells need shares, and resting orders reserve both
+/// until they fill or cancel.
 #[derive(Clone, Debug)]
 pub struct Trader {
     pub id: TraderId,
+    /// The user this trader belongs to.
+    pub user_id: UserId,
+    /// The account its cash moves through.
+    pub account_id: AccountId,
     pub name: String,
-    pub cash_cents: i64,
-    /// Cash committed to resting buy orders.
-    pub reserved_cents: i64,
     pub positions: BTreeMap<&'static str, Position>,
     /// Shares committed to resting sell orders, per symbol.
     pub reserved_shares: BTreeMap<&'static str, u64>,
@@ -49,10 +54,10 @@ pub struct Trader {
 }
 
 /// Why an order was refused before reaching the exchange.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
-    /// Not enough free cash for the buy.
-    InsufficientCash { needed: i64, available: i64 },
+    /// The account would not fund the buy: frozen, closed or short of cash.
+    Account(MoneyError),
     /// Not enough free shares for the sell.
     InsufficientShares { needed: u64, available: u64 },
 }
@@ -60,12 +65,7 @@ pub enum Refused {
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InsufficientCash { needed, available } => write!(
-                f,
-                "insufficient cash: need {:.2}, have {:.2} free",
-                *needed as f64 / 100.0,
-                *available as f64 / 100.0
-            ),
+            Self::Account(e) => write!(f, "{e}"),
             Self::InsufficientShares { needed, available } => {
                 write!(
                     f,
@@ -76,13 +76,26 @@ impl std::fmt::Display for Refused {
     }
 }
 
+impl From<MoneyError> for Refused {
+    fn from(e: MoneyError) -> Self {
+        Self::Account(e)
+    }
+}
+
 impl Trader {
-    pub fn new(id: TraderId, name: String, cash_cents: i64, fill_cap: usize, now_ms: i64) -> Self {
+    pub fn new(
+        id: TraderId,
+        user_id: UserId,
+        account_id: AccountId,
+        name: String,
+        fill_cap: usize,
+        now_ms: i64,
+    ) -> Self {
         Self {
             id,
+            user_id,
+            account_id,
             name,
-            cash_cents,
-            reserved_cents: 0,
             positions: BTreeMap::new(),
             reserved_shares: BTreeMap::new(),
             fills: VecDeque::new(),
@@ -96,11 +109,6 @@ impl Trader {
         Owner::Trader(self.id)
     }
 
-    /// Cash not committed to resting buys.
-    pub fn free_cash_cents(&self) -> i64 {
-        self.cash_cents.saturating_sub(self.reserved_cents)
-    }
-
     /// Shares of `symbol` not committed to resting sells.
     pub fn free_shares(&self, symbol: &str) -> u64 {
         let held = self
@@ -110,26 +118,22 @@ impl Trader {
         held.saturating_sub(self.reserved_shares.get(symbol).copied().unwrap_or(0))
     }
 
-    /// Check that an order can be afforded. `cost_cents` is the worst-case
-    /// cash a buy could consume (limit: `qty × price`; market: the preview).
+    /// Validate an order against the trader's account before it reaches the
+    /// exchange. `cost_cents` is the worst-case cash a buy could consume
+    /// (limit: `qty × price`; market: the preview). A sell needs no cash but
+    /// still needs an account that is allowed to trade.
     pub fn check(
         &self,
+        account: &Account,
         symbol: &str,
         side: Side,
         qty: u64,
         cost_cents: i64,
     ) -> Result<(), Refused> {
         match side {
-            Side::Buy => {
-                let available = self.free_cash_cents();
-                if cost_cents > available {
-                    return Err(Refused::InsufficientCash {
-                        needed: cost_cents,
-                        available,
-                    });
-                }
-            }
+            Side::Buy => account.authorise(cost_cents)?,
             Side::Sell => {
+                account.check_tradable()?;
                 let available = self.free_shares(symbol);
                 if qty > available {
                     return Err(Refused::InsufficientShares {
@@ -142,17 +146,21 @@ impl Trader {
         Ok(())
     }
 
-    /// Reserve for the resting remainder of a just-submitted order.
-    pub fn reserve(&mut self, symbol: &'static str, side: Side, remaining: u64, price_cents: i64) {
+    /// Reserve for the resting remainder of a just-submitted order: cash on
+    /// the account for a buy, shares here for a sell.
+    pub fn reserve(
+        &mut self,
+        account: &mut Account,
+        symbol: &'static str,
+        side: Side,
+        remaining: u64,
+        price_cents: i64,
+    ) {
         if remaining == 0 {
             return;
         }
         match side {
-            Side::Buy => {
-                self.reserved_cents = self
-                    .reserved_cents
-                    .saturating_add(cents(price_cents, remaining));
-            }
+            Side::Buy => account.reserve(notional_cents(price_cents, remaining)),
             Side::Sell => {
                 let r = self.reserved_shares.entry(symbol).or_insert(0);
                 *r = r.saturating_add(remaining);
@@ -162,11 +170,16 @@ impl Trader {
 
     /// Release the reservation of `qty` shares at `price` (a fill of a
     /// resting order, or a cancel).
-    pub fn release(&mut self, symbol: &str, side: Side, qty: u64, price_cents: i64) {
+    pub fn release(
+        &mut self,
+        account: &mut Account,
+        symbol: &str,
+        side: Side,
+        qty: u64,
+        price_cents: i64,
+    ) {
         match side {
-            Side::Buy => {
-                self.reserved_cents = (self.reserved_cents - cents(price_cents, qty)).max(0);
-            }
+            Side::Buy => account.release(notional_cents(price_cents, qty)),
             Side::Sell => {
                 if let Some(r) = self.reserved_shares.get_mut(symbol) {
                     *r = r.saturating_sub(qty);
@@ -178,15 +191,21 @@ impl Trader {
         }
     }
 
-    /// Book a trade this trader took part in. Returns the fill records
-    /// created (two for a self-trade).
-    pub fn apply_trade(&mut self, symbol: &'static str, trade: &Trade) -> Vec<FillRecord> {
+    /// Book a trade this trader took part in: cash moves through `account`,
+    /// the position and the fill log are updated here. Returns the fill
+    /// records created (two for a self-trade).
+    pub fn apply_trade(
+        &mut self,
+        account: &mut Account,
+        symbol: &'static str,
+        trade: &Trade,
+    ) -> Vec<FillRecord> {
         let me = self.owner();
         let mut out = Vec::new();
         let taker_is_trader = matches!(trade.taker.owner, Owner::Trader(_));
         let maker_is_trader = matches!(trade.maker.owner, Owner::Trader(_));
         if trade.taker.owner == me {
-            self.book_fill(symbol, trade.taker_side, trade);
+            self.book_fill(account, symbol, trade.taker_side, trade, trade.taker.order);
             out.push(self.record(
                 symbol,
                 trade.taker.order,
@@ -198,8 +217,8 @@ impl Trader {
         }
         if trade.maker.owner == me {
             let side = trade.taker_side.opposite();
-            self.release(symbol, side, trade.qty, trade.price_cents);
-            self.book_fill(symbol, side, trade);
+            self.release(account, symbol, side, trade.qty, trade.price_cents);
+            self.book_fill(account, symbol, side, trade, trade.maker.order);
             out.push(self.record(
                 symbol,
                 trade.maker.order,
@@ -212,12 +231,16 @@ impl Trader {
         out
     }
 
-    fn book_fill(&mut self, symbol: &'static str, side: Side, trade: &Trade) {
-        let value = cents(trade.price_cents, trade.qty);
-        self.cash_cents = match side {
-            Side::Buy => self.cash_cents.saturating_sub(value),
-            Side::Sell => self.cash_cents.saturating_add(value),
-        };
+    fn book_fill(
+        &mut self,
+        account: &mut Account,
+        symbol: &'static str,
+        side: Side,
+        trade: &Trade,
+        order: OrderId,
+    ) {
+        let value = notional_cents(trade.price_cents, trade.qty);
+        account.settle(side, value, symbol, order.0, trade.ts.0);
         let pos = self.positions.entry(symbol).or_default();
         pos.apply(side, trade.qty, trade.price_cents);
         if pos.qty == 0 && pos.realised_pnl_cents == 0 && pos.cash_cents == 0 {
@@ -259,19 +282,24 @@ impl Trader {
     }
 }
 
-fn cents(price_cents: i64, qty: u64) -> i64 {
-    i64::try_from(i128::from(price_cents) * i128::from(qty)).unwrap_or(i64::MAX)
-}
-
 // ---------------------------------------------------------------------------
 // JSON shapes
 
-/// Body of `POST /api/traders`.
+/// Body of `POST /api/traders`. With no `user_id` a user is created for the
+/// trader; with no `account_id` an account is opened for it and funded with
+/// `cash_cents`.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct CreateTraderRequest {
     pub name: Option<String>,
     /// Starting cash; defaults to the server's `starting_cash_cents`.
     pub cash_cents: Option<i64>,
+    /// Existing user to attach the trader to.
+    pub user_id: Option<u64>,
+    /// Existing account to trade on. It must belong to `user_id`, and
+    /// `cash_cents` is then ignored — deposit into the account instead.
+    pub account_id: Option<u64>,
+    /// Email for the user created alongside the trader.
+    pub email: Option<String>,
 }
 
 /// Body of `POST /api/symbols/{symbol}/orders`.
@@ -412,8 +440,12 @@ pub struct PositionDto {
 #[derive(Clone, Debug, Serialize)]
 pub struct PortfolioDto {
     pub id: u64,
+    pub user_id: u64,
+    pub account_id: u64,
     pub name: String,
     pub created_at_ms: i64,
+    pub account_status: AccountStatus,
+    /// The account's balance.
     pub cash_cents: i64,
     pub reserved_cents: i64,
     pub free_cash_cents: i64,
@@ -431,7 +463,10 @@ pub struct PortfolioDto {
 #[derive(Clone, Debug, Serialize)]
 pub struct TraderSummary {
     pub id: u64,
+    pub user_id: u64,
+    pub account_id: u64,
     pub name: String,
+    pub account_status: AccountStatus,
     pub cash_cents: i64,
     pub equity_cents: i64,
     pub positions: usize,
@@ -441,9 +476,20 @@ pub struct TraderSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::AccountId;
     use fehu::{Party, Timestamp};
 
     const ME: TraderId = TraderId(1);
+
+    /// A trader and the account it trades on, funded with `cash_cents`.
+    fn trader(cash_cents: i64) -> (Trader, Account) {
+        let account = Account::open(AccountId(1), UserId(1), "main".into(), cash_cents, 100, 0)
+            .expect("valid opening balance");
+        (
+            Trader::new(ME, UserId(1), AccountId(1), "p".into(), 10, 0),
+            account,
+        )
+    }
 
     fn trade(taker: Owner, maker: Owner, side: Side, qty: u64, price: i64) -> Trade {
         Trade {
@@ -464,49 +510,69 @@ mod tests {
 
     #[test]
     fn reservations_and_fills() {
-        let mut t = Trader::new(ME, "p".into(), 100_000, 10, 0);
-        assert!(t.check("ACME", Side::Buy, 10, 100_001).is_err());
-        assert!(t.check("ACME", Side::Sell, 1, 0).is_err());
-        t.check("ACME", Side::Buy, 10, 50_000).unwrap();
+        let (mut t, mut a) = trader(100_000);
+        assert!(t.check(&a, "ACME", Side::Buy, 10, 100_001).is_err());
+        assert!(t.check(&a, "ACME", Side::Sell, 1, 0).is_err());
+        t.check(&a, "ACME", Side::Buy, 10, 50_000).unwrap();
         // Rest a buy of 10 @ 5000.
-        t.reserve("ACME", Side::Buy, 10, 5_000);
-        assert_eq!(t.free_cash_cents(), 50_000);
+        t.reserve(&mut a, "ACME", Side::Buy, 10, 5_000);
+        assert_eq!(a.available_cents(), 50_000);
         // Half of it fills as maker.
         let fills = t.apply_trade(
+            &mut a,
             "ACME",
             &trade(Owner::Synthetic, Owner::Trader(ME), Side::Sell, 5, 5_000),
         );
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].liquidity, "maker");
         assert_eq!(fills[0].side, Side::Buy);
-        assert_eq!(t.cash_cents, 75_000);
-        assert_eq!(t.reserved_cents, 25_000);
-        assert_eq!(t.free_cash_cents(), 50_000);
+        assert_eq!(a.balance_cents(), 75_000);
+        assert_eq!(a.reserved_cents(), 25_000);
+        assert_eq!(a.available_cents(), 50_000);
         assert_eq!(t.positions["ACME"].qty, 5);
         // Cancel the rest.
-        t.release("ACME", Side::Buy, 5, 5_000);
-        assert_eq!(t.reserved_cents, 0);
+        t.release(&mut a, "ACME", Side::Buy, 5, 5_000);
+        assert_eq!(a.reserved_cents(), 0);
         // Sell 3 as taker at 6000.
-        assert!(t.check("ACME", Side::Sell, 6, 0).is_err());
-        t.check("ACME", Side::Sell, 3, 0).unwrap();
+        assert!(t.check(&a, "ACME", Side::Sell, 6, 0).is_err());
+        t.check(&a, "ACME", Side::Sell, 3, 0).unwrap();
         let fills = t.apply_trade(
+            &mut a,
             "ACME",
             &trade(Owner::Trader(ME), Owner::Synthetic, Side::Sell, 3, 6_000),
         );
         assert_eq!(fills[0].liquidity, "taker");
-        assert_eq!(t.cash_cents, 93_000);
+        assert_eq!(a.balance_cents(), 93_000);
         assert_eq!(t.positions["ACME"].qty, 2);
         assert_eq!(t.positions["ACME"].realised_pnl_cents, 3_000);
         // A self-trade books both sides and nets to nothing.
-        t.reserve("ACME", Side::Sell, 2, 7_000);
+        t.reserve(&mut a, "ACME", Side::Sell, 2, 7_000);
         assert_eq!(t.free_shares("ACME"), 0);
         let fills = t.apply_trade(
+            &mut a,
             "ACME",
             &trade(Owner::Trader(ME), Owner::Trader(ME), Side::Buy, 2, 7_000),
         );
         assert_eq!(fills.len(), 2);
-        assert_eq!(t.cash_cents, 93_000);
+        assert_eq!(a.balance_cents(), 93_000);
         assert_eq!(t.positions["ACME"].qty, 2);
         assert_eq!(t.free_shares("ACME"), 2);
+        // Every movement is on the ledger, and the account stays valid.
+        assert!(a.is_valid());
+        assert_eq!(a.ledger(100).len(), 5, "open + four settlements");
+    }
+
+    #[test]
+    fn a_frozen_account_cannot_trade_at_all() {
+        let (t, mut a) = trader(100_000);
+        a.set_status(AccountStatus::Frozen).unwrap();
+        assert!(matches!(
+            t.check(&a, "ACME", Side::Buy, 1, 1).unwrap_err(),
+            Refused::Account(MoneyError::Status { .. })
+        ));
+        assert!(matches!(
+            t.check(&a, "ACME", Side::Sell, 1, 0).unwrap_err(),
+            Refused::Account(MoneyError::Status { .. })
+        ));
     }
 }

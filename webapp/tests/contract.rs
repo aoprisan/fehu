@@ -217,8 +217,11 @@ async fn trading_shapes() {
     let trader = post(&app, "/api/traders", json!({ "name": "contract" })).await;
     let portfolio_keys = [
         "id",
+        "user_id",
+        "account_id",
         "name",
         "created_at_ms",
+        "account_status",
         "cash_cents",
         "reserved_cents",
         "free_cash_cents",
@@ -341,6 +344,100 @@ async fn trading_shapes() {
         first("TradesResponse", &trades, "trades"),
         &trade_keys,
     );
+}
+
+#[tokio::test]
+async fn account_shapes() {
+    let app = test_app();
+
+    let user = post(
+        &app,
+        "/api/users",
+        json!({ "name": "ada", "email": "ada@example.com" }),
+    )
+    .await;
+    assert_keys(
+        "UserDto",
+        &user,
+        &[
+            "id",
+            "name",
+            "email",
+            "created_at_ms",
+            "accounts",
+            "traders",
+            "balance_cents",
+        ],
+    );
+    let user_id = user["id"].as_u64().unwrap();
+
+    let account_keys = [
+        "id",
+        "user_id",
+        "name",
+        "status",
+        "opened_at_ms",
+        "balance_cents",
+        "reserved_cents",
+        "available_cents",
+        "deposited_cents",
+        "withdrawn_cents",
+        "entries_total",
+        "trader_id",
+        "valid",
+    ];
+    let account = post(
+        &app,
+        &format!("/api/users/{user_id}/accounts"),
+        json!({ "name": "main", "cash_cents": 250_000 }),
+    )
+    .await;
+    assert_keys("AccountDto", &account, &account_keys);
+    assert_eq!(account["status"], "active", "AccountStatus is lower-case");
+    let account_id = account["id"].as_u64().unwrap();
+
+    let ledger = post(
+        &app,
+        &format!("/api/accounts/{account_id}/deposit"),
+        json!({ "amount_cents": 1_000, "memo": "allowance" }),
+    )
+    .await;
+    assert_keys("LedgerResponse", &ledger, &["account", "entries"]);
+    assert_keys("AccountDto", &ledger["account"], &account_keys);
+    assert_keys(
+        "LedgerEntry",
+        first("LedgerResponse", &ledger, "entries"),
+        &[
+            "id",
+            "ts_ms",
+            "kind",
+            "amount_cents",
+            "balance_cents",
+            "symbol",
+            "order_id",
+            "memo",
+        ],
+    );
+    assert_eq!(ledger["entries"][0]["kind"], "deposit");
+
+    let check = get(&app, &format!("/api/accounts/{account_id}/validate")).await;
+    assert_keys(
+        "AccountCheck",
+        &check,
+        &[
+            "account_id",
+            "status",
+            "valid",
+            "issues",
+            "balance_cents",
+            "reserved_cents",
+            "available_cents",
+            "can_trade",
+            "can_deposit",
+            "can_withdraw",
+        ],
+    );
+    assert_eq!(check["valid"], true);
 }
 
 #[tokio::test]

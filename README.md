@@ -87,8 +87,18 @@ change and `just ui-dev` serves it with hot reload against a running backend.
 | `POST` | `/api/game/events` | Semantic game event: `{"kind":"scandal","symbol":"ACME","magnitude":1.5}`; market-wide kinds (`market_crash`, `rate_hike`, …) need no symbol |
 | `GET` | `/api/game/catalog` | Every game-event kind and the simulator events it expands to |
 | `GET` | `/api/events` | Audit log of accepted events, newest first (`?symbol=`, `?limit=`) |
-| `POST` | `/api/traders` | Create a trader: `{"name":"alice","cash_cents":10000000}` (both optional) |
+| `POST` | `/api/users` | Create a user: `{"name":"ada","email":"ada@example.com"}` (both optional) |
+| `GET` | `/api/users`, `/api/users/{id}` | Users, their accounts and traders |
+| `POST` | `/api/users/{id}/accounts` | Open another account: `{"name":"main","cash_cents":10000000}` |
+| `GET` | `/api/users/{id}/accounts`, `/api/accounts`, `/api/accounts/{id}` | Accounts: balance, reserved, available, status |
+| `POST` | `/api/accounts/{id}/deposit` | Add money: `{"amount_cents":250000,"memo":"week 1"}` |
+| `POST` | `/api/accounts/{id}/withdraw` | Take money out; only the available balance can leave |
+| `POST` | `/api/accounts/{id}/status` | `{"status":"active\|frozen\|closed"}` |
+| `GET` | `/api/accounts/{id}/ledger?limit=100` | Every movement of money, newest first |
+| `GET` | `/api/accounts/{id}/validate` | Status, what the account may do, and any broken invariant |
+| `POST` | `/api/traders` | Create a trader, with a user and a funded account: `{"name":"alice","cash_cents":10000000}` (both optional); `user_id` and `account_id` join existing ones |
 | `GET` | `/api/traders`, `/api/traders/{id}` | Traders; a portfolio with cash, positions marked to the reference price, open orders and fills |
+| `POST` | `/api/traders/{id}/deposit` | Add money to the trader's account: `{"amount_cents":250000}` |
 | `POST` | `/api/traders/{id}/cancel_all` | Cancel every resting order of a trader |
 | `POST` | `/api/symbols/{sym}/orders` | `{"trader_id":1,"side":"buy","qty":100,"type":"market"}` or `"type":"limit","price_cents":8400`, optional `"tif":"gtc\|ioc\|fok"`; responds with fills and status |
 | `GET` | `/api/symbols/{sym}/orders?trader_id=` | A trader's resting orders on that symbol |
@@ -102,11 +112,21 @@ At start-up each symbol generates a year of daily bars in coarse mode and then
 three days of 1 s ticks, so every interval has history before the first
 request. `FEHU_TIME_SCALE=60` runs the market at 60 simulated seconds per
 wall second; `FEHU_BIND`, `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`,
-`FEHU_STARTING_CASH_CENTS`, `FEHU_TAPE` and `FEHU_FILL_LOG` are the other
-knobs. Same seeds and same events give the same prices on every run; trading
-adds impact on top, so a market with no orders replays the bare simulation.
-Traders are not persisted: they start with cash, no shares, no margin and
-no shorting.
+`FEHU_STARTING_CASH_CENTS`, `FEHU_TAPE`, `FEHU_FILL_LOG` and
+`FEHU_LEDGER_LOG` are the other knobs. Same seeds and same events give the
+same prices on every run; trading adds impact on top, so a market with no
+orders replays the bare simulation.
+
+A **user** is the player, an **account** holds their money, and a **trader**
+is the market-facing identity that trades on one account (several traders may
+share one). All money is an integer count of cents — never a float — and
+every amount is checked: deposits and withdrawals must be positive, a
+withdrawal cannot touch the cash a resting buy order has reserved, and an
+order is validated against its account before it reaches the exchange (the
+account must be active and its available balance must cover the worst-case
+cost; sells need free shares). Fills settle through the account, so every
+cent that moves is on its ledger. Nothing is persisted: accounts start with
+cash, no shares, no margin and no shorting.
 
 ## License
 
