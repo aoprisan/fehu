@@ -1269,7 +1269,10 @@ the price moves through it and the resume settles what the new quotes cross,
 and a closed session refuses orders while an open one takes them. Fees: a
 taker pays and a maker is paid, each as its own ledger entry beside the trade
 it belongs to, and a buy that could afford the shares but not the fee is
-refused rather than overdrawn. Stops: a
+refused rather than overdrawn. Expiry: an order with a date is withdrawn when
+it passes and its reservation comes back, a date already gone is refused
+rather than silently cancelled, a day order ends with its session, and a day
+order without a calendar is refused. Stops: a
 trigger waits, fires when the price reaches it, becomes an order in the log
 and tells its owner; one behind the market, unfunded or malformed is refused
 when it is armed; it is private property that only its owner may see or
@@ -1302,10 +1305,21 @@ reserves nothing while it waits. A halted or closed symbol holds its
 triggers and fires them on the resume, `stop_triggered` reports both
 outcomes to the owner, and save format 4 carries the untriggered stops.
 
-**Iceberg, GTD and day orders.** Iceberg needs the book to re-post a slice as
-each one fills, which is `book.rs`, not the web app. GTD and day orders need
-an expiry sweep on the engine step, which is easy but pointless until sessions
-are the default rather than an option (§14.12).
+**GTD and day orders (implemented).** A submission may carry
+`expires_at_ms`, or `day: true` for the close of the session it was sent in.
+Either way the deadline lands on the `OrderRecord` — which is saved, and
+which the log never evicts while an order is live — so by the time the engine
+sees them a day order and a good-till-date order are the same thing: a
+resting order with a time on it. `Market::sweep_expired` runs at the end of
+every step, cancels what is due, releases what it reserved and tells the
+owner with an `order_expired` message. It runs on halted symbols too: a halt
+stops trading, not the clock, and an order whose date has passed should not
+come back when the market does. A `day` order without a trading calendar is
+refused rather than left to live forever, because there is no close for it to
+end at.
+
+**Iceberg.** Still unbuilt: it needs the book to re-post a slice as each one
+fills, which is `book.rs` and its queue priority, not the web app.
 
 **Tick and lot size (implemented).** `MarketRules { tick_cents, lot }` lives
 in `TradingParams`, and the exchange copies it into the book whenever one is

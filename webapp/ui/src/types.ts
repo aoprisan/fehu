@@ -346,6 +346,12 @@ export interface OrderRecord {
   avg_price_cents: number | null;
   submitted_at_ms: number;
   updated_at_ms: number;
+  /**
+   * Simulated time this order is withdrawn at if it is still resting: a
+   * good-till-date order's deadline, or a day order's session close. `null`
+   * leaves it resting until it fills or is cancelled.
+   */
+  expires_at_ms: number | null;
 }
 
 /** `trading::FillRecord`. */
@@ -580,6 +586,16 @@ export type OrderRequest = OrderKind & {
    * meaningful for a `gtc` limit order.
    */
   post_only?: boolean;
+  /**
+   * Simulated time at which the resting remainder is withdrawn. Absent
+   * leaves it resting until it fills or is cancelled.
+   */
+  expires_at_ms?: number;
+  /**
+   * A day order: the resting remainder is withdrawn at the close of the
+   * session it was sent in. Needs a trading calendar.
+   */
+  day?: boolean;
 };
 
 /** Body of `PATCH /api/symbols/{symbol}/orders/{id}`. */
@@ -668,6 +684,13 @@ export interface FillMessage {
 /** A symbol stopped trading, or started again. */
 export type StatusMessage = { type: 'status' } & SymbolStatus;
 
+/** A resting order reached its expiry and was withdrawn. */
+export interface OrderExpiredMessage {
+  type: 'order_expired';
+  trader_id: number;
+  order: OrderRecord;
+}
+
 /**
  * A stop fired. It is held no longer: it either became `order`, or was
  * `refused` when the account was checked the second time.
@@ -689,7 +712,13 @@ export interface StopTriggeredMessage {
 export type Sequenced<M> = M & { seq: number };
 
 export type StreamMessage = Sequenced<
-  HelloMessage | TickMessage | EventMessage | FillMessage | StatusMessage | StopTriggeredMessage
+  | HelloMessage
+  | TickMessage
+  | EventMessage
+  | FillMessage
+  | StatusMessage
+  | StopTriggeredMessage
+  | OrderExpiredMessage
 >;
 
 /** The server's error body: `{"error": {"code", "message"}}`. */

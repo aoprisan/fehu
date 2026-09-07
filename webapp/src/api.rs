@@ -1325,6 +1325,7 @@ async fn submit_order(
         qty: req.qty,
     };
     let client_order_id = clean_client_order_id(req.client_order_id)?;
+    let (day, expires_at_ms) = (req.day, req.expires_at_ms);
 
     let (response, fills, replayed) = {
         let mut market = app.market();
@@ -1351,6 +1352,7 @@ async fn submit_order(
         if !crossing.is_empty() {
             return Err(ApiError::self_trade(&crossing));
         }
+        let expires_at_ms = expiry_of(&market.symbols[idx], day, expires_at_ms, app.clock.now())?;
         // The same order sent twice — a retry after a timeout, say — is
         // placed once: the first response is replayed, and a re-used id that
         // asks for something else is refused rather than quietly obeyed.
@@ -1366,7 +1368,7 @@ async fn submit_order(
             (accepted, Vec::new(), true)
         } else {
             let (response, fills) = market
-                .place(idx, trader, order, client_order_id)
+                .place_expiring(idx, trader, order, client_order_id, expires_at_ms)
                 .map_err(ApiError::place)?;
             (response, fills, false)
         }
@@ -1490,6 +1492,42 @@ async fn cancel_stop(
         "stop cancelled"
     );
     Ok(Json(stop))
+}
+
+/// When a submission's resting remainder should be withdrawn, if ever.
+///
+/// `expires_at_ms` names the moment; `day` asks for the close of the session
+/// the order is sent in, which needs a trading calendar to have a close at
+/// all. Both are about the *resting* remainder: an order that trades on
+/// arrival has nothing left to expire.
+fn expiry_of(
+    s: &SymbolState,
+    day: bool,
+    expires_at_ms: Option<i64>,
+    now: fehu::Timestamp,
+) -> Result<Option<i64>, ApiError> {
+    if day && expires_at_ms.is_some() {
+        return Err(ApiError::invalid_order(
+            "an order is either a day order or expires at a time of its own, not both",
+        ));
+    }
+    if day {
+        return match s.next_close_ms(now) {
+            Some(close) => Ok(Some(close)),
+            None => Err(ApiError::invalid_order(
+                "a day order needs a trading calendar (FEHU_MARKET_HOURS): with none, \
+                 the session never closes and there is nothing to expire at",
+            )),
+        };
+    }
+    match expires_at_ms {
+        None => Ok(None),
+        Some(at) if at > now.0 => Ok(Some(at)),
+        Some(at) => Err(ApiError::invalid_order(format!(
+            "expires_at_ms {at} is not in the future (it is now {})",
+            now.0
+        ))),
+    }
 }
 
 /// The price an order can reach: its limit, or for a market order the collar
@@ -2221,15 +2259,15 @@ async fn stream(
     // replay buffer holds everybody's, so the same rule applies to it.
     let owner = Arc::clone(&app);
     let visible = move |m: &StreamMessage| match m {
-        StreamMessage::Fill { trader_id, .. } | StreamMessage::StopTriggered { trader_id, .. } => {
-            viewer.is_some_and(|user| {
-                owner
-                    .market()
-                    .traders
-                    .get(&TraderId(*trader_id))
-                    .is_some_and(|t| t.user_id == user)
-            })
-        }
+        StreamMessage::Fill { trader_id, .. }
+        | StreamMessage::StopTriggered { trader_id, .. }
+        | StreamMessage::OrderExpired { trader_id, .. } => viewer.is_some_and(|user| {
+            owner
+                .market()
+                .traders
+                .get(&TraderId(*trader_id))
+                .is_some_and(|t| t.user_id == user)
+        }),
         _ => true,
     };
     let mine = visible.clone();

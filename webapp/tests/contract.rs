@@ -531,6 +531,7 @@ async fn trading_shapes() {
             "avg_price_cents",
             "submitted_at_ms",
             "updated_at_ms",
+            "expires_at_ms",
         ],
     );
     assert_eq!(records[0]["status"], "resting", "OrderStatus is lower-case");
@@ -828,6 +829,39 @@ async fn stream_message_shapes() {
         ],
     );
     assert_eq!(triggered["type"], "stop_triggered");
+
+    // `order_expired` carries the record of the order the clock took away.
+    let owner = post(&app, "/api/traders", json!({ "name": "expiry" })).await;
+    let owner_key = api_key_of(&owner);
+    let owner_id = owner["id"].as_u64().unwrap();
+    let bid = get(&app, "/api/symbols/ACME/book").await["bid_cents"]
+        .as_i64()
+        .unwrap();
+    post_as(
+        &app,
+        Some(owner_key.as_str()),
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": owner_id, "side": "buy", "qty": 1, "type": "limit",
+                "price_cents": bid / 2 }),
+    )
+    .await;
+    let record = app
+        .market()
+        .orders_of(fehu::TraderId(owner_id))
+        .next()
+        .expect("the order is in the log")
+        .clone();
+    let expired = serde_json::to_value(StreamMessage::OrderExpired {
+        trader_id: owner_id,
+        order: record,
+    })
+    .unwrap();
+    assert_keys(
+        "OrderExpiredMessage",
+        &expired,
+        &["type", "trader_id", "order"],
+    );
+    assert_eq!(expired["type"], "order_expired");
 
     // `event` flattens the record next to the tag.
     let record = post(

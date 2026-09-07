@@ -457,6 +457,14 @@ pub struct OrderRequest {
     /// instead. Only meaningful for a `gtc` limit order.
     #[serde(default)]
     pub post_only: bool,
+    /// Simulated time at which the order is withdrawn if it is still
+    /// resting. Absent leaves it resting until it fills or is cancelled.
+    pub expires_at_ms: Option<i64>,
+    /// A day order: withdrawn at the close of the session it was sent in.
+    /// Needs a trading calendar; without one there is no close to expire at,
+    /// and the order is refused rather than quietly living forever.
+    #[serde(default)]
+    pub day: bool,
 }
 
 /// Body of `PATCH /api/symbols/{symbol}/orders/{order_id}`: a new price, a
@@ -622,6 +630,10 @@ pub struct OrderRecord {
     pub avg_price_cents: Option<f64>,
     pub submitted_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Simulated time this order is withdrawn at if it is still resting.
+    /// The engine sweeps for these at the end of every step.
+    #[serde(default)]
+    pub expires_at_ms: Option<i64>,
     /// The response the submission returned, replayed verbatim if the same
     /// `client_order_id` arrives again. Not part of the record's own JSON,
     /// but it is saved, so a retry across a restart still replays.
@@ -658,8 +670,22 @@ impl OrderRecord {
             avg_price_cents: placement.avg_price_cents(),
             submitted_at_ms: ts_ms,
             updated_at_ms: ts_ms,
+            expires_at_ms: None,
             accepted: Some(response),
         }
+    }
+
+    /// Withdraw this order at `at_ms` if it is still resting then.
+    #[must_use]
+    pub fn expiring_at(mut self, at_ms: Option<i64>) -> Self {
+        self.expires_at_ms = at_ms;
+        self
+    }
+
+    /// This order is live and its time is up at `now_ms`.
+    #[must_use]
+    pub fn has_expired(&self, now_ms: i64) -> bool {
+        self.is_live() && self.expires_at_ms.is_some_and(|at| at <= now_ms)
     }
 
     /// The order is neither filled nor cancelled: the book still has it.

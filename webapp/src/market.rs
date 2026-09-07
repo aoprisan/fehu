@@ -1221,6 +1221,54 @@ impl Market {
             .collect()
     }
 
+    /// Withdraw every resting order whose time is up.
+    ///
+    /// A day order and a good-till-date order differ only in where the
+    /// deadline came from; by the time the engine sees them they are both
+    /// just a resting order with an `expires_at_ms`. The sweep runs at the
+    /// end of every step, on every symbol — a halted one included, because a
+    /// halt stops trading, not the clock, and an order whose date has passed
+    /// should not come back when the market does.
+    fn sweep_expired(&mut self, index: usize) -> Vec<StreamMessage> {
+        let sym = self.symbols[index].info.symbol;
+        let now_ms = self.symbols[index].exchange.clock().0;
+        let due: Vec<u64> = self
+            .orders
+            .values()
+            .filter(|o| o.symbol == sym && o.has_expired(now_ms))
+            .map(|o| o.order_id)
+            .collect();
+        let mut messages = Vec::new();
+        for order_id in due {
+            let trader = TraderId(self.orders[&order_id].trader_id);
+            let Ok(cancelled) = self.symbols[index]
+                .exchange
+                .cancel(fehu::OrderId(order_id), trader)
+            else {
+                // Filled or already gone between the log and the book: the
+                // record is no longer live, so nothing is owed.
+                continue;
+            };
+            if let Some((t, account)) = self.trader_and_account(trader) {
+                t.release(
+                    account,
+                    sym,
+                    cancelled.side,
+                    cancelled.remaining,
+                    cancelled.price_cents,
+                );
+            }
+            self.cancel_order_record(sym, order_id, cancelled.remaining, now_ms);
+            if let Some(record) = self.orders.get(&order_id) {
+                messages.push(StreamMessage::OrderExpired {
+                    trader_id: trader.0,
+                    order: record.clone(),
+                });
+            }
+        }
+        messages
+    }
+
     /// Start trading again, whatever stopped it.
     pub fn resume(
         &mut self,
@@ -1313,6 +1361,13 @@ impl Market {
             if let Some(status) = self.review_halt(i, target, &mut fills) {
                 messages.push(StreamMessage::Status(status));
             }
+        }
+        // Before the stops, so a trigger cannot fire an order that would
+        // immediately be swept, and after the halts for the same reason a
+        // resume settles first.
+        for i in 0..self.symbols.len() {
+            let expired = self.sweep_expired(i);
+            messages.extend(expired);
         }
         // After the halts, so a symbol that just resumed fires the triggers
         // the price reached while it was stopped.
@@ -1488,6 +1543,19 @@ impl Market {
         order: fehu::Order,
         client_order_id: Option<String>,
     ) -> Result<(OrderResponse, Vec<FillRecord>), PlaceError> {
+        self.place_expiring(idx, trader, order, client_order_id, None)
+    }
+
+    /// [`place`](Self::place), for an order that is withdrawn at `expires_at_ms`
+    /// if it is still resting then.
+    pub fn place_expiring(
+        &mut self,
+        idx: usize,
+        trader: TraderId,
+        order: fehu::Order,
+        client_order_id: Option<String>,
+        expires_at_ms: Option<i64>,
+    ) -> Result<(OrderResponse, Vec<FillRecord>), PlaceError> {
         let sym = self.symbols[idx].info.symbol;
         // Worst-case cash a buy can consume.
         let cost = match order.kind {
@@ -1556,15 +1624,18 @@ impl Market {
         }
         let response = OrderResponse::new(sym, trader, order.side, order.qty, &placement);
         let now = self.symbols[idx].exchange.clock().0;
-        self.record_order(OrderRecord::new(
-            client_order_id,
-            trader,
-            sym,
-            &order,
-            &placement,
-            response.clone(),
-            now,
-        ));
+        self.record_order(
+            OrderRecord::new(
+                client_order_id,
+                trader,
+                sym,
+                &order,
+                &placement,
+                response.clone(),
+                now,
+            )
+            .expiring_at(expires_at_ms),
+        );
         Ok((response, fills))
     }
 }
@@ -1609,6 +1680,8 @@ pub enum StreamMessage {
     Fill { trader_id: u64, fill: FillRecord },
     /// A symbol stopped trading, or started again.
     Status(SymbolStatus),
+    /// A resting order reached its expiry and was withdrawn.
+    OrderExpired { trader_id: u64, order: OrderRecord },
     /// A stop fired. It is held no longer: it either became the order in
     /// `order`, or was `refused` when the account was checked again.
     StopTriggered {

@@ -2787,6 +2787,162 @@ async fn order_ids_are_unique_across_symbols_and_survive_retries() {
 }
 
 #[tokio::test]
+async fn an_order_with_a_date_is_withdrawn_when_it_passes() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "dora").await;
+    let id = player.trader;
+    let bid = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+    // Far under the market, so only the clock can take it away.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit",
+                "price_cents": bid / 2, "expires_at_ms": NOW_MS + 30_000 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let order_id = body["order_id"].as_u64().unwrap();
+    let (_, record) = get(&player, &format!("/api/orders/{order_id}")).await;
+    assert_eq!(record["expires_at_ms"], NOW_MS + 30_000);
+
+    // A date already gone is a mistake, not an instant cancel.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit",
+                "price_cents": bid / 2, "expires_at_ms": NOW_MS - 1 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    let mut rx = app.tx.subscribe();
+    engine::advance_to(&app, Timestamp(NOW_MS + 20_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert_eq!(
+        p["open_orders"].as_array().unwrap().len(),
+        1,
+        "not due yet: {p}"
+    );
+    assert!(p["reserved_cents"].as_i64().unwrap() > 0);
+
+    engine::advance_to(&app, Timestamp(NOW_MS + 40_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(
+        p["open_orders"].as_array().unwrap().is_empty(),
+        "its time was up: {p}"
+    );
+    assert_eq!(p["reserved_cents"], 0, "the reservation came back with it");
+    let (_, record) = get(&player, &format!("/api/orders/{order_id}")).await;
+    assert_eq!(record["status"], "cancelled");
+    assert_eq!(record["remaining"], 10);
+
+    // And the owner was told, rather than left to notice.
+    let mut expired = None;
+    while let Ok(message) = rx.try_recv() {
+        let value = serde_json::to_value(&message).unwrap();
+        if value["type"] == "order_expired" {
+            expired = Some(value);
+        }
+    }
+    let expired = expired.expect("an expiry is published");
+    assert_eq!(expired["trader_id"], id);
+    assert_eq!(expired["order"]["order_id"], order_id);
+    assert_eq!(expired["order"]["status"], "cancelled");
+
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
+async fn a_day_order_lasts_until_the_session_closes() {
+    // A session that is open at NOW_MS (22:13 UTC) and closes at 23:00.
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        market_hours: Some(fehu::MarketHours {
+            open_secs: 22 * 3600,
+            close_secs: 23 * 3600,
+            ..fehu::MarketHours::default()
+        }),
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "davide").await;
+    let id = player.trader;
+    let (_, status) = get(&app, "/api/symbols/ACME/status").await;
+    assert_eq!(status["market_open"], true, "{status}");
+    let close = status["next_close_ms"].as_i64().unwrap();
+    let bid = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit",
+                "price_cents": bid / 2, "day": true }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let order_id = body["order_id"].as_u64().unwrap();
+    let (_, record) = get(&player, &format!("/api/orders/{order_id}")).await;
+    assert_eq!(
+        record["expires_at_ms"], close,
+        "a day order ends with the session: {record}"
+    );
+
+    // Asking for both a day order and a date of its own is a contradiction.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit",
+                "price_cents": bid / 2, "day": true, "expires_at_ms": close + 1 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    engine::advance_to(&app, Timestamp(close + 60_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(
+        p["open_orders"].as_array().unwrap().is_empty(),
+        "the session closed on it: {p}"
+    );
+    assert_eq!(p["reserved_cents"], 0);
+}
+
+#[tokio::test]
+async fn a_day_order_needs_a_calendar_to_have_a_close() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        ..Options::default()
+    });
+    let player = sign_up(&app, "dahlia").await;
+    let bid = get(&app, "/api/symbols/ACME/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": player.trader, "side": "buy", "qty": 10, "type": "limit",
+                "price_cents": bid / 2, "day": true }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("FEHU_MARKET_HOURS"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn the_taker_pays_a_fee_and_the_maker_is_paid_a_rebate() {
     let app = App::new(Options {
         history_days: 0,
