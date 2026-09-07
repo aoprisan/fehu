@@ -20,6 +20,7 @@ import type {
   PortfolioDto,
   PushEventRequest,
   SharesResponse,
+  SymbolStatus,
   SymbolsResponse,
   TradesResponse,
   TransferRequest,
@@ -116,6 +117,10 @@ export const api = {
   /** Where one symbol's shares are: outstanding, held, bid for, available. */
   shares: (symbol: string): Promise<SharesResponse> =>
     request(`/api/symbols/${enc(symbol)}/shares`),
+
+  /** Whether a symbol can be traded right now, and if not, why not. */
+  status: (symbol: string): Promise<SymbolStatus> =>
+    request(`/api/symbols/${enc(symbol)}/status`),
 
   trader: (id: number): Promise<PortfolioDto> => request(`/api/traders/${id}`),
 

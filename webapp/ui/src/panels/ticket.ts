@@ -85,6 +85,14 @@ export class TicketPanel {
     this.updateLabel();
   }
 
+  /** Why the market will take no order for the selected symbol, if it won't. */
+  #stopped(): 'halted' | 'closed' | null {
+    const quote = this.#store.currentQuote();
+    if (quote === null) return null;
+    if (quote.halted) return 'halted';
+    return quote.market_open ? null : 'closed';
+  }
+
   updateLabel(): void {
     this.#renderHolding();
     const limit = this.#kind.value === 'limit';
@@ -92,8 +100,16 @@ export class TicketPanel {
     const side = this.#store.state.side;
     const qty = this.#qty.value === '' ? '?' : this.#qty.value;
     const how = limit ? (this.#price.value === '' ? 'limit' : `@ ${this.#price.value}`) : 'at market';
-    this.#submit.textContent = `${side === 'buy' ? 'Buy' : 'Sell'} ${qty} ${how}`;
-    this.#submit.className = `submit full ${side}`;
+    // A halted or closed market takes no orders; the server refuses them too.
+    const stopped = this.#stopped();
+    this.#submit.disabled = stopped !== null;
+    this.#submit.textContent =
+      stopped === null
+        ? `${side === 'buy' ? 'Buy' : 'Sell'} ${qty} ${how}`
+        : stopped === 'halted'
+          ? 'Trading halted'
+          : 'Market closed';
+    this.#submit.className = `submit full ${stopped === null ? side : 'stopped'}`;
   }
 
   #onSymbolChange(): void {
@@ -113,6 +129,14 @@ export class TicketPanel {
   async #submitOrder(): Promise<void> {
     const trader = this.#store.state.trader;
     if (trader === null) return;
+    const stopped = this.#stopped();
+    if (stopped !== null) {
+      setOrderStatus(
+        stopped === 'halted' ? 'trading in this symbol is halted' : 'the market is closed',
+        true,
+      );
+      return;
+    }
     const qty = Number.parseInt(this.#qty.value, 10);
     if (!Number.isSafeInteger(qty) || qty <= 0) return;
     const side = this.#store.state.side;

@@ -91,6 +91,8 @@ read that portfolio, cancel those orders or move that money. The key is shown
 | `GET` | `/api/symbols` | Quotes for every symbol |
 | `GET` | `/api/symbols/{sym}` | Quote, latent snapshot, config and share count |
 | `GET` | `/api/symbols/{sym}/shares` | The symbol's shares: outstanding, held by traders, bid for, still available, and who holds them |
+| `GET` | `/api/symbols/{sym}/status` | Whether the symbol can be traded: session open, halted, the limit band and the next open/close |
+| `POST` | `/api/symbols/{sym}/halt`, `/resume` | Game master: stop and start trading in one symbol |
 | `GET` | `/api/symbols/{sym}/bars?interval=M1\|M5\|H1\|D1&limit=500` | OHLCV bars, oldest first, in-progress bar last |
 | `POST` | `/api/symbols/{sym}/events` | Raw simulator event: `{"type":"jump","pct":-0.1}`, `drift_shift`, `drift_for_total_move`, `vol_shift`, `fundamental_shift`, `fundamental_target`; optional `at_ms` / `delay_secs`, `source`, `note` |
 | `POST` | `/api/game/events` | Semantic game event: `{"kind":"scandal","symbol":"ACME","magnitude":1.5}`; market-wide kinds (`market_crash`, `rate_hike`, …) need no symbol |
@@ -125,7 +127,10 @@ three days of 1 s ticks, so every interval has history before the first
 request. `FEHU_TIME_SCALE=60` runs the market at 60 simulated seconds per
 wall second; `FEHU_BIND`, `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`,
 `FEHU_STARTING_CASH_CENTS`, `FEHU_TAPE`, `FEHU_FILL_LOG`, `FEHU_ORDER_LOG`
-and `FEHU_LEDGER_LOG` are the other knobs. `FEHU_STATE_FILE` keeps the market
+and `FEHU_LEDGER_LOG` are the other knobs. `FEHU_MARKET_HOURS=09:30-16:00`
+gives the market a UTC weekday session (unset, it never closes);
+`FEHU_PRICE_LIMIT_PCT` (0.10) and `FEHU_HALT_SECS` (300) set the limit move
+that halts a symbol and how long the halt lasts. `FEHU_STATE_FILE` keeps the market
 across restarts (`FEHU_SAVE_SECS`, 30 by default, sets how often it is
 written). `FEHU_ADMIN_KEY` locks the
 game-master endpoints (`POST /api/game/events` and
@@ -145,6 +150,19 @@ account must be active and its available balance must cover the worst-case
 cost). Fills settle through the account, so every cent that moves is on its
 ledger. Nothing is persisted: accounts start with cash, no shares, no margin
 and no shorting.
+
+The market can stop. Give it `FEHU_MARKET_HOURS` and orders outside the
+session are refused with `409 market_closed`; leave it unset and it trades
+around the clock, which is what a game whose players log in at all hours
+wants. Separately, a symbol whose price moves more than `FEHU_PRICE_LIMIT_PCT`
+from where its day opened is **halted**: no new orders (`409 symbol_halted`)
+for `FEHU_HALT_SECS` of simulated time, after which it starts again with the
+band measured afresh. The game master can halt and resume a symbol by hand,
+and a manual halt has no end until they lift it. Resting orders are left
+alone through all of this and can always be cancelled — a player must be able
+to pull an order out of a market that has stopped. `GET
+/api/symbols/{sym}/status` reports all of it, quotes carry `market_open` and
+`halted`, and the stream sends a `status` message whenever it changes.
 
 Set `FEHU_STATE_FILE` and the market survives a restart. The whole thing is
 written there — every symbol's simulator, book and bars, and every user,

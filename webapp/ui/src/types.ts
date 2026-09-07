@@ -67,6 +67,42 @@ export interface Quote {
   shares_outstanding: number;
   /** `price × shares_outstanding`. */
   market_cap_cents: number;
+  /** A session is running. */
+  market_open: boolean;
+  /** Trading is stopped. */
+  halted: boolean;
+}
+
+/** `market::HaltReason`. */
+export type HaltReason = 'limit_move' | 'manual';
+
+/** `market::Halt` — trading in one symbol, stopped. */
+export interface Halt {
+  reason: HaltReason;
+  since_ms: number;
+  /** When an automatic halt lifts; `null` for a manual one. */
+  until_ms: number | null;
+  band_cents: number;
+  price_cents: number;
+  /** How far the price had moved from the band, as a fraction. */
+  move_pct: number;
+}
+
+/** `GET /api/symbols/{symbol}/status` (`market::SymbolStatus`). */
+export interface SymbolStatus {
+  symbol: string;
+  ts_ms: number;
+  market_open: boolean;
+  halted: boolean;
+  /** Orders are accepted: open, and not halted. */
+  tradable: boolean;
+  halt: Halt | null;
+  next_open_ms: number | null;
+  next_close_ms: number | null;
+  band_cents: number;
+  move_pct: number;
+  /** The move that stops trading; `0` when automatic halts are off. */
+  limit_pct: number;
 }
 
 /** `api::HolderDto` — one trader's stake in a symbol. */
@@ -551,7 +587,15 @@ export interface FillMessage {
   fill: FillRecord;
 }
 
-export type StreamMessage = HelloMessage | TickMessage | EventMessage | FillMessage;
+/** A symbol stopped trading, or started again. */
+export type StatusMessage = { type: 'status' } & SymbolStatus;
+
+export type StreamMessage =
+  | HelloMessage
+  | TickMessage
+  | EventMessage
+  | FillMessage
+  | StatusMessage;
 
 /** The server's error body: `{"error": {"code", "message"}}`. */
 export interface ApiErrorBody {

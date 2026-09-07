@@ -5,9 +5,11 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use fehu::Timestamp;
-use fehu_webapp::{App, Options, engine, router};
+use fehu_webapp::market::{App, Options};
+use fehu_webapp::{engine, router};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use std::time::Duration;
 use tower::util::ServiceExt;
 
 /// 2023-11-14T22:13:20Z. Fixed so the tests are deterministic.
@@ -1776,4 +1778,236 @@ async fn the_game_master_endpoints_can_be_locked() {
     let (status, body) = get(&app, "/api/events").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["events"].as_array().unwrap().len(), 2);
+}
+
+/// An app whose market keeps a trading calendar, and whose "now" is `now_ms`.
+fn app_with(options: Options) -> Arc<App> {
+    App::new(Options {
+        history_days: 2,
+        warmup_hours: 1,
+        ..options
+    })
+}
+
+#[tokio::test]
+async fn a_big_move_halts_trading_and_the_halt_lifts_itself() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        price_limit_pct: 0.05,
+        halt_secs: 60,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "hal").await;
+    let id = player.trader;
+
+    let (_, status) = get(&app, "/api/symbols/ACME/status").await;
+    assert_eq!(status["tradable"], true);
+    assert_eq!(status["limit_pct"], 0.05);
+    let band = status["band_cents"].as_i64().unwrap();
+    assert!(band > 0, "the band starts at the price: {status}");
+
+    // A jump well past the limit, then a tick to notice it.
+    post(
+        &app,
+        "/api/symbols/ACME/events",
+        json!({ "type": "jump", "pct": 0.20, "source": "test" }),
+    )
+    .await;
+    engine::advance_to(&app, app.clock.now() + Duration::from_secs(2));
+
+    let (_, status) = get(&app, "/api/symbols/ACME/status").await;
+    assert_eq!(status["halted"], true, "{status}");
+    assert_eq!(status["tradable"], false);
+    assert_eq!(status["halt"]["reason"], "limit_move");
+    assert_eq!(status["halt"]["band_cents"], band);
+    assert!(
+        status["halt"]["move_pct"].as_f64().unwrap() >= 0.05,
+        "{status}"
+    );
+    let until = status["halt"]["until_ms"]
+        .as_i64()
+        .expect("an automatic halt ends");
+
+    // No new orders while it is halted…
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "symbol_halted");
+    // …but the other symbols carry on.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/HLIO/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "market" }),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::CREATED,
+        "one symbol halting is not four: {body}"
+    );
+
+    // The halt lifts by itself, and the band is measured again from here.
+    engine::advance_to(&app, fehu::Timestamp(until + 1_000));
+    let (_, status) = get(&app, "/api/symbols/ACME/status").await;
+    assert_eq!(status["halted"], false, "{status}");
+    assert_eq!(status["halt"], Value::Null);
+    assert_ne!(status["band_cents"], band, "the band moved with the price");
+    assert!(status["move_pct"].as_f64().unwrap().abs() < 0.05);
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn a_resting_order_survives_a_halt_and_can_be_cancelled() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        ..Options::default()
+    });
+    let player = sign_up(&app, "hana").await;
+    let id = player.trader;
+    let bid = get(&app, "/api/symbols/PXCO/book").await.1["bid_cents"]
+        .as_i64()
+        .unwrap();
+    let (_, order) = post(
+        &player,
+        "/api/symbols/PXCO/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "type": "limit", "price_cents": bid / 2 }),
+    )
+    .await;
+    let order_id = order["order_id"].as_u64().unwrap();
+
+    let (code, status) = post(&app, "/api/symbols/PXCO/halt", json!({})).await;
+    assert_eq!(code, StatusCode::OK, "{status}");
+    assert_eq!(status["halt"]["reason"], "manual");
+    assert_eq!(
+        status["halt"]["until_ms"],
+        Value::Null,
+        "a manual halt has no end"
+    );
+
+    // It stays put through the halt: still resting, still reserving cash.
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["open_orders"][0]["order_id"], order_id);
+    assert!(p["reserved_cents"].as_i64().unwrap() > 0);
+    // A player can always pull an order out of a stopped market.
+    let (code, body) = delete(
+        &player,
+        &format!("/api/symbols/PXCO/orders/{order_id}?trader_id={id}"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(p["open_orders"].as_array().unwrap().is_empty());
+    assert_eq!(p["reserved_cents"], 0);
+
+    // Time alone does not lift a manual halt.
+    engine::advance_to(&app, app.clock.now() + Duration::from_secs(3_600));
+    let (_, status) = get(&app, "/api/symbols/PXCO/status").await;
+    assert_eq!(status["halted"], true, "{status}");
+    let (code, status) = post(&app, "/api/symbols/PXCO/resume", json!({})).await;
+    assert_eq!(code, StatusCode::OK, "{status}");
+    assert_eq!(status["tradable"], true);
+}
+
+#[tokio::test]
+async fn only_the_game_master_can_halt_a_symbol() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        admin_key: Some("s3cret".into()),
+        ..Options::default()
+    });
+    let player = sign_up(&app, "hettie").await;
+
+    let (code, _) = post(&app, "/api/symbols/ACME/halt", json!({})).await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED, "no key");
+    let (code, body) = post(&player, "/api/symbols/ACME/halt", json!({})).await;
+    assert_eq!(
+        code,
+        StatusCode::UNAUTHORIZED,
+        "a player's key is not the master's"
+    );
+    assert_eq!(body["error"]["code"], "invalid_api_key");
+
+    let master = Player {
+        app: Arc::clone(&app),
+        user: 0,
+        trader: 0,
+        key: "s3cret".into(),
+    };
+    let (code, status) = post(&master, "/api/symbols/ACME/halt", json!({})).await;
+    assert_eq!(code, StatusCode::OK, "{status}");
+    assert_eq!(status["halted"], true);
+    // Reading the state stays open to everyone.
+    let (code, status) = get(&app, "/api/symbols/ACME/status").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(status["halted"], true);
+    post(&master, "/api/symbols/ACME/resume", json!({})).await;
+}
+
+#[tokio::test]
+async fn a_closed_session_takes_no_orders() {
+    // 2023-11-14T22:13:20Z is a Tuesday evening: outside 09:30–16:00 UTC.
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        market_hours: Some(fehu::MarketHours::default()),
+        ..Options::default()
+    });
+    let player = sign_up(&app, "nox").await;
+    let id = player.trader;
+
+    let (_, status) = get(&app, "/api/symbols/ACME/status").await;
+    assert_eq!(status["market_open"], false, "{status}");
+    assert_eq!(status["tradable"], false);
+    assert_eq!(status["halted"], false, "closed is not halted");
+    let next_open = status["next_open_ms"]
+        .as_i64()
+        .expect("a calendar has a next open");
+    assert!(next_open > NOW_MS, "{status}");
+    assert_eq!(
+        status["next_close_ms"],
+        Value::Null,
+        "no session is running"
+    );
+
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "market_closed");
+    let (_, quotes) = get(&app, "/api/symbols").await;
+    assert_eq!(quotes["symbols"][0]["market_open"], false);
+    assert_eq!(quotes["symbols"][0]["halted"], false);
+
+    // Inside the session the same order goes through.
+    let open = app_with(Options {
+        // 2023-11-14T14:00:00Z, a Tuesday afternoon.
+        now_ms: Some(1_699_970_400_000),
+        market_hours: Some(fehu::MarketHours::default()),
+        ..Options::default()
+    });
+    let player = sign_up(&open, "diurnal").await;
+    let id = player.trader;
+    let (_, status) = get(&open, "/api/symbols/ACME/status").await;
+    assert_eq!(status["market_open"], true, "{status}");
+    assert_eq!(status["tradable"], true);
+    assert!(status["next_close_ms"].as_i64().unwrap() > 1_699_970_400_000);
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 5, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
 }
