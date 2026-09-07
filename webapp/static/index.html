@@ -51,6 +51,10 @@
           <div>
             <h2>Account</h2>
             <div class="acct" id="acct">—</div>
+            <form class="deposit" id="deposit">
+              <input type="number" name="amount" min="0.01" step="0.01" placeholder="amount" required>
+              <button type="submit">Add money</button>
+            </form>
             <table class="pos"><tbody id="positions"></tbody></table>
             <h2>Open orders</h2>
             <ul id="orders"></ul>
