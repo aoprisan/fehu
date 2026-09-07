@@ -641,3 +641,74 @@ async fn a_maker_rebate_is_paid_even_before_the_venue_has_collected_anything() {
     );
     assert_eq!(audit(&app, "after maker fills").await, genesis);
 }
+
+#[tokio::test]
+async fn a_resting_buy_that_spends_everything_still_settles() {
+    // The cash a resting buy reserves is exactly the cash that pays for it.
+    // If the reservation is still held when the fill is posted, a trader who
+    // committed their whole balance to the order looks insolvent at the
+    // moment it fills — and the settlement is refused after the book has
+    // already traded.
+    let app = App::new(Options {
+        price_limit_pct: 0.0,
+        ..options()
+    });
+    let genesis = audit(&app, "at genesis").await;
+    let ada = sign_up(&app, "ada").await;
+
+    let (_, account) = get(
+        &app,
+        Some(&ada.key),
+        &format!("/api/accounts/{}", ada.account),
+    )
+    .await;
+    let cash = account["available_cents"].as_i64().unwrap();
+    let (_, book) = get(&app, None, "/api/symbols/ACME/book").await;
+    let bid = book["bid_cents"].as_i64().unwrap();
+    // Every cent of it, committed to one resting bid.
+    let qty = cash / bid;
+    let (status, body) = post(
+        &app,
+        Some(&ada.key),
+        "/api/symbols/ACME/orders",
+        json!({"trader_id": ada.id, "type": "limit", "side": "buy", "qty": qty,
+               "price_cents": bid}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (_, account) = get(
+        &app,
+        Some(&ada.key),
+        &format!("/api/accounts/{}", ada.account),
+    )
+    .await;
+    assert!(
+        account["available_cents"].as_i64().unwrap() < bid,
+        "the order reserves all but the change: {account}"
+    );
+
+    for minute in 1..=60 {
+        engine::advance_to(&app, Timestamp(NOW_MS + minute * 60_000)).await;
+    }
+
+    let (_, portfolio) = get(&app, Some(&ada.key), &format!("/api/traders/{}", ada.id)).await;
+    let filled: i64 = portfolio["fills"]
+        .as_array()
+        .expect("the fill log")
+        .iter()
+        .map(|f| f["qty"].as_i64().unwrap())
+        .sum();
+    let resting: i64 = portfolio["open_orders"]
+        .as_array()
+        .expect("the open orders")
+        .iter()
+        .map(|o| o["remaining"].as_i64().unwrap())
+        .sum();
+    assert!(filled > 0, "the bid was hit at all: {portfolio}");
+    assert_eq!(
+        filled + resting,
+        qty,
+        "every share the book worked off the order was booked: {portfolio}"
+    );
+    assert_eq!(audit(&app, "after the bid filled").await, genesis);
+}

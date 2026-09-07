@@ -340,8 +340,9 @@ impl Trader {
     /// Record a trade this trader took part in: the position, the reservation
     /// its resting order held, and the rows in the account's history.
     ///
-    /// The currency has already moved — `tx_id` names the one balanced
-    /// transaction that moved it, which
+    /// The currency has already moved, and so has the reservation that was
+    /// holding it back — `tx_id` names the one balanced transaction that
+    /// moved it, which
     /// [`Market::book`](crate::market::Market::book) posted for both sides
     /// and the venue at once. What is left is each side's own view of it, and
     /// that is what this writes. Returns the fill records created (two for a
@@ -382,8 +383,10 @@ impl Trader {
             ));
         }
         if trade.maker.owner == me {
+            // The reservation behind this fill was released before the
+            // settlement was posted — see `Market::book` for why it has to
+            // be, and why it cannot be done here.
             let side = trade.taker_side.opposite();
-            self.release(ledger, account, symbol, side, trade.qty, trade.price_cents);
             let fee = self.book_fill(
                 ledger,
                 account,
@@ -1207,6 +1210,20 @@ mod tests {
             Owner::Trader(_) => account.wallet,
             _ => w.synthetic,
         };
+        // The maker's reservation goes back before the settlement is posted,
+        // exactly as `Market::book` does it: the cash a resting buy holds is
+        // the cash that pays for its own fill.
+        if trade.maker.owner == trader.owner() {
+            let side = trade.taker_side.opposite();
+            trader.release(
+                &mut w.ledger,
+                account,
+                symbol,
+                side,
+                trade.qty,
+                trade.price_cents,
+            );
+        }
         let value = notional_cents(trade.price_cents, trade.qty);
         let tx = w
             .ledger

@@ -1081,6 +1081,17 @@ impl Market {
                     record.fill(t.qty, t.price_cents, t.ts.0);
                 }
             }
+            // Give back what the resting side reserved *before* settling it.
+            // The cash a resting buy holds back is exactly the cash that pays
+            // for its own fill, so a trader who committed their whole balance
+            // to an order would look insolvent at the moment it filled — and
+            // the settlement would be refused after the book had traded.
+            if let Some(id) = t.maker.owner.trader()
+                && let Some((trader, account, ledger)) = self.settling(id)
+            {
+                let side = t.taker_side.opposite();
+                trader.release(ledger, account, sym, side, t.qty, t.price_cents);
+            }
             let Some((tx_id, settled)) = self.settle_trade(sym, t, fees) else {
                 continue;
             };

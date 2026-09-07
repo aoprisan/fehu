@@ -441,6 +441,25 @@ fill, and what it cannot pay it does not pay. That is what `SettledFees`
 is: what the venue actually charged, as opposed to what its schedule says
 it would.
 
+That fix exposed a second of the same shape, and a far more ordinary one:
+**a resting buy's reservation was still held when its own fill was
+posted.** The reserved cash *is* the cash that pays for the fill, so a
+trader who had committed most of their balance to an order looked
+insolvent at the moment it filled, and the settlement was refused — again
+after the book had traded. A bid for 1212 shares worked down to 791
+remaining with an empty fill log, no position and an untouched balance.
+The reservation is now released before the settlement is posted rather
+than after it.
+
+Both were invisible before the ledger, because settlement could not fail:
+the account was simply credited or debited whatever it held. Being unable
+to fail quietly is most of what a balanced transaction is for. The general
+lesson for milestones 2 and 3: settlement runs *after* the book has
+traded and cannot be unwound, so everything it needs must be true before
+it is called. `Market::settle_trade` counts and logs a refusal it cannot
+prevent, and `/api/reconcile` reports the drift, but that is a smoke alarm
+rather than a design.
+
 ## Acceptance scenario
 
 Initialise a world with a genesis supply in treasury. Onboard two players.
@@ -493,7 +512,7 @@ cargo clippy -p fehu-webapp --all-targets -- -D warnings    # clean (was red)
 cargo build --all-features / --no-default-features / +serde # clean
 cargo test --all-features                                   # 102 passed, 0 failed
 cargo test --no-default-features --tests                    #  95 passed, 0 failed
-cargo test -p fehu-webapp                                   # 134 passed, 0 failed
+cargo test -p fehu-webapp                                   # 136 passed, 0 failed
 cargo build --release --target wasm32-unknown-unknown …     # clean, both feature sets
 cd webapp/ui && npm ci && npm run build                     # bundle unchanged
 ```
