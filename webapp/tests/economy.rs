@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use fehu::Timestamp;
 use fehu_webapp::market::{App, Options};
 use fehu_webapp::{engine, router};
 use http_body_util::BodyExt;
@@ -565,4 +566,78 @@ async fn the_synthetic_counterparty_is_measured_rather_than_hidden() {
     assert_eq!(audit(&app, "after a round trip").await, genesis);
     let (_, report) = get(&app, Some(OPERATOR), "/api/reconcile").await;
     assert!(report["synthetic_debt_cents"].as_i64().unwrap() >= 0);
+}
+
+#[tokio::test]
+async fn a_maker_rebate_is_paid_even_before_the_venue_has_collected_anything() {
+    // The venue pays a maker rebate out of what it takes in fees. With no
+    // taker fee it takes nothing, and the very first maker fill asks it to
+    // pay out of an empty wallet.
+    //
+    // That must not refuse the settlement: the book has already traded, so
+    // the shares have moved and refusing would leave the money behind.
+    let app = App::new(Options {
+        maker_fee_bps: -25,
+        taker_fee_bps: 0,
+        price_limit_pct: 0.0,
+        ..options()
+    });
+    let genesis = audit(&app, "at genesis").await;
+    let ada = sign_up(&app, "ada").await;
+
+    // Rest a bid under the market and let the simulator's flow sell into it.
+    let (_, book) = get(&app, None, "/api/symbols/ACME/book").await;
+    let bid = book["bid_cents"].as_i64().unwrap();
+    let (status, body) = post(
+        &app,
+        Some(&ada.key),
+        "/api/symbols/ACME/orders",
+        json!({"trader_id": ada.id, "type": "limit", "side": "buy", "qty": 500,
+               "price_cents": bid}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for minute in 1..=60 {
+        engine::advance_to(&app, Timestamp(NOW_MS + minute * 60_000)).await;
+    }
+
+    let (_, portfolio) = get(&app, Some(&ada.key), &format!("/api/traders/{}", ada.id)).await;
+    let fills = portfolio["fills"].as_array().expect("the fill log");
+    assert!(
+        fills.iter().any(|f| f["liquidity"] == "maker"),
+        "the resting bid was hit: {portfolio}"
+    );
+    assert!(
+        fills
+            .iter()
+            .filter(|f| f["liquidity"] == "maker")
+            .all(|f| f["fee_cents"].as_i64().unwrap() >= 0),
+        "a maker is never charged: {portfolio}"
+    );
+
+    // The regression this guards: a settlement the venue could not fund was
+    // refused *after* the book had traded, so the shares moved and nothing
+    // was booked — an empty fill log and no position against an order the
+    // book had already worked down.
+    let filled: i64 = fills
+        .iter()
+        .map(|f| f["qty"].as_i64().unwrap())
+        .sum::<i64>();
+    let resting: i64 = portfolio["open_orders"]
+        .as_array()
+        .expect("the open orders")
+        .iter()
+        .map(|o| o["remaining"].as_i64().unwrap())
+        .sum();
+    assert_eq!(
+        filled + resting,
+        500,
+        "every share the book worked off the order was booked: {portfolio}"
+    );
+    assert_eq!(
+        portfolio["positions"][0]["qty"].as_i64().unwrap(),
+        filled,
+        "and the position is what was filled: {portfolio}"
+    );
+    assert_eq!(audit(&app, "after maker fills").await, genesis);
 }

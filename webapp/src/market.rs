@@ -78,7 +78,7 @@ use crate::metrics::Metrics;
 use crate::save::{MarketSave, STATE_VERSION, Save};
 use crate::trading::{
     BookDto, Fees, FillRecord, HoldingDto, Liquidity, MAX_STOPS_PER_TRADER, OpenOrderDto,
-    OrderRecord, OrderResponse, Refused, StopOrder, StopRequest, TradeDto, Trader,
+    OrderRecord, OrderResponse, Refused, SettledFees, StopOrder, StopRequest, TradeDto, Trader,
 };
 
 pub use crate::symbol::*;
@@ -1081,7 +1081,7 @@ impl Market {
                     record.fill(t.qty, t.price_cents, t.ts.0);
                 }
             }
-            let Some(tx_id) = self.settle_trade(sym, t, fees) else {
+            let Some((tx_id, settled)) = self.settle_trade(sym, t, fees) else {
                 continue;
             };
             let mut parties = [t.taker.owner.trader(), t.maker.owner.trader()];
@@ -1090,7 +1090,7 @@ impl Market {
             }
             for id in parties.into_iter().flatten() {
                 if let Some((trader, account, ledger)) = self.settling(id) {
-                    fills.extend(trader.apply_trade(ledger, account, sym, t, fees, tx_id));
+                    fills.extend(trader.apply_trade(ledger, account, sym, t, settled, tx_id));
                 }
             }
         }
@@ -1117,7 +1117,12 @@ impl Market {
     /// large sell. So this counts the refusal, logs it loudly and leaves the
     /// drift for [`crate::reconcile`] to report, rather than papering over it
     /// with currency nobody minted.
-    fn settle_trade(&mut self, sym: &'static str, trade: &Trade, fees: Fees) -> Option<u64> {
+    fn settle_trade(
+        &mut self,
+        sym: &'static str,
+        trade: &Trade,
+        fees: Fees,
+    ) -> Option<(u64, SettledFees)> {
         let synthetic = self.wallets.synthetic;
         let wallet_of = |owner: Owner| match owner.trader() {
             Some(id) => self
@@ -1148,8 +1153,30 @@ impl Market {
             }
         };
         let taker_fee = fee_for(trade.taker.owner, Liquidity::Taker);
-        let maker_fee = fee_for(trade.maker.owner, Liquidity::Maker);
         let venue = self.wallets.venue;
+        // A rebate comes out of what the venue has taken, and no further.
+        // Nothing else caps it: a taker fee smaller than the maker rebate,
+        // or a taker with no wallet to charge, would otherwise ask the venue
+        // to pay currency it never collected — which is the same money from
+        // nowhere that fees leaving the world used to be, pointing the other
+        // way. What it cannot pay, it does not pay.
+        let purse = self
+            .ledger
+            .available(venue)
+            .saturating_add(-taker_fee)
+            .max(0);
+        let maker_fee = fee_for(trade.maker.owner, Liquidity::Maker).min(purse);
+        let settled = SettledFees {
+            taker_cents: taker_fee,
+            maker_cents: maker_fee,
+        };
+        if maker_fee < fee_for(trade.maker.owner, Liquidity::Maker) {
+            tracing::warn!(
+                symbol = sym,
+                purse,
+                "maker rebate capped at what the venue has collected"
+            );
+        }
         let draft = settlement_draft(
             taker,
             maker,
@@ -1164,7 +1191,7 @@ impl Market {
         .posting(maker, maker_fee)
         .posting(venue, -maker_fee);
         match self.ledger.post(draft) {
-            Ok(tx) => Some(tx.id),
+            Ok(tx) => Some((tx.id, settled)),
             Err(e) => {
                 self.settlement_failures = self.settlement_failures.saturating_add(1);
                 tracing::error!(

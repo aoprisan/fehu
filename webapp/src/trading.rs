@@ -105,6 +105,30 @@ impl Fees {
     }
 }
 
+/// What the venue actually charged and paid on one fill.
+///
+/// Not the same thing as [`Fees`], which says what it *would* charge: a
+/// rebate is capped at what the venue can pay, so the two differ whenever
+/// the venue is asked for more than it holds. This is the number that was
+/// posted, and so the number a trader is told.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SettledFees {
+    /// Charged to whoever took liquidity, signed the way the ledger is.
+    pub taker_cents: i64,
+    /// Paid to whoever provided it, signed the way the ledger is.
+    pub maker_cents: i64,
+}
+
+impl SettledFees {
+    /// This side's share of it.
+    pub fn on(self, liquidity: Liquidity) -> i64 {
+        match liquidity {
+            Liquidity::Taker => self.taker_cents,
+            Liquidity::Maker => self.maker_cents,
+        }
+    }
+}
+
 /// One execution from a trader's point of view.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FillRecord {
@@ -328,7 +352,7 @@ impl Trader {
         account: &mut Account,
         symbol: &'static str,
         trade: &Trade,
-        fees: Fees,
+        fees: SettledFees,
         tx_id: u64,
     ) -> Vec<FillRecord> {
         let me = self.owner();
@@ -396,12 +420,12 @@ impl Trader {
         side: Side,
         trade: &Trade,
         order: OrderId,
-        fees: Fees,
+        fees: SettledFees,
         liquidity: Liquidity,
         tx_id: u64,
     ) -> i64 {
         let value = notional_cents(trade.price_cents, trade.qty);
-        let fee = fees.on(liquidity, value);
+        let fee = fees.on(liquidity);
         let (kind, signed) = match side {
             Side::Buy => (LedgerKind::Buy, -value),
             Side::Sell => (LedgerKind::Sell, value),
@@ -1178,7 +1202,7 @@ mod tests {
         symbol: &'static str,
         trade: &Trade,
     ) -> Vec<FillRecord> {
-        let fees = Fees::default();
+        let fees = SettledFees::default();
         let wallet_of = |owner: Owner| match owner {
             Owner::Trader(_) => account.wallet,
             _ => w.synthetic,

@@ -428,6 +428,19 @@ is in debt (that debt is the slack), and a wallet allowed to hold a negative
 balance must not be allowed to hold a reservation, or it can be drained
 straight through one.
 
+And one the plan does not mention at all, which conserved currency turns
+from a leak into a hole: **a maker rebate has to come from somewhere.** With
+`FEHU_MAKER_FEE_BPS` set and no taker fee to fund it — or with a taker that
+has no wallet to charge, which every fill against synthetic liquidity is —
+the venue is asked to pay currency it has never collected. Before the
+ledger that money simply appeared. With it, the settlement was refused
+*after* the book had traded: the shares moved and nothing was booked, an
+empty fill log against an order the book had already worked down. A rebate
+is now capped at what the venue holds plus what it collects on that same
+fill, and what it cannot pay it does not pay. That is what `SettledFees`
+is: what the venue actually charged, as opposed to what its schedule says
+it would.
+
 ## Acceptance scenario
 
 Initialise a world with a genesis supply in treasury. Onboard two players.

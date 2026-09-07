@@ -175,7 +175,9 @@ too, and an order off the grid is refused by the book rather than by the
 server. `FEHU_TAKER_FEE_BPS` (0) charges whoever takes liquidity, in basis
 points of the fill, and `FEHU_MAKER_FEE_BPS` (0, negative) pays whoever
 provided it; each fee is its own ledger entry beside the trade, and a buy has
-to be able to afford the fee as well as the shares.
+to be able to afford the fee as well as the shares. A rebate is paid out of
+what the venue has taken in fees and no further: what it has not collected,
+it does not pay.
 `FEHU_STATE_FILE` keeps the market
 across restarts (`FEHU_SAVE_SECS`, 30 by default, sets how often it is
 written). `FEHU_ADMIN_KEY` locks the
