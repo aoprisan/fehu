@@ -12,7 +12,7 @@ use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use fehu::{Candle, Config, Interval, Order, OrderKind, Owner, TraderId};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::BroadcastStream;
@@ -29,13 +29,13 @@ use crate::events::{
     PushEventRequest, Scope, SimEvent,
 };
 use crate::market::{
-    App, Closed, Market, Quote, SnapshotDto, StreamMessage, SymbolInfo, SymbolState, SymbolStatus,
-    wall_now_ms,
+    App, Closed, Market, PlaceError, Quote, SnapshotDto, StreamMessage, SymbolInfo, SymbolState,
+    SymbolStatus, wall_now_ms,
 };
 use crate::trading::{
-    AmendRequest, AmendResponse, BookDto, CreateTraderRequest, FillRecord, HolderDto,
-    MAX_CLIENT_ORDER_ID, OpenOrderDto, OrderRecord, OrderRequest, OrderResponse, PortfolioDto,
-    PositionDto, Refused, TradeDto, TraderSummary, UserHoldingsResponse,
+    AmendRequest, AmendResponse, BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID,
+    OpenOrderDto, OrderRecord, OrderRequest, OrderResponse, PortfolioDto, PositionDto, Refused,
+    StopOrder, StopRequest, TradeDto, TraderSummary, UserHoldingsResponse,
 };
 
 type AppState = Arc<App>;
@@ -77,9 +77,15 @@ pub fn router(app: AppState) -> Router {
             "/api/symbols/{symbol}/orders/{order_id}",
             get(get_order).patch(amend_order).delete(cancel_order),
         )
+        .route(
+            "/api/symbols/{symbol}/stops",
+            get(list_stops).post(submit_stop),
+        )
+        .route("/api/symbols/{symbol}/stops/{stop_id}", delete(cancel_stop))
         .route("/api/traders", get(list_traders).post(create_trader))
         .route("/api/traders/{trader_id}", get(get_trader))
         .route("/api/traders/{trader_id}/orders", get(list_trader_orders))
+        .route("/api/traders/{trader_id}/stops", get(list_trader_stops))
         .route("/api/orders/{order_id}", get(get_order_record))
         .route("/api/traders/{trader_id}/cancel_all", post(cancel_all))
         .route("/api/traders/{trader_id}/deposit", post(trader_deposit))
@@ -159,6 +165,14 @@ impl ApiError {
         )
     }
 
+    fn unknown_stop(id: u64) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "unknown_stop",
+            format!("no stop {id} is being held for that trader (it may have fired)"),
+        )
+    }
+
     fn invalid_order(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_order", message)
     }
@@ -197,6 +211,15 @@ impl ApiError {
                  which asked for something else"
             ),
         )
+    }
+
+    /// A submission the market would not place.
+    fn place(e: PlaceError) -> Self {
+        match e {
+            PlaceError::Refused(e) => Self::refused(e),
+            PlaceError::UnknownTrader(id) => Self::unknown_trader(id),
+            PlaceError::Invalid(message) => Self::invalid_order(message),
+        }
     }
 
     /// An order the trader's account would not fund.
@@ -1179,6 +1202,7 @@ fn portfolio(market: &Market, id: TraderId) -> Result<PortfolioDto, ApiError> {
         unrealised_pnl_cents: unrealised,
         positions,
         open_orders,
+        stops: market.stops_of(t.id).cloned().collect(),
         fills: t.fills.iter().rev().cloned().collect(),
         // Only the response that creates a user carries their key.
         api_key: None,
@@ -1235,7 +1259,9 @@ async fn submit_order(
             };
             (accepted, Vec::new(), true)
         } else {
-            let (response, fills) = place_order(&mut market, idx, trader, order, client_order_id)?;
+            let (response, fills) = market
+                .place(idx, trader, order, client_order_id)
+                .map_err(ApiError::place)?;
             (response, fills, false)
         }
     };
@@ -1267,84 +1293,97 @@ struct TraderQuery {
     trader_id: u64,
 }
 
-/// Send a validated order to the exchange and book everything that follows:
-/// the money check, the share checks, the fills, the reservation of what
-/// rests, and the order log. The caller holds the market lock and has already
-/// established who the trader is and that the symbol is open to them.
-fn place_order(
-    market: &mut Market,
-    idx: usize,
-    trader: TraderId,
-    order: Order,
-    client_order_id: Option<String>,
-) -> Result<(OrderResponse, Vec<FillRecord>), ApiError> {
-    let sym = market.symbols[idx].info.symbol;
-    // Worst-case cash a buy can consume.
-    let cost = match order.kind {
-        OrderKind::Limit { price_cents } => {
-            i64::try_from(i128::from(price_cents) * i128::from(order.qty)).unwrap_or(i64::MAX)
-        }
-        OrderKind::Market => {
-            market.symbols[idx]
-                .exchange
-                .preview_market(order.side, order.qty)
-                .notional_cents
-        }
+/// Arm a stop: a trigger the engine watches, not an order in the book.
+///
+/// Unlike an order this is accepted while the symbol is halted or its session
+/// is closed — the trigger simply waits, and fires when trading resumes.
+async fn submit_stop(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    caller: Caller,
+    payload: Result<Json<StopRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<StopOrder>), ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let req = StopRequest {
+        client_order_id: clean_client_order_id(req.client_order_id)?,
+        ..req
     };
-    // A symbol has a fixed number of shares: a buy can only be filled from the
-    // ones no trader holds or is already bidding for.
-    if order.side == fehu::Side::Buy {
-        let available = market.available_shares(sym);
-        if order.qty > available {
-            return Err(ApiError::refused(Refused::SupplyExhausted {
-                needed: order.qty,
-                available,
-            }));
-        }
-    }
-    // Validate the order against the account that would fund it: it must be
-    // active, a buy must have the cash available, and a sell the shares —
-    // nothing may be sold that the trader does not hold.
-    let account = market
-        .account_of(trader)
-        .ok_or_else(|| ApiError::unknown_trader(trader.0))?;
-    market.traders[&trader]
-        .check(account, sym, order.side, order.qty, cost)
-        .map_err(ApiError::refused)?;
-    // The log and retry index span all symbols. Allocate above every book's
-    // counter while holding the market lock, including ids used by synthetic
-    // flow since the last trader submission. Counters already persist in saves.
-    let next_id = market
-        .symbols
-        .iter()
-        .map(|s| s.exchange.book().next_order_id())
-        .max()
-        .unwrap_or(fehu::OrderId(1));
-    market.symbols[idx].exchange.advance_order_id(next_id);
-    let placement = market.symbols[idx]
-        .exchange
-        .submit(order)
-        .map_err(|e| ApiError::invalid_order(e.to_string()))?;
-    market.symbols[idx].record_trades(&placement.trades);
-    let fills = market.apply_trades(sym, &placement.trades);
-    if placement.status == fehu::OrderStatus::Resting
-        && let OrderKind::Limit { price_cents } = order.kind
-        && let Some((t, account)) = market.trader_and_account(trader)
-    {
-        t.reserve(account, sym, order.side, placement.remaining, price_cents);
-    }
-    let response = OrderResponse::new(sym, trader, order.side, order.qty, &placement);
+    let mut market = app.market();
+    let idx = market
+        .symbol_index(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    owned_trader(&market, caller, TraderId(req.trader_id))?;
     let now = market.symbols[idx].exchange.clock().0;
-    market.record_order(OrderRecord::new(
-        client_order_id,
-        trader,
-        sym,
-        &order,
-        &placement,
-        response.clone(),
-        now,
-    ));
-    Ok((response, fills))
+    let stop = market.place_stop(idx, &req, now).map_err(ApiError::place)?;
+    tracing::info!(
+        trader = stop.trader_id,
+        symbol = stop.symbol,
+        stop = stop.stop_id,
+        side = ?stop.side,
+        qty = stop.qty,
+        at = stop.stop_price_cents,
+        "stop armed"
+    );
+    Ok((StatusCode::CREATED, Json(stop)))
+}
+
+/// A trader's stops on one symbol. Stops are private: they say what a trader
+/// intends to do, which is nobody else's business.
+async fn list_stops(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    Query(q): Query<TraderQuery>,
+    caller: Caller,
+) -> Result<Json<Vec<StopOrder>>, ApiError> {
+    let market = app.market();
+    owned_trader(&market, caller, TraderId(q.trader_id))?;
+    let s = market
+        .symbol(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    Ok(Json(
+        s.stops
+            .iter()
+            .filter(|stop| stop.trader_id == q.trader_id)
+            .cloned()
+            .collect(),
+    ))
+}
+
+/// Every stop a trader holds, across all symbols.
+async fn list_trader_stops(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    caller: Caller,
+) -> Result<Json<Vec<StopOrder>>, ApiError> {
+    let market = app.market();
+    let trader = TraderId(trader_id);
+    owned_trader(&market, caller, trader)?;
+    Ok(Json(market.stops_of(trader).cloned().collect()))
+}
+
+/// Withdraw a stop before it fires.
+async fn cancel_stop(
+    State(app): State<AppState>,
+    Path((symbol, stop_id)): Path<(String, u64)>,
+    Query(q): Query<TraderQuery>,
+    caller: Caller,
+) -> Result<Json<StopOrder>, ApiError> {
+    let mut market = app.market();
+    market
+        .symbol_index(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    let trader = TraderId(q.trader_id);
+    owned_trader(&market, caller, trader)?;
+    let stop = market
+        .cancel_stop(stop_id, trader)
+        .ok_or_else(|| ApiError::unknown_stop(stop_id))?;
+    tracing::info!(
+        trader = stop.trader_id,
+        symbol = stop.symbol,
+        stop = stop.stop_id,
+        "stop cancelled"
+    );
+    Ok(Json(stop))
 }
 
 /// The price an order can reach: its limit, or for a market order the collar
@@ -1590,7 +1629,9 @@ async fn amend_order(
         if !crossing.is_empty() {
             return Err(ApiError::self_trade(&crossing));
         }
-        let (response, fills) = place_order(&mut market, idx, trader, order, client_order_id)?;
+        let (response, fills) = market
+            .place(idx, trader, order, client_order_id)
+            .map_err(ApiError::place)?;
         (
             response,
             fills,
@@ -2061,7 +2102,8 @@ async fn stream(
         .take_while(Result::is_ok)
         .filter_map(Result::ok)
         .filter(move |m| match m {
-            StreamMessage::Fill { trader_id, .. } => viewer.is_some_and(|user| {
+            StreamMessage::Fill { trader_id, .. }
+            | StreamMessage::StopTriggered { trader_id, .. } => viewer.is_some_and(|user| {
                 owner
                     .market()
                     .traders

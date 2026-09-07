@@ -1790,6 +1790,329 @@ fn app_with(options: Options) -> Arc<App> {
 }
 
 #[tokio::test]
+async fn a_stop_waits_for_its_price_and_then_becomes_an_order() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        // Halts are their own test; this one is about the trigger.
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "stanislaw").await;
+    let id = player.trader;
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": id, "side": "buy", "qty": 100, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+
+    // A sell stop five per cent under the market: nothing until the price
+    // falls that far.
+    let price = get(&app, "/api/symbols/ACME/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    let trigger = price * 95 / 100;
+    let (code, stop) = post(
+        &player,
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "sell", "qty": 100, "stop_price_cents": trigger }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{stop}");
+    assert_eq!(stop["stop_price_cents"], trigger);
+    assert_eq!(stop["limit_price_cents"], Value::Null, "a plain stop");
+    let stop_id = stop["stop_id"].as_u64().unwrap();
+
+    // It reserves nothing: the shares are still free to sell by hand.
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["positions"][0]["free_shares"], 100);
+    assert_eq!(p["stops"][0]["stop_id"], stop_id);
+    assert_eq!(
+        get(&player, "/api/symbols/ACME/stops?trader_id=1").await.1[0]["stop_id"],
+        stop_id
+    );
+
+    // A move that does not reach it leaves it alone.
+    engine::advance_to(&app, Timestamp(NOW_MS + 2_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert_eq!(p["stops"].as_array().unwrap().len(), 1, "fired too early");
+
+    let mut rx = app.tx.subscribe();
+    post(
+        &app,
+        "/api/symbols/ACME/events",
+        json!({ "type": "jump", "pct": -0.10, "source": "test" }),
+    )
+    .await;
+    engine::advance_to(&app, Timestamp(NOW_MS + 12_000));
+
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(
+        p["stops"].as_array().unwrap().is_empty(),
+        "the stop should be gone once it fires: {p}"
+    );
+    assert_eq!(p["positions"][0]["qty"], 0, "the stop sold the position");
+    assert_eq!(p["fills"][0]["side"], "sell");
+    assert_eq!(p["fills"][0]["liquidity"], "taker");
+
+    // And the trader was told, with the order the trigger placed.
+    let mut triggered = None;
+    while let Ok(message) = rx.try_recv() {
+        let value = serde_json::to_value(&message).unwrap();
+        if value["type"] == "stop_triggered" {
+            triggered = Some(value);
+        }
+    }
+    let triggered = triggered.expect("a fired stop is published");
+    assert_eq!(triggered["trader_id"], id);
+    assert_eq!(triggered["stop"]["stop_id"], stop_id);
+    assert_eq!(triggered["refused"], Value::Null);
+    assert_eq!(triggered["order"]["status"], "filled");
+    assert!(triggered["price_cents"].as_i64().unwrap() <= trigger);
+
+    // The order it became is in the log like any other.
+    let order_id = triggered["order"]["order_id"].as_u64().unwrap();
+    let (code, record) = get(&player, &format!("/api/orders/{order_id}")).await;
+    assert_eq!(code, StatusCode::OK, "{record}");
+    assert_eq!(record["kind"], "market");
+    assert_eq!(record["filled"], 100);
+}
+
+#[tokio::test]
+async fn a_stop_must_trigger_on_the_far_side_of_the_market() {
+    let app = test_app();
+    let player = sign_up(&app, "sabine").await;
+    let id = player.trader;
+    let price = get(&app, "/api/symbols/ACME/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+
+    // A buy stop under the market has already triggered, which makes it a
+    // market order pretending to be a trigger.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "stop_price_cents": price / 2 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_order");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("above"),
+        "{body}"
+    );
+
+    for bad in [
+        json!({ "trader_id": id, "side": "sell", "qty": 0, "stop_price_cents": price / 2 }),
+        json!({ "trader_id": id, "side": "sell", "qty": 1, "stop_price_cents": 0 }),
+        json!({ "trader_id": id, "side": "sell", "qty": 1, "stop_price_cents": price / 2,
+                "limit_price_cents": -1 }),
+    ] {
+        let (code, body) = post(&player, "/api/symbols/ACME/stops", bad.clone()).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{bad} gave {body}");
+    }
+
+    // A sell stop needs the shares, just like the sell it becomes.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "sell", "qty": 10, "stop_price_cents": price / 2 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "order_refused");
+}
+
+#[tokio::test]
+async fn a_stop_is_private_property_and_can_be_withdrawn() {
+    let app = test_app();
+    let owner = sign_up(&app, "olga").await;
+    let other = sign_up(&app, "otto").await;
+    let id = owner.trader;
+    let price = get(&app, "/api/symbols/HLIO/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    let (code, stop) = post(
+        &owner,
+        "/api/symbols/HLIO/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": 5, "stop_price_cents": price * 2 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{stop}");
+    let stop_id = stop["stop_id"].as_u64().unwrap();
+
+    // Somebody else's key cannot see it or take it away.
+    let (code, body) = get(&other, &format!("/api/symbols/HLIO/stops?trader_id={id}")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{body}");
+    let (code, body) = delete(
+        &other,
+        &format!("/api/symbols/HLIO/stops/{stop_id}?trader_id={id}"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{body}");
+    let (code, body) = get(&app, &format!("/api/traders/{id}/stops")).await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED, "{body}");
+
+    let (code, body) = get(&owner, &format!("/api/traders/{id}/stops")).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["stop_id"], stop_id);
+    let (code, body) = delete(
+        &owner,
+        &format!("/api/symbols/HLIO/stops/{stop_id}?trader_id={id}"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["stop_id"], stop_id);
+    // Twice is a mistake worth reporting, not a silent success.
+    let (code, body) = delete(
+        &owner,
+        &format!("/api/symbols/HLIO/stops/{stop_id}?trader_id={id}"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "unknown_stop");
+    let (_, p) = get(&owner, &format!("/api/traders/{id}")).await;
+    assert!(p["stops"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_halted_symbol_holds_its_stops_until_trading_resumes() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "hilda").await;
+    let id = player.trader;
+    let price = get(&app, "/api/symbols/PXCO/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    let trigger = price * 105 / 100;
+    let (code, stop) = post(
+        &player,
+        "/api/symbols/PXCO/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": 10, "stop_price_cents": trigger }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{stop}");
+
+    let (code, body) = post(&app, "/api/symbols/PXCO/halt", json!({})).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    // A stop can be armed while the market is stopped: it is not an order.
+    let (code, body) = post(
+        &player,
+        "/api/symbols/PXCO/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "stop_price_cents": trigger * 2 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+
+    post(
+        &app,
+        "/api/symbols/PXCO/events",
+        json!({ "type": "jump", "pct": 0.10, "source": "test" }),
+    )
+    .await;
+    engine::advance_to(&app, Timestamp(NOW_MS + 10_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert_eq!(
+        p["stops"].as_array().unwrap().len(),
+        2,
+        "a halted symbol fires nothing: {p}"
+    );
+    assert!(p["fills"].as_array().unwrap().is_empty());
+
+    let (code, body) = post(&app, "/api/symbols/PXCO/resume", json!({})).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    engine::advance_to(&app, Timestamp(NOW_MS + 12_000));
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert_eq!(
+        p["stops"].as_array().unwrap().len(),
+        1,
+        "the reached trigger should fire on the resume: {p}"
+    );
+    assert_eq!(p["positions"][0]["qty"], 10);
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+#[tokio::test]
+async fn a_stop_the_money_no_longer_covers_is_refused_when_it_fires() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    let player = sign_up(&app, "penny").await;
+    let id = player.trader;
+    let price = get(&app, "/api/symbols/NBLA/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    // Affordable now: a tenth of the account at today's price.
+    let qty = (10_000_000 / price / 10).max(1) as u64;
+    let trigger = price * 105 / 100;
+    let (code, stop) = post(
+        &player,
+        "/api/symbols/NBLA/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": qty, "stop_price_cents": trigger }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{stop}");
+
+    // The money leaves between the arming and the trigger. Nothing was
+    // reserved for the stop, so this is allowed — and the second check is
+    // what catches it.
+    let account = stop_account(&app, id);
+    let (code, body) = post(
+        &player,
+        &format!("/api/accounts/{account}/withdraw"),
+        json!({ "amount_cents": 9_999_000 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+
+    let mut rx = app.tx.subscribe();
+    post(
+        &app,
+        "/api/symbols/NBLA/events",
+        json!({ "type": "jump", "pct": 0.10, "source": "test" }),
+    )
+    .await;
+    engine::advance_to(&app, Timestamp(NOW_MS + 10_000));
+
+    let mut triggered = None;
+    while let Ok(message) = rx.try_recv() {
+        let value = serde_json::to_value(&message).unwrap();
+        if value["type"] == "stop_triggered" {
+            triggered = Some(value);
+        }
+    }
+    let triggered = triggered.expect("a refused stop is still published");
+    assert_eq!(triggered["order"], Value::Null);
+    assert!(
+        triggered["refused"]
+            .as_str()
+            .unwrap()
+            .contains("insufficient funds"),
+        "{triggered}"
+    );
+    let (_, p) = get(&player, &format!("/api/traders/{id}")).await;
+    assert!(
+        p["stops"].as_array().unwrap().is_empty(),
+        "a fired stop is spent, refused or not: {p}"
+    );
+    assert!(p["fills"].as_array().unwrap().is_empty());
+    let (_, report) = get(&app, "/api/reconcile").await;
+    assert_eq!(report["valid"], true, "{report}");
+}
+
+/// The account a trader's cash lives in.
+fn stop_account(app: &Arc<App>, trader: u64) -> u64 {
+    app.market().traders[&fehu::TraderId(trader)].account_id.0
+}
+
+#[tokio::test]
 async fn a_big_move_halts_trading_and_the_halt_lifts_itself() {
     let app = app_with(Options {
         now_ms: Some(NOW_MS),

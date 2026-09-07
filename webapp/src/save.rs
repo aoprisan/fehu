@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::account::{Account, User};
 use crate::events::EventRecord;
 use crate::market::{App, Halt};
-use crate::trading::{OrderRecord, Trader};
+use crate::trading::{OrderRecord, StopOrder, Trader};
 
 /// A listed symbol's ticker.
 ///
@@ -39,8 +39,9 @@ use crate::trading::{OrderRecord, Trader};
 pub type Symbol = &'static str;
 
 /// Current save format. Version 2 is migrated by hashing its plaintext
-/// credentials; all other older or newer versions are refused.
-pub const STATE_VERSION: u32 = 3;
+/// credentials and version 3 by starting the stop store empty; all other
+/// older or newer versions are refused.
+pub const STATE_VERSION: u32 = 4;
 
 /// Everything needed to carry on where the server left off.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,6 +75,9 @@ pub struct SymbolSave {
     pub halt: Option<Halt>,
     /// The price the limit band is measured from.
     pub band_cents: i64,
+    /// Triggers still waiting for a price. Version 3 files carry none.
+    #[serde(default)]
+    pub stops: Vec<StopOrder>,
 }
 
 /// The people, their money and everything written down about them.
@@ -97,6 +101,10 @@ pub struct MarketSave {
     pub next_account_id: u64,
     pub next_trader_id: u64,
     pub next_event_id: u64,
+    /// Ids for the stops held on the symbols. Version 3 files have none, so
+    /// the counter starts where a fresh market would.
+    #[serde(default)]
+    pub next_stop_id: u64,
 }
 
 /// Why a save could not be written or read.
@@ -181,10 +189,19 @@ pub fn read(path: &Path) -> Result<Save, SaveError> {
     let file = std::fs::File::open(path)?;
     let mut save: Save = serde_json::from_reader(io::BufReader::new(file))?;
     if save.version == 2 {
+        // Version 2 held the keys themselves; the digests are all this build
+        // ever wants, and hashing them here keeps every player's credential
+        // working across the upgrade.
         for (key, _) in &mut save.market.api_keys {
             *key = crate::auth::key_digest(key);
         }
-        save.version = STATE_VERSION;
+        save.version = 3;
+    }
+    if save.version == 3 {
+        // Version 3 predates stops. `serde` has already defaulted the store
+        // to empty; the counter has to start where a fresh market's does.
+        save.market.next_stop_id = save.market.next_stop_id.max(1);
+        save.version = 4;
     }
     if save.version != STATE_VERSION {
         return Err(SaveError::Version {
@@ -233,6 +250,39 @@ fn validate_accounting(save: &Save) -> Result<(), SaveError> {
         save.market.next_event_id,
         &mut issues,
     );
+    let mut stop_ids = BTreeSet::new();
+    let traders: BTreeSet<u64> = save.market.traders.iter().map(|t| t.id.0).collect();
+    if save.market.next_stop_id == 0 || save.market.next_stop_id == u64::MAX {
+        issues.push("stop id counter is invalid or exhausted".into());
+    }
+    for symbol in &save.symbols {
+        for stop in &symbol.stops {
+            if stop.stop_id == 0
+                || stop.stop_id >= save.market.next_stop_id
+                || !stop_ids.insert(stop.stop_id)
+            {
+                issues.push("stop ids are duplicated, zero, or overlap the next id".into());
+            }
+            if !traders.contains(&stop.trader_id) {
+                issues.push(format!("stop {} has no trader", stop.stop_id));
+            }
+            if stop.symbol != symbol.symbol {
+                issues.push(format!(
+                    "stop {} is filed under another symbol",
+                    stop.stop_id
+                ));
+            }
+            if stop.qty == 0
+                || stop.stop_price_cents <= 0
+                || stop.limit_price_cents.is_some_and(|p| p <= 0)
+            {
+                issues.push(format!(
+                    "stop {} has an invalid size or price",
+                    stop.stop_id
+                ));
+            }
+        }
+    }
     let mut key_users = BTreeSet::new();
     let mut digests = BTreeSet::new();
     for (digest, user) in &save.market.api_keys {

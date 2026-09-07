@@ -290,6 +290,39 @@ export interface OpenOrderDto {
 }
 
 /**
+ * `trading::StopOrder` — a trigger held aside until the price touches it.
+ * It is not an order: it rests nowhere and reserves nothing until it fires,
+ * and then it becomes an ordinary order.
+ */
+export interface StopOrder {
+  stop_id: number;
+  trader_id: number;
+  symbol: string;
+  side: Side;
+  qty: number;
+  /** A buy fires at or above this price, a sell at or below. */
+  stop_price_cents: number;
+  /** The limit the fired order carries; `null` fires a market order. */
+  limit_price_cents: number | null;
+  /** The time in force of the order it fires, not of the trigger itself. */
+  tif: TimeInForce;
+  client_order_id: string | null;
+  created_at_ms: number;
+}
+
+/** Body of `POST /api/symbols/{symbol}/stops`. */
+export interface StopRequest {
+  trader_id: number;
+  side: Side;
+  qty: number;
+  stop_price_cents: number;
+  /** Absent makes it a stop-market rather than a stop-limit. */
+  limit_price_cents?: number | null;
+  tif?: TimeInForce;
+  client_order_id?: string | null;
+}
+
+/**
  * `trading::OrderRecord` — one submitted order and what became of it. The
  * book forgets an order once it is filled or cancelled; this does not.
  */
@@ -390,6 +423,8 @@ export interface PortfolioDto {
   unrealised_pnl_cents: number;
   positions: PositionDto[];
   open_orders: OpenOrderDto[];
+  /** Triggers waiting for a price, oldest first. */
+  stops: StopOrder[];
   /** Newest first. */
   fills: FillRecord[];
   /**
@@ -616,12 +651,27 @@ export interface FillMessage {
 /** A symbol stopped trading, or started again. */
 export type StatusMessage = { type: 'status' } & SymbolStatus;
 
+/**
+ * A stop fired. It is held no longer: it either became `order`, or was
+ * `refused` when the account was checked the second time.
+ */
+export interface StopTriggeredMessage {
+  type: 'stop_triggered';
+  trader_id: number;
+  stop: StopOrder;
+  /** The price that reached the trigger. */
+  price_cents: number;
+  order: OrderResponse | null;
+  refused: string | null;
+}
+
 export type StreamMessage =
   | HelloMessage
   | TickMessage
   | EventMessage
   | FillMessage
-  | StatusMessage;
+  | StatusMessage
+  | StopTriggeredMessage;
 
 /** The server's error body: `{"error": {"code", "message"}}`. */
 export interface ApiErrorBody {

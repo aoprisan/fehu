@@ -253,6 +253,76 @@ async fn a_halt_survives_a_restart() {
 }
 
 #[tokio::test]
+async fn held_stops_survive_a_restart_and_still_fire() {
+    let dir = TempDir::new("fehu-save-stops");
+    let path = dir.path().join("state.json");
+    // Halts hold stops rather than firing them, which is its own test; here
+    // the move that reaches the trigger must not also stop the symbol.
+    let options = |file| Options {
+        price_limit_pct: 0.0,
+        ..options(file)
+    };
+    let before = App::new(options(Some(path.clone())));
+    let (id, key) = busy_market(&before).await;
+    let price = get(&before, None, "/api/symbols/ACME/book").await.1["reference_cents"]
+        .as_i64()
+        .unwrap();
+    let trigger = price * 105 / 100;
+    let (status, stop) = post(
+        &before,
+        Some(&key),
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": 5, "stop_price_cents": trigger,
+                "limit_price_cents": trigger * 2, "client_order_id": "the-stop" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{stop}");
+    save::write(&before, &path).unwrap();
+
+    let after = App::restore(options(Some(path.clone())), save::read(&path).unwrap());
+    let (_, stops) = get(&after, Some(&key), &format!("/api/traders/{id}/stops")).await;
+    assert_eq!(stops[0], stop, "the same trigger came back, not a new one");
+
+    // The id counter came back with it, so the next stop is not the old one.
+    let (status, second) = post(
+        &after,
+        Some(&key),
+        "/api/symbols/ACME/stops",
+        json!({ "trader_id": id, "side": "buy", "qty": 1, "stop_price_cents": trigger * 3 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    assert_ne!(second["stop_id"], stop["stop_id"]);
+
+    // And the restored trigger still fires, on the market that came back.
+    post(
+        &after,
+        Some(&key),
+        "/api/symbols/ACME/events",
+        json!({ "type": "jump", "pct": 0.10, "source": "restart" }),
+    )
+    .await;
+    engine::advance_to(
+        &after,
+        after.clock.now() + std::time::Duration::from_secs(10),
+    );
+    let (_, portfolio) = get(&after, Some(&key), &format!("/api/traders/{id}")).await;
+    assert_eq!(
+        portfolio["stops"].as_array().unwrap().len(),
+        1,
+        "the reached trigger fired, the far one did not: {portfolio}"
+    );
+    assert!(
+        portfolio["fills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["qty"] == 5),
+        "the stop it fired should have traded: {portfolio}"
+    );
+}
+
+#[tokio::test]
 async fn a_save_this_build_cannot_use_is_refused() {
     let dir = TempDir::new("fehu-save-bad");
     let path = dir.path().join("state.json");

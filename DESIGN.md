@@ -1117,7 +1117,51 @@ print rather than into a trickle of fills nobody could have cancelled. `GET /api
 place, quotes carry `market_open` and `halted` for the symbol rail, and a
 `status` stream message reports every change.
 
-### 14.13 Keeping the market across a restart
+### 14.13 Stops: orders the book has not heard of yet
+
+A stop is not an order. It rests nowhere, holds no queue position, reserves
+neither cash nor shares, and the book has never been told about it. It is a
+line drawn on the price, and `SymbolState::stops` is where the lines for one
+symbol are kept — a plain `Vec<StopOrder>`, oldest first, saved with the
+symbol so a restart does not lose anybody's exit.
+
+`POST /api/symbols/{s}/stops` arms one: a side, a quantity,
+`stop_price_cents`, and optionally `limit_price_cents`, which is what makes
+it a stop-limit rather than a plain stop. The trigger must be on the far side
+of the market — a buy above the last price, a sell below — because a stop
+that has already been reached is a market order wearing a disguise, and
+almost always a typo. Unlike an order it is accepted while the symbol is
+halted or its session closed: the trigger simply waits.
+
+`Market::fire_stops` runs at the end of every engine step, after
+`review_halt` so a symbol that resumed in this step fires the triggers the
+price reached while it was stopped, and skipped entirely for a symbol that is
+halted or outside its session. A buy fires at or above its price, a sell at
+or below, both against the last tick, oldest stop first. Firing removes the
+stop and sends the order it became through `Market::place` — the same door as
+any submission, so it takes the same cash, share and supply checks, prints
+the same fills, and is written to the same order log.
+
+That second check is the point of the design rather than an afterthought. A
+stop reserves nothing while it waits, so the money that would have paid for
+it can be spent or withdrawn in the meantime; the check when it fires is what
+catches that. A stop that fires and cannot be placed is spent either way: it
+is reported, not retried, because a trigger that keeps trying is a different
+instrument. Both outcomes reach the trader as a `stop_triggered` stream
+message carrying the trigger, the price that reached it, and either the order
+or the refusal — private to its owner, like a fill, because a stop says what
+somebody intends to do.
+
+Stops are listed per symbol (`GET /api/symbols/{s}/stops?trader_id=`), per
+trader (`GET /api/traders/{id}/stops`) and in the portfolio, withdrawn with
+`DELETE /api/symbols/{s}/stops/{stop_id}`, and capped at
+`MAX_STOPS_PER_TRADER` per trader — a trigger costs its owner nothing to
+hold, which without a cap is somebody else's memory. Stop ids are their own
+sequence: a stop only enters the order log when it becomes an order. The
+store holds untriggered stops only, so a fired one lives on as its order
+record and its stream message, not as a stop with a terminal status.
+
+### 14.14 Keeping the market across a restart
 
 Prices are reproducible from a seed; accounts are not. `webapp/src/save.rs`
 therefore writes the whole `Market` to one file (`FEHU_STATE_FILE`) every
@@ -1154,7 +1198,7 @@ Tickers are `&'static str` throughout the server (`save::Symbol`), which
 that from the derive, and the `symbol*` modules turn a ticker on disk back
 into one of the build's four, refusing anything else.
 
-### 14.14 Tests
+### 14.15 Tests
 
 `tests/trading.rs`: book priority/partial fills/IOC/FOK/cancel/preview; the
 no-trader invariant against the bare simulator for 20 k ticks; ladder
@@ -1196,9 +1240,17 @@ and a failed write leaves the previous save intact, a halt included. Sessions
 and halts: a limit move halts a symbol and refuses its orders while the others
 carry on, the halt lifts itself and re-bands, a manual halt outlasts any amount
 of time and only the game master can place or lift one, a resting order
-survives a halt and can still be cancelled, and a closed session refuses orders
-while an open one takes them. `webapp/tests/contract.rs`
-pins the JSON key sets the TypeScript UI is typed against.
+survives a halt and can still be cancelled, a halted book fills nothing while
+the price moves through it and the resume settles what the new quotes cross,
+and a closed session refuses orders while an open one takes them. Stops: a
+trigger waits, fires when the price reaches it, becomes an order in the log
+and tells its owner; one behind the market, unfunded or malformed is refused
+when it is armed; it is private property that only its owner may see or
+withdraw; a halted symbol holds its triggers and fires them on the resume;
+one whose money has left in the meantime is refused when it fires rather than
+half-placed; and held stops come back from a save and still fire.
+`webapp/tests/contract.rs` pins the JSON key sets the TypeScript UI is typed
+against.
 
 ---
 
@@ -1211,20 +1263,13 @@ first and a patch second.
 
 ### 15.1 Orders the book will not take
 
-**Stop and stop-limit.** The one piece of the order-type work not done. A stop
-is not an order in the book: it is a trigger held aside until the price
-touches it, and only then submitted. That means a per-symbol store of
-untriggered stops (`stop_price_cents`, side, quantity, and either "market" or
-a limit price), evaluated at the end of every engine step against the last
-tick the way `review_halt` is (§14.12) — a buy stop triggers at or above its
-price, a sell stop at or below — then placed through `place_order` and logged
-like any other order. It needs its own listing and cancel endpoints, a
-`stop_triggered` stream message, cash or shares checked twice (once when
-accepted, once when triggered, because the balance may have moved in
-between), a decision about what a trigger does while a symbol is halted (hold
-it, most likely, and fire on resume), and a save-format bump to carry the
-untriggered stops. That last point is why it is a pass of its own rather than
-a corner of the amend work.
+**Stop and stop-limit (implemented, §14.13).** Held per symbol, fired at the
+end of every engine step against the last tick, placed through
+`Market::place` and logged like any other order. The funds are checked twice
+— once when the stop is accepted and once when it fires — because a stop
+reserves nothing while it waits. A halted or closed symbol holds its
+triggers and fires them on the resume, `stop_triggered` reports both
+outcomes to the owner, and save format 4 carries the untriggered stops.
 
 **Iceberg, GTD and day orders.** Iceberg needs the book to re-post a slice as
 each one fills, which is `book.rs`, not the web app. GTD and day orders need
@@ -1267,7 +1312,7 @@ record.
 
 **Listing and delisting.** The symbol set is fixed at build time
 (`TICKERS`), which the save format depends on: a file listing other symbols is
-refused (§14.13). Adding symbols at runtime means a symbol table in the save
+refused (§14.14). Adding symbols at runtime means a symbol table in the save
 file and a story for what happens to a delisted symbol's positions.
 
 ### 15.4 Running it for more than a game

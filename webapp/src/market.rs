@@ -16,7 +16,10 @@ use crate::account::{Account, AccountId, MoneyError, User, UserId, notional_cent
 use crate::auth::Keyring;
 use crate::events::EventRecord;
 use crate::save::{MarketSave, STATE_VERSION, Save, SymbolSave};
-use crate::trading::{BookDto, FillRecord, HoldingDto, OrderRecord, TradeDto, Trader};
+use crate::trading::{
+    BookDto, FillRecord, HoldingDto, MAX_STOPS_PER_TRADER, OrderRecord, OrderResponse, Refused,
+    StopOrder, StopRequest, TradeDto, Trader,
+};
 
 /// Milliseconds in one day.
 pub const DAY_MS: i64 = 86_400_000;
@@ -389,6 +392,9 @@ pub struct SymbolState {
     /// where trading resumed. A move of more than `price_limit_pct` away from
     /// it halts the symbol.
     pub band_cents: i64,
+    /// Stops waiting for the price to reach them, oldest first. They are not
+    /// orders and the book does not know about them; see [`StopOrder`].
+    pub stops: Vec<StopOrder>,
 }
 
 impl SymbolState {
@@ -407,6 +413,7 @@ impl SymbolState {
             trades_total: 0,
             halt: None,
             band_cents: 0,
+            stops: Vec::new(),
         }
     }
 
@@ -612,6 +619,7 @@ impl SymbolState {
             trades_total: self.trades_total,
             halt: self.halt,
             band_cents: self.band_cents,
+            stops: self.stops.clone(),
         }
     }
 
@@ -636,6 +644,7 @@ impl SymbolState {
             trades_total: save.trades_total,
             halt: save.halt,
             band_cents: save.band_cents,
+            stops: save.stops,
         }
     }
 
@@ -705,6 +714,9 @@ pub struct Market {
     next_account_id: u64,
     pub traders: BTreeMap<TraderId, Trader>,
     next_trader_id: u64,
+    /// Ids for the stops held on the symbols. Separate from order ids: a
+    /// stop only becomes an order when it fires.
+    next_stop_id: u64,
     /// Every order the log still holds, by order id.
     orders: BTreeMap<u64, OrderRecord>,
     /// Order ids in the order they were accepted, for eviction.
@@ -1036,6 +1048,146 @@ impl Market {
         self.status(index, now)
     }
 
+    /// Hold a stop until the price reaches it.
+    ///
+    /// The account is checked here so an obviously unfundable trigger is
+    /// refused while the trader is still looking at the response, but nothing
+    /// is reserved: a stop that never fires costs its owner nothing, and the
+    /// real check is the one made when it does fire.
+    pub fn place_stop(
+        &mut self,
+        idx: usize,
+        req: &StopRequest,
+        now_ms: i64,
+    ) -> Result<StopOrder, PlaceError> {
+        let trader = TraderId(req.trader_id);
+        let sym = self.symbols[idx].info.symbol;
+        if req.qty == 0 {
+            return Err(PlaceError::Invalid("a stop must be for some shares".into()));
+        }
+        if req.stop_price_cents <= 0 || req.limit_price_cents.is_some_and(|p| p <= 0) {
+            return Err(PlaceError::Invalid(
+                "a stop's prices must be above zero".into(),
+            ));
+        }
+        // A trigger the market has already passed is not a trigger: it is a
+        // market order with extra steps, and almost certainly a mistake.
+        let price = self.symbols[idx].price_cents();
+        let behind = match req.side {
+            Side::Buy => req.stop_price_cents <= price,
+            Side::Sell => req.stop_price_cents >= price,
+        };
+        if behind {
+            let (side, where_) = match req.side {
+                Side::Buy => ("buy", "above"),
+                Side::Sell => ("sell", "below"),
+            };
+            return Err(PlaceError::Invalid(format!(
+                "a {side} stop must trigger {where_} the market: {} is already reached at {price}",
+                req.stop_price_cents
+            )));
+        }
+        if self.stops_of(trader).count() >= MAX_STOPS_PER_TRADER {
+            return Err(PlaceError::Invalid(format!(
+                "a trader may hold {MAX_STOPS_PER_TRADER} stops at once; cancel one first"
+            )));
+        }
+        let stop = StopOrder {
+            stop_id: self.next_stop_id,
+            trader_id: req.trader_id,
+            symbol: sym,
+            side: req.side,
+            qty: req.qty,
+            stop_price_cents: req.stop_price_cents,
+            limit_price_cents: req.limit_price_cents,
+            tif: req.tif,
+            client_order_id: req.client_order_id.clone(),
+            created_at_ms: now_ms,
+        };
+        let account = self
+            .account_of(trader)
+            .ok_or(PlaceError::UnknownTrader(trader.0))?;
+        self.traders[&trader]
+            .check(account, sym, req.side, req.qty, stop.cost_cents())
+            .map_err(PlaceError::Refused)?;
+        self.next_stop_id += 1;
+        self.symbols[idx].stops.push(stop.clone());
+        Ok(stop)
+    }
+
+    /// Every stop a trader is holding, oldest first, across all symbols.
+    pub fn stops_of(&self, trader: TraderId) -> impl Iterator<Item = &StopOrder> {
+        self.symbols
+            .iter()
+            .flat_map(|s| s.stops.iter())
+            .filter(move |stop| stop.trader_id == trader.0)
+    }
+
+    /// Withdraw a held stop. `None` if no such stop is held, or it is
+    /// somebody else's.
+    pub fn cancel_stop(&mut self, stop_id: u64, trader: TraderId) -> Option<StopOrder> {
+        for symbol in &mut self.symbols {
+            if let Some(at) = symbol
+                .stops
+                .iter()
+                .position(|s| s.stop_id == stop_id && s.trader_id == trader.0)
+            {
+                return Some(symbol.stops.remove(at));
+            }
+        }
+        None
+    }
+
+    /// Fire every stop the last price has reached, oldest first, and place
+    /// the orders they become.
+    ///
+    /// A symbol that is halted or outside its session fires nothing: the
+    /// triggers are held, and a resume in this same step lets them go. A stop
+    /// that fires is gone from the store either way — the account is checked
+    /// a second time here, and a trigger the money no longer covers is
+    /// reported rather than retried.
+    fn fire_stops(
+        &mut self,
+        index: usize,
+        now: Timestamp,
+        fills: &mut Vec<FillRecord>,
+    ) -> Vec<StreamMessage> {
+        let symbol = &mut self.symbols[index];
+        if symbol.stops.is_empty() || symbol.halt.is_some() || !symbol.is_open(now) {
+            return Vec::new();
+        }
+        let price_cents = symbol.price_cents();
+        let mut fired = Vec::new();
+        symbol.stops.retain(|stop| {
+            let hit = stop.triggered_by(price_cents);
+            if hit {
+                fired.push(stop.clone());
+            }
+            !hit
+        });
+        fired
+            .into_iter()
+            .map(|stop| {
+                let trader = TraderId(stop.trader_id);
+                let placed = self.place(index, trader, stop.order(), stop.client_order_id.clone());
+                let (order, refused) = match placed {
+                    Ok((response, placed_fills)) => {
+                        fills.extend(placed_fills);
+                        (Some(response), None)
+                    }
+                    Err(e) => (None, Some(e.to_string())),
+                };
+                StreamMessage::StopTriggered {
+                    trader_id: stop.trader_id,
+                    stop,
+                    price_cents,
+                    order,
+                    refused,
+                }
+            })
+            .collect()
+    }
+
     /// Start trading again, whatever stopped it.
     pub fn resume(
         &mut self,
@@ -1129,6 +1281,12 @@ impl Market {
                 messages.push(StreamMessage::Status(status));
             }
         }
+        // After the halts, so a symbol that just resumed fires the triggers
+        // the price reached while it was stopped.
+        for i in 0..self.symbols.len() {
+            let triggered = self.fire_stops(i, target, &mut fills);
+            messages.extend(triggered);
+        }
         messages.extend(fills.into_iter().map(|fill| StreamMessage::Fill {
             trader_id: fill_trader(&fill),
             fill,
@@ -1176,6 +1334,7 @@ impl Market {
             next_account_id: self.next_account_id,
             next_trader_id: self.next_trader_id,
             next_event_id: self.next_event_id,
+            next_stop_id: self.next_stop_id,
         }
     }
 
@@ -1194,6 +1353,7 @@ impl Market {
             next_account_id: save.next_account_id.max(1),
             traders: save.traders.into_iter().map(|t| (t.id, t)).collect(),
             next_trader_id: save.next_trader_id.max(1),
+            next_stop_id: save.next_stop_id.max(1),
             orders: BTreeMap::new(),
             order_ids: VecDeque::new(),
             client_order_ids: BTreeMap::new(),
@@ -1205,8 +1365,7 @@ impl Market {
         };
         // Through the same door as a live order, so the client-id index and
         // the eviction order come out the same.
-        let responses: BTreeMap<u64, crate::trading::OrderResponse> =
-            save.order_responses.into_iter().collect();
+        let responses: BTreeMap<u64, OrderResponse> = save.order_responses.into_iter().collect();
         for mut record in save.orders {
             record.accepted = responses.get(&record.order_id).cloned();
             market.record_order(record);
@@ -1256,6 +1415,113 @@ fn fill_trader(f: &FillRecord) -> u64 {
     f.trader_id
 }
 
+/// Why a submission could not be placed. The web layer turns these into
+/// status codes; the engine turns them into a stop that fired and was
+/// refused.
+#[derive(Clone, Debug)]
+pub enum PlaceError {
+    /// The account or the trader's shares would not fund it.
+    Refused(Refused),
+    /// The trader is not one this market knows.
+    UnknownTrader(u64),
+    /// The book itself refused the order.
+    Invalid(String),
+}
+
+impl std::fmt::Display for PlaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(e) => write!(f, "{e}"),
+            Self::UnknownTrader(id) => write!(f, "no such trader: {id}"),
+            Self::Invalid(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl Market {
+    /// Send a validated order to the exchange and book everything that
+    /// follows: the money check, the share checks, the fills, the reservation
+    /// of what rests, and the order log. The caller holds the market lock and
+    /// has already established who the trader is and that the symbol is open
+    /// to them.
+    pub fn place(
+        &mut self,
+        idx: usize,
+        trader: TraderId,
+        order: fehu::Order,
+        client_order_id: Option<String>,
+    ) -> Result<(OrderResponse, Vec<FillRecord>), PlaceError> {
+        let sym = self.symbols[idx].info.symbol;
+        // Worst-case cash a buy can consume.
+        let cost = match order.kind {
+            fehu::OrderKind::Limit { price_cents } => {
+                i64::try_from(i128::from(price_cents) * i128::from(order.qty)).unwrap_or(i64::MAX)
+            }
+            fehu::OrderKind::Market => {
+                self.symbols[idx]
+                    .exchange
+                    .preview_market(order.side, order.qty)
+                    .notional_cents
+            }
+        };
+        // A symbol has a fixed number of shares: a buy can only be filled from
+        // the ones no trader holds or is already bidding for.
+        if order.side == Side::Buy {
+            let available = self.available_shares(sym);
+            if order.qty > available {
+                return Err(PlaceError::Refused(Refused::SupplyExhausted {
+                    needed: order.qty,
+                    available,
+                }));
+            }
+        }
+        // Validate the order against the account that would fund it: it must
+        // be active, a buy must have the cash available, and a sell the shares
+        // — nothing may be sold that the trader does not hold.
+        let account = self
+            .account_of(trader)
+            .ok_or(PlaceError::UnknownTrader(trader.0))?;
+        self.traders[&trader]
+            .check(account, sym, order.side, order.qty, cost)
+            .map_err(PlaceError::Refused)?;
+        // The log and retry index span all symbols. Allocate above every
+        // book's counter while holding the market lock, including ids used by
+        // synthetic flow since the last trader submission. Counters already
+        // persist in saves.
+        let next_id = self
+            .symbols
+            .iter()
+            .map(|s| s.exchange.book().next_order_id())
+            .max()
+            .unwrap_or(fehu::OrderId(1));
+        self.symbols[idx].exchange.advance_order_id(next_id);
+        let placement = self.symbols[idx]
+            .exchange
+            .submit(order)
+            .map_err(|e| PlaceError::Invalid(e.to_string()))?;
+        self.symbols[idx].record_trades(&placement.trades);
+        let fills = self.apply_trades(sym, &placement.trades);
+        if placement.status == fehu::OrderStatus::Resting
+            && let fehu::OrderKind::Limit { price_cents } = order.kind
+            && let Some((t, account)) = self.trader_and_account(trader)
+        {
+            t.reserve(account, sym, order.side, placement.remaining, price_cents);
+        }
+        let response = OrderResponse::new(sym, trader, order.side, order.qty, &placement);
+        let now = self.symbols[idx].exchange.clock().0;
+        self.record_order(OrderRecord::new(
+            client_order_id,
+            trader,
+            sym,
+            &order,
+            &placement,
+            response.clone(),
+            now,
+        ));
+        Ok((response, fills))
+    }
+}
+
 /// What goes out over the SSE stream.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1289,6 +1555,16 @@ pub enum StreamMessage {
     Fill { trader_id: u64, fill: FillRecord },
     /// A symbol stopped trading, or started again.
     Status(SymbolStatus),
+    /// A stop fired. It is held no longer: it either became the order in
+    /// `order`, or was `refused` when the account was checked again.
+    StopTriggered {
+        trader_id: u64,
+        stop: StopOrder,
+        /// The price that reached the trigger.
+        price_cents: i64,
+        order: Option<OrderResponse>,
+        refused: Option<String>,
+    },
 }
 
 /// Start-up options, all overridable through `FEHU_*` environment variables.
@@ -1500,6 +1776,7 @@ impl App {
                 next_account_id: 1,
                 traders: BTreeMap::new(),
                 next_trader_id: 1,
+                next_stop_id: 1,
                 orders: BTreeMap::new(),
                 order_ids: VecDeque::new(),
                 client_order_ids: BTreeMap::new(),

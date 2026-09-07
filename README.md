@@ -118,6 +118,9 @@ read that portfolio, cancel those orders or move that money. The key is shown
 | `PATCH` | `/api/symbols/{sym}/orders/{id}` | Amend a resting order: `{"trader_id":1,"price_cents":8500,"qty":50}` — a cancel and a fresh order, so it loses queue position |
 | `GET` | `/api/orders/{id}` | One order and what became of it — filled and cancelled ones included |
 | `GET` | `/api/traders/{id}/orders?status=resting\|filled\|cancelled&limit=100` | A trader's orders, newest first |
+| `POST` | `/api/symbols/{sym}/stops` | Arm a stop: `{"trader_id":1,"side":"sell","qty":100,"stop_price_cents":8000}`, plus `"limit_price_cents"` for a stop-limit. The trigger must be on the far side of the market |
+| `GET` | `/api/symbols/{sym}/stops?trader_id=`, `/api/traders/{id}/stops` | A trader's held stops, on one symbol or all of them |
+| `DELETE` | `/api/symbols/{sym}/stops/{id}?trader_id=` | Withdraw a stop before it fires |
 | `GET` | `/api/symbols/{sym}/book?depth=10` | Aggregated bids and asks, reference price, pending trader flow |
 | `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first |
 | `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and — for `?api_key=`, since `EventSource` cannot set headers — that player's `fill`s |
@@ -167,8 +170,8 @@ to pull an order out of a market that has stopped. `GET
 `halted`, and the stream sends a `status` message whenever it changes.
 
 Set `FEHU_STATE_FILE` and the market survives a restart. The whole thing is
-written there — every symbol's simulator, book and bars, and every user,
-account, ledger, position, resting order and API key — every `FEHU_SAVE_SECS`
+written there — every symbol's simulator, book, bars and held stops, and
+every user, account, ledger, position, resting order and API key — every `FEHU_SAVE_SECS`
 seconds and once more on a clean shutdown, and read back at start-up in place
 of the warm-up, continuing from the simulated time it had reached. The write
 goes through a temporary file and a rename, so an interrupted save cannot
@@ -219,13 +222,23 @@ adds a user's positions up per symbol — owned, reserved and sellable — acros
 every trader of theirs, and shares belong to the trader that bought them: one
 trader cannot sell another's, even under the same user.
 
+A **stop** is a line drawn on the price rather than an order: it rests
+nowhere, holds no queue position and reserves nothing, and the book has never
+heard of it. Arm one on the far side of the market — a buy above, a sell
+below — and when the last price reaches it the engine sends the order it
+becomes through the same checks as anything else, which is also where the
+account is checked for the second time, because the money may have moved
+since. A halted or closed symbol holds its triggers and fires them when
+trading resumes, and the owner is told either way with a `stop_triggered`
+message carrying the order it became or the reason it could not be placed.
+
 A stream client that falls behind is disconnected so it can reconnect and
 reload snapshots. The bundled UI refreshes market data and the portfolio on
 every connection. The stream does not yet replay missed messages.
 
-What is deliberately *not* built — stop orders, fees, corporate actions,
-sequence numbers on the stream — and the decisions behind what is, are listed
-in [DESIGN.md §15](DESIGN.md#15-not-built-yet).
+What is deliberately *not* built — fees, corporate actions, sequence numbers
+on the stream — and the decisions behind what is, are listed in
+[DESIGN.md §15](DESIGN.md#15-not-built-yet).
 
 ## License
 

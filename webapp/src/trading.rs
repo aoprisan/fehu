@@ -418,6 +418,91 @@ impl OrderStyle {
 /// Longest `client_order_id` the server keeps.
 pub const MAX_CLIENT_ORDER_ID: usize = 64;
 
+/// Stops one trader may hold at once, across every symbol. A stop costs
+/// nothing to keep — it reserves neither cash nor shares — so without a cap
+/// one client could fill the market's memory with triggers that never fire.
+pub const MAX_STOPS_PER_TRADER: usize = 100;
+
+/// A trigger held aside until the price touches it.
+///
+/// A stop is not an order: it rests nowhere, reserves nothing and takes no
+/// queue position, and the book has never heard of it. When the last price
+/// reaches `stop_price_cents` the engine submits it like any other order —
+/// which is also when the account is checked for the second time, because
+/// the money may have moved since the stop was accepted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StopOrder {
+    pub stop_id: u64,
+    pub trader_id: u64,
+    #[serde(with = "crate::save::symbol")]
+    pub symbol: Symbol,
+    pub side: Side,
+    pub qty: u64,
+    /// A buy fires at or above this price, a sell at or below.
+    pub stop_price_cents: i64,
+    /// The limit the order carries when it fires. `null` fires a market
+    /// order — a plain stop rather than a stop-limit.
+    pub limit_price_cents: Option<i64>,
+    /// The time in force of the order it fires, not of the trigger: a stop
+    /// is held until it fires or is cancelled, whatever this says.
+    pub tif: TimeInForce,
+    /// Handed to the order the trigger places, so a stop is as idempotent as
+    /// anything else the trader sends.
+    pub client_order_id: Option<String>,
+    pub created_at_ms: i64,
+}
+
+impl StopOrder {
+    /// The order this fires.
+    #[must_use]
+    pub fn order(&self) -> Order {
+        Order {
+            owner: Owner::Trader(TraderId(self.trader_id)),
+            side: self.side,
+            kind: match self.limit_price_cents {
+                Some(price_cents) => OrderKind::Limit { price_cents },
+                None => OrderKind::Market,
+            },
+            tif: self.tif,
+            qty: self.qty,
+        }
+    }
+
+    /// Whether a last price of `price_cents` reaches the trigger.
+    #[must_use]
+    pub fn triggered_by(&self, price_cents: i64) -> bool {
+        match self.side {
+            Side::Buy => price_cents >= self.stop_price_cents,
+            Side::Sell => price_cents <= self.stop_price_cents,
+        }
+    }
+
+    /// Worst-case cash the order it fires could consume, for the check made
+    /// when the stop is accepted. A stop-market has no limit to work from,
+    /// so the trigger price stands in for one.
+    #[must_use]
+    pub fn cost_cents(&self) -> i64 {
+        let price = self.limit_price_cents.unwrap_or(self.stop_price_cents);
+        i64::try_from(i128::from(price) * i128::from(self.qty)).unwrap_or(i64::MAX)
+    }
+}
+
+/// Body of `POST /api/symbols/{symbol}/stops`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct StopRequest {
+    pub trader_id: u64,
+    pub side: Side,
+    pub qty: u64,
+    /// The price that fires it: above the market for a buy, below for a sell.
+    pub stop_price_cents: i64,
+    /// The limit the fired order carries. Absent makes it a stop-market.
+    pub limit_price_cents: Option<i64>,
+    #[serde(default)]
+    pub tif: TimeInForce,
+    /// Passed on to the order the trigger places.
+    pub client_order_id: Option<String>,
+}
+
 /// One submitted order for as long as the log keeps it: what was asked for,
 /// what has happened to it since, and the id the caller gave it.
 ///
@@ -820,6 +905,9 @@ pub struct PortfolioDto {
     pub unrealised_pnl_cents: i64,
     pub positions: Vec<PositionDto>,
     pub open_orders: Vec<OpenOrderDto>,
+    /// Triggers waiting for a price, oldest first. Not orders: they rest
+    /// nowhere and reserve nothing until they fire.
+    pub stops: Vec<StopOrder>,
     /// Newest first.
     pub fills: Vec<FillRecord>,
     /// The key that proves a request speaks for the trader's user, shown **once**:
