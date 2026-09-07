@@ -111,6 +111,24 @@ async fn market_data_shapes() {
             "pending_events",
             "bid_cents",
             "ask_cents",
+            "shares_outstanding",
+            "market_cap_cents",
+        ],
+    );
+
+    let shares = get(&app, "/api/symbols/ACME/shares").await;
+    assert_keys(
+        "SharesDto",
+        &shares,
+        &[
+            "symbol",
+            "shares_outstanding",
+            "held_shares",
+            "bid_shares",
+            "available_shares",
+            "price_cents",
+            "market_cap_cents",
+            "holders",
         ],
     );
 
@@ -300,6 +318,7 @@ async fn trading_shapes() {
             "unrealised_pnl_cents",
             "realised_pnl_cents",
             "reserved_shares",
+            "free_shares",
         ],
     );
     assert_keys(
@@ -330,6 +349,54 @@ async fn trading_shapes() {
             "price_cents",
             "liquidity",
             "counterparty",
+        ],
+    );
+
+    let holdings = get(
+        &app,
+        &format!("/api/users/{}/holdings", portfolio["user_id"]),
+    )
+    .await;
+    assert_keys(
+        "UserHoldingsResponse",
+        &holdings,
+        &[
+            "user_id",
+            "shares_owned",
+            "reserved_shares",
+            "free_shares",
+            "market_value_cents",
+            "holdings",
+        ],
+    );
+    assert_keys(
+        "HoldingDto",
+        first("UserHoldingsResponse", &holdings, "holdings"),
+        &[
+            "symbol",
+            "qty",
+            "reserved_shares",
+            "free_shares",
+            "cost_cents",
+            "avg_cost_cents",
+            "mark_cents",
+            "market_value_cents",
+            "unrealised_pnl_cents",
+            "realised_pnl_cents",
+            "traders",
+        ],
+    );
+
+    let shares = get(&app, "/api/symbols/ACME/shares").await;
+    assert_keys(
+        "HolderDto",
+        first("SharesDto", &shares, "holders"),
+        &[
+            "trader_id",
+            "user_id",
+            "qty",
+            "reserved_shares",
+            "free_shares",
         ],
     );
 
@@ -367,6 +434,8 @@ async fn account_shapes() {
             "accounts",
             "traders",
             "balance_cents",
+            "shares_owned",
+            "holdings_value_cents",
         ],
     );
     let user_id = user["id"].as_u64().unwrap();

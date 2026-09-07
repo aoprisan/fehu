@@ -1,7 +1,15 @@
-/** The order ticket: side, quantity, market or limit, time in force. */
+/**
+ * The order ticket: side, quantity, market or limit, time in force.
+ *
+ * A sell is bounded by what the trader actually holds — the server refuses
+ * anything more, so the ticket shows the free share count and stops the order
+ * before it is sent.
+ */
 
 import type { Actions } from '../actions.js';
 import { byId, query, queryAll } from '../dom.js';
+import { fmtVol } from '../format.js';
+import { setOrderStatus } from '../status.js';
 import type { Store } from '../store.js';
 import type { OrderRequest, Side, TimeInForce } from '../types.js';
 
@@ -21,6 +29,7 @@ export class TicketPanel {
   readonly #price = query(byId('ticket'), '[name=price]', HTMLInputElement);
   readonly #tif = query(byId('ticket'), '[name=tif]', HTMLSelectElement);
   readonly #submit = query(byId('ticket'), '.submit', HTMLButtonElement);
+  readonly #holding = byId('ticket-holding');
 
   constructor(store: Store, actions: Actions) {
     this.#store = store;
@@ -41,6 +50,31 @@ export class TicketPanel {
       void this.#submitOrder();
     });
     store.on('symbols', () => this.#onSymbolChange());
+    // A fill changes what is sellable, but must not clear a typed price.
+    store.on('trader', () => this.#renderHolding());
+  }
+
+  /** Shares of the selected symbol this trader may still sell. */
+  #freeShares(): number {
+    const { trader, symbol } = this.#store.state;
+    if (trader === null || symbol === null) return 0;
+    return trader.positions.find((p) => p.symbol === symbol)?.free_shares ?? 0;
+  }
+
+  /** What the trader holds of the selected symbol, and the symbol's float. */
+  #renderHolding(): void {
+    const { trader, symbol } = this.#store.state;
+    if (trader === null || symbol === null) {
+      this.#holding.textContent = '';
+      return;
+    }
+    const position = trader.positions.find((p) => p.symbol === symbol);
+    const qty = position?.qty ?? 0;
+    const free = position?.free_shares ?? 0;
+    const parts = [`own ${qty}`, `sellable ${free}`];
+    const quote = this.#store.currentQuote();
+    if (quote !== null) parts.push(`of ${fmtVol(quote.shares_outstanding)} shares`);
+    this.#holding.textContent = `${symbol}: ${parts.join(' · ')}`;
   }
 
   /** Pre-fill a limit at a price clicked in the ladder. */
@@ -52,6 +86,7 @@ export class TicketPanel {
   }
 
   updateLabel(): void {
+    this.#renderHolding();
     const limit = this.#kind.value === 'limit';
     this.#price.disabled = !limit;
     const side = this.#store.state.side;
@@ -80,8 +115,14 @@ export class TicketPanel {
     if (trader === null) return;
     const qty = Number.parseInt(this.#qty.value, 10);
     if (!Number.isSafeInteger(qty) || qty <= 0) return;
+    const side = this.#store.state.side;
+    // Nothing may be sold that is not owned; the server checks this too.
+    if (side === 'sell' && qty > this.#freeShares()) {
+      setOrderStatus(`insufficient shares: ${this.#freeShares()} free to sell`, true);
+      return;
+    }
     const tif = isTif(this.#tif.value) ? this.#tif.value : 'gtc';
-    const base = { trader_id: trader.id, side: this.#store.state.side, qty, tif };
+    const base = { trader_id: trader.id, side, qty, tif };
 
     let order: OrderRequest;
     if (this.#kind.value === 'limit') {

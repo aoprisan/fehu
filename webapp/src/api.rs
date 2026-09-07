@@ -31,8 +31,8 @@ use crate::market::{
     App, Market, Quote, SnapshotDto, StreamMessage, SymbolInfo, SymbolState, wall_now_ms,
 };
 use crate::trading::{
-    BookDto, CreateTraderRequest, OpenOrderDto, OrderRequest, OrderResponse, PortfolioDto,
-    PositionDto, Refused, TradeDto, TraderSummary,
+    BookDto, CreateTraderRequest, HolderDto, OpenOrderDto, OrderRequest, OrderResponse,
+    PortfolioDto, PositionDto, Refused, TradeDto, TraderSummary, UserHoldingsResponse,
 };
 
 type AppState = Arc<App>;
@@ -59,6 +59,7 @@ pub fn router(app: AppState) -> Router {
             "/api/symbols/{symbol}/events",
             get(list_symbol_events).post(push_sim_event),
         )
+        .route("/api/symbols/{symbol}/shares", get(get_shares))
         .route("/api/symbols/{symbol}/book", get(get_book))
         .route("/api/symbols/{symbol}/trades", get(get_trades))
         .route(
@@ -75,6 +76,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/traders/{trader_id}/deposit", post(trader_deposit))
         .route("/api/users", get(list_users).post(create_user))
         .route("/api/users/{user_id}", get(get_user))
+        .route("/api/users/{user_id}/holdings", get(get_holdings))
         .route(
             "/api/users/{user_id}/accounts",
             get(list_user_accounts).post(open_account),
@@ -307,6 +309,49 @@ struct SymbolDetail {
     snapshot: SnapshotDto,
     config: Config,
     ticks_total: u64,
+    shares: SharesDto,
+}
+
+/// `GET /api/symbols/{symbol}/shares`: where the symbol's shares are. The
+/// four numbers add up: `outstanding = held + bid_for + available`.
+#[derive(Serialize)]
+struct SharesDto {
+    symbol: &'static str,
+    /// Shares in existence.
+    shares_outstanding: u64,
+    /// Held by traders.
+    held_shares: u64,
+    /// Bid for by traders' resting buy orders.
+    bid_shares: u64,
+    /// Neither held nor bid for: what a buy can still be filled from.
+    available_shares: u64,
+    price_cents: i64,
+    /// `price × shares_outstanding`.
+    market_cap_cents: i64,
+    /// Every trader holding shares, largest stake first.
+    holders: Vec<HolderDto>,
+}
+
+impl SharesDto {
+    fn new(market: &Market, s: &SymbolState) -> Self {
+        let sym = s.info.symbol;
+        let mut holders: Vec<HolderDto> = market
+            .traders
+            .values()
+            .filter_map(|t| HolderDto::new(t, sym))
+            .collect();
+        holders.sort_by_key(|h| (std::cmp::Reverse(h.qty), h.trader_id));
+        Self {
+            symbol: sym,
+            shares_outstanding: s.info.shares_outstanding,
+            held_shares: market.held_shares(sym),
+            bid_shares: market.bid_shares(sym),
+            available_shares: market.available_shares(sym),
+            price_cents: s.price_cents(),
+            market_cap_cents: s.market_cap_cents(),
+            holders,
+        }
+    }
 }
 
 async fn get_symbol(
@@ -323,7 +368,19 @@ async fn get_symbol(
         snapshot: s.sim().snapshot().into(),
         config: s.sim().config().clone(),
         ticks_total: s.ticks_total,
+        shares: SharesDto::new(&market, s),
     }))
+}
+
+async fn get_shares(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+) -> Result<Json<SharesDto>, ApiError> {
+    let market = app.market();
+    let s = market
+        .symbol(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    Ok(Json(SharesDto::new(&market, s)))
 }
 
 #[derive(Deserialize)]
@@ -795,6 +852,7 @@ fn portfolio(market: &Market, id: TraderId) -> Result<PortfolioDto, ApiError> {
             unrealised_pnl_cents: u,
             realised_pnl_cents: p.realised_pnl_cents,
             reserved_shares: t.reserved_shares.get(sym).copied().unwrap_or(0),
+            free_shares: t.free_shares(sym),
         });
     }
     let open_orders = market
@@ -863,8 +921,20 @@ async fn submit_order(
                     .notional_cents
             }
         };
+        // A symbol has a fixed number of shares: a buy can only be filled
+        // from the ones no trader holds or is already bidding for.
+        if order.side == fehu::Side::Buy {
+            let available = market.available_shares(sym);
+            if order.qty > available {
+                return Err(ApiError::refused(Refused::SupplyExhausted {
+                    needed: order.qty,
+                    available,
+                }));
+            }
+        }
         // Validate the order against the account that would fund it: it must
-        // be active, and a buy must have the cash available.
+        // be active, a buy must have the cash available, and a sell the
+        // shares — nothing may be sold that the trader does not hold.
         let account = market
             .account_of(trader)
             .ok_or_else(|| ApiError::unknown_trader(trader.0))?;
@@ -1044,6 +1114,22 @@ async fn get_user(
 ) -> Result<Json<UserDto>, ApiError> {
     let market = app.market();
     Ok(Json(user_dto(&market, UserId(user_id))?))
+}
+
+/// Every share the user owns, per symbol, across all of their traders.
+async fn get_holdings(
+    State(app): State<AppState>,
+    Path(user_id): Path<u64>,
+) -> Result<Json<UserHoldingsResponse>, ApiError> {
+    let user = UserId(user_id);
+    let market = app.market();
+    if !market.users.contains_key(&user) {
+        return Err(ApiError::unknown_user(user_id));
+    }
+    Ok(Json(UserHoldingsResponse::new(
+        user_id,
+        market.user_holdings(user),
+    )))
 }
 
 /// Open another account for a user, with `cash_cents` paid in.
@@ -1250,6 +1336,7 @@ fn user_dto(market: &Market, id: UserId) -> Result<UserDto, ApiError> {
         .users
         .get(&id)
         .ok_or_else(|| ApiError::unknown_user(id.0))?;
+    let holdings = market.user_holdings(id);
     Ok(UserDto {
         id: user.id.0,
         name: user.name.clone(),
@@ -1267,6 +1354,14 @@ fn user_dto(market: &Market, id: UserId) -> Result<UserDto, ApiError> {
             .iter()
             .filter_map(|a| market.accounts.get(a))
             .map(Account::balance_cents)
+            .fold(0i64, i64::saturating_add),
+        shares_owned: holdings
+            .iter()
+            .map(|h| h.qty)
+            .fold(0u64, u64::saturating_add),
+        holdings_value_cents: holdings
+            .iter()
+            .map(|h| h.market_value_cents)
             .fold(0i64, i64::saturating_add),
     })
 }

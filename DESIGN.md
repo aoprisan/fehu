@@ -934,7 +934,8 @@ New endpoints: `POST /api/traders`, `GET /api/traders[/{id}]`,
 `POST /api/accounts/{id}/deposit|withdraw|status`,
 `GET /api/accounts/{id}/ledger|validate`, `POST|GET /api/symbols/{s}/orders`,
 `GET|DELETE /api/symbols/{s}/orders/{id}`, `GET /api/symbols/{s}/book`,
-`GET /api/symbols/{s}/trades`. The `tick` stream message carries the best
+`GET /api/symbols/{s}/trades`, `GET /api/symbols/{s}/shares` and
+`GET /api/users/{id}/holdings`. The `tick` stream message carries the best
 bid/ask, the top of the book and the step's prints; `fill` messages report
 a trader's executions. The UI gains a book ladder, an order ticket, the
 account and open orders, a tape, and fill markers on the chart. The four
@@ -966,14 +967,40 @@ negative balance, or more reserved than held — which
 An order is validated against its account *before* it reaches the exchange:
 `Account::authorise` refuses it unless the account is active and its
 available balance (`balance − reserved`) covers the worst case — `qty ×
-price` for a limit, the ladder-walk preview for a market order — and sells
-additionally need free shares. What rests reserves cash on the account; what
-fills settles through it, so every cent that moves is on the ledger and the
-sum of the entries is the balance. Cancels release the reservation, and
-reserved cash can be neither withdrawn nor closed out from under a resting
-order.
+price` for a limit, the ladder-walk preview for a market order. What rests
+reserves cash on the account; what fills settles through it, so every cent
+that moves is on the ledger and the sum of the entries is the balance.
+Cancels release the reservation, and reserved cash can be neither withdrawn
+nor closed out from under a resting order.
 
-### 14.9 Tests
+### 14.9 Shares: how many exist, and who may sell them
+
+Shares are counted as strictly as cents, from both ends.
+
+*Supply.* `SymbolInfo::shares_outstanding` fixes how many shares of a symbol
+exist (240 M ACME, 85 M NBLA, 610 M HLIO, 150 M PXCO). `Market` splits that
+number three ways — `held_shares` (the traders' positions), `bid_shares` (the
+remainder of their resting buys, counted as spoken for) and
+`available_shares` (the rest, what the synthetic book can still supply) — and
+a buy for more than `available_shares` is refused with
+`Refused::SupplyExhausted` before any cash is looked at. `GET
+/api/symbols/{s}/shares` reports the split and the holders; the quote carries
+`shares_outstanding` and the market cap it implies.
+
+*Ownership.* A trader's shares live in its own `Position`, and `Trader::check`
+refuses a sell whose quantity exceeds `free_shares` — the position less
+whatever earlier resting sells already promised (`reserved_shares`). So there
+is no shorting and no selling what a fill has not delivered, and shares belong
+to the trader that bought them: one trader cannot sell another's, even under
+the same user. A resting sell reserves shares exactly as a resting buy
+reserves cash; a fill or a cancel releases them.
+
+*Per user.* `Market::user_holdings` adds a user's positions up per symbol
+across every trader of theirs — owned, reserved, still sellable, cost, mark
+and P&L — behind `GET /api/users/{id}/holdings`, and `UserDto` carries the
+totals (`shares_owned`, `holdings_value_cents`) next to the cash balance.
+
+### 14.10 Tests
 
 `tests/trading.rs`: book priority/partial fills/IOC/FOK/cancel/preview; the
 no-trader invariant against the bare simulator for 20 k ticks; ladder
@@ -989,5 +1016,10 @@ surface end to end, including reservations and rejections; users opening
 accounts and paying money in, the ledger adding up to the balance after a
 fill, refused amounts (zero, negative, over the cap, fractional JSON,
 overdrawn), a frozen account refusing orders and withdrawals while still
-taking deposits, and one user running several traders. `webapp/tests/contract.rs`
+taking deposits, and one user running several traders. Shares: a sell is
+refused with nothing owned, above what is owned, and above what resting sells
+leave free, and goes through again once they are cancelled; the per-symbol
+count splits into held, bid for and available, a buy beyond it is refused
+before the cash check, and a user's holdings add up across their traders
+while one trader still cannot sell another's shares. `webapp/tests/contract.rs`
 pins the JSON key sets the TypeScript UI is typed against.

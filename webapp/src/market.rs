@@ -6,15 +6,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fehu::{
-    Candle, Candles, Config, Exchange, Interval, JumpParams, LiquidityParams, Snapshot, Tick,
+    Candle, Candles, Config, Exchange, Interval, JumpParams, LiquidityParams, Side, Snapshot, Tick,
     Timestamp, Trade, TraderId, TradingParams, VolumeParams,
 };
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::account::{Account, AccountId, MoneyError, User, UserId};
+use crate::account::{Account, AccountId, MoneyError, User, UserId, notional_cents};
 use crate::events::EventRecord;
-use crate::trading::{BookDto, FillRecord, TradeDto, Trader};
+use crate::trading::{BookDto, FillRecord, HoldingDto, TradeDto, Trader};
 
 /// Milliseconds in one day.
 pub const DAY_MS: i64 = 86_400_000;
@@ -30,6 +30,11 @@ pub struct SymbolInfo {
     pub sector: &'static str,
     /// One-line flavour text.
     pub description: &'static str,
+    /// Shares in existence. Nothing creates or destroys them: what the
+    /// traders hold plus what is still out in the market adds up to this, so
+    /// a buy cannot ask for more than is left (see
+    /// [`Market::available_shares`]).
+    pub shares_outstanding: u64,
     /// RNG seed. Same seed + same events ⇒ same prices, every run.
     pub seed: u64,
 }
@@ -60,6 +65,7 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
                 name: "Acme Industrial",
                 sector: "Industrials",
                 description: "Century-old conglomerate. Low volatility, steady drift, rare jumps.",
+                shares_outstanding: 240_000_000,
                 seed: 0xACE,
             },
             config: Config {
@@ -82,6 +88,7 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
                 name: "Nebula Robotics",
                 sector: "Technology",
                 description: "Pre-profit robotics darling. High volatility, big drift, frequent jumps.",
+                shares_outstanding: 85_000_000,
                 seed: 0x4E42,
             },
             config: Config {
@@ -114,6 +121,7 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
                 name: "Helio Energy",
                 sector: "Energy",
                 description: "Solar and storage utility. Commodity-driven, moderate volatility.",
+                shares_outstanding: 610_000_000,
                 seed: 0x4845,
             },
             config: Config {
@@ -136,6 +144,7 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
                 name: "Pax Consumer Co",
                 sector: "Consumer Staples",
                 description: "Household brands. Defensive: low volatility, shocks fade slowly.",
+                shares_outstanding: 150_000_000,
                 seed: 0x5058,
             },
             config: Config {
@@ -213,6 +222,10 @@ pub struct Quote {
     pub pending_events: usize,
     pub bid_cents: Option<i64>,
     pub ask_cents: Option<i64>,
+    /// Shares in existence for this symbol.
+    pub shares_outstanding: u64,
+    /// `price × shares_outstanding`.
+    pub market_cap_cents: i64,
 }
 
 /// Serialisable view of [`fehu::Snapshot`].
@@ -382,6 +395,18 @@ impl SymbolState {
         v
     }
 
+    /// The last traded price, or the simulator's reference before the first
+    /// tick.
+    pub fn price_cents(&self) -> i64 {
+        self.last_tick
+            .map_or_else(|| self.sim().snapshot().price_cents, |t| t.price_cents)
+    }
+
+    /// The whole company at the last traded price.
+    pub fn market_cap_cents(&self) -> i64 {
+        notional_cents(self.price_cents(), self.info.shares_outstanding)
+    }
+
     /// Current quote.
     pub fn quote(&self) -> Quote {
         let snap = self.sim().snapshot();
@@ -412,6 +437,8 @@ impl SymbolState {
             pending_events: snap.pending_events,
             bid_cents: self.exchange.book().best_bid(),
             ask_cents: self.exchange.book().best_ask(),
+            shares_outstanding: self.info.shares_outstanding,
+            market_cap_cents: notional_cents(price, self.info.shares_outstanding),
         }
     }
 }
@@ -542,6 +569,86 @@ impl Market {
         let t = traders.get_mut(&trader)?;
         let a = accounts.get_mut(&t.account_id)?;
         Some((t, a))
+    }
+
+    /// The canonical ticker of `ticker`, matched case-insensitively.
+    pub fn ticker(&self, ticker: &str) -> Option<&'static str> {
+        self.symbol(ticker).map(|s| s.info.symbol)
+    }
+
+    /// Shares of `symbol` the traders hold between them.
+    pub fn held_shares(&self, symbol: &str) -> u64 {
+        let Some(sym) = self.ticker(symbol) else {
+            return 0;
+        };
+        self.traders
+            .values()
+            .map(|t| t.held_shares(sym))
+            .fold(0, u64::saturating_add)
+    }
+
+    /// Shares of `symbol` the traders' resting buy orders are still bidding
+    /// for. They are counted as spoken for: were they all to fill, the
+    /// traders would hold them.
+    pub fn bid_shares(&self, symbol: &str) -> u64 {
+        self.symbol(symbol).map_or(0, |s| {
+            s.exchange
+                .book()
+                .orders()
+                .filter(|o| o.side == Side::Buy && o.owner.trader().is_some())
+                .map(|o| o.remaining)
+                .fold(0, u64::saturating_add)
+        })
+    }
+
+    /// Shares of `symbol` no trader holds or has bid for — what a buy can
+    /// still be filled from. A symbol has a fixed number of shares
+    /// ([`SymbolInfo::shares_outstanding`]), so once the traders between them
+    /// hold or bid for all of them there is nothing left to buy.
+    pub fn available_shares(&self, symbol: &str) -> u64 {
+        self.symbol(symbol).map_or(0, |s| {
+            s.info
+                .shares_outstanding
+                .saturating_sub(self.held_shares(symbol))
+                .saturating_sub(self.bid_shares(symbol))
+        })
+    }
+
+    /// What `user` owns, one entry per symbol, added up across every trader
+    /// of theirs and marked to the reference price. Ordered by ticker.
+    pub fn user_holdings(&self, user: UserId) -> Vec<HoldingDto> {
+        let mut by_symbol: BTreeMap<&'static str, HoldingDto> = BTreeMap::new();
+        for trader in self.traders.values().filter(|t| t.user_id == user) {
+            for sym in trader.positions.keys() {
+                by_symbol
+                    .entry(sym)
+                    .or_insert_with(|| HoldingDto::empty(sym))
+                    .add(trader);
+            }
+        }
+        by_symbol
+            .into_values()
+            .map(|mut h| {
+                h.mark(
+                    self.symbol(h.symbol)
+                        .map_or(0, |s| s.exchange.reference_cents()),
+                );
+                h
+            })
+            .collect()
+    }
+
+    /// Shares of `symbol` that `user` could sell right now: what their
+    /// traders hold, less what their resting sells already promised.
+    pub fn user_free_shares(&self, user: UserId, symbol: &str) -> u64 {
+        let Some(sym) = self.ticker(symbol) else {
+            return 0;
+        };
+        self.traders
+            .values()
+            .filter(|t| t.user_id == user)
+            .map(|t| t.free_shares(sym))
+            .fold(0, u64::saturating_add)
     }
 
     /// Book every trade in `trades` (for symbol `sym`) to the traders
