@@ -2687,7 +2687,7 @@ async fn reconciliation_checks_a_busy_market_and_detects_broken_reservations() {
         let (status, body) = post(&player, "/api/symbols/ACME/orders", order).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
     }
-    engine::step(&app);
+    engine::step(&app).await;
     let (status, report) = get(&app, "/api/reconcile").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(report["valid"], true, "{report}");

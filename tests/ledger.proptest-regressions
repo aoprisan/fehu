@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f6fed4efcd9fbf9a5272963fa0a0cb9987ab367a62d670b5de504e49ca544eb1 # shrinks to ops = [Burn { from: 7, cents: 1 }]
+cc 0b99103351ad7a690add77cf6093d78c71b080d9ddbf445613b55701c991d86f # shrinks to setup = [Fee { from: 7, cents: 2 }], op = Unbalanced { from: 7, to: 7, cents: 9223372036854775807 }
+cc 7cec44a8cb29613899152b50df2c0b3982043877b6393a07aa9d94db7d8fe85d # shrinks to ops = [Mint { to: 7, cents: 1000000000000000 }, Reserve { wallet: 7, cents: 1 }, Fee { from: 7, cents: 1000000000000000 }]
