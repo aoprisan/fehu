@@ -736,9 +736,9 @@ async fn stream_message_shapes() {
     assert_eq!(hello["seq"], 7, "the envelope numbers every message");
 
     // Drive one engine step and capture what the stream would carry.
-    let mut rx = app.tx.subscribe();
+    let mut rx = app.listen();
     let target = app.clock.now() + Duration::from_secs(120);
-    engine::advance_to(&app, target);
+    engine::advance_to(&app, target).await;
 
     let mut saw_tick = false;
     let mut last_seq = 0;
@@ -773,9 +773,7 @@ async fn stream_message_shapes() {
 
     // `status` flattens the symbol's state next to the tag.
     let status = serde_json::to_value(StreamMessage::Status(
-        app.market()
-            .status(0, app.clock.now())
-            .expect("ACME exists"),
+        app.status("ACME").await.expect("ACME exists"),
     ))
     .unwrap();
     assert_keys(
@@ -848,11 +846,11 @@ async fn stream_message_shapes() {
     )
     .await;
     let record = app
-        .market()
-        .orders_of(fehu::TraderId(owner_id))
-        .next()
-        .expect("the order is in the log")
-        .clone();
+        .market
+        .call(move |m| m.orders_of(fehu::TraderId(owner_id)).next().cloned())
+        .await
+        .unwrap()
+        .expect("the order is in the log");
     let expired = serde_json::to_value(StreamMessage::OrderExpired {
         trader_id: owner_id,
         order: record,
@@ -889,7 +887,7 @@ async fn stream_message_shapes() {
     // `listed` carries the new symbol's first quote; `delisted` flattens what
     // the delisting undid next to the tag.
     let listed = serde_json::to_value(StreamMessage::Listed {
-        quote: app.market().symbols[0].quote(),
+        quote: app.quotes().await[0].clone(),
     })
     .unwrap();
     assert_keys("ListedMessage", &listed, &["type", "quote"]);

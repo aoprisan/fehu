@@ -186,8 +186,8 @@ impl From<serde_json::Error> for SaveError {
 
 /// Write `app`'s state to `path`, through a temporary file so an interrupted
 /// write cannot destroy the previous save.
-pub fn write(app: &App, path: &Path) -> Result<(), SaveError> {
-    let save = app.save();
+pub async fn write(app: &App, path: &Path) -> Result<(), SaveError> {
+    let save = app.save().await;
     let tmp = temp_path(path);
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
@@ -374,10 +374,10 @@ fn validate_accounting(save: &Save) -> Result<(), SaveError> {
     if !issues.is_empty() {
         return Err(SaveError::Invalid(issues));
     }
-    // Restore without warming up or starting background tasks. Reconciliation
-    // checks the retained ledgers and all books, even when logs are bounded.
-    let app = App::restore(crate::market::Options::default(), save.clone());
-    let report = app.market().reconcile();
+    // Reconcile the file as it stands, before anything is built from it.
+    // This checks the retained ledgers and all books, even when logs are
+    // bounded.
+    let report = crate::reconcile::reconcile(save);
     if report.valid {
         Ok(())
     } else {
@@ -422,7 +422,7 @@ pub async fn autosave(app: Arc<App>, path: PathBuf, period: Duration) {
     interval.tick().await; // The first tick is immediate; the state is fresh.
     loop {
         interval.tick().await;
-        match write(&app, &path) {
+        match write(&app, &path).await {
             Ok(()) => tracing::debug!(path = %path.display(), "state saved"),
             Err(e) => tracing::error!(path = %path.display(), error = %e, "state not saved"),
         }
@@ -521,8 +521,8 @@ fn intern(ticker: &str) -> Result<&'static str, String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn snapshot_flush_errors_are_reported() {
+    #[tokio::test]
+    async fn snapshot_flush_errors_are_reported() {
         struct FailsOnFlush;
         impl Write for FailsOnFlush {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -538,7 +538,7 @@ mod tests {
             ..Default::default()
         });
         assert!(matches!(
-            write_snapshot(FailsOnFlush, &app.save()),
+            write_snapshot(FailsOnFlush, &app.save().await),
             Err(SaveError::Io(_))
         ));
     }

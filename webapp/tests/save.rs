@@ -102,7 +102,7 @@ async fn busy_market(app: &Arc<App>) -> (u64, String) {
         json!({ "kind": "hype", "symbol": "ACME" }),
     )
     .await;
-    engine::advance_to(app, app.clock.now() + std::time::Duration::from_secs(30));
+    engine::advance_to(app, app.clock.now() + std::time::Duration::from_secs(30)).await;
     (id, key)
 }
 
@@ -131,7 +131,7 @@ async fn a_saved_market_comes_back_whole() {
     let (_, events) = get(&before, None, "/api/events").await;
     let (_, shares) = get(&before, Some(&key), "/api/symbols/ACME/shares").await;
 
-    save::write(&before, &path).expect("state written");
+    save::write(&before, &path).await.expect("state written");
     assert!(path.exists(), "the save file is where it was asked for");
     let saved_text = std::fs::read_to_string(&path).unwrap();
     assert!(
@@ -182,7 +182,8 @@ async fn a_saved_market_comes_back_whole() {
     let ticks = engine::advance_to(
         &after,
         after.clock.now() + std::time::Duration::from_secs(5),
-    );
+    )
+    .await;
     assert!(ticks > 0, "the market runs on");
     let (status, body) = post(
         &after,
@@ -204,7 +205,7 @@ async fn a_second_player_can_still_sign_up_after_a_restore() {
     let path = dir.path().join("state.json");
     let before = App::new(options(Some(path.clone())));
     let (first, first_key) = busy_market(&before).await;
-    save::write(&before, &path).unwrap();
+    save::write(&before, &path).await.unwrap();
 
     let after = App::restore(options(Some(path.clone())), save::read(&path).unwrap());
     let (status, second) = post(&after, None, "/api/traders", json!({ "name": "newcomer" })).await;
@@ -238,7 +239,7 @@ async fn a_halt_survives_a_restart() {
 
     let (status, halted) = post(&before, None, "/api/symbols/ACME/halt", json!({})).await;
     assert_eq!(status, StatusCode::OK, "{halted}");
-    save::write(&before, &path).unwrap();
+    save::write(&before, &path).await.unwrap();
 
     let after = App::restore(options(Some(path.clone())), save::read(&path).unwrap());
     let (_, status) = get(&after, None, "/api/symbols/ACME/status").await;
@@ -279,7 +280,7 @@ async fn held_stops_survive_a_restart_and_still_fire() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{stop}");
-    save::write(&before, &path).unwrap();
+    save::write(&before, &path).await.unwrap();
 
     let after = App::restore(options(Some(path.clone())), save::read(&path).unwrap());
     let (_, stops) = get(&after, Some(&key), &format!("/api/traders/{id}/stops")).await;
@@ -307,7 +308,8 @@ async fn held_stops_survive_a_restart_and_still_fire() {
     engine::advance_to(
         &after,
         after.clock.now() + std::time::Duration::from_secs(10),
-    );
+    )
+    .await;
     let (_, portfolio) = get(&after, Some(&key), &format!("/api/traders/{id}")).await;
     assert_eq!(
         portfolio["stops"].as_array().unwrap().len(),
@@ -354,7 +356,7 @@ async fn an_iceberg_comes_back_with_what_it_was_hiding() {
         .1["reserved_cents"]
         .as_i64()
         .unwrap();
-    save::write(&before, &path).unwrap();
+    save::write(&before, &path).await.unwrap();
 
     // A file whose books do not add up is refused, so getting this far is
     // already most of the check.
@@ -419,7 +421,7 @@ async fn an_iceberg_comes_back_with_what_it_was_hiding() {
         .find(|l| l["price_cents"] == price)
         .unwrap_or_else(|| panic!("the next slice should be showing: {book}"));
     assert_eq!(top["qty"], 25, "a restored iceberg still refreshes: {book}");
-    assert!(after.market().reconcile().valid);
+    assert!(after.reconcile().await.valid);
 }
 
 #[tokio::test]
@@ -450,11 +452,12 @@ async fn the_symbols_a_market_comes_back_with_are_the_ones_it_was_saved_with() {
     engine::advance_to(
         &before,
         before.clock.now() + std::time::Duration::from_secs(5),
-    );
+    )
+    .await;
 
     let (_, symbols) = get(&before, None, "/api/symbols").await;
     let (_, detail) = get(&before, None, "/api/symbols/WDGT").await;
-    save::write(&before, &path).expect("state written");
+    save::write(&before, &path).await.expect("state written");
 
     let after = App::restore(options(Some(path.clone())), save::read(&path).unwrap());
     let (_, restored) = get(&after, None, "/api/symbols").await;
@@ -478,7 +481,7 @@ async fn the_symbols_a_market_comes_back_with_are_the_ones_it_was_saved_with() {
     );
     let (status, _) = get(&after, None, "/api/symbols/HLIO").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "a delisting stays done");
-    assert!(after.market().reconcile().valid);
+    assert!(after.reconcile().await.valid);
 
     // And the restored market goes on listing and delisting.
     let (status, body) = post(&after, None, "/api/symbols/WDGT/delist", json!({})).await;
@@ -491,7 +494,7 @@ async fn a_version_4_save_takes_its_symbols_from_the_build() {
     let path = dir.path().join("state.json");
     let app = App::new(options(Some(path.clone())));
     busy_market(&app).await;
-    save::write(&app, &path).unwrap();
+    save::write(&app, &path).await.unwrap();
 
     // Version 4 knew nothing of listings: it named its symbols and left the
     // metadata to the build, which is where the migration has to find it.
@@ -518,7 +521,7 @@ async fn a_version_4_save_takes_its_symbols_from_the_build() {
         .collect();
     assert_eq!(tickers, ["ACME", "NBLA", "HLIO", "PXCO"]);
     assert_eq!(symbols["symbols"][0]["name"], "Acme Industrial");
-    assert!(after.market().reconcile().valid);
+    assert!(after.reconcile().await.valid);
 }
 
 #[tokio::test]
@@ -527,7 +530,7 @@ async fn a_save_this_build_cannot_use_is_refused() {
     let path = dir.path().join("state.json");
     let app = App::new(options(Some(path.clone())));
     busy_market(&app).await;
-    save::write(&app, &path).unwrap();
+    save::write(&app, &path).await.unwrap();
 
     let good = std::fs::read_to_string(&path).unwrap();
     let mut value: Value = serde_json::from_str(&good).unwrap();
@@ -598,13 +601,16 @@ async fn a_failed_write_leaves_the_previous_save_alone() {
     let path = dir.path().join("state.json");
     let app = App::new(options(Some(path.clone())));
     busy_market(&app).await;
-    save::write(&app, &path).unwrap();
+    save::write(&app, &path).await.unwrap();
     let first = std::fs::read_to_string(&path).unwrap();
 
     // A directory where the temporary file wants to be: the write fails and
     // the previous save is untouched.
     std::fs::create_dir(dir.path().join("state.json.tmp")).unwrap();
-    assert!(save::write(&app, &path).is_err(), "the write cannot finish");
+    assert!(
+        save::write(&app, &path).await.is_err(),
+        "the write cannot finish"
+    );
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
         first,
@@ -648,9 +654,13 @@ async fn version_two_keys_are_migrated_without_changing_player_credentials() {
     let path = dir.path().join("state.json");
     let app = App::new(options(None));
     let (id, key) = busy_market(&app).await;
-    let mut legacy = app.save();
+    let mut legacy = app.save().await;
     legacy.version = 2;
-    let user = app.market().traders[&fehu::TraderId(id)].user_id.0;
+    let user = app
+        .market
+        .call(move |m| m.traders[&fehu::TraderId(id)].user_id.0)
+        .await
+        .unwrap();
     legacy.market.api_keys = vec![(key.clone(), user)];
     std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
     let migrated = save::read(&path).unwrap();
@@ -670,7 +680,7 @@ async fn version_two_keys_are_migrated_without_changing_player_credentials() {
             .0,
         StatusCode::UNAUTHORIZED
     );
-    save::write(&restored, &path).unwrap();
+    save::write(&restored, &path).await.unwrap();
     assert!(!std::fs::read_to_string(&path).unwrap().contains(&key));
     let again = App::restore(options(None), save::read(&path).unwrap());
     assert_eq!(
@@ -687,7 +697,7 @@ async fn inconsistent_accounting_and_identity_saves_are_refused() {
     let path = dir.path().join("state.json");
     let app = App::new(options(None));
     busy_market(&app).await;
-    let good = serde_json::to_value(app.save()).unwrap();
+    let good = serde_json::to_value(app.save().await).unwrap();
     let mut cases = Vec::new();
     let mut bad = good.clone();
     bad["symbols"][0]["exchange"]["book"]["index"] = json!({});

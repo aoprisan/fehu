@@ -54,9 +54,9 @@ println!("{} prints, impact {:+.5}", report.trades.len(), report.impact);
 - **Determinism:** `xoshiro256++` seeded by you, `libm` for all transcendental
   math, no clocks or globals. Same seed + same events ⇒ identical ticks on
   every platform.
-- **Docs:** [`DESIGN.md`](DESIGN.md) has the model, parameter ranges,
-  tick-scaling formulas, the per-tick algorithm, and (§14) the trading layer
-  and why it sits on top of the price process rather than replacing it.
+- **Docs:** the module docs are the reference — `sim.rs` for the price
+  process, `exchange.rs` for why the book sits on top of it rather than
+  replacing it, and `webapp/src/market.rs` for how the server runs.
 - **Tooling:** `just build | test | lint | bench | wasm | dump | serve`.
 - **Sample app:** [`webapp/`](webapp) is an axum server around four seeded
   symbols — listed and delisted at runtime — with a TypeScript UI in
@@ -73,6 +73,18 @@ UI draws the OHLC bars, the book, the tape and the player's account live.
 ```text
 cargo run --release -p fehu-webapp     # then open http://localhost:3000
 ```
+
+The server has no locks. Each symbol — its simulator, its book, its bars,
+its tape — is a tokio task of its own, and so is the market that holds
+everybody's money and every order ever sent; anything that wants to read or
+change one sends it a job and, if it needs an answer, waits for the reply.
+Calls go one way: the market calls the symbols, the symbols call nobody, so
+there is no cycle to deadlock on. Every change to money or to a book is one
+job on the market, which calls the symbol for the book operation and books
+the money side before it runs anything else; the engine step is one such
+job that fans the advance out to every symbol at once and joins them. Reads
+of a quote, a book or the bars go straight to the symbol and wait for
+nothing else. `webapp/src/market.rs` has the whole account.
 
 The UI is TypeScript ([`webapp/ui/`](webapp/ui/README.md)) built with Vite.
 Its output is committed to `webapp/static/` and embedded into the binary, so
@@ -265,9 +277,8 @@ buffer cannot reach that far back the `hello` says `gap: true`, which is when
 — and only when — reloading the snapshots is the only recovery. The bundled
 UI does all of this.
 
-What is deliberately *not* built — fees, corporate actions, tick and lot
-sizes — and the decisions behind what is, are listed in
-[DESIGN.md §15](DESIGN.md#15-not-built-yet).
+What is still not built — stock splits, and a buyback that retires stock —
+is written up in [`HANDOFF.md`](HANDOFF.md).
 
 ## License
 

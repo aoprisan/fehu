@@ -57,7 +57,7 @@ pub struct Snapshot {
     pub pending_events: usize,
 }
 
-/// The price process. See `DESIGN.md` for the model.
+/// The price process.
 ///
 /// With the `serde` feature the whole state (config, RNG, latent variables,
 /// pending events, in-progress candles) round-trips losslessly; loading a state
@@ -468,7 +468,7 @@ impl Simulator {
         };
         let delta = model_secs / d.year_secs;
 
-        // GARCH coefficients for a step of this length (§8.5 of DESIGN.md):
+        // GARCH coefficients for a step of this length:
         // φ = e^{−κ_v Δ}, α = min(sqrt(r (1 − φ²) / 2), φ), β = φ − α,
         // ω = (1 − φ) σ² dt in per-tick units.
         let phi = exp(-LN_2 * model_secs / cfg.garch.variance_half_life.as_secs_f64());

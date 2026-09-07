@@ -9,6 +9,7 @@
 //! in `main.rs` wires it to a TCP listener.
 
 pub mod account;
+pub mod actor;
 pub mod api;
 pub mod auth;
 pub mod engine;
@@ -18,8 +19,10 @@ pub mod market;
 pub mod metrics;
 pub mod reconcile;
 pub mod save;
+pub mod symbol;
 pub mod symbols;
 pub mod trading;
 
+pub use actor::Actor;
 pub use api::router;
-pub use market::{App, Options};
+pub use market::{App, Market, Options};

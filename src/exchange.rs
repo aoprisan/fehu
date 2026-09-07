@@ -4,7 +4,7 @@
 //! Every tick the exchange
 //!
 //! 1. converts the traders' net flow since the last tick into a price-impact
-//!    event on the simulator (§14 of `DESIGN.md`),
+//!    event on the simulator (see "Price impact" below),
 //! 2. steps the simulator, which yields the new reference price and volume,
 //! 3. realises that volume as synthetic prints against the book (biased
 //!    toward the direction of the tick's return), which also fills traders'

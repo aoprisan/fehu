@@ -1,5 +1,5 @@
-//! See the README below and `DESIGN.md` in the repository for the model,
-//! equations and parameter ranges.
+//! See the README below, and the module docs of `sim` and `exchange` for the
+//! model, equations and parameter ranges.
 #![doc = include_str!("../README.md")]
 #![no_std]
 #![forbid(unsafe_code)]
