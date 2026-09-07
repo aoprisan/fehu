@@ -1048,7 +1048,40 @@ that move prices, are gated by `FEHU_ADMIN_KEY` when it is set — compared in
 constant time — and open when it is not, which is what a single-player game on
 localhost wants and a shared server does not.
 
-### 14.12 Tests
+### 14.12 Keeping the market across a restart
+
+Prices are reproducible from a seed; accounts are not. `webapp/src/save.rs`
+therefore writes the whole `Market` to one file (`FEHU_STATE_FILE`) every
+`FEHU_SAVE_SECS` and once more on a clean shutdown, and `main` reads it back
+at start-up in place of the warm-up.
+
+The file is versioned JSON (`STATE_VERSION`), with the crate's own `Exchange`
+and `Candles` representations nested inside the web app's users, accounts,
+traders, order log, event log and keyring — `serde_json`'s `float_roundtrip`
+is on, so a restored simulator continues bit-exactly. Symbols are the one
+thing not saved: their metadata comes from the build and only the ticker is
+written, so a file listing symbols this build does not have is refused, as is
+one from another format version. Refusing is the point — a market that comes
+back without its accounts is worse than one that does not come back.
+
+Two details make the restart seamless. `sim_now_ms` is the furthest the
+market reached — the clock, or a symbol's own clock if an engine step left it
+ahead — and start-up continues from there, so nothing is frozen waiting for
+wall time to catch up. And the response each order was accepted with is saved
+beside the order log, so a `client_order_id` retried across a restart still
+replays rather than being refused.
+
+Writes are atomic: the snapshot goes to `<file>.tmp` and is renamed over the
+target, so an interrupted write leaves the previous save intact. A failed
+periodic save is logged and retried at the next tick; it never takes the
+server down.
+
+Tickers are `&'static str` throughout the server (`save::Symbol`), which
+`serde` would otherwise treat as data borrowed from the input; the alias hides
+that from the derive, and the `symbol*` modules turn a ticker on disk back
+into one of the build's four, refusing anything else.
+
+### 14.13 Tests
 
 `tests/trading.rs`: book priority/partial fills/IOC/FOK/cancel/preview; the
 no-trader invariant against the bare simulator for 20 k ticks; ladder
@@ -1077,5 +1110,10 @@ resting order's record follows its partial fills to `filled`. Keys: every
 private endpoint answers 401 without one and 403 with somebody else's, having
 moved nothing; a forged key is refused; listings show the caller their own
 only; market data stays open; and `FEHU_ADMIN_KEY` locks the game-master
-endpoints while leaving the event log readable. `webapp/tests/contract.rs`
+endpoints while leaving the event log readable. `webapp/tests/save.rs`: a
+saved market comes back whole — the same portfolio, ledger, order log, book,
+bars, events and holders, with keys that still work, ids that carry on and a
+`client_order_id` that still replays — a new player can still sign up
+afterwards, a file from another version or with unknown symbols is refused,
+and a failed write leaves the previous save intact. `webapp/tests/contract.rs`
 pins the JSON key sets the TypeScript UI is typed against.
