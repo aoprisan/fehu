@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 use fehu::{Side, TraderId};
 use serde::Serialize;
 
+use fehu::ledger::Ledger;
+
 use crate::account::{Account, AccountId};
 use crate::save::{Save, SymbolSave};
 use crate::trading::Trader;
@@ -23,13 +25,38 @@ pub struct Reconciliation {
     pub traders_checked: usize,
     pub symbols_checked: usize,
     pub resting_orders_checked: usize,
+    /// Wallets in the currency ledger, the four the world always has
+    /// included.
+    pub wallets_checked: usize,
+    /// Currency created since genesis.
+    pub minted_cents: i64,
+    /// Currency destroyed.
+    pub burned_cents: i64,
+    /// `minted − burned`: what every wallet but issuance must add up to, and
+    /// does, or `issues` says so.
+    pub outstanding_cents: i64,
+    /// What the wallets actually hold, added up. Equal to `outstanding_cents`
+    /// in a healthy world — that equality is the whole audit.
+    pub circulating_cents: i128,
+    /// What unfunded liquidity has put into players' hands beyond its float.
+    /// Not an error: it is currency the world knows about and can point at.
+    /// It goes to zero when both sides of every fill are funded.
+    pub synthetic_debt_cents: i128,
     pub issues: Vec<String>,
 }
 
 /// Reconcile actual resting orders with cash/share reservations, ownership,
 /// outstanding supply and the retained cash ledgers without changing state.
+///
+/// Since the currency ledger arrived this also answers the question the whole
+/// economy rests on: **does the money add up?** Everything the wallets hold
+/// must equal what has been minted less what has been burned, and no route a
+/// player can reach may move either number. That check is a sum, and it is
+/// [`Ledger::check`] — run here over the same consistent snapshot as
+/// everything else.
 pub fn reconcile(save: &Save) -> Reconciliation {
     let symbols: &[SymbolSave] = &save.symbols;
+    let ledger: &Ledger = &save.market.ledger;
     let symbol = |ticker: &str| {
         symbols
             .iter()
@@ -96,10 +123,14 @@ pub fn reconcile(save: &Save) -> Reconciliation {
                 id.0
             ));
         }
-        for issue in account.issues().into_iter().chain(account.ledger_issues()) {
+        for issue in account
+            .issues(ledger)
+            .into_iter()
+            .chain(account.ledger_issues(ledger))
+        {
             issues.push(format!("account {}: {issue}", id.0));
         }
-        if i128::from(account.reserved_cents()) != cash.get(id).copied().unwrap_or(0) {
+        if i128::from(account.reserved_cents(ledger)) != cash.get(id).copied().unwrap_or(0) {
             issues.push(format!(
                 "account {} cash reservation differs from resting buys",
                 id.0
@@ -149,18 +180,39 @@ pub fn reconcile(save: &Save) -> Reconciliation {
             }
         }
     }
+    // The conservation sum, and the wallets behind it.
+    issues.extend(ledger.check().into_iter().map(|i| format!("ledger: {i}")));
+    // Every account's wallet is its own: two accounts sharing one would let
+    // a balance be spent twice over and still add up.
+    let mut wallets = BTreeMap::<fehu::ledger::WalletId, u64>::new();
+    for account in accounts.values() {
+        *wallets.entry(account.wallet).or_default() += 1;
+    }
+    for (wallet, count) in wallets {
+        if count > 1 {
+            issues.push(format!("wallet {} is shared by {count} accounts", wallet.0));
+        }
+    }
+    let supply = ledger.supply();
     Reconciliation {
         valid: issues.is_empty(),
         accounts_checked: accounts.len(),
         traders_checked: traders.len(),
         symbols_checked: symbols.len(),
         resting_orders_checked,
+        wallets_checked: ledger.len(),
+        minted_cents: supply.minted_cents,
+        burned_cents: supply.burned_cents,
+        outstanding_cents: supply.outstanding_cents(),
+        circulating_cents: ledger.circulating_cents(),
+        synthetic_debt_cents: ledger.synthetic_debt_cents(),
         issues,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::market::Market;
     use crate::{App, Options};
     use fehu::{Order, Owner, Side};
 
@@ -200,13 +252,23 @@ mod tests {
                 .unwrap();
         }
         app.market
-            .call(move |m| m.accounts.get_mut(&account).unwrap().reserve(20))
+            .call(move |m| {
+                let Market {
+                    accounts, ledger, ..
+                } = m;
+                accounts.get(&account).unwrap().reserve(ledger, 20);
+            })
             .await
             .unwrap();
         let report = app.reconcile().await;
         assert!(report.valid, "{report:?}");
         app.market
-            .call(move |m| m.accounts.get_mut(&account).unwrap().release(10))
+            .call(move |m| {
+                let Market {
+                    accounts, ledger, ..
+                } = m;
+                accounts.get(&account).unwrap().release(ledger, 10);
+            })
             .await
             .unwrap();
         assert!(!app.reconcile().await.valid);
@@ -233,7 +295,12 @@ mod tests {
             .await
             .unwrap();
         app.market
-            .call(move |m| m.accounts.get_mut(&account).unwrap().reserve(10))
+            .call(move |m| {
+                let Market {
+                    accounts, ledger, ..
+                } = m;
+                accounts.get(&account).unwrap().reserve(ledger, 10);
+            })
             .await
             .unwrap();
         assert!(

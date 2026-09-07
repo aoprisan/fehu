@@ -601,10 +601,10 @@ impl core::fmt::Display for LedgerError {
                 available_cents,
             } => write!(
                 f,
-                "wallet {} has {} available, needs {}",
+                "insufficient funds: wallet {} needs {}, {} available",
                 wallet.0,
-                cents(available_cents),
-                cents(needed_cents)
+                cents(needed_cents),
+                cents(available_cents)
             ),
             Self::BalanceCap {
                 wallet,

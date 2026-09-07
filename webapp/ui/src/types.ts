@@ -476,7 +476,8 @@ export type LedgerKind =
   | 'buy'
   | 'sell'
   | 'fee'
-  | 'dividend';
+  | 'dividend'
+  | 'delisting';
 
 /** `account::UserDto`. */
 export interface UserDto {
@@ -506,6 +507,8 @@ export interface AccountDto {
   user_id: number;
   name: string;
   status: AccountStatus;
+  /** The wallet in the currency ledger this account's money lives in. */
+  wallet_id: number;
   opened_at_ms: number;
   balance_cents: number;
   /** Held against resting buy orders. */
@@ -524,6 +527,8 @@ export interface LedgerEntry {
   id: number;
   ts_ms: number;
   kind: LedgerKind;
+  /** The balanced ledger transaction this entry is one side of. */
+  tx_id: number;
   /** Signed: positive credits the account, negative debits it. */
   amount_cents: number;
   /** The balance after this entry. */
@@ -783,5 +788,33 @@ export interface Reconciliation {
   traders_checked: number;
   symbols_checked: number;
   resting_orders_checked: number;
+  /** Wallets in the currency ledger, the four the world always has included. */
+  wallets_checked: number;
+  minted_cents: number;
+  burned_cents: number;
+  /** `minted − burned`. */
+  outstanding_cents: number;
+  /** What the wallets hold. Equal to `outstanding_cents` in a healthy world. */
+  circulating_cents: number;
+  /** What unfunded liquidity has put into players' hands beyond its float. */
+  synthetic_debt_cents: number;
   issues: string[];
+}
+
+/** `GET /api/supply`: how much currency exists, and where it sits. */
+export interface SupplyDto {
+  minted_cents: number;
+  burned_cents: number;
+  /** `minted − burned`. */
+  outstanding_cents: number;
+  /** What the wallets actually hold. */
+  circulating_cents: number;
+  /** The two agree: currency is conserved. */
+  balanced: boolean;
+  treasury_cents: number;
+  venue_cents: number;
+  issuer_cents: number;
+  player_cents: number;
+  synthetic_debt_cents: number;
+  wallets: number;
 }

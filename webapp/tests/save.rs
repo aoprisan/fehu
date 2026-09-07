@@ -489,27 +489,36 @@ async fn the_symbols_a_market_comes_back_with_are_the_ones_it_was_saved_with() {
 }
 
 #[tokio::test]
-async fn a_version_4_save_takes_its_symbols_from_the_build() {
-    let dir = TempDir::new("fehu-save-v4");
+async fn a_save_older_than_the_ledger_is_refused_rather_than_guessed_at() {
+    let dir = TempDir::new("fehu-save-old");
     let path = dir.path().join("state.json");
     let app = App::new(options(Some(path.clone())));
     busy_market(&app).await;
     save::write(&app, &path).await.unwrap();
+    let good = std::fs::read_to_string(&path).unwrap();
 
-    // Version 4 knew nothing of listings: it named its symbols and left the
-    // metadata to the build, which is where the migration has to find it.
-    let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    value["version"] = json!(4);
-    for symbol in value["symbols"].as_array_mut().unwrap() {
-        symbol.as_object_mut().unwrap().remove("info");
+    // Every version before 6 kept a balance on each account and no supply
+    // behind it. There is no way to carry one forward without inventing
+    // where its currency came from, so none of them is carried forward: a
+    // half-loaded world is worse than none, and a world with money nobody
+    // minted is worse than both.
+    for version in 1..save::STATE_VERSION {
+        let mut value: Value = serde_json::from_str(&good).unwrap();
+        value["version"] = json!(version);
+        std::fs::write(&path, value.to_string()).unwrap();
+        assert!(
+            matches!(
+                save::read(&path),
+                Err(save::SaveError::Version { found, expected })
+                    if found == version && expected == save::STATE_VERSION
+            ),
+            "version {version} is refused, naming the version it is"
+        );
     }
-    value["market"]
-        .as_object_mut()
-        .unwrap()
-        .remove("next_order_id");
-    std::fs::write(&path, value.to_string()).unwrap();
 
-    let restored = save::read(&path).expect("a version-4 file still loads");
+    // And the current one still loads.
+    std::fs::write(&path, &good).unwrap();
+    let restored = save::read(&path).expect("this build reads its own saves");
     assert_eq!(restored.version, save::STATE_VERSION);
     let after = App::restore(options(None), restored);
     let (_, symbols) = get(&after, None, "/api/symbols").await;
@@ -520,8 +529,6 @@ async fn a_version_4_save_takes_its_symbols_from_the_build() {
         .map(|s| s["symbol"].as_str().unwrap())
         .collect();
     assert_eq!(tickers, ["ACME", "NBLA", "HLIO", "PXCO"]);
-    assert_eq!(symbols["symbols"][0]["name"], "Acme Industrial");
-    assert!(after.reconcile().await.valid);
 }
 
 #[tokio::test]
@@ -565,18 +572,17 @@ async fn a_save_this_build_cannot_use_is_refused() {
         "a ticker listed twice is refused"
     );
 
-    // A version-4 file naming a symbol this build does not seed. Its
-    // metadata lived in the build, and this build does not have it.
+    // A file with no version at all is a file of unknown provenance, and is
+    // turned away like any other version this build does not read.
     let mut value: Value = serde_json::from_str(&good).unwrap();
-    value["version"] = json!(4);
-    for symbol in value["symbols"].as_array_mut().unwrap() {
-        symbol.as_object_mut().unwrap().remove("info");
-    }
-    value["symbols"][0]["symbol"] = json!("WHAT");
+    value.as_object_mut().unwrap().remove("version");
     std::fs::write(&path, value.to_string()).unwrap();
     assert!(
-        matches!(save::read(&path), Err(save::SaveError::Symbols { .. })),
-        "a version-4 file with no metadata for a symbol is refused"
+        matches!(
+            save::read(&path),
+            Err(save::SaveError::Version { found: 0, .. })
+        ),
+        "a file that does not say what it is cannot be read"
     );
 
     // Not JSON at all.
@@ -649,49 +655,6 @@ mod tempdir_lite {
 }
 
 #[tokio::test]
-async fn version_two_keys_are_migrated_without_changing_player_credentials() {
-    let dir = TempDir::new("fehu-save-key-migration");
-    let path = dir.path().join("state.json");
-    let app = App::new(options(None));
-    let (id, key) = busy_market(&app).await;
-    let mut legacy = app.save().await;
-    legacy.version = 2;
-    let user = app
-        .market
-        .call(move |m| m.traders[&fehu::TraderId(id)].user_id.0)
-        .await
-        .unwrap();
-    legacy.market.api_keys = vec![(key.clone(), user)];
-    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-    let migrated = save::read(&path).unwrap();
-    assert_eq!(migrated.version, save::STATE_VERSION);
-    assert!(!serde_json::to_string(&migrated).unwrap().contains(&key));
-    let digest = migrated.market.api_keys[0].0.clone();
-    let restored = App::restore(options(None), migrated);
-    assert_eq!(
-        get(&restored, Some(&key), &format!("/api/traders/{id}"))
-            .await
-            .0,
-        StatusCode::OK
-    );
-    assert_eq!(
-        get(&restored, Some(&digest), &format!("/api/traders/{id}"))
-            .await
-            .0,
-        StatusCode::UNAUTHORIZED
-    );
-    save::write(&restored, &path).await.unwrap();
-    assert!(!std::fs::read_to_string(&path).unwrap().contains(&key));
-    let again = App::restore(options(None), save::read(&path).unwrap());
-    assert_eq!(
-        get(&again, Some(&key), &format!("/api/traders/{id}"))
-            .await
-            .0,
-        StatusCode::OK
-    );
-}
-
-#[tokio::test]
 async fn inconsistent_accounting_and_identity_saves_are_refused() {
     let dir = TempDir::new("fehu-save-invariants");
     let path = dir.path().join("state.json");
@@ -712,12 +675,20 @@ async fn inconsistent_accounting_and_identity_saves_are_refused() {
     let mut bad = good.clone();
     bad["market"]["next_trader_id"] = json!(1);
     cases.push(("counter overlaps live trader", bad));
+    // The money is in the ledger now, so that is where it has to be
+    // tampered with: an account's history and its wallet must still agree,
+    // and so must the whole world's balances and its supply.
+    let wallet = good["market"]["accounts"][0]["wallet"].as_u64().unwrap();
+    let wallet = wallet.to_string();
     let mut bad = good.clone();
-    bad["market"]["accounts"][0]["balance_cents"] = json!(0);
+    bad["market"]["ledger"]["wallets"][&wallet]["balance_cents"] = json!(0);
     cases.push(("ledger does not match cash", bad));
     let mut bad = good.clone();
-    bad["market"]["accounts"][0]["reserved_cents"] = json!(0);
+    bad["market"]["ledger"]["wallets"][&wallet]["reserved_cents"] = json!(0);
     cases.push(("reservation does not match book", bad));
+    let mut bad = good.clone();
+    bad["market"]["ledger"]["supply"]["minted_cents"] = json!(1);
+    cases.push(("supply does not match the wallets", bad));
     let mut bad = good.clone();
     bad["market"]["traders"][0]["account_id"] = json!(999999);
     cases.push(("orphan trader", bad));
