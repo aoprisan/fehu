@@ -14,8 +14,7 @@ use crate::market::{App, StreamMessage};
 pub fn advance_to(app: &App, target: Timestamp) -> u64 {
     let (total, messages): (u64, Vec<StreamMessage>) = app.market().advance_to(target);
     for m in messages {
-        // `Err` only means nobody is listening right now.
-        let _ = app.tx.send(m);
+        app.publish(m);
     }
     total
 }

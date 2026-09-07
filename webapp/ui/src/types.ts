@@ -614,12 +614,23 @@ export interface OrderResponse {
 
 // --- the SSE stream (market::StreamMessage) --------------------------------
 
-/** First message on every connection. */
+/**
+ * First message on every connection. Its `seq` is where the connection joins
+ * rather than a number of its own: the next message is `seq + 1`.
+ */
 export interface HelloMessage {
   type: 'hello';
   sim_now_ms: number;
   time_scale: number;
   quotes: Quote[];
+  /** The earliest sequence `?since=` can still ask for. */
+  oldest_seq: number;
+  /**
+   * This connection asked to resume from further back than the server's
+   * replay buffer reaches: messages were missed for good, and the client
+   * should reload its snapshots rather than trust its state.
+   */
+  gap: boolean;
 }
 
 /** The last tick of one engine step for one symbol. */
@@ -665,13 +676,15 @@ export interface StopTriggeredMessage {
   refused: string | null;
 }
 
-export type StreamMessage =
-  | HelloMessage
-  | TickMessage
-  | EventMessage
-  | FillMessage
-  | StatusMessage
-  | StopTriggeredMessage;
+/**
+ * Every message carries the sequence number it was published under, so a
+ * client can tell a quiet market from a gap and resume with `?since=`.
+ */
+export type Sequenced<M> = M & { seq: number };
+
+export type StreamMessage = Sequenced<
+  HelloMessage | TickMessage | EventMessage | FillMessage | StatusMessage | StopTriggeredMessage
+>;
 
 /** The server's error body: `{"error": {"code", "message"}}`. */
 export interface ApiErrorBody {

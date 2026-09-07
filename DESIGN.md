@@ -1249,6 +1249,10 @@ when it is armed; it is private property that only its owner may see or
 withdraw; a halted symbol holds its triggers and fires them on the resume;
 one whose money has left in the meantime is refused when it fires rather than
 half-placed; and held stops come back from a save and still fire.
+The stream: a client that falls behind is disconnected rather than skipped,
+a reconnect with `?since=` replays exactly what it missed once each and in
+order, asking for more than the buffer holds is answered with `gap: true`
+alongside what is left, and a replay hands nobody somebody else's fills.
 `webapp/tests/contract.rs` pins the JSON key sets the TypeScript UI is typed
 against.
 
@@ -1282,18 +1286,41 @@ steps" or "trade me in lots of ten". `TradingParams` is where they would go,
 with the check in `OrderBook::validate` so the crate refuses them rather than
 the web app.
 
-### 15.2 What the stream does not promise
+### 15.2 What the stream promises (implemented)
 
-A client that falls behind now has its stream closed on the broadcast lag
-error. `EventSource` reconnects, receives a fresh `hello`, and the bundled UI
-reloads quotes, bars, events, book/tape and the portfolio on every connection.
-This makes gaps recoverable through snapshots, including a missed fill when
-no later tick would otherwise prompt a portfolio refresh.
+Every message the server publishes goes through `App::publish`, which gives
+it the next sequence number and keeps it in a bounded ring buffer
+(`FEHU_STREAM_REPLAY`, 1024 by default). The number rides in the envelope
+alongside the tag — `{"seq": 41, "type": "tick", …}` — so a client can tell a
+quiet market from a gap without guessing.
 
-Sequence numbers and bounded replay remain unfinished: there is no `?since=`
-or replay buffer, and reconnecting recovers current state rather than every
-intermediate message. A custom client must likewise reload snapshots after
-reconnecting; it cannot treat successive connections as continuous history.
+`GET /api/stream?since=N` resumes: everything published after `N` that the
+buffer still holds is replayed, oldest first, before the live feed. The
+subscription is taken while the sequence lock is held, so no message can slip
+between the replay and the live feed — each arrives exactly once, in order.
+The `hello` that opens a connection carries `seq` (where the connection
+joins, so the first live message is `seq + 1`), `oldest_seq` (how far back
+`?since=` can still reach) and `gap`, which is set when the client asked for
+more than the buffer had. `gap` is the honest answer to the one question the
+protocol could not previously answer: *did I miss anything?* Only then does a
+client have to reload its snapshots.
+
+Privacy survives the replay. A fill and a `stop_triggered` belong to their
+trader, and the buffer holds everybody's, so the same filter runs over the
+replay as over the live feed: a stream that has not proved who it speaks for
+gets neither, however far back it asks.
+
+Falling behind still ends the connection rather than silently skipping —
+`BroadcastStream`'s lag error terminates the stream — but now the client
+reconnects with the sequence it got to and picks up where it left off. The
+bundled UI does exactly that: it reopens at its own `seq` rather than letting
+`EventSource` rejoin the live feed, and reloads snapshots only when the
+`hello` reports a gap.
+
+What is still not promised: the buffer is memory, not a log, so a client that
+is away longer than `FEHU_STREAM_REPLAY` messages gets `gap: true` and has to
+resynchronise; nothing is persisted, so a server restart starts the sequence
+at 1 again and every `?since=` is a gap.
 
 ### 15.3 Money the market does not move
 

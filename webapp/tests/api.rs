@@ -2791,17 +2791,163 @@ async fn a_lagging_stream_disconnects_instead_of_silently_skipping_messages() {
     let hello = body.frame().await.unwrap().unwrap().into_data().unwrap();
     assert!(std::str::from_utf8(&hello).unwrap().contains("hello"));
     // Do not poll the body while overflowing its bounded receiver.
+    let status = app
+        .market()
+        .status(0, app.clock.now())
+        .expect("ACME exists");
     for _ in 0..8192 {
-        app.tx
-            .send(fehu_webapp::market::StreamMessage::Hello {
-                sim_now_ms: NOW_MS,
-                time_scale: 1.0,
-                quotes: Vec::new(),
-            })
-            .unwrap();
+        app.publish(fehu_webapp::market::StreamMessage::Status(status));
     }
     let next = tokio::time::timeout(Duration::from_secs(1), body.frame())
         .await
         .expect("a gap must terminate promptly");
     assert!(next.is_none(), "later messages must not hide the gap");
+}
+
+/// The `hello` a stream opens with, and the messages after it, as JSON.
+async fn stream_frames(app: &Arc<App>, uri: &str, want: usize) -> Vec<Value> {
+    let response = router(Arc::clone(app))
+        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    let mut body = response.into_body();
+    let mut out = Vec::new();
+    while out.len() < want {
+        let Ok(Some(Ok(frame))) = tokio::time::timeout(Duration::from_secs(1), body.frame()).await
+        else {
+            break;
+        };
+        let Some(bytes) = frame.data_ref() else {
+            continue;
+        };
+        for line in std::str::from_utf8(bytes).unwrap().lines() {
+            if let Some(json) = line.strip_prefix("data: ") {
+                out.push(serde_json::from_str(json).unwrap());
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_reconnecting_stream_replays_what_it_missed() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        price_limit_pct: 0.0,
+        ..Options::default()
+    });
+    // Nothing has been published yet: the stream joins at zero and says how
+    // far back it could be asked to go.
+    let opened = stream_frames(&app, "/api/stream", 1).await;
+    assert_eq!(opened[0]["type"], "hello");
+    assert_eq!(opened[0]["seq"], 0, "no messages yet: {}", opened[0]);
+    assert_eq!(opened[0]["gap"], false);
+
+    engine::advance_to(&app, Timestamp(NOW_MS + 5_000));
+    let live = stream_frames(&app, "/api/stream", 1).await;
+    let joined = live[0]["seq"].as_u64().unwrap();
+    assert!(joined > 0, "the engine step published something: {live:?}");
+
+    // A client that was watching from the start asks for everything since,
+    // and gets it, in order, before the live feed.
+    let replayed = stream_frames(&app, "/api/stream?since=0", joined as usize + 1).await;
+    assert_eq!(replayed[0]["type"], "hello");
+    assert_eq!(replayed[0]["gap"], false, "the buffer still reaches back");
+    assert_eq!(replayed[0]["seq"], joined, "joining where the live one did");
+    let numbers: Vec<u64> = replayed[1..]
+        .iter()
+        .map(|m| m["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        numbers,
+        (1..=joined).collect::<Vec<_>>(),
+        "every message since, once each, in order"
+    );
+
+    // Asking again from where that left off replays nothing.
+    let caught_up = stream_frames(&app, &format!("/api/stream?since={joined}"), 2).await;
+    assert_eq!(caught_up.len(), 1, "nothing to replay: {caught_up:?}");
+    assert_eq!(caught_up[0]["type"], "hello");
+}
+
+#[tokio::test]
+async fn a_stream_says_so_when_the_replay_buffer_cannot_reach_back() {
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        // Two messages of history: the third pushes the first out.
+        stream_replay: 2,
+        ..Options::default()
+    });
+    let status = app
+        .market()
+        .status(0, app.clock.now())
+        .expect("ACME exists");
+    for _ in 0..5 {
+        app.publish(fehu_webapp::market::StreamMessage::Status(status));
+    }
+    let frames = stream_frames(&app, "/api/stream?since=1", 4).await;
+    let hello = &frames[0];
+    assert_eq!(hello["type"], "hello");
+    assert_eq!(hello["seq"], 5);
+    assert_eq!(hello["oldest_seq"], 4, "only the last two are kept");
+    assert_eq!(
+        hello["gap"], true,
+        "message 2 is gone for good and the client must be told: {hello}"
+    );
+    // What is left is still replayed, rather than being withheld.
+    let numbers: Vec<u64> = frames[1..]
+        .iter()
+        .map(|m| m["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(numbers, vec![4, 5]);
+
+    // Within reach, there is no gap.
+    let frames = stream_frames(&app, "/api/stream?since=4", 2).await;
+    assert_eq!(frames[0]["gap"], false, "{}", frames[0]);
+    assert_eq!(frames[1]["seq"], 5);
+}
+
+#[tokio::test]
+async fn a_replay_keeps_other_traders_fills_to_themselves() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        ..Options::default()
+    });
+    let alice = sign_up(&app, "alice").await;
+    let bruno = sign_up(&app, "bruno").await;
+    let (code, body) = post(
+        &alice,
+        "/api/symbols/ACME/orders",
+        json!({ "trader_id": alice.trader, "side": "buy", "qty": 10, "type": "market" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+
+    let mine = stream_frames(
+        &app,
+        &format!("/api/stream?since=0&api_key={}", alice.key),
+        8,
+    )
+    .await;
+    assert!(
+        mine.iter().any(|m| m["type"] == "fill"),
+        "a trader replays their own fills: {mine:?}"
+    );
+    let theirs = stream_frames(
+        &app,
+        &format!("/api/stream?since=0&api_key={}", bruno.key),
+        8,
+    )
+    .await;
+    assert!(
+        !theirs.iter().any(|m| m["type"] == "fill"),
+        "a replay must not hand over somebody else's fills: {theirs:?}"
+    );
+    let anonymous = stream_frames(&app, "/api/stream?since=0", 8).await;
+    assert!(!anonymous.iter().any(|m| m["type"] == "fill"));
 }

@@ -29,8 +29,8 @@ use crate::events::{
     PushEventRequest, Scope, SimEvent,
 };
 use crate::market::{
-    App, Closed, Market, PlaceError, Quote, SnapshotDto, StreamMessage, SymbolInfo, SymbolState,
-    SymbolStatus, wall_now_ms,
+    App, Closed, Market, PlaceError, Quote, Sequenced, SnapshotDto, StreamMessage, Subscription,
+    SymbolInfo, SymbolState, SymbolStatus, wall_now_ms,
 };
 use crate::trading::{
     AmendRequest, AmendResponse, BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID,
@@ -650,7 +650,7 @@ async fn halt_symbol(
         .halt(idx, now)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
     tracing::info!(symbol = status.symbol, "trading halted");
-    let _ = app.tx.send(StreamMessage::Status(status));
+    app.publish(StreamMessage::Status(status));
     Ok(Json(status))
 }
 
@@ -669,9 +669,9 @@ async fn resume_symbol(
         .resume(idx, now)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
     tracing::info!(symbol = status.symbol, "trading resumed");
-    let _ = app.tx.send(StreamMessage::Status(status));
+    app.publish(StreamMessage::Status(status));
     for fill in fills {
-        let _ = app.tx.send(StreamMessage::Fill {
+        app.publish(StreamMessage::Fill {
             trader_id: fill.trader_id,
             fill,
         });
@@ -832,7 +832,7 @@ async fn push_sim_event(
         })
     };
     tracing::info!(id = record.id, symbol = %symbol, kind = %record.kind, "event accepted");
-    let _ = app.tx.send(StreamMessage::Event(record.clone()));
+    app.publish(StreamMessage::Event(record.clone()));
     Ok((StatusCode::ACCEPTED, Json(record)))
 }
 
@@ -911,7 +911,7 @@ async fn push_game_event(
         })
     };
     tracing::info!(id = record.id, symbols = ?record.symbols, kind = %record.kind, magnitude, "game event accepted");
-    let _ = app.tx.send(StreamMessage::Event(record.clone()));
+    app.publish(StreamMessage::Event(record.clone()));
     Ok((StatusCode::ACCEPTED, Json(record)))
 }
 
@@ -1280,7 +1280,7 @@ async fn submit_order(
         "order"
     );
     for fill in fills {
-        let _ = app.tx.send(StreamMessage::Fill {
+        app.publish(StreamMessage::Fill {
             trader_id: fill.trader_id,
             fill,
         });
@@ -1647,7 +1647,7 @@ async fn amend_order(
         "order amended"
     );
     for fill in fills {
-        let _ = app.tx.send(StreamMessage::Fill {
+        app.publish(StreamMessage::Fill {
             trader_id: fill.trader_id,
             fill,
         });
@@ -2069,19 +2069,30 @@ async fn catalog() -> Json<Vec<CatalogEntry>> {
 }
 
 /// Server-sent events: a `hello` with the current quotes, then every tick
-/// and every accepted event. Each message is JSON with a `type` field.
+/// and every accepted event. Each message is JSON with a `type` field and the
+/// `seq` it was published under.
 #[derive(Deserialize)]
 struct StreamQuery {
     /// `EventSource` cannot set headers, so the stream takes the key in the
     /// query string. Without one the stream carries market data only.
     api_key: Option<String>,
+    /// Resume after this sequence number: everything published since, as far
+    /// back as the replay buffer still reaches, arrives before the live feed.
+    /// `hello` reports `gap: true` when the buffer no longer goes that far.
+    since: Option<u64>,
 }
 
 async fn stream(
     State(app): State<AppState>,
     Query(q): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = app.tx.subscribe();
+    let Subscription {
+        rx,
+        seq,
+        oldest_seq,
+        replay,
+        gap,
+    } = app.subscribe(q.since);
     let (hello, viewer) = {
         let market = app.market();
         (
@@ -2089,31 +2100,46 @@ async fn stream(
                 sim_now_ms: app.clock.now().0,
                 time_scale: app.clock.scale,
                 quotes: market.symbols.iter().map(SymbolState::quote).collect(),
+                oldest_seq,
+                gap,
             },
             q.api_key.as_deref().and_then(|k| market.keys.user_of(k)),
         )
     };
     // Ticks and events are public; a fill belongs to the trader that made it,
-    // so it goes only to a stream that proved it speaks for that trader.
+    // so it goes only to a stream that proved it speaks for that trader. The
+    // replay buffer holds everybody's, so the same rule applies to it.
     let owner = Arc::clone(&app);
-    // A gap ends this connection: EventSource reconnects and clients reload
-    // snapshots. Never present later messages as an uninterrupted stream.
-    let live = BroadcastStream::new(rx)
-        .take_while(Result::is_ok)
-        .filter_map(Result::ok)
-        .filter(move |m| match m {
-            StreamMessage::Fill { trader_id, .. }
-            | StreamMessage::StopTriggered { trader_id, .. } => viewer.is_some_and(|user| {
+    let visible = move |m: &StreamMessage| match m {
+        StreamMessage::Fill { trader_id, .. } | StreamMessage::StopTriggered { trader_id, .. } => {
+            viewer.is_some_and(|user| {
                 owner
                     .market()
                     .traders
                     .get(&TraderId(*trader_id))
                     .is_some_and(|t| t.user_id == user)
-            }),
-            _ => true,
-        });
-    let all = tokio_stream::once(hello)
-        .chain(live)
-        .filter_map(|m| Event::default().json_data(&m).ok().map(Ok));
+            })
+        }
+        _ => true,
+    };
+    let mine = visible.clone();
+    // A gap ends this connection: the client reconnects with `?since=` and
+    // picks up where it left off. Never present later messages as an
+    // uninterrupted stream.
+    let live = BroadcastStream::new(rx)
+        .take_while(Result::is_ok)
+        .filter_map(Result::ok)
+        .filter(move |m| mine(&m.message));
+    let missed: Vec<Sequenced> = replay.into_iter().filter(|m| visible(&m.message)).collect();
+    // The `hello` carries the sequence the connection joins at, so the first
+    // live message a client sees is `seq + 1` — or, after a replay, the
+    // number the replay left off at.
+    let all = tokio_stream::once(Sequenced {
+        seq,
+        message: hello,
+    })
+    .chain(tokio_stream::iter(missed))
+    .chain(live)
+    .filter_map(|m| Event::default().json_data(&m).ok().map(Ok));
     Sse::new(all).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }

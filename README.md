@@ -232,12 +232,18 @@ since. A halted or closed symbol holds its triggers and fires them when
 trading resumes, and the owner is told either way with a `stop_triggered`
 message carrying the order it became or the reason it could not be placed.
 
-A stream client that falls behind is disconnected so it can reconnect and
-reload snapshots. The bundled UI refreshes market data and the portfolio on
-every connection. The stream does not yet replay missed messages.
+Every stream message is numbered. `GET /api/stream` opens with a `hello`
+saying which sequence the connection joins at and how far back the server can
+still reach; `GET /api/stream?since=N` replays everything published after `N`
+that its buffer (`FEHU_STREAM_REPLAY`) still holds, before the live feed. A
+client that falls behind is disconnected rather than handed later messages as
+if nothing were missing, and reconnects with the sequence it got to. When the
+buffer cannot reach that far back the `hello` says `gap: true`, which is when
+— and only when — reloading the snapshots is the only recovery. The bundled
+UI does all of this.
 
-What is deliberately *not* built — fees, corporate actions, sequence numbers
-on the stream — and the decisions behind what is, are listed in
+What is deliberately *not* built — fees, corporate actions, tick and lot
+sizes — and the decisions behind what is, are listed in
 [DESIGN.md §15](DESIGN.md#15-not-built-yet).
 
 ## License

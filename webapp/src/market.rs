@@ -1526,11 +1526,18 @@ impl Market {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamMessage {
-    /// First message on every connection.
+    /// First message on every connection. Its `seq` is where the connection
+    /// joins rather than a message number of its own.
     Hello {
         sim_now_ms: i64,
         time_scale: f64,
         quotes: Vec<Quote>,
+        /// The earliest sequence `?since=` can still ask for.
+        oldest_seq: u64,
+        /// Set when this connection asked to resume from further back than
+        /// the replay buffer reaches: messages were missed for good, and the
+        /// client should reload its snapshots rather than trust its state.
+        gap: bool,
     },
     /// The last tick of one engine step for one symbol.
     Tick {
@@ -1565,6 +1572,58 @@ pub enum StreamMessage {
         order: Option<OrderResponse>,
         refused: Option<String>,
     },
+}
+
+/// A stream message with its place in the stream.
+///
+/// Every message the server publishes takes the next number, so a client can
+/// tell a gap from a quiet market and ask for what it missed with `?since=`.
+/// On the `hello` that opens a connection the number means something slightly
+/// different: it is where the connection joins, so the first live message is
+/// `seq + 1`.
+#[derive(Clone, Debug, Serialize)]
+pub struct Sequenced {
+    pub seq: u64,
+    #[serde(flatten)]
+    pub message: StreamMessage,
+}
+
+/// The sequence counter and the bounded buffer behind `?since=`.
+#[derive(Debug)]
+struct StreamLog {
+    /// The number the next published message will take.
+    next_seq: u64,
+    /// The most recently published messages, oldest first.
+    recent: VecDeque<Sequenced>,
+    cap: usize,
+}
+
+impl StreamLog {
+    fn new(cap: usize) -> Self {
+        Self {
+            // The first message published is 1, so 0 is "nothing yet" and a
+            // client may ask for everything with `?since=0`.
+            next_seq: 1,
+            recent: VecDeque::new(),
+            cap,
+        }
+    }
+}
+
+/// A new stream connection: where it joins, what it missed, and the live
+/// feed from there.
+pub struct Subscription {
+    pub rx: broadcast::Receiver<Sequenced>,
+    /// The last sequence published before this connection opened.
+    pub seq: u64,
+    /// The earliest sequence the replay buffer still holds. Equal to
+    /// `seq + 1` when nothing is buffered.
+    pub oldest_seq: u64,
+    /// What `?since=` asked for and the buffer still had, oldest first.
+    pub replay: Vec<Sequenced>,
+    /// Set when `?since=` reached further back than the buffer goes: some
+    /// messages are gone for good and the client must reload its snapshots.
+    pub gap: bool,
 }
 
 /// Start-up options, all overridable through `FEHU_*` environment variables.
@@ -1617,6 +1676,9 @@ pub struct Options {
     /// How long an automatic halt lasts, in simulated seconds.
     /// `FEHU_HALT_SECS`.
     pub halt_secs: u64,
+    /// Stream messages kept for `?since=` replay. `FEHU_STREAM_REPLAY`; `0`
+    /// keeps none, and every reconnect is then a gap.
+    pub stream_replay: usize,
 }
 
 impl Default for Options {
@@ -1639,6 +1701,7 @@ impl Default for Options {
             market_hours: None,
             price_limit_pct: 0.10,
             halt_secs: 300,
+            stream_replay: 1_024,
         }
     }
 }
@@ -1675,6 +1738,7 @@ impl Options {
                 .and_then(parse_market_hours),
             price_limit_pct: env_parse("FEHU_PRICE_LIMIT_PCT", d.price_limit_pct).max(0.0),
             halt_secs: env_parse("FEHU_HALT_SECS", d.halt_secs).max(1),
+            stream_replay: env_parse("FEHU_STREAM_REPLAY", d.stream_replay),
         }
     }
 }
@@ -1734,7 +1798,12 @@ pub struct App {
     pub started_at: SystemTime,
     pub market: Mutex<Market>,
     /// Fan-out for the SSE stream. Sending with no subscribers is fine.
-    pub tx: broadcast::Sender<StreamMessage>,
+    /// Publish through [`App::publish`] rather than sending here directly:
+    /// the sequence number and the replay buffer are assigned there.
+    pub tx: broadcast::Sender<Sequenced>,
+    /// The sequence counter and replay buffer. Held behind its own lock, and
+    /// never taken while the market lock is held.
+    stream: Mutex<StreamLog>,
 }
 
 impl App {
@@ -1757,6 +1826,7 @@ impl App {
             })
             .collect();
         let (tx, _) = broadcast::channel(4096);
+        let stream = Mutex::new(StreamLog::new(options.stream_replay));
         Arc::new(Self {
             clock: SimClock {
                 wall_epoch: Instant::now(),
@@ -1764,6 +1834,7 @@ impl App {
                 scale: options.time_scale,
             },
             started_at: SystemTime::now(),
+            stream,
             market: Mutex::new(Market {
                 symbols,
                 events: VecDeque::new(),
@@ -1833,6 +1904,7 @@ impl App {
             .collect();
         let market = Market::from_save(symbols, save.market, &options);
         let (tx, _) = broadcast::channel(4096);
+        let stream = Mutex::new(StreamLog::new(options.stream_replay));
         Arc::new(Self {
             clock: SimClock {
                 wall_epoch: Instant::now(),
@@ -1842,8 +1914,67 @@ impl App {
             started_at: SystemTime::now(),
             market: Mutex::new(market),
             tx,
+            stream,
             options,
         })
+    }
+
+    /// Publish a message to every open stream, numbering it and keeping it
+    /// in the replay buffer. Returns the number it was given.
+    ///
+    /// Nothing reaches a client any other way: the number is what lets a
+    /// reconnecting one tell "nothing happened" from "I missed something".
+    pub fn publish(&self, message: StreamMessage) -> u64 {
+        let sequenced = {
+            let mut log = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+            let seq = log.next_seq;
+            log.next_seq += 1;
+            let sequenced = Sequenced { seq, message };
+            if log.cap > 0 {
+                while log.recent.len() >= log.cap {
+                    log.recent.pop_front();
+                }
+                log.recent.push_back(sequenced.clone());
+            }
+            sequenced
+        };
+        let seq = sequenced.seq;
+        // `Err` only means nobody is listening right now.
+        let _ = self.tx.send(sequenced);
+        seq
+    }
+
+    /// Open a stream connection, optionally asking for everything after
+    /// `since`.
+    ///
+    /// The subscription is taken while the sequence lock is held, so nothing
+    /// can slip between the replay and the live feed: every message is either
+    /// in `replay` or arrives on `rx`, exactly once, in order.
+    pub fn subscribe(&self, since: Option<u64>) -> Subscription {
+        let log = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+        let rx = self.tx.subscribe();
+        let seq = log.next_seq.saturating_sub(1);
+        let oldest_seq = log.recent.front().map_or(log.next_seq, |m| m.seq);
+        let (replay, gap) = match since {
+            None => (Vec::new(), false),
+            Some(since) => (
+                log.recent
+                    .iter()
+                    .filter(|m| m.seq > since)
+                    .cloned()
+                    .collect(),
+                // The buffer starts after the first message they wanted, so
+                // whatever fell out of it is gone for good.
+                since + 1 < oldest_seq,
+            ),
+        };
+        Subscription {
+            rx,
+            seq,
+            oldest_seq,
+            replay,
+            gap,
+        }
     }
 
     /// Lock the market. A poisoned lock is recovered: the state is plain data

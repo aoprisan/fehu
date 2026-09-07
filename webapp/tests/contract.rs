@@ -700,19 +700,34 @@ async fn account_shapes() {
 async fn stream_message_shapes() {
     let app = test_app();
 
-    // `hello` is built by the SSE handler from the same pieces.
-    let hello = serde_json::to_value(StreamMessage::Hello {
-        sim_now_ms: NOW_MS,
-        time_scale: 1.0,
-        quotes: Vec::new(),
+    // `hello` is built by the SSE handler from the same pieces, and every
+    // message goes out inside the envelope that numbers it.
+    let hello = serde_json::to_value(fehu_webapp::market::Sequenced {
+        seq: 7,
+        message: StreamMessage::Hello {
+            sim_now_ms: NOW_MS,
+            time_scale: 1.0,
+            quotes: Vec::new(),
+            oldest_seq: 1,
+            gap: false,
+        },
     })
     .unwrap();
     assert_keys(
         "HelloMessage",
         &hello,
-        &["type", "sim_now_ms", "time_scale", "quotes"],
+        &[
+            "seq",
+            "type",
+            "sim_now_ms",
+            "time_scale",
+            "quotes",
+            "oldest_seq",
+            "gap",
+        ],
     );
     assert_eq!(hello["type"], "hello");
+    assert_eq!(hello["seq"], 7, "the envelope numbers every message");
 
     // Drive one engine step and capture what the stream would carry.
     let mut rx = app.tx.subscribe();
@@ -720,13 +735,18 @@ async fn stream_message_shapes() {
     engine::advance_to(&app, target);
 
     let mut saw_tick = false;
+    let mut last_seq = 0;
     while let Ok(message) = rx.try_recv() {
         let value = serde_json::to_value(&message).unwrap();
-        if value["type"] == "tick" {
+        let seq = value["seq"].as_u64().expect("every message is numbered");
+        assert!(seq > last_seq, "sequence numbers only go up: {value}");
+        last_seq = seq;
+        if value["type"] == "tick" && !saw_tick {
             assert_keys(
                 "TickMessage",
                 &value,
                 &[
+                    "seq",
                     "type",
                     "symbol",
                     "ts_ms",
@@ -741,7 +761,6 @@ async fn stream_message_shapes() {
             );
             assert_keys("BookDto", &value["book"], &["bids", "asks"]);
             saw_tick = true;
-            break;
         }
     }
     assert!(saw_tick, "the engine step published no tick to check");
