@@ -828,6 +828,8 @@ export interface SupplyDto {
   venue_cents: number;
   issuer_cents: number;
   player_cents: number;
+  /** Sitting in the tills of the traders the world runs itself. */
+  npc_cents: number;
   synthetic_debt_cents: number;
   wallets: number;
 }
@@ -886,4 +888,48 @@ export interface ConsumeReceipt {
   qty: number;
   position_qty: number;
   units_outstanding: number;
+}
+
+// --- webapp/src/npc.rs -----------------------------------------------------
+
+/**
+ * `npc::Policy` — how an NPC quotes: a ladder of its own, in basis points of
+ * the reference price.
+ */
+export interface NpcPolicy {
+  /** Half the spread. The best bid sits this far below the reference. */
+  half_spread_bps: number;
+  levels: number;
+  level_step_bps: number;
+  /** Units quoted at each level. */
+  size: number;
+  /** How far the reference must move before the quotes are redrawn. */
+  requote_bps: number;
+}
+
+/**
+ * `npc::NpcDto` — one of the traders the world runs itself, and what it has
+ * left. Its bid disappears when its wallet is empty and its ask when its
+ * inventory is.
+ */
+export interface NpcDto {
+  trader_id: number;
+  user_id: number;
+  account_id: number;
+  symbol: string;
+  name: string;
+  policy: NpcPolicy;
+  /** Quoting is on. Off, it keeps its money and stock and stops offering them. */
+  active: boolean;
+  /** Currency it can still bid with. */
+  cash_cents: number;
+  /** Units it holds. */
+  inventory: number;
+  /** Units already promised to resting sells. */
+  reserved: number;
+}
+
+/** `GET /api/npcs` (`npc::NpcsResponse`). */
+export interface NpcsResponse {
+  npcs: NpcDto[];
 }

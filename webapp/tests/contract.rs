@@ -1043,6 +1043,7 @@ async fn supply_contract() {
             "venue_cents",
             "issuer_cents",
             "player_cents",
+            "npc_cents",
             "synthetic_debt_cents",
             "wallets",
         ],
@@ -1129,4 +1130,53 @@ async fn goods_contract() {
             "units_outstanding",
         ],
     );
+}
+
+#[tokio::test]
+async fn npc_contract() {
+    let app = test_app();
+    let npc = post(
+        &app,
+        "/api/npcs",
+        json!({ "symbol": "ACME", "name": "Acme Merchant", "cash_cents": 1_000_000, "inventory": 500 }),
+    )
+    .await;
+    let npc_keys = [
+        "trader_id",
+        "user_id",
+        "account_id",
+        "symbol",
+        "name",
+        "policy",
+        "active",
+        "cash_cents",
+        "inventory",
+        "reserved",
+    ];
+    assert_keys("NpcDto", &npc, &npc_keys);
+    assert_keys(
+        "Policy",
+        &npc["policy"],
+        &[
+            "half_spread_bps",
+            "levels",
+            "level_step_bps",
+            "size",
+            "requote_bps",
+        ],
+    );
+
+    let npcs = get(&app, "/api/npcs").await;
+    assert_keys("NpcsResponse", &npcs, &["npcs"]);
+    assert_keys("NpcDto", first("NpcsResponse", &npcs, "npcs"), &npc_keys);
+
+    let off = post_as(
+        &app,
+        None,
+        &format!("/api/npcs/{}/active", npc["trader_id"]),
+        json!({ "active": false }),
+    )
+    .await;
+    assert_keys("NpcDto", &off, &npc_keys);
+    assert_eq!(off["active"], false);
 }

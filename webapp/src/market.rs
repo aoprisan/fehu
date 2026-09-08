@@ -72,11 +72,14 @@ use crate::account::{
 };
 use crate::actor::{Actor, Gone};
 use crate::auth::Keyring;
-use crate::catalog::{Catalog, CatalogItem, ConsumeReceipt, GoodsError, PurchaseReceipt};
+use crate::catalog::{
+    Catalog, CatalogError, CatalogItem, ConsumeReceipt, GoodsError, PurchaseReceipt,
+};
 use crate::events::EventRecord;
 use crate::journal::JournalError;
 use crate::limit::{Decision, Limiter, Rate};
 use crate::metrics::Metrics;
+use crate::npc::{MAX_NPCS, Npc, NpcDto, Policy};
 use crate::save::{MarketSave, STATE_VERSION, Save};
 use crate::trading::{
     BookDto, Fees, FillRecord, HoldingDto, Liquidity, MAX_STOPS_PER_TRADER, OpenOrderDto,
@@ -381,6 +384,14 @@ pub struct PlaceRequest {
     pub day: bool,
     pub expires_at_ms: Option<i64>,
     pub display_qty: Option<u64>,
+    /// Write the order into the order log, so a client can look it up later.
+    ///
+    /// True for everything a client sent. False for an NPC's quotes, which
+    /// nobody will ever ask after by id and which are redrawn often enough
+    /// that logging them would evict every player's record within a minute.
+    /// The book, the reservations and the audit do not read the log, so
+    /// leaving them out of it changes nothing they check.
+    pub logged: bool,
 }
 
 /// What placing an order came to.
@@ -549,6 +560,8 @@ pub struct SupplyDto {
     pub issuer_cents: i64,
     /// Held by players, across every account.
     pub player_cents: i64,
+    /// Sitting in the tills of the traders the world runs itself.
+    pub npc_cents: i64,
     /// What unfunded liquidity has put into players' hands beyond its float.
     pub synthetic_debt_cents: i64,
     /// Wallets open, the four the world always has included.
@@ -577,6 +590,7 @@ impl SupplyDto {
             venue_cents: by_kind(WalletKind::Venue),
             issuer_cents: by_kind(WalletKind::Issuer),
             player_cents: by_kind(WalletKind::Player),
+            npc_cents: by_kind(WalletKind::Npc),
             synthetic_debt_cents: i64::try_from(m.ledger.synthetic_debt_cents())
                 .unwrap_or(i64::MAX),
             wallets: m.ledger.len(),
@@ -611,6 +625,8 @@ pub struct Market {
     pub issuers: BTreeMap<&'static str, WalletId>,
     /// What the world will make, and for how much. See [`crate::catalog`].
     pub catalog: Catalog,
+    /// The traders the world runs itself, by trader id. See [`crate::npc`].
+    pub npcs: BTreeMap<TraderId, Npc>,
     /// Settlements the ledger refused after the book had already traded.
     /// Always zero in a healthy market; see [`Market::book`].
     pub settlement_failures: u64,
@@ -702,6 +718,25 @@ impl Market {
         now_ms: i64,
         key_digest: String,
     ) -> UserId {
+        let id = self.insert_user(name, email, now_ms);
+        self.directory.keys.install(id, key_digest);
+        self.publish_directory();
+        id
+    }
+
+    /// Register a user nobody can sign in as.
+    ///
+    /// An NPC needs an identity — a trader belongs to a user, and every
+    /// audit walks that link — but it has no player behind it, so it is
+    /// given no key at all. There is then no credential for it to leak, and
+    /// no request can ever arrive claiming to be it.
+    pub fn create_house_user(&mut self, name: Option<String>, now_ms: i64) -> UserId {
+        let id = self.insert_user(name, None, now_ms);
+        self.publish_directory();
+        id
+    }
+
+    fn insert_user(&mut self, name: Option<String>, email: Option<String>, now_ms: i64) -> UserId {
         let id = UserId(self.next_user_id);
         self.next_user_id += 1;
         let user = User {
@@ -712,8 +747,6 @@ impl Market {
             accounts: Vec::new(),
         };
         self.users.insert(id, user);
-        self.directory.keys.install(id, key_digest);
-        self.publish_directory();
         id
     }
 
@@ -731,6 +764,22 @@ impl Market {
         name: Option<String>,
         cash_cents: i64,
         now_ms: i64,
+    ) -> Result<AccountId, MoneyError> {
+        self.open_account_as(user_id, name, cash_cents, now_ms, WalletKind::Player)
+    }
+
+    /// [`Market::open_account`], saying what kind of wallet holds the money.
+    ///
+    /// The kind is not a permission — every wallet but issuance obeys the
+    /// same rules — it is what lets an audit say *where* the world's
+    /// currency is sitting, and a shop till is not a player's pocket.
+    fn open_account_as(
+        &mut self,
+        user_id: UserId,
+        name: Option<String>,
+        cash_cents: i64,
+        now_ms: i64,
+        kind: WalletKind,
     ) -> Result<AccountId, MoneyError> {
         debug_assert!(self.users.contains_key(&user_id), "unknown user");
         if cash_cents < 0 {
@@ -751,7 +800,7 @@ impl Market {
             }
         }
         let id = AccountId(self.next_account_id);
-        let wallet = self.ledger.open(WalletKind::Player);
+        let wallet = self.ledger.open(kind);
         let account = Account::open(
             id,
             user_id,
@@ -1437,18 +1486,20 @@ impl Market {
             );
         }
         let response = OrderResponse::new(sym, trader, order.side, order.qty, &placement);
-        self.record_order(
-            OrderRecord::new(
-                req.client_order_id,
-                trader,
-                sym,
-                &order,
-                &placement,
-                response.clone(),
-                clock_ms,
-            )
-            .expiring_at(prepared.expires_at_ms),
-        );
+        if req.logged {
+            self.record_order(
+                OrderRecord::new(
+                    req.client_order_id,
+                    trader,
+                    sym,
+                    &order,
+                    &placement,
+                    response.clone(),
+                    clock_ms,
+                )
+                .expiring_at(prepared.expires_at_ms),
+            );
+        }
         Ok(response)
     }
 
@@ -1501,6 +1552,7 @@ impl Market {
                     day: false,
                     expires_at_ms: None,
                     display_qty: None,
+                    logged: true,
                 },
             )
             .await?;
@@ -1879,6 +1931,246 @@ impl Market {
             quote: quote.clone(),
         });
         Ok(quote)
+    }
+
+    /// Create an NPC: a funded trader the world runs itself.
+    ///
+    /// It gets a user nobody can sign in as, an account whose wallet is an
+    /// [`Npc`](WalletKind::Npc) one, `cash_cents` out of treasury, and
+    /// `inventory` units of the symbol it makes a market in. None of that
+    /// creates currency — the cash is a transfer, exactly as a player's
+    /// opening balance is.
+    ///
+    /// The inventory is where the two asset kinds part. A stock's shares
+    /// already exist, so the NPC is *assigned* some of the float that nobody
+    /// held; a good's units do not, so they are *issued*, and the count of
+    /// what has been issued goes up by exactly what the NPC was given. Both
+    /// leave the audit's sentence true.
+    ///
+    /// # Errors
+    /// [`GoodsError`] naming what was wrong. Nothing is created by a
+    /// refusal.
+    pub async fn create_npc(
+        &mut self,
+        symbol: &Symbol,
+        name: Option<String>,
+        policy: Policy,
+        cash_cents: i64,
+        inventory: u64,
+        now_ms: i64,
+    ) -> Result<Npc, GoodsError> {
+        let sym = symbol.ticker;
+        if self.npcs.len() >= MAX_NPCS {
+            return Err(GoodsError::Quantity(format!(
+                "this world runs {MAX_NPCS} NPCs already"
+            )));
+        }
+        policy
+            .validate()
+            .map_err(|e| GoodsError::Quantity(format!("policy: {e}")))?;
+        if cash_cents < 0 {
+            return Err(GoodsError::Money(MoneyError::NotPositive {
+                amount_cents: cash_cents,
+            }));
+        }
+        // What the symbol can give it, before anything is created. A stock
+        // can only hand over shares nobody holds; a good can issue whatever
+        // its count will hold.
+        let (is_good, outstanding, issued) = symbol
+            .ask(|s| match &s.info.asset {
+                AssetKind::Good { issued, .. } => (true, s.info.units_outstanding(), *issued),
+                AssetKind::Stock {
+                    shares_outstanding, ..
+                } => (false, *shares_outstanding, 0),
+            })
+            .await?;
+        if is_good {
+            if issued.checked_add(inventory).is_none() {
+                return Err(GoodsError::Quantity(format!(
+                    "{sym} cannot issue that many more units"
+                )));
+            }
+        } else {
+            let unheld = outstanding.saturating_sub(self.held_shares(sym));
+            if inventory > unheld {
+                return Err(GoodsError::Catalog(CatalogError::Exhausted {
+                    wanted: inventory,
+                    available: unheld,
+                }));
+            }
+        }
+        let name = clean(name, 64).unwrap_or_else(|| format!("{sym} merchant"));
+        let user_id = self.create_house_user(Some(name.clone()), now_ms);
+        let account_id = self
+            .open_account_as(
+                user_id,
+                Some(name.clone()),
+                cash_cents,
+                now_ms,
+                WalletKind::Npc,
+            )
+            .inspect_err(|_| {
+                // The faucet was dry, so the NPC does not exist. Its user
+                // would otherwise be left behind with nothing attached.
+                self.users.remove(&user_id);
+            })?;
+        let trader = self.create_trader(user_id, account_id, Some(name.clone()), now_ms);
+        if inventory > 0 {
+            if is_good {
+                let _ = symbol
+                    .change(move |s| s.info.issue(inventory))
+                    .await
+                    .map_err(GoodsError::from)?;
+            }
+            let reference = symbol.ask(|s| s.price_cents()).await?;
+            if let Some(t) = self.traders.get_mut(&trader) {
+                t.endow(sym, inventory, reference);
+            }
+        }
+        let npc = Npc {
+            trader,
+            user_id,
+            account_id,
+            symbol: sym,
+            name,
+            policy,
+            active: true,
+            quoted_ref_cents: 0,
+            quoted_orders: 0,
+        };
+        self.npcs.insert(trader, npc.clone());
+        Ok(npc)
+    }
+
+    /// Switch an NPC's quoting on or off. Its money and its inventory stay
+    /// where they are either way; what stops is putting them on the book.
+    pub async fn set_npc_active(&mut self, trader: TraderId, active: bool) -> Option<Npc> {
+        let npc = self.npcs.get_mut(&trader)?;
+        npc.active = active;
+        if !active {
+            npc.quoted_ref_cents = 0;
+            npc.quoted_orders = 0;
+        }
+        let npc = npc.clone();
+        if !active {
+            self.cancel_all(trader).await;
+        }
+        Some(npc)
+    }
+
+    /// One NPC, as the API shows it: what it is, and what it has left.
+    pub fn npc_view(&self, trader: TraderId) -> Option<NpcDto> {
+        let npc = self.npcs.get(&trader)?;
+        Some(NpcDto {
+            trader_id: npc.trader.0,
+            user_id: npc.user_id.0,
+            account_id: npc.account_id.0,
+            symbol: npc.symbol,
+            name: npc.name.clone(),
+            policy: npc.policy,
+            active: npc.active,
+            cash_cents: self
+                .accounts
+                .get(&npc.account_id)
+                .map_or(0, |a| a.available_cents(&self.ledger)),
+            inventory: self
+                .traders
+                .get(&npc.trader)
+                .map_or(0, |t| t.held_shares(npc.symbol)),
+            reserved: self.traders.get(&npc.trader).map_or(0, |t| {
+                t.reserved_shares.get(npc.symbol).copied().unwrap_or(0)
+            }),
+        })
+    }
+
+    /// Every NPC, as the API shows it.
+    pub fn npc_views(&self) -> Vec<NpcDto> {
+        self.npcs
+            .keys()
+            .filter_map(|trader| self.npc_view(*trader))
+            .collect()
+    }
+
+    /// Redraw every NPC's quotes that the market has moved away from.
+    ///
+    /// Run at the end of an engine step, which is a journaled command, and
+    /// reading nothing but the market and the symbols — no clock, no
+    /// randomness — so a replayed step draws the same book.
+    ///
+    /// An NPC quotes what it can fund and what it holds and no more. The
+    /// levels it cannot afford are simply refused by the same checks that
+    /// refuse a player's order, which is how an empty till shows up as an
+    /// empty side of the book rather than as a rule written down somewhere.
+    async fn requote_npcs(&mut self) {
+        let ids: Vec<TraderId> = self
+            .npcs
+            .values()
+            .filter(|npc| npc.active)
+            .map(|npc| npc.trader)
+            .collect();
+        for trader in ids {
+            let Some(npc) = self.npcs.get(&trader).cloned() else {
+                continue;
+            };
+            let Some(symbol) = self.symbol(npc.symbol).cloned() else {
+                continue;
+            };
+            let Ok(Some((reference, tradable))) = symbol
+                .ask_listed(|s| (s.price_cents(), s.halt.is_none()))
+                .await
+            else {
+                continue;
+            };
+            if !tradable || reference <= 0 {
+                continue;
+            }
+            let Ok(resting) = symbol.ask(move |s| resting_orders(s, trader)).await else {
+                continue;
+            };
+            if npc.policy.still_good(npc.quoted_ref_cents, reference)
+                && resting == npc.quoted_orders
+            {
+                continue;
+            }
+            self.cancel_all(trader).await;
+            for k in 0..npc.policy.levels {
+                for side in [Side::Buy, Side::Sell] {
+                    let price_cents = npc.policy.price_cents(side, reference, k);
+                    let order = Order {
+                        owner: Owner::Trader(trader),
+                        side,
+                        kind: fehu::OrderKind::Limit { price_cents },
+                        tif: fehu::TimeInForce::Gtc,
+                        qty: npc.policy.size,
+                    };
+                    // A refusal is the answer, not an error: an NPC that
+                    // cannot fund this level has nothing to say at it.
+                    let _ = self
+                        .place(
+                            &symbol,
+                            trader,
+                            PlaceRequest {
+                                order,
+                                client_order_id: None,
+                                post_only: true,
+                                day: false,
+                                expires_at_ms: None,
+                                display_qty: None,
+                                logged: false,
+                            },
+                        )
+                        .await;
+                }
+            }
+            let resting = symbol
+                .ask(move |s| resting_orders(s, trader))
+                .await
+                .unwrap_or(0);
+            if let Some(npc) = self.npcs.get_mut(&trader) {
+                npc.quoted_ref_cents = reference;
+                npc.quoted_orders = resting;
+            }
+        }
     }
 
     /// Write or replace a catalogue line.
@@ -2337,6 +2629,7 @@ impl Market {
             total += stepped.ticks;
             self.settle(symbol, stepped).await;
         }
+        self.requote_npcs().await;
         total
     }
 
@@ -2367,6 +2660,7 @@ impl Market {
                         day: false,
                         expires_at_ms: None,
                         display_qty: None,
+                        logged: true,
                     },
                 )
                 .await;
@@ -2513,6 +2807,7 @@ impl Market {
                     .map(|(sym, id)| ((*sym).to_string(), *id))
                     .collect(),
                 catalog: self.catalog.clone(),
+                npcs: self.npcs.values().cloned().collect(),
                 users: self.users.values().cloned().collect(),
                 accounts: self.accounts.values().cloned().collect(),
                 traders: self.traders.values().cloned().collect(),
@@ -2546,12 +2841,26 @@ impl Market {
     }
 }
 
+/// How many of `trader`'s orders are resting in this symbol's book.
+fn resting_orders(s: &SymbolState, trader: TraderId) -> u32 {
+    let owner = Owner::Trader(trader);
+    u32::try_from(
+        s.exchange
+            .book()
+            .orders()
+            .filter(|o| o.owner == owner)
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
+}
+
 /// What a market is built with.
 struct MarketParts {
     ledger: Ledger,
     wallets: Wallets,
     issuers: BTreeMap<&'static str, WalletId>,
     catalog: Catalog,
+    npcs: BTreeMap<TraderId, Npc>,
     symbols: Vec<SymbolState>,
     directory: Directory,
     events: VecDeque<EventRecord>,
@@ -2599,6 +2908,7 @@ impl Market {
             wallets: parts.wallets,
             issuers: parts.issuers,
             catalog: parts.catalog,
+            npcs: parts.npcs,
             settlement_failures: 0,
             symbols,
             listings_tx,
@@ -2678,6 +2988,10 @@ fn prepare_listing(
         tick_cents: options.tick_cents,
         lot: options.lot,
     };
+    // A good is never quoted synthetically, whatever the world does with
+    // its stocks: its units are counted, and a print would be one nobody
+    // issued.
+    spec.trading.synthetic = options.synthetic && !spec.info.is_good();
     let mut state = SymbolState::create(spec, options.max_bars, options.tape_len)?;
     state.warm_up(history_days, now);
     Ok(state)
@@ -2960,6 +3274,7 @@ impl App {
                     tick_cents: options.tick_cents,
                     lot: options.lot,
                 };
+                spec.trading.synthetic = options.synthetic;
                 let mut s = SymbolState::new(spec, options.max_bars, options.tape_len);
                 s.warm_up(options.history_days, now);
                 s
@@ -2976,7 +3291,14 @@ impl App {
             ledger
                 .mint(wallets.treasury, genesis, Reason::Genesis)
                 .expect("a fresh ledger takes its own genesis");
-            let float = options.synthetic_float_cents.clamp(0, genesis);
+            // Nothing settles against the synthetic wallet in a world with
+            // no synthetic liquidity, so setting currency aside for it would
+            // only take it out of treasury for good.
+            let float = if options.synthetic {
+                options.synthetic_float_cents.clamp(0, genesis)
+            } else {
+                0
+            };
             if float > 0 {
                 ledger
                     .post(
@@ -2995,6 +3317,7 @@ impl App {
                 wallets,
                 issuers: BTreeMap::new(),
                 catalog: Catalog::default(),
+                npcs: BTreeMap::new(),
                 symbols,
                 directory: Directory::default(),
                 events: VecDeque::new(),
@@ -3059,6 +3382,7 @@ impl App {
                     .filter_map(|(sym, id)| Some((crate::symbols::lookup(&sym)?, id)))
                     .collect(),
                 catalog: m.catalog,
+                npcs: m.npcs.into_iter().map(|n| (n.trader, n)).collect(),
                 symbols,
                 directory,
                 events: m.events.into_iter().collect(),
@@ -3406,6 +3730,21 @@ pub struct Options {
     /// [`crate::reconcile`] reports rather than hides. It is retired when
     /// both sides of every fill are funded.
     pub synthetic_float_cents: i64,
+    /// Whether symbols are quoted by the simulator's synthetic ladder and
+    /// its printed flow. `FEHU_SYNTHETIC=0` turns it off for the whole
+    /// world.
+    ///
+    /// On, a fresh symbol is tradable with nobody else in the market, which
+    /// is what makes the demo a demo — at the price that every fill against
+    /// it is currency put into a player's hands by nobody, measured as the
+    /// synthetic wallet's debt. Off, the only liquidity is what somebody
+    /// funded: players' orders and the NPCs the world runs
+    /// ([`crate::npc`]), and the synthetic wallet stays at zero because
+    /// nothing ever settles against it.
+    ///
+    /// A good ignores this and is never quoted synthetically: its units are
+    /// counted, and a print would be a unit nobody issued.
+    pub synthetic: bool,
     /// What each newly listed symbol's issuer wallet is funded with out of
     /// treasury, in cents. `FEHU_ISSUER_FLOAT_CENTS`.
     ///
@@ -3491,6 +3830,7 @@ impl Default for Options {
             // treasury itself can hold it.
             genesis_cents: 100_000_000_000_000,
             synthetic_float_cents: 50_000_000_000_000,
+            synthetic: true,
             issuer_float_cents: 100_000_000_000,
             admin_key: None,
             state_file: None,
@@ -3551,6 +3891,7 @@ impl Options {
             starting_cash_cents: env_parse("FEHU_STARTING_CASH_CENTS", d.starting_cash_cents),
             genesis_cents: env_parse("FEHU_GENESIS_CENTS", d.genesis_cents)
                 .clamp(0, MAX_BALANCE_CENTS),
+            synthetic: env_flag("FEHU_SYNTHETIC", d.synthetic),
             synthetic_float_cents: env_parse("FEHU_SYNTHETIC_FLOAT_CENTS", d.synthetic_float_cents)
                 .max(0),
             issuer_float_cents: env_parse("FEHU_ISSUER_FLOAT_CENTS", d.issuer_float_cents).max(0),
@@ -3597,6 +3938,17 @@ fn parse_market_hours(value: &str) -> Option<MarketHours> {
         close_secs,
         ..MarketHours::default()
     })
+}
+
+/// A boolean from the environment: `0`, `false`, `no` and `off` are false,
+/// `1`, `true`, `yes` and `on` are true, and anything else leaves the
+/// default alone.
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name).ok().as_deref().map(str::trim) {
+        Some("0" | "false" | "no" | "off" | "FALSE" | "NO" | "OFF") => false,
+        Some("1" | "true" | "yes" | "on" | "TRUE" | "YES" | "ON") => true,
+        _ => default,
+    }
 }
 
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {

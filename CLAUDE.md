@@ -92,6 +92,8 @@ below follows from that:
   validation plus the per-tick derived quantities cached from it.
 - `book.rs` — a standalone price–time-priority limit order book. Whole cents,
   integer shares, sequential ids. It knows nothing about the price process.
+- `ledger.rs` — the conserved currency ledger: wallets, balanced
+  transactions, supply. Pure integer arithmetic, no clock and no globals.
 - `exchange.rs` — composes the two: trader net flow becomes a square-root
   price-impact event on the simulator, the simulator steps, the tick volume
   prints as synthetic flow against the book, and a synthetic maker ladder is
@@ -164,7 +166,10 @@ The journal file is truncated when a snapshot lands, so `save.rs` and
 snapshot, because a snapshot may fall between any two commands. No credential
 ever reaches either: a key exists once, in the response that issued it.
 
-Other modules: `account.rs` (users, accounts, cash ledger), `trading.rs`
+Other modules: `catalog.rs` (what the world will make and what it charges;
+goods are issued by a purchase and destroyed by consuming them), `npc.rs`
+(the funded traders the world runs itself, re-quoted inside the engine
+step), `account.rs` (users, accounts, cash ledger), `trading.rs`
 (traders, positions, share reservations, wire DTOs), `auth.rs` (API keys —
 issued once, stored as domain-separated SHA-256 digests), `events.rs` (raw
 simulator events and the semantic game-event catalogue), `symbols.rs`

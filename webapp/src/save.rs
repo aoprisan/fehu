@@ -147,6 +147,9 @@ pub struct MarketSave {
     /// What the world will make and what it charges. Since version 8.
     #[serde(default)]
     pub catalog: crate::catalog::Catalog,
+    /// The traders the world runs itself. Since version 8.
+    #[serde(default)]
+    pub npcs: Vec<crate::npc::Npc>,
     pub users: Vec<User>,
     pub accounts: Vec<Account>,
     pub traders: Vec<Trader>,
@@ -382,8 +385,15 @@ fn validate_accounting(save: &Save) -> Result<(), SaveError> {
             issues.push("API key digest has an invalid format".into());
         }
     }
-    if users != key_users {
-        issues.push("every user must have exactly one API key digest".into());
+    // Every user has exactly one key, except the ones nobody can sign in
+    // as: an NPC's identity is created without a credential on purpose, so
+    // that there is none to leak and no request can arrive claiming to be
+    // it. A user with no key and no NPC behind it is a user nothing can
+    // reach, which is a broken file rather than a design.
+    let house: BTreeSet<u64> = save.market.npcs.iter().map(|n| n.user_id.0).collect();
+    let keyless: BTreeSet<u64> = users.difference(&key_users).copied().collect();
+    if !keyless.is_subset(&house) {
+        issues.push("every user must have exactly one API key digest, or be an NPC's".into());
     }
     if !issues.is_empty() {
         return Err(SaveError::Invalid(issues));

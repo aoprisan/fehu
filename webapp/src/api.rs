@@ -37,6 +37,7 @@ use crate::market::{
     SnapshotDto, StreamMessage, Subscription, SupplyDto, Symbol, SymbolInfo, SymbolStatus,
     SymbolView, wall_now_ms,
 };
+use crate::npc::{NpcsResponse, Policy};
 use crate::trading::{
     AmendRequest, BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID, OpenOrderDto,
     OrderRecord, OrderRequest, PortfolioDto, PositionDto, Refused, StopOrder, StopRequest,
@@ -110,6 +111,8 @@ pub fn router(app: AppState) -> Router {
         .route("/api/accounts/{account_id}/status", post(set_status))
         .route("/api/accounts/{account_id}/validate", get(validate_account))
         .route("/api/accounts/{account_id}/ledger", get(get_ledger))
+        .route("/api/npcs", get(list_npcs).post(create_npc))
+        .route("/api/npcs/{trader_id}/active", post(set_npc_active))
         .route("/api/catalog", get(get_catalog).post(set_catalog_item))
         .route("/api/catalog/{symbol}", delete(remove_catalog_item))
         .route("/api/traders/{trader_id}/purchases", post(purchase))
@@ -1156,6 +1159,104 @@ async fn list_symbol(
                 source: req.source.unwrap_or_else(|| "api".into()),
                 note: req.note,
             },
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+// ---------------------------------------------------------------------------
+// NPCs: the traders the world runs itself.
+
+/// `GET /api/npcs`: who the world is trading as, and what each has left.
+async fn list_npcs(State(app): State<AppState>) -> Result<Json<NpcsResponse>, ApiError> {
+    Ok(Json(NpcsResponse {
+        npcs: app.market.call(|m| m.npc_views()).await?,
+    }))
+}
+
+/// Body of `POST /api/npcs`.
+#[derive(Deserialize)]
+struct NpcRequest {
+    /// The symbol it makes a market in.
+    symbol: String,
+    name: Option<String>,
+    /// Currency it is funded with, out of treasury. Nothing is minted.
+    cash_cents: i64,
+    /// Units it starts holding: shares of a stock nobody held, or units of a
+    /// good issued to it.
+    #[serde(default)]
+    inventory: u64,
+    /// How it quotes. The defaults are a 25 bp half-spread over five levels.
+    #[serde(default)]
+    half_spread_bps: Option<u32>,
+    #[serde(default)]
+    levels: Option<u32>,
+    #[serde(default)]
+    level_step_bps: Option<u32>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    requote_bps: Option<u32>,
+}
+
+/// Put a funded trader in the market that the world runs.
+async fn create_npc(
+    State(app): State<AppState>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<NpcRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let symbol = crate::symbol::intern(&req.symbol)
+        .ok_or_else(|| ApiError::not_found(&req.symbol))?
+        .to_string();
+    let base = Policy::default();
+    let policy = Policy {
+        half_spread_bps: req.half_spread_bps.unwrap_or(base.half_spread_bps),
+        levels: req.levels.unwrap_or(base.levels),
+        level_step_bps: req.level_step_bps.unwrap_or(base.level_step_bps),
+        size: req.size.unwrap_or(base.size),
+        requote_bps: req.requote_bps.unwrap_or(base.requote_bps),
+    };
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::CreateNpc {
+            symbol,
+            name: clean_text(req.name, 64),
+            policy,
+            cash_cents: req.cash_cents,
+            inventory: req.inventory,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Body of `POST /api/npcs/{trader_id}/active`.
+#[derive(Deserialize)]
+struct ActiveRequest {
+    active: bool,
+}
+
+/// Start or stop an NPC quoting. Its money and inventory stay where they are.
+async fn set_npc_active(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<ActiveRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::SetNpcActive {
+            trader_id,
+            active: req.active,
         },
     )
     .await

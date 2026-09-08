@@ -372,6 +372,33 @@ impl Trader {
         pos.qty
     }
 
+    /// Give the trader `qty` units of `symbol` at `price_cents` a unit,
+    /// with no money moving and no fill.
+    ///
+    /// This is a world-start endowment, and it exists for exactly one
+    /// caller: an NPC being handed the inventory it will make a market in.
+    /// The units are not created here — a stock's shares already exist and
+    /// this is an assignment of ones nobody held, a good's have just been
+    /// issued against its count — so the audit's sentence stays true either
+    /// way. `price_cents` is the reference price at the time, so the NPC has
+    /// a cost basis to quote a margin over rather than an infinite one.
+    ///
+    /// The position's `cash_cents` is deliberately left alone: it records
+    /// what trades in this symbol paid in and out, and an endowment paid
+    /// nothing. Only the units and their basis arrive.
+    pub fn endow(&mut self, symbol: &'static str, qty: u64, price_cents: i64) {
+        if qty == 0 {
+            return;
+        }
+        let pos = self.positions.entry(symbol).or_default();
+        pos.qty = pos
+            .qty
+            .saturating_add(i64::try_from(qty).unwrap_or(i64::MAX));
+        pos.cost_cents = pos
+            .cost_cents
+            .saturating_add(notional_cents(price_cents, qty));
+    }
+
     /// Take `qty` units of `symbol` out of the position for good.
     ///
     /// Consuming is a sale at nothing: the units leave and nothing comes

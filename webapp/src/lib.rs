@@ -19,6 +19,7 @@ pub mod journal;
 pub mod limit;
 pub mod market;
 pub mod metrics;
+pub mod npc;
 pub mod reconcile;
 pub mod save;
 pub mod symbol;

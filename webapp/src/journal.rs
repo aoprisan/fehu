@@ -83,6 +83,7 @@ use crate::market::{
     Amendment, AssetKind, DelistError, Market, PlaceRequest, Placed, SymbolInfo, SymbolSpec,
     wall_now_ms,
 };
+use crate::npc::Policy;
 use crate::trading::{AmendRequest, AmendResponse, OpenOrderDto, OrderRequest, StopRequest};
 
 /// Format of the journal file. A file written by another version is refused
@@ -237,6 +238,19 @@ pub enum Command {
     RemoveCatalogItem {
         symbol: String,
     },
+    /// Operator: put a funded trader in the market that the world runs.
+    CreateNpc {
+        symbol: String,
+        name: Option<String>,
+        policy: Policy,
+        cash_cents: i64,
+        inventory: u64,
+    },
+    /// Operator: start or stop an NPC quoting.
+    SetNpcActive {
+        trader_id: u64,
+        active: bool,
+    },
     /// Buy units of a good at the catalogue price: the only thing that
     /// brings a unit of one into existence.
     Purchase {
@@ -312,6 +326,8 @@ impl Command {
             Self::ListSymbol { .. } => "list_symbol",
             Self::SetCatalogItem { .. } => "set_catalog_item",
             Self::RemoveCatalogItem { .. } => "remove_catalog_item",
+            Self::CreateNpc { .. } => "create_npc",
+            Self::SetNpcActive { .. } => "set_npc_active",
             Self::Purchase { .. } => "purchase",
             Self::Consume { .. } => "consume",
             Self::Delist { .. } => "delist",
@@ -1189,6 +1205,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 day: order.day,
                 expires_at_ms: order.expires_at_ms,
                 display_qty: order.display_qty,
+                logged: true,
             };
             let placed = m
                 .place(&handle, trader, request)
@@ -1309,6 +1326,44 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 .remove_catalog_item(sym)
                 .ok_or_else(|| ApiError::not_found(symbol))?;
             Applied::new(200, &item)
+        }
+
+        Command::CreateNpc {
+            symbol,
+            name,
+            policy,
+            cash_cents,
+            inventory,
+        } => {
+            let handle = m
+                .symbol(symbol)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(symbol))?;
+            let npc = m
+                .create_npc(
+                    &handle,
+                    name.clone(),
+                    *policy,
+                    *cash_cents,
+                    *inventory,
+                    wall_ms,
+                )
+                .await
+                .map_err(ApiError::goods)?;
+            let view = m
+                .npc_view(npc.trader)
+                .ok_or_else(|| ApiError::internal("the NPC vanished as it was made"))?;
+            Applied::new(201, &view)
+        }
+
+        Command::SetNpcActive { trader_id, active } => {
+            m.set_npc_active(TraderId(*trader_id), *active)
+                .await
+                .ok_or_else(|| ApiError::unknown_trader(*trader_id))?;
+            let view = m
+                .npc_view(TraderId(*trader_id))
+                .ok_or_else(|| ApiError::unknown_trader(*trader_id))?;
+            Applied::new(200, &view)
         }
 
         Command::Purchase {
@@ -1625,12 +1680,10 @@ async fn apply_listing(
             volatility: listing.volatility,
             ..fehu::Config::default()
         },
-        trading: fehu::TradingParams {
-            // A good's units are counted, so nothing may print one into
-            // existence: it is quoted by whoever holds it and nobody else.
-            synthetic: !listing.asset.is_good(),
-            ..fehu::TradingParams::default()
-        },
+        // Whether this listing is quoted synthetically is the venue's
+        // decision, not the request's: `prepare_listing` sets it from the
+        // world's options and the asset kind together.
+        trading: fehu::TradingParams::default(),
     };
     let state = m
         .prepare_listing(spec, listing.history_days, at)

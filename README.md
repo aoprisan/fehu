@@ -153,6 +153,9 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/symbols/{sym}/book?depth=10` | Aggregated bids and asks, reference price, pending trader flow |
 | `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first |
 | `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and — for `?api_key=`, since `EventSource` cannot set headers — that player's `fill`s |
+| `GET` | `/api/npcs` | The traders the world runs itself: what each quotes, and what it has left |
+| `POST` | `/api/npcs` | Game master: put a funded merchant in a symbol — `{"symbol":"ORE","cash_cents":5000000,"inventory":800}`, optional `name`, `size`, `levels`, `half_spread_bps`, `level_step_bps`, `requote_bps` |
+| `POST` | `/api/npcs/{trader_id}/active` | Game master: `{"active":false}` — stop it quoting. It keeps its money and its stock |
 | `GET` | `/api/catalog` | What the world will make and what it charges: one line per good |
 | `POST` | `/api/catalog` | Game master: write or replace a line — `{"symbol":"ORE","price_cents":250,"available":500}`, `available` omitted for a seam that never runs out |
 | `DELETE` | `/api/catalog/{sym}` | Game master: stop making a good. What was made stays made |
@@ -175,7 +178,9 @@ that, so a treasury that runs dry refuses to open more rather than printing
 the difference. `FEHU_ISSUER_FLOAT_CENTS` (10^11) is what each symbol's
 issuer wallet is given to pay dividends and buyouts from, and
 `FEHU_SYNTHETIC_FLOAT_CENTS` (5×10^13) is what the stand-in for the
-simulator's unfunded liquidity starts with — see **The currency** below. `FEHU_MARKET_HOURS=09:30-16:00`
+simulator's unfunded liquidity starts with — see **The currency** below —
+and `FEHU_SYNTHETIC=0` switches that liquidity off altogether, leaving the
+book to whoever funded what is in it. `FEHU_MARKET_HOURS=09:30-16:00`
 gives the market a UTC weekday session (unset, it never closes);
 `FEHU_PRICE_LIMIT_PCT` (0.10) and `FEHU_HALT_SECS` (300) set the limit move
 that halts a symbol and how long the halt lasts. `FEHU_RATE_PER_SEC` (20) and
@@ -393,10 +398,32 @@ no currency moves at all — a thing that has been used up is not a thing that
 has been sold. Both are journaled commands, so a retry under the same
 `Idempotency-Key` is answered, not re-made, and both survive a restart.
 
-The catalogue is the world selling to a player, which is a placeholder for a
-merchant selling to one. When NPC traders arrive they will hold inventory,
-quote it on the same book through the same orders, and run out; the
-catalogue stays as what stocks them.
+The catalogue is the world selling to a player. An **NPC** is a merchant
+selling to one. `POST /api/npcs` funds a trader out of treasury, hands it
+inventory — shares of a stock nobody held, or units of a good issued to it —
+and gives it a quoting policy: a half-spread and a few levels either side of
+the reference price, redrawn when the market moves past a band or when
+something it was offering has been taken.
+
+Nothing about an NPC is special, and that is the point. It has a wallet, a
+position and reservations; its orders go through the same command path as a
+player's, and a fill against it settles, charges fees and reconciles like any
+other. It quotes only what it can fund and what it holds, so its bid
+disappears when its till is empty and its ask when its stock is — scarcity
+shows up in the book rather than as a rule written down somewhere. Its
+decisions are taken inside the engine step, which is a journaled command, and
+read nothing but the market and the symbol, so a replayed step redraws the
+same book. Nobody can sign in as one: an NPC's user is created without a
+credential, so there is none to leak.
+
+That is what makes `FEHU_SYNTHETIC=0` worth having. With the ladder off,
+every fill has a funded counterparty on both sides, and the wallet that
+stands in for liquidity nobody paid for — `synthetic_debt_cents` in
+`GET /api/supply` — never has to stand in for anything. The simulator carries
+on underneath as the reference price the merchants read, so game events still
+move the market, but through somebody's decision rather than through a print
+nobody paid for. The cost is that a world with no merchants and no players
+has an empty book, which is why the ladder is still on by default.
 
 A **stop** is a line drawn on the price rather than an order: it rests
 nowhere, holds no queue position and reserves nothing, and the book has never
