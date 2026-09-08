@@ -14,6 +14,7 @@ use fehu::ledger::Ledger;
 
 use crate::account::{Account, AccountId};
 use crate::save::{Save, SymbolSave};
+use crate::symbol::AssetKind;
 use crate::trading::Trader;
 
 /// A consistent snapshot's reconciliation results. Ledger checks cover only
@@ -109,11 +110,32 @@ pub fn reconcile(save: &Save) -> Reconciliation {
                 }
             }
         }
-        let outstanding = sym.info.as_ref().map(|i| u128::from(i.shares_outstanding));
-        if held < 0 || outstanding.is_some_and(|out| held as u128 + bids > out) {
-            issues.push(format!(
-                "{ticker} holdings and resting bids exceed outstanding supply or are negative"
-            ));
+        if held < 0 {
+            issues.push(format!("{ticker} holdings are negative"));
+        } else if let Some(info) = sym.info.as_ref() {
+            let out = u128::from(info.units_outstanding());
+            let held = held as u128;
+            match &info.asset {
+                // A good's units exist only because a command issued them,
+                // and are only ever somewhere: what is issued and not yet
+                // consumed is exactly what the holders hold. Resting bids do
+                // not enter into it — nothing fills them but a holder.
+                AssetKind::Good { .. } if held != out => issues.push(format!(
+                    "{ticker} holdings ({held}) differ from units issued less consumed ({out})"
+                )),
+                // A stock quoted by synthetic liquidity can be bought from
+                // the shares nobody holds, so the resting bids are spoken
+                // for as well.
+                AssetKind::Stock { .. } if sym.exchange.params().synthetic && held + bids > out => {
+                    issues.push(format!(
+                        "{ticker} holdings and resting bids exceed outstanding supply"
+                    ));
+                }
+                AssetKind::Stock { .. } if held > out => {
+                    issues.push(format!("{ticker} holdings exceed outstanding supply"))
+                }
+                _ => {}
+            }
         }
     }
     for (id, account) in &accounts {
@@ -213,6 +235,7 @@ pub fn reconcile(save: &Save) -> Reconciliation {
 #[cfg(test)]
 mod tests {
     use crate::market::Market;
+    use crate::symbol::AssetKind;
     use crate::{App, Options};
     use fehu::{Order, Owner, Side};
 
@@ -294,7 +317,7 @@ mod tests {
                 s.exchange
                     .submit(Order::limit(Owner::Trader(trader), Side::Buy, 1, 10))
                     .unwrap();
-                s.info.shares_outstanding = 1;
+                s.info.asset = AssetKind::stock(1);
             })
             .await
             .unwrap();

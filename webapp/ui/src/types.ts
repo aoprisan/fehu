@@ -45,6 +45,12 @@ export interface Level {
 
 // --- webapp/src/market.rs --------------------------------------------------
 
+/**
+ * `symbol::AssetKind` — what a listing is. A `stock` has a fixed float and
+ * pays dividends; a `good` is issued and consumed and has neither.
+ */
+export type AssetKind = 'stock' | 'good';
+
 /** `market::Quote`. */
 export interface Quote {
   symbol: string;
@@ -63,7 +69,11 @@ export interface Quote {
   pending_events: number;
   bid_cents: number | null;
   ask_cents: number | null;
-  /** Shares in existence for this symbol. */
+  /** What this listing is. */
+  asset_kind: AssetKind;
+  /** What one unit of a good is called; `null` for a stock. */
+  unit: string | null;
+  /** Units in existence: a stock's shares, or a good's issued less consumed. */
   shares_outstanding: number;
   /** `price × shares_outstanding`. */
   market_cap_cents: number;
@@ -120,6 +130,9 @@ export interface HolderDto {
  */
 export interface SharesResponse {
   symbol: string;
+  asset_kind: AssetKind;
+  /** What one unit of a good is called; `null` for a stock. */
+  unit: string | null;
   shares_outstanding: number;
   /** Held by traders. */
   held_shares: number;

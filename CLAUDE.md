@@ -70,9 +70,9 @@ below follows from that:
   price series. `tests/trading.rs` holds that invariant.
 - Version constants that gate save compatibility: `fehu::STATE_VERSION`
   (simulator), `fehu::EXCHANGE_VERSION`, `fehu_webapp::save::STATE_VERSION`
-  (the whole market file, currently 7) and
+  (the whole market file, currently 8) and
   `fehu_webapp::journal::JOURNAL_VERSION` (the command journal beside it,
-  currently 1). Loading a mismatched version is refused rather than guessed
+  currently 2). Loading a mismatched version is refused rather than guessed
   at.
 - JSON round-trips need `serde_json`'s `float_roundtrip` feature; without it a
   parsed `f64` can be one ulp off. Binary formats (postcard) are always exact.

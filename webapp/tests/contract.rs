@@ -153,6 +153,8 @@ async fn market_data_shapes() {
             "pending_events",
             "bid_cents",
             "ask_cents",
+            "asset_kind",
+            "unit",
             "shares_outstanding",
             "market_cap_cents",
             "market_open",
@@ -166,6 +168,8 @@ async fn market_data_shapes() {
         &shares,
         &[
             "symbol",
+            "asset_kind",
+            "unit",
             "shares_outstanding",
             "held_shares",
             "bid_shares",

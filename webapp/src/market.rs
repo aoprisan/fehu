@@ -1354,16 +1354,26 @@ impl Market {
         req: PlaceRequest,
     ) -> Result<OrderResponse, PlaceError> {
         let sym = symbol.ticker;
-        // A symbol has a fixed number of shares: a buy can only be filled from
-        // the ones no trader holds or is already bidding for. Both numbers
-        // are still what they were when the symbol counted them: nothing
-        // touches a book between here and the submit but this job.
+        // A symbol quoted by synthetic liquidity has a ceiling nothing else
+        // enforces: the ladder will sell what nobody holds, so a buy is
+        // limited to the units no trader holds or is already bidding for.
+        // Both numbers are still what they were when the symbol counted
+        // them: nothing touches a book between here and the submit but this
+        // job.
+        //
+        // Without that ladder the ceiling is not needed and would be wrong.
+        // Every fill then comes from a trader who holds the units and has
+        // reserved them, so a bid can no more conjure a unit than a wish
+        // can; refusing it against the outstanding count would only stop
+        // two players bidding for the same good at once.
         if order.side == Side::Buy {
-            let outstanding = symbol.ask(|s| s.info.shares_outstanding).await?;
+            let (outstanding, synthetic) = symbol
+                .ask(|s| (s.info.units_outstanding(), s.exchange.params().synthetic))
+                .await?;
             let available = outstanding
                 .saturating_sub(self.held_shares(sym))
                 .saturating_sub(prepared.bid_shares);
-            if order.qty > available {
+            if synthetic && order.qty > available {
                 self.orders_refused = self.orders_refused.saturating_add(1);
                 return Err(PlaceError::Refused(Refused::SupplyExhausted {
                     needed: order.qty,

@@ -32,9 +32,9 @@ use crate::events::{CatalogEntry, EventRecord, GameEventKind, GameEventRequest, 
 use crate::journal::{Command, Listing, Outcome, Principal, seed_from_ticker};
 use crate::limit::Decision;
 use crate::market::{
-    App, Closed, Market, OrderCheck, PayoutError, PlaceError, Quote, Sequenced, SnapshotDto,
-    StreamMessage, Subscription, SupplyDto, Symbol, SymbolInfo, SymbolStatus, SymbolView,
-    wall_now_ms,
+    App, AssetKind, Closed, Market, OrderCheck, PayoutError, PlaceError, Quote, Sequenced,
+    SnapshotDto, StreamMessage, Subscription, SupplyDto, Symbol, SymbolInfo, SymbolStatus,
+    SymbolView, wall_now_ms,
 };
 use crate::trading::{
     AmendRequest, BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID, OpenOrderDto,
@@ -916,7 +916,11 @@ struct SymbolDetail {
 #[derive(Serialize)]
 struct SharesDto {
     symbol: &'static str,
-    /// Shares in existence.
+    /// `stock` or `good`.
+    asset_kind: &'static str,
+    /// What one unit of a good is called; `null` for a stock.
+    unit: Option<String>,
+    /// Units in existence.
     shares_outstanding: u64,
     /// Held by traders.
     held_shares: u64,
@@ -939,17 +943,20 @@ impl SharesDto {
     /// holds them. Two actors, asked in turn.
     async fn fetch(app: &App, symbol: &Symbol, caller: Option<Caller>) -> Result<Self, ApiError> {
         let sym = symbol.ticker;
-        let (shares_outstanding, bid_shares, price_cents, market_cap_cents) = symbol
-            .ask_listed(|s| {
-                (
-                    s.info.shares_outstanding,
-                    s.bid_shares(),
-                    s.price_cents(),
-                    s.market_cap_cents(),
-                )
-            })
-            .await?
-            .ok_or_else(|| ApiError::not_found(sym))?;
+        let (asset_kind, unit, shares_outstanding, bid_shares, price_cents, market_cap_cents) =
+            symbol
+                .ask_listed(|s| {
+                    (
+                        s.info.asset.label(),
+                        s.info.asset.unit().map(str::to_owned),
+                        s.info.units_outstanding(),
+                        s.bid_shares(),
+                        s.price_cents(),
+                        s.market_cap_cents(),
+                    )
+                })
+                .await?
+                .ok_or_else(|| ApiError::not_found(sym))?;
         let (held_shares, mut holders) = app
             .market
             .call(move |m| {
@@ -965,6 +972,8 @@ impl SharesDto {
         holders.sort_by_key(|h| (std::cmp::Reverse(h.qty), h.trader_id));
         Ok(Self {
             symbol: sym,
+            asset_kind,
+            unit,
             shares_outstanding,
             held_shares,
             bid_shares,
@@ -1031,9 +1040,17 @@ struct ListingRequest {
     name: Option<String>,
     sector: Option<String>,
     description: Option<String>,
-    /// Shares in existence. The market never creates or destroys them, so
-    /// this is the ceiling on what every trader can hold between them.
+    /// `stock`, the default, or `good`.
+    kind: Option<String>,
+    /// Shares in existence, for a stock. The market never creates or
+    /// destroys them, so this is the ceiling on what every trader can hold
+    /// between them. A good has no such number: its units are issued and
+    /// consumed one command at a time, and it is listed holding none.
+    #[serde(default)]
     shares_outstanding: u64,
+    /// What one unit of a good is called: `kg`, `crate`, `ingot`. Ignored
+    /// for a stock, whose unit is a share.
+    unit: Option<String>,
     /// Where the price starts, in cents.
     start_price_cents: i64,
     /// Annual log drift and annualised volatility; the simulator's defaults
@@ -1072,6 +1089,17 @@ async fn list_symbol(
     if app.symbol(symbol).is_some() {
         return Err(ApiError::conflict(format!("{symbol} is already listed")));
     }
+    let asset = match req.kind.as_deref().map(str::trim).unwrap_or("stock") {
+        "stock" => AssetKind::stock(req.shares_outstanding),
+        "good" => AssetKind::good(
+            clean_text(req.unit, crate::symbol::MAX_UNIT_LEN).unwrap_or_else(|| "unit".into()),
+        ),
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "unknown asset kind {other:?}: a listing is a \"stock\" or a \"good\""
+            )));
+        }
+    };
     let defaults = Config::default();
     run(
         &app,
@@ -1083,7 +1111,7 @@ async fn list_symbol(
                 name: clean_text(req.name, 64).unwrap_or_else(|| symbol.to_string()),
                 sector: clean_text(req.sector, 64).unwrap_or_else(|| "Uncategorised".into()),
                 description: clean_text(req.description, 280).unwrap_or_default(),
-                shares_outstanding: req.shares_outstanding,
+                asset,
                 seed: req.seed.unwrap_or_else(|| seed_from_ticker(symbol)),
                 start_price_cents: req.start_price_cents,
                 drift: req.drift.unwrap_or(defaults.drift),

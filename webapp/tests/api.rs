@@ -1322,7 +1322,8 @@ async fn every_symbol_has_a_finite_number_of_shares() {
     assert_eq!(shares["holders"][0]["qty"], 500);
     assert_eq!(shares["holders"][0]["free_shares"], 500);
     let (_, detail) = get(&player, "/api/symbols/ACME").await;
-    assert_eq!(detail["info"]["shares_outstanding"], outstanding);
+    assert_eq!(detail["info"]["asset"]["kind"], "stock");
+    assert_eq!(detail["info"]["asset"]["shares_outstanding"], outstanding);
     assert_eq!(detail["shares"]["held_shares"], 500);
     // The totals are public; who holds them is not.
     let (_, anon) = get(&app, "/api/symbols/ACME/shares").await;

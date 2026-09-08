@@ -80,13 +80,14 @@ use crate::account::{AccountId, AccountStatus, UserId};
 use crate::api::ApiError;
 use crate::events::{EventRecord, GameEventKind, MAX_MAGNITUDE, Prepared, Scope, SimEvent};
 use crate::market::{
-    Amendment, DelistError, Market, PlaceRequest, Placed, SymbolInfo, SymbolSpec, wall_now_ms,
+    Amendment, AssetKind, DelistError, Market, PlaceRequest, Placed, SymbolInfo, SymbolSpec,
+    wall_now_ms,
 };
 use crate::trading::{AmendRequest, AmendResponse, OpenOrderDto, OrderRequest, StopRequest};
 
 /// Format of the journal file. A file written by another version is refused
 /// rather than half-understood, exactly as a save file is.
-pub const JOURNAL_VERSION: u32 = 1;
+pub const JOURNAL_VERSION: u32 = 2;
 
 /// Who asked for a command.
 ///
@@ -125,7 +126,9 @@ pub struct Listing {
     pub name: String,
     pub sector: String,
     pub description: String,
-    pub shares_outstanding: u64,
+    /// What is being listed: a company with a fixed float, or a good with a
+    /// unit and a count that production and consumption move.
+    pub asset: AssetKind,
     pub seed: u64,
     pub start_price_cents: i64,
     pub drift: f64,
@@ -1262,6 +1265,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
             note,
         } => {
             let at = m.now();
+            stock_only(m, symbol, "delisted").await?;
             let delisting = m
                 .delist(symbol, *cents_per_share, note.clone(), at.0)
                 .await
@@ -1310,6 +1314,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 .ask_listed(|s| s.price_cents())
                 .await?
                 .ok_or_else(|| ApiError::not_found(handle.ticker))?;
+            stock_only(m, symbol, "paid a dividend").await?;
             let (paid, effects) = m
                 .pay_dividend(&handle, *cents_per_share, note.clone(), at.0)
                 .await
@@ -1474,6 +1479,26 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
 /// it takes to generate its history, during which nothing else changes the
 /// market — but it is what makes the listing a command like any other, and
 /// so replayable. Listing is rare and an operator's; a fill is neither.
+/// Refuse a corporate action on a good.
+///
+/// Both belong to a company: a dividend hands out a share of the profits and
+/// a delisting buys the shares back. A crate of ore has neither profits nor
+/// shareholders, so rather than inventing a meaning the route says no. What
+/// ends a good's life is consuming it.
+async fn stock_only(m: &Market, symbol: &str, what: &str) -> Result<(), ApiError> {
+    let handle = m
+        .symbol(symbol)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found(symbol))?;
+    if handle.ask(|s| s.info.is_good()).await? {
+        return Err(ApiError::invalid_event(format!(
+            "{} is a good: its units are issued and consumed, so it is never {what}",
+            handle.ticker
+        )));
+    }
+    Ok(())
+}
+
 async fn apply_listing(
     m: &mut Market,
     wall_ms: i64,
@@ -1481,10 +1506,20 @@ async fn apply_listing(
 ) -> Result<Applied, ApiError> {
     let symbol = crate::symbols::register(&listing.symbol)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    if listing.shares_outstanding == 0 {
-        return Err(ApiError::bad_request(
-            "a listing needs shares: shares_outstanding must be positive",
-        ));
+    match &listing.asset {
+        AssetKind::Stock {
+            shares_outstanding: 0,
+        } => {
+            return Err(ApiError::bad_request(
+                "a listing needs shares: shares_outstanding must be positive",
+            ));
+        }
+        AssetKind::Good { consumed, .. } if *consumed > 0 => {
+            return Err(ApiError::bad_request(
+                "a good is listed with nothing consumed yet",
+            ));
+        }
+        _ => {}
     }
     let at = m.now();
     if m.symbol(symbol).is_some() {
@@ -1496,7 +1531,7 @@ async fn apply_listing(
             name: listing.name.clone(),
             sector: listing.sector.clone(),
             description: listing.description.clone(),
-            shares_outstanding: listing.shares_outstanding,
+            asset: listing.asset.clone(),
             seed: listing.seed,
         },
         config: fehu::Config {
@@ -1505,7 +1540,12 @@ async fn apply_listing(
             volatility: listing.volatility,
             ..fehu::Config::default()
         },
-        trading: fehu::TradingParams::default(),
+        trading: fehu::TradingParams {
+            // A good's units are counted, so nothing may print one into
+            // existence: it is quoted by whoever holds it and nobody else.
+            synthetic: !listing.asset.is_good(),
+            ..fehu::TradingParams::default()
+        },
     };
     let state = m
         .prepare_listing(spec, listing.history_days, at)
@@ -1524,8 +1564,11 @@ async fn apply_listing(
         magnitude: None,
         effects: Vec::new(),
         summary: vec![format!(
-            "{symbol} listed at {} cents, {} shares outstanding",
-            quote.price_cents, quote.shares_outstanding
+            "{symbol} listed as a {} at {} cents, {} {} outstanding",
+            quote.asset_kind,
+            quote.price_cents,
+            quote.shares_outstanding,
+            quote.unit.as_deref().unwrap_or("shares")
         )],
     });
     Applied::new(201, &ListingResponse { quote, event })

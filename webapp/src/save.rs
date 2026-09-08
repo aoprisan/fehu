@@ -58,6 +58,14 @@ pub type Symbol = &'static str;
 
 /// Current save format. Any other version, older or newer, is refused.
 ///
+/// Version 8 gave every listing an [`AssetKind`](crate::symbol::AssetKind):
+/// a company with a fixed float, or a good with a unit and a count that
+/// production and consumption move. A version 7 file names a
+/// `shares_outstanding` and nothing else, which is a stock — but its
+/// exchange also predates the switch that stops synthetic liquidity
+/// printing units nobody issued, so the file is refused rather than read as
+/// half a world.
+///
 /// Version 7 added the command journal's sequence and its idempotency index,
 /// so a snapshot says exactly which commands it already contains and a retry
 /// that arrives after a restart is still a retry. A version 6 file has
@@ -76,7 +84,7 @@ pub type Symbol = &'static str;
 /// transaction out of issuance, so the currency has a recorded origin and
 /// the books still add up. It is a day's work when there is such a world.
 /// There is not: the current file is a demo, regenerated from its seeds.
-pub const STATE_VERSION: u32 = 7;
+pub const STATE_VERSION: u32 = 8;
 
 /// Everything needed to carry on where the server left off.
 #[derive(Clone, Debug, Serialize, Deserialize)]

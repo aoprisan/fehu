@@ -115,7 +115,7 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | Method | Path | What |
 |---|---|---|
 | `GET` | `/api/symbols` | Quotes for every listed symbol |
-| `POST` | `/api/symbols` | Game master: list a new symbol — `{"symbol":"WDGT","name":"Widget Corp","shares_outstanding":1000000,"start_price_cents":5000}`, optional `sector`, `description`, `drift`, `volatility`, `seed`, `history_days` |
+| `POST` | `/api/symbols` | Game master: list a new symbol — `{"symbol":"WDGT","name":"Widget Corp","shares_outstanding":1000000,"start_price_cents":5000}`, optional `sector`, `description`, `drift`, `volatility`, `seed`, `history_days`. `{"kind":"good","unit":"kg"}` lists a good instead: no float, no ladder, no dividend |
 | `GET` | `/api/symbols/{sym}` | Quote, latent snapshot, config and share count |
 | `GET` | `/api/symbols/{sym}/shares` | The symbol's shares: outstanding, held by traders, bid for, still available, and who holds them |
 | `GET` | `/api/symbols/{sym}/status` | Whether the symbol can be traded: session open, halted, the limit band and the next open/close |
@@ -343,7 +343,7 @@ the same order sent twice — a retry after a timeout — is placed once, the
 first response is replayed with `200` instead of `201`, and re-using that id
 for a *different* order is refused with `409` rather than quietly obeyed.
 
-Shares are counted the same way. Every symbol has a fixed number of them
+Shares are counted the same way. Every stock has a fixed number of them
 (`shares_outstanding`: 240 M of ACME, 85 M of NBLA, 610 M of HLIO, 150 M of
 PXCO), and a buy can only be filled from the ones no trader holds or is
 already bidding for — `GET /api/symbols/{sym}/shares` shows the split. A sell
@@ -355,6 +355,25 @@ buy reserves cash, and a cancel gives them back. `GET /api/users/{id}/holdings`
 adds a user's positions up per symbol — owned, reserved and sellable — across
 every trader of theirs, and shares belong to the trader that bought them: one
 trader cannot sell another's, even under the same user.
+
+Not every listing is a company. A symbol has an **asset kind** — `stock` or
+`good` — and every quote says which (`asset_kind`, and `unit` for a good).
+A good is the same thing everywhere it matters: the same book, the same
+positions, the same reservations, the same fills. It differs in three
+places. Its units are *issued and consumed* rather than floated, so
+`shares_outstanding` is what has been issued less what has been consumed and
+it starts at zero. It is quoted **without synthetic liquidity** — no maker
+ladder, no printed volume — because a fill against liquidity nobody funded
+would be a unit nobody issued; the simulator still runs underneath it as a
+reference price, but the book holds only real orders and the tape only real
+trades. And it has neither a dividend nor a buyout, so both routes refuse
+it: what ends a good's life is consuming it.
+
+That difference is what the audit checks. For a stock, holdings plus resting
+bids may not exceed the float — the bids count because the ladder would sell
+what nobody holds. For a good there is no ladder, so a bid speaks for
+nothing, and the question is stricter: every issued unit that has not been
+consumed is held by somebody.
 
 A **stop** is a line drawn on the price rather than an order: it rests
 nowhere, holds no queue position and reserves nothing, and the book has never
