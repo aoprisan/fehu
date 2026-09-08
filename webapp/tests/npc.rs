@@ -449,6 +449,59 @@ async fn a_world_with_no_synthetic_liquidity_owes_nobody_anything() {
 }
 
 /// A throwaway directory that cleans up after itself, as in `save.rs`.
+#[tokio::test]
+async fn a_world_can_be_seeded_with_a_merchant_behind_every_symbol() {
+    // No synthetic ladder: without merchants this world's books are empty,
+    // which is exactly the case seeding exists for.
+    let app = App::new(Options {
+        history_days: 0,
+        warmup_hours: 0,
+        now_ms: Some(NOW_MS),
+        rate_per_sec: 0.0,
+        synthetic: false,
+        synthetic_float_cents: 0,
+        ..Options::default()
+    });
+    let before = supply(&app).await;
+    engine::advance_to(&app, Timestamp(NOW_MS + 1_000)).await;
+    let (_, book) = get(&app, None, "/api/symbols/acme/book").await;
+    assert!(
+        book["bids"].as_array().unwrap().is_empty() && book["asks"].as_array().unwrap().is_empty(),
+        "nobody has funded anything yet: {book}"
+    );
+
+    let made = app.seed_merchants(10_000_000).await;
+    assert_eq!(made, 4, "one behind each seeded symbol");
+
+    let after = supply(&app).await;
+    assert_eq!(
+        after["outstanding_cents"], before["outstanding_cents"],
+        "the tills are filled out of treasury, not minted"
+    );
+    assert_eq!(after["npc_cents"], 40_000_000);
+
+    engine::advance_to(&app, Timestamp(NOW_MS + 2_000)).await;
+    let (_, book) = get(&app, None, "/api/symbols/acme/book").await;
+    assert!(
+        !book["bids"].as_array().unwrap().is_empty(),
+        "and now somebody is quoting: {book}"
+    );
+    assert!(!book["asks"].as_array().unwrap().is_empty(), "{book}");
+    assert_eq!(
+        supply(&app).await["synthetic_debt_cents"],
+        0,
+        "with nothing owed to nobody"
+    );
+    reconciles(&app).await;
+
+    // Seeding again is a second call, not a second merchant: a symbol that
+    // already has one is skipped.
+    assert_eq!(app.seed_merchants(10_000_000).await, 0);
+    let (_, npcs) = get(&app, None, "/api/npcs").await;
+    assert_eq!(npcs["npcs"].as_array().unwrap().len(), 4);
+    reconciles(&app).await;
+}
+
 mod tempdir_lite {
     use std::path::{Path, PathBuf};
 

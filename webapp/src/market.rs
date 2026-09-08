@@ -4161,6 +4161,81 @@ impl App {
     ///
     /// # Errors
     /// The file could not be created or its header written.
+    /// Put a funded merchant behind every symbol that has none.
+    ///
+    /// A world with no synthetic ladder and no merchants has an empty book,
+    /// which is what kept the ladder switched on by default when milestone 3
+    /// built the switch. This is the other half of that: with
+    /// `FEHU_SEED_MERCHANTS_CENTS` set, the demo starts as an economy —
+    /// every listing has somebody standing behind it who paid for the
+    /// inventory, and `FEHU_SYNTHETIC=0` leaves a book that still has two
+    /// sides.
+    ///
+    /// Each merchant is given `cents` out of treasury and, at the reference
+    /// price, about as much stock as that would buy: one that can sell as
+    /// much as it can buy quotes both sides for as long as the price holds.
+    /// Every one of them is created by the same journaled
+    /// [`Command::CreateNpc`](crate::journal::Command::CreateNpc) a request
+    /// would send, so a replayed world seeds identically — and it is only
+    /// ever called for a world that was warmed up rather than restored,
+    /// because a restored one already has whatever merchants it had.
+    ///
+    /// Returns how many were created.
+    pub async fn seed_merchants(&self, cents: i64) -> usize {
+        if cents <= 0 {
+            return 0;
+        }
+        let mut made = 0;
+        for symbol in self.listings().all() {
+            let ticker = symbol.ticker;
+            let Ok(reference) = symbol.ask(|s| s.price_cents()).await else {
+                continue;
+            };
+            if reference <= 0 {
+                continue;
+            }
+            let inventory = u64::try_from(cents / reference).unwrap_or(0);
+            let at = self.clock.now();
+            let wall_ms = wall_now_ms();
+            let command = crate::journal::Command::CreateNpc {
+                symbol: ticker.to_string(),
+                name: Some(format!("{ticker} Merchant")),
+                policy: Policy::default(),
+                cash_cents: cents,
+                inventory,
+            };
+            let key = Some(format!("seed-merchant:{ticker}"));
+            let outcome = self
+                .market
+                .call_async(move |m| {
+                    Box::pin(async move {
+                        if m.npcs.values().any(|npc| npc.symbol == ticker) {
+                            return None;
+                        }
+                        Some(
+                            m.run_command(
+                                crate::journal::Principal::Operator,
+                                key,
+                                at,
+                                wall_ms,
+                                command,
+                            )
+                            .await,
+                        )
+                    })
+                })
+                .await;
+            match outcome {
+                Ok(Some(Ok(_))) => made += 1,
+                Ok(Some(Err(e))) => {
+                    tracing::warn!(symbol = ticker, error = %e.message(), "no merchant seeded");
+                }
+                Ok(None) | Err(Gone) => {}
+            }
+        }
+        made
+    }
+
     pub async fn attach_journal(&self, path: &std::path::Path) -> Result<(), JournalError> {
         let path = path.to_path_buf();
         self.market
@@ -4509,6 +4584,14 @@ pub struct Options {
     /// It is saved with the market, because a snapshot may fall between any
     /// two commands.
     pub command_log: usize,
+    /// What each seeded symbol's merchant is funded with at start-up, in
+    /// cents. `FEHU_SEED_MERCHANTS_CENTS`; `0`, the default, seeds none.
+    ///
+    /// Only for a world that is being warmed up: a restored one already has
+    /// the merchants it had. With this set and `FEHU_SYNTHETIC=0` the demo
+    /// is an economy in which every fill has a funded counterparty — see
+    /// [`App::seed_merchants`].
+    pub seed_merchant_cents: i64,
     /// Finished jobs kept, with what each one delivered. `FEHU_JOB_LOG`.
     ///
     /// A *running* job is never dropped whatever this says: it is a promise
@@ -4561,6 +4644,7 @@ impl Default for Options {
             taker_fee_bps: 0,
             maker_fee_bps: 0,
             command_log: 10_000,
+            seed_merchant_cents: 0,
             job_log: crate::jobs::DEFAULT_JOB_LOG,
             reward_log: crate::rewards::DEFAULT_REWARD_LOG,
         }
@@ -4635,6 +4719,8 @@ impl Options {
             taker_fee_bps: env_parse("FEHU_TAKER_FEE_BPS", d.taker_fee_bps),
             maker_fee_bps: env_parse("FEHU_MAKER_FEE_BPS", d.maker_fee_bps),
             command_log: env_parse("FEHU_COMMAND_LOG", d.command_log),
+            seed_merchant_cents: env_parse("FEHU_SEED_MERCHANTS_CENTS", d.seed_merchant_cents)
+                .max(0),
             job_log: env_parse("FEHU_JOB_LOG", d.job_log),
             reward_log: env_parse("FEHU_REWARD_LOG", d.reward_log),
         }

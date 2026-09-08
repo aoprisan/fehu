@@ -8,7 +8,8 @@
 //! `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`, `FEHU_MAX_BARS`, `FEHU_EVENT_LOG`,
 //! `FEHU_TAPE`, `FEHU_FILL_LOG`, `FEHU_ORDER_LOG`, `FEHU_LEDGER_LOG`,
 //! `FEHU_STARTING_CASH_CENTS`, `FEHU_ADMIN_KEY`, `FEHU_STATE_FILE`,
-//! `FEHU_SAVE_SECS`, `FEHU_COMMAND_LOG`, `FEHU_MAX_SYMBOLS`, `RUST_LOG`.
+//! `FEHU_SAVE_SECS`, `FEHU_COMMAND_LOG`, `FEHU_JOB_LOG`, `FEHU_REWARD_LOG`,
+//! `FEHU_SEED_MERCHANTS_CENTS`, `FEHU_MAX_SYMBOLS`, `RUST_LOG`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,6 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => Vec::new(),
     };
+    let fresh = saved.is_none();
+    let seed_merchant_cents = options.seed_merchant_cents;
     let app = match saved {
         Some(save) => App::resume(options, save, entries).await,
         None => {
@@ -70,6 +73,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = journal_path.as_deref() {
         app.attach_journal(path).await?;
         tracing::info!(path = %path.display(), "journaling commands");
+    }
+    // A world that was warmed up rather than restored has no merchants, and
+    // with `FEHU_SYNTHETIC=0` no liquidity at all. Seeding runs after the
+    // journal is attached, so the merchants it makes are written down like
+    // any other command.
+    if fresh && seed_merchant_cents > 0 {
+        let made = app.seed_merchants(seed_merchant_cents).await;
+        tracing::info!(
+            merchants = made,
+            cents = seed_merchant_cents,
+            "merchants seeded"
+        );
     }
     for symbol in app.listings().all() {
         let Ok((q, daily_bars, minute_bars, ticks)) = symbol

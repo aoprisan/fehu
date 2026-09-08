@@ -197,7 +197,14 @@ issuer wallet is given to pay dividends and buyouts from, and
 `FEHU_SYNTHETIC_FLOAT_CENTS` (5×10^13) is what the stand-in for the
 simulator's unfunded liquidity starts with — see **The currency** below —
 and `FEHU_SYNTHETIC=0` switches that liquidity off altogether, leaving the
-book to whoever funded what is in it. `FEHU_MARKET_HOURS=09:30-16:00`
+book to whoever funded what is in it. `FEHU_SEED_MERCHANTS_CENTS` is the
+other half of that switch: set it and a world that is being *warmed up* gets
+a funded merchant behind every seeded symbol, each with that much currency
+out of treasury and about as much stock as it would buy, so
+`FEHU_SEED_MERCHANTS_CENTS=10000000 FEHU_SYNTHETIC=0` is a demo in which
+every fill has somebody on the other side who paid for what they are
+selling. A restored world is left alone: it already has the merchants it
+had. `FEHU_MARKET_HOURS=09:30-16:00`
 gives the market a UTC weekday session (unset, it never closes);
 `FEHU_PRICE_LIMIT_PCT` (0.10) and `FEHU_HALT_SECS` (300) set the limit move
 that halts a symbol and how long the halt lasts. `FEHU_RATE_PER_SEC` (20) and

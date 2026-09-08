@@ -682,6 +682,18 @@ aliased: mint, burn and freeze stay at their account-addressed paths, because
 `/admin/mint` would need an account in its body and there is nothing to gain
 from a third way of naming one.
 
+**The demo can now be an economy without being one by default.** Milestone 3
+left the ladder switched on because a world with no merchants and no players
+would otherwise have an empty book, and said seeding the four demo symbols
+belonged here. It does, as `FEHU_SEED_MERCHANTS_CENTS`: a world that is being
+*warmed up* gets a funded merchant behind every listing, each given that much
+currency out of treasury and about as much stock as it would buy, through the
+same journaled command a request would send. With `FEHU_SYNTHETIC=0` beside
+it the demo is a market in which everything on the book was paid for. It is
+off by default, because turning it on by default would change what every
+existing test's world is; and a *restored* world is left alone, since it
+already has the merchants it had.
+
 **And the acceptance found one thing.** `POST /api/symbols` answered a retry
 of the listing that succeeded with `409 already listed`: its cheap
 "is this ticker taken" check ran *before* `run_command` reached the
@@ -745,7 +757,7 @@ cargo clippy -p fehu-webapp --all-targets -- -D warnings    # clean
 cargo build --all-features / --no-default-features / +serde # clean
 cargo test --all-features                                   # 103 passed, 0 failed
 cargo test --no-default-features --tests                    #  96 passed, 0 failed
-cargo test -p fehu-webapp                                   # 227 passed, 0 failed
+cargo test -p fehu-webapp                                   # 228 passed, 0 failed
 cargo build --release --target wasm32-unknown-unknown …     # clean, both feature sets
 cd webapp/ui && npm ci && npm run build                     # bundle rebuilt and committed
 ```
@@ -761,7 +773,9 @@ and a world stopped with a job in the furnace that comes back running it.
 a reward that moves currency rather than making it, one refused when the
 budget runs dry, the same game event paid once however many keys ask for it,
 transfers between players, a frozen account that is paid but pays nobody, and
-a restart that still remembers what it has paid for.
+a restart that still remembers what it has paid for. One test joins
+`webapp/tests/npc.rs`: a world with no synthetic liquidity, seeded, quoting
+both sides of every book and owing nobody anything.
 
 `webapp/tests/economy_jobs.rs` is the milestone's own acceptance: the
 scenario above, asked after every step whether the currency adds up, whether
