@@ -69,9 +69,11 @@ below follows from that:
   uses a `long_jump`ed stream), so adding trading does not perturb the bare
   price series. `tests/trading.rs` holds that invariant.
 - Version constants that gate save compatibility: `fehu::STATE_VERSION`
-  (simulator), `fehu::EXCHANGE_VERSION`, and `fehu_webapp::save::STATE_VERSION`
-  (the whole market file, currently 5). Loading a mismatched version is
-  refused rather than guessed at.
+  (simulator), `fehu::EXCHANGE_VERSION`, `fehu_webapp::save::STATE_VERSION`
+  (the whole market file, currently 7) and
+  `fehu_webapp::journal::JOURNAL_VERSION` (the command journal beside it,
+  currently 1). Loading a mismatched version is refused rather than guessed
+  at.
 - JSON round-trips need `serde_json`'s `float_roundtrip` feature; without it a
   parsed `f64` can be one ulp off. Binary formats (postcard) are always exact.
 
@@ -130,12 +132,45 @@ Consequences worth knowing:
 - Auth and the symbol table are published on `tokio::sync::watch` as immutable
   snapshots, so request handlers read them without sending a job.
 
+### Commands and the journal
+
+**Nothing changes the market except a `journal::Command`.** Every mutating
+handler in `api.rs` authorises the request, cleans it, builds a `Command` and
+calls `run`/`run_at`; `journal::apply` is the only implementation of what a
+mutation does, and the reply is a `Committed` — a JSON body plus
+`Fehu-Journal-Seq`. Adding a route that changes something means adding a
+variant and an arm, not a new closure on the market actor.
+
+`Market::run_command` is the funnel: it checks the `Idempotency-Key` index,
+applies the command, appends the entry and `fsync`s it, and only then
+answers. Start-up loads the snapshot and replays the entries after it
+(`App::resume`) through that same `apply`, so the live path and the replay
+path cannot drift apart.
+
+Two rules follow, and both are easy to break by accident:
+
+- **A command may not read anything a replay cannot.** No clock, no RNG, no
+  `wall_now_ms()`. The simulated instant is pinned on the market for the
+  duration (`Market::now`, *not* `self.clock.now()`) and the wall clock is a
+  field of the entry; anything else the server generates — an API key digest
+  — is resolved by the handler and journaled. The engine tick is a command
+  (`Command::Step`) for exactly this reason.
+- **Refusals are not journaled.** Every apply path validates fully before it
+  mutates, so a refused command leaves nothing behind and a retry of one is
+  simply re-applied.
+
+The journal file is truncated when a snapshot lands, so `save.rs` and
+`journal.rs` are two halves of one thing; the idempotency index lives in the
+snapshot, because a snapshot may fall between any two commands. No credential
+ever reaches either: a key exists once, in the response that issued it.
+
 Other modules: `account.rs` (users, accounts, cash ledger), `trading.rs`
 (traders, positions, share reservations, wire DTOs), `auth.rs` (API keys —
 issued once, stored as domain-separated SHA-256 digests), `events.rs` (raw
 simulator events and the semantic game-event catalogue), `symbols.rs`
 (tickers registered and `Box::leak`ed to `&'static str`, capped and length-
-bounded), `api.rs` (all HTTP handlers and the SSE stream), `metrics.rs`.
+bounded), `api.rs` (all HTTP handlers and the SSE stream), `journal.rs`
+(commands, the append-only journal, replay), `metrics.rs`.
 
 ### Money and shares
 

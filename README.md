@@ -102,7 +102,15 @@ issued when they signed up, as `Authorization: Bearer <key>` (or
 `X-Api-Key`), and a key only ever speaks for its own user: nobody else can
 read that portfolio, cancel those orders or move that money. The key is shown
 **once**, in the response that created the user — `POST /api/users` or
-`POST /api/traders` — and is `null` in every response after.
+`POST /api/traders` — and is `null` in every response after. That response is
+the only copy there will ever be: the server keeps a hash of it and nothing
+more.
+
+Every request that changes something may carry an **`Idempotency-Key`**
+header, and should if it moves money: the same key over the same body is
+applied once and answered twice. Responses carry `Fehu-Journal-Seq`, and a
+replayed one also carries `Fehu-Idempotent-Replay`. See
+[The journal](#the-journal).
 
 | Method | Path | What |
 |---|---|---|
@@ -146,6 +154,7 @@ read that portfolio, cancel those orders or move that money. The key is shown
 | `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first |
 | `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and — for `?api_key=`, since `EventSource` cannot set headers — that player's `fill`s |
 | `GET` | `/api/supply` | How much currency exists and where it sits: minted, burned, outstanding, what the wallets actually hold, and whether the two agree |
+| `GET` | `/api/commands/{key}` | The answer a command was given, by the `Idempotency-Key` it was sent under, for a client that lost the response |
 | `GET` | `/api/reconcile` | Game master: check ownership, reservations, share supply, retained cash ledgers **and that the currency adds up**; returns `valid` and `issues` |
 | `GET` | `/api/health` | Uptime, simulated time, tick/trade counters, orders placed and refused, fills booked and any that failed to settle, stream and rate-limit state, and how long requests and engine steps are taking |
 
@@ -179,8 +188,11 @@ to be able to afford the fee as well as the shares. A rebate is paid out of
 what the venue has taken in fees and no further: what it has not collected,
 it does not pay.
 `FEHU_STATE_FILE` keeps the market
-across restarts (`FEHU_SAVE_SECS`, 30 by default, sets how often it is
-written). `FEHU_ADMIN_KEY` locks the
+across restarts (`FEHU_SAVE_SECS`, 30 by default, sets how often the snapshot
+is written; the command journal beside it is written before every change is
+acknowledged, so the interval costs nothing that was promised).
+`FEHU_COMMAND_LOG` (10 000) is how many `Idempotency-Key`s are remembered,
+which is how late a retry may arrive and still be free. `FEHU_ADMIN_KEY` locks the
 game-master endpoints behind a key of your choosing: the ones that move
 prices (`POST /api/game/events`, `POST /api/symbols/{sym}/events`), the ones
 that list, halt and delist symbols, and — since currency became conserved —
@@ -249,8 +261,8 @@ to pull an order out of a market that has stopped. `GET
 
 Set `FEHU_STATE_FILE` and the market survives a restart. The whole thing is
 written there — every symbol's simulator, book, bars and held stops, and
-every user, account, wallet, position, resting order and API key, with the
-currency ledger and the supply behind it — every `FEHU_SAVE_SECS`
+every user, account, wallet, position, resting order and API key digest, with
+the currency ledger and the supply behind it — every `FEHU_SAVE_SECS`
 seconds and once more on a clean shutdown, and read back at start-up in place
 of the warm-up, continuing from the simulated time it had reached. The write
 goes through a temporary file and a rename, so an interrupted save cannot
@@ -266,12 +278,51 @@ add up to what has been minted less what has been burned.
 Without the variable nothing is kept and every start warms up a
 fresh market.
 
+### The journal
+
+A snapshot every thirty seconds would lose up to thirty seconds of trading,
+which is not a thing to lose. So the snapshot is only a checkpoint: beside it
+is an append-only **command journal**, and every change is written there and
+flushed *before* the response goes out. Nothing this server has acknowledged
+is lost, whatever stops it.
+
+It journals the **commands**, not their effects, which the simulator's
+determinism makes exact: the checkpoint plus the commands after it, applied
+in order, is the state that was acknowledged. Each entry carries the request
+with everything the server chose already resolved — the simulated instant it
+runs at, the wall clock it arrived on, the seed of a listing — so a replay
+reads no clock and rolls no dice. The engine tick is a command too, which is
+what makes an order that filled against the price at 12:04:31 fill against it
+again. On start-up the snapshot is loaded, the entries after it are applied,
+and the journal is rewritten from the sequence the *next* snapshot includes.
+
+Every mutation takes an optional **`Idempotency-Key`** header. The first
+request under a key is applied and its response written down; the same key
+with the same body is answered with that response instead of doing the work
+again (`Fehu-Idempotent-Replay: true`), and the same key with a *different*
+body is refused with `409 idempotency_conflict` rather than quietly obeyed.
+Every response says where it landed in the journal, as `Fehu-Journal-Seq`,
+and `GET /api/commands/{key}` gives back the answer a command was given, for
+a client that lost it. `client_order_id` on an order is the same idea one
+level down, and still works on its own.
+
+If the journal cannot be written the server stops accepting changes —
+`503 journal_unavailable` — and goes on serving reads. Memory would otherwise
+be ahead of the disk, and a market that cannot promise to remember a change
+should not accept one.
+
+What this is not is a database: one writer, one file, no history to query and
+no outbox to deliver from. That is deliberate — see `docs/economy-engine-plan.md`
+for what a live service would need instead.
+
 Keys are the only credential: they are 128 bits of operating-system entropy,
-issued once at sign-up. Authentication and saves retain domain-separated
-SHA-256 hashes; a stored hash cannot be used as a bearer key. Save format 3
-reads version-2 files by hashing their original keys, so players keep using
-the same credentials. The next save writes only hashes; any older backups
-still contain the original keys.
+generated once at sign-up. The server keeps only a domain-separated SHA-256
+digest of one — in memory, in the journal and in the save file alike — so
+none of them is a list of live credentials and a stored digest cannot be used
+as a bearer key. The consequence is worth knowing: the response that creates
+a user is the only copy of its key that will ever exist. A *replayed* sign-up
+comes back without one, and a client that loses that response has to create
+another user.
 
 Three rules shape what the book will take. A **post-only** order (`"post_only":true`)
 must rest: if its price would trade on arrival it is refused rather than

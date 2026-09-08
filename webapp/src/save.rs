@@ -21,6 +21,17 @@
 //! Writes are atomic: the snapshot goes to a temporary file beside the
 //! target, which is then renamed over it, so a crash mid-write leaves the
 //! previous save intact.
+//!
+//! # The snapshot is half of the persistence
+//!
+//! A snapshot is a checkpoint, not the record. Everything between two of
+//! them is in the command journal beside it ([`crate::journal`]), which is
+//! written before each change is acknowledged; a snapshot records the
+//! journal sequence it includes ([`MarketSave::journal_seq`]), start-up
+//! replays what came after, and the journal is rewritten from that point
+//! once the new snapshot is safely renamed into place. So the file is
+//! allowed to be minutes out of date without anything acknowledged being at
+//! risk, and it is what keeps the journal short.
 
 use std::collections::BTreeSet;
 use std::io::{self, Write};
@@ -47,6 +58,12 @@ pub type Symbol = &'static str;
 
 /// Current save format. Any other version, older or newer, is refused.
 ///
+/// Version 7 added the command journal's sequence and its idempotency index,
+/// so a snapshot says exactly which commands it already contains and a retry
+/// that arrives after a restart is still a retry. A version 6 file has
+/// neither, and starting from one would replay a journal from the beginning
+/// or lose it; there is no data to migrate, so it is refused like the rest.
+///
 /// Version 6 moved the money into the currency ledger. Every earlier version
 /// keeps a balance on each account and no supply behind it, so there is
 /// nothing to migrate one *to* without inventing where its currency came
@@ -59,7 +76,7 @@ pub type Symbol = &'static str;
 /// transaction out of issuance, so the currency has a recorded origin and
 /// the books still add up. It is a day's work when there is such a world.
 /// There is not: the current file is a demo, regenerated from its seeds.
-pub const STATE_VERSION: u32 = 6;
+pub const STATE_VERSION: u32 = 7;
 
 /// Everything needed to carry on where the server left off.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -146,6 +163,16 @@ pub struct MarketSave {
     /// symbol's book leaves behind, so its orders' ids are never reissued.
     #[serde(default)]
     pub next_order_id: u64,
+    /// The journal sequence this snapshot includes. Start-up replays the
+    /// entries after it and nothing before it, and the journal is rewritten
+    /// from here once the file is safely in place.
+    #[serde(default)]
+    pub journal_seq: u64,
+    /// What each `Idempotency-Key` answered, oldest first. It lives here
+    /// rather than in the journal because a snapshot may fall between any
+    /// two commands, and a retry must be a retry on either side of one.
+    #[serde(default)]
+    pub commands: Vec<crate::journal::CommandRecord>,
 }
 
 /// Why a save could not be written or read.
@@ -197,6 +224,7 @@ impl From<serde_json::Error> for SaveError {
 /// write cannot destroy the previous save.
 pub async fn write(app: &App, path: &Path) -> Result<(), SaveError> {
     let save = app.save().await;
+    let seq = save.market.journal_seq;
     let tmp = temp_path(path);
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
@@ -206,6 +234,10 @@ pub async fn write(app: &App, path: &Path) -> Result<(), SaveError> {
     file.sync_all()?;
     drop(file);
     std::fs::rename(&tmp, path)?;
+    // Only once the snapshot is in place: the commands up to `seq` are in it
+    // now, so the journal no longer has to carry them. A truncation that
+    // fails costs nothing but a replay of entries the snapshot already has.
+    app.truncate_journal(seq).await;
     Ok(())
 }
 

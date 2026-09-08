@@ -516,7 +516,9 @@ pub struct CreateTraderRequest {
 }
 
 /// Body of `POST /api/symbols/{symbol}/orders`.
-#[derive(Clone, Debug, Deserialize)]
+// Serialised as well as deserialised: this is what the journal writes
+// down, so a replayed request is the request that was accepted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrderRequest {
     pub trader_id: u64,
     pub side: Side,
@@ -553,7 +555,9 @@ pub struct OrderRequest {
 /// An amendment is a cancel and a fresh order, so the amended order goes to
 /// the back of the queue at its price — the same as anywhere else that does
 /// not have a true in-place amend.
-#[derive(Clone, Debug, Deserialize)]
+// Serialised as well as deserialised: this is what the journal writes
+// down, so a replayed request is the request that was accepted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AmendRequest {
     pub trader_id: u64,
     /// New limit price; unchanged if absent.
@@ -662,7 +666,9 @@ impl StopOrder {
 }
 
 /// Body of `POST /api/symbols/{symbol}/stops`.
-#[derive(Clone, Debug, Deserialize)]
+// Serialised as well as deserialised: this is what the journal writes
+// down, so a replayed request is the request that was accepted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StopRequest {
     pub trader_id: u64,
     pub side: Side,

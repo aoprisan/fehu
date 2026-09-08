@@ -14,6 +14,7 @@ pub mod api;
 pub mod auth;
 pub mod engine;
 pub mod events;
+pub mod journal;
 pub mod limit;
 pub mod market;
 pub mod metrics;
