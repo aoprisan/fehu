@@ -30,6 +30,7 @@ use fehu::ledger::LedgerError;
 use crate::actor::Gone;
 use crate::catalog::{CatalogError, CatalogResponse, GoodsError, MAX_NOTE_LEN};
 use crate::events::{CatalogEntry, EventRecord, GameEventKind, GameEventRequest, PushEventRequest};
+use crate::jobs::{JobError, JobsResponse, MAX_RECIPE_NOTE, RecipesResponse};
 use crate::journal::{Command, Listing, Outcome, Principal, seed_from_ticker};
 use crate::limit::Decision;
 use crate::market::{
@@ -38,11 +39,13 @@ use crate::market::{
     SymbolView, wall_now_ms,
 };
 use crate::npc::{NpcsResponse, Policy};
+use crate::rewards::{BudgetsResponse, RewardError};
 use crate::trading::{
-    AmendRequest, BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID, OpenOrderDto,
-    OrderRecord, OrderRequest, PortfolioDto, PositionDto, Refused, StopOrder, StopRequest,
-    TradeDto, TraderSummary, UserHoldingsResponse,
+    AmendRequest, BookDto, CreateTraderRequest, HolderDto, HoldingDto, MAX_CLIENT_ORDER_ID,
+    OpenOrderDto, OrderRecord, OrderRequest, PortfolioDto, PositionDto, Refused, StopOrder,
+    StopRequest, TradeDto, TraderSummary, UserHoldingsResponse,
 };
+use crate::world::WorldResponse;
 
 type AppState = Arc<App>;
 
@@ -117,8 +120,72 @@ pub fn router(app: AppState) -> Router {
         .route("/api/catalog/{symbol}", delete(remove_catalog_item))
         .route("/api/traders/{trader_id}/purchases", post(purchase))
         .route("/api/traders/{trader_id}/consume", post(consume))
+        .route("/api/recipes", get(get_recipes).post(set_recipe))
+        .route("/api/recipes/{id}", delete(remove_recipe))
+        .route("/api/jobs", get(list_jobs).post(start_job))
+        .route("/api/jobs/{job_id}", get(get_job))
+        .route("/api/jobs/{job_id}/cancel", post(cancel_job))
+        .route("/api/budgets", get(get_budgets).post(create_budget))
+        .route("/api/budgets/{wallet_id}/fund", post(fund_budget))
+        .route("/api/rewards", post(pay_reward))
+        .route("/api/rewards/rules", post(set_reward_rule))
+        .route("/api/rewards/rules/{id}", delete(remove_reward_rule))
+        .route("/api/transfers", post(transfer))
+        .route("/api/wallets/{wallet_id}", get(get_wallet))
+        .route(
+            "/api/wallets/{wallet_id}/transactions",
+            get(get_wallet_transactions),
+        )
+        .route("/api/traders/{trader_id}/inventory", get(get_inventory))
+        .route("/api/world", get(world))
         .route("/api/supply", get(supply))
         .route("/api/commands/{key}", get(get_command))
+        // The economy surface the plan names, at the paths it names them at.
+        // Every one of these is the same handler as the route above it: one
+        // implementation, two spellings, so the game backend can speak the
+        // documented economy API and the demo UI can go on speaking the one
+        // it was written against.
+        .route("/api/v1/economy/players", post(create_trader))
+        .route(
+            "/api/v1/economy/players/{trader_id}/inventory",
+            get(get_inventory),
+        )
+        .route("/api/v1/economy/wallets/{wallet_id}", get(get_wallet))
+        .route(
+            "/api/v1/economy/wallets/{wallet_id}/transactions",
+            get(get_wallet_transactions),
+        )
+        .route("/api/v1/economy/transfers", post(transfer))
+        .route("/api/v1/economy/rewards", post(pay_reward))
+        .route("/api/v1/economy/purchases", post(purchase_body))
+        .route("/api/v1/economy/consume", post(consume_body))
+        .route("/api/v1/economy/jobs", get(list_jobs).post(start_job))
+        .route("/api/v1/economy/jobs/{job_id}", get(get_job))
+        .route("/api/v1/economy/jobs/{job_id}/cancel", post(cancel_job))
+        .route("/api/v1/economy/recipes", get(get_recipes))
+        .route("/api/v1/economy/catalog", get(get_catalog))
+        .route("/api/v1/economy/budgets", get(get_budgets))
+        .route("/api/v1/economy/supply", get(supply))
+        .route("/api/v1/economy/world", get(world))
+        .route("/api/v1/economy/commands/{key}", get(get_command))
+        .route("/api/v1/economy/reconcile", get(reconcile))
+        .route("/api/v1/economy/admin/recipes", post(set_recipe))
+        .route("/api/v1/economy/admin/recipes/{id}", delete(remove_recipe))
+        .route("/api/v1/economy/admin/catalog", post(set_catalog_item))
+        .route(
+            "/api/v1/economy/admin/catalog/{symbol}",
+            delete(remove_catalog_item),
+        )
+        .route("/api/v1/economy/admin/budgets", post(create_budget))
+        .route(
+            "/api/v1/economy/admin/budgets/{wallet_id}/fund",
+            post(fund_budget),
+        )
+        .route("/api/v1/economy/admin/rewards", post(set_reward_rule))
+        .route(
+            "/api/v1/economy/admin/rewards/{id}",
+            delete(remove_reward_rule),
+        )
         .route("/api/game/catalog", get(catalog))
         .route("/api/game/events", get(list_events).post(push_game_event))
         .route("/api/events", get(list_events))
@@ -400,6 +467,7 @@ impl ApiError {
                 (StatusCode::BAD_REQUEST, "invalid_amount")
             }
             MoneyError::NoWallet { .. } => (StatusCode::INTERNAL_SERVER_ERROR, "no_wallet"),
+            MoneyError::SameAccount { .. } => (StatusCode::BAD_REQUEST, "same_account"),
             MoneyError::Ledger(e) => match e {
                 LedgerError::BalanceCap { .. } => (StatusCode::UNPROCESSABLE_ENTITY, "balance_cap"),
                 LedgerError::Insufficient { .. } => {
@@ -450,6 +518,59 @@ impl ApiError {
                 "insufficient_inventory",
                 e.to_string(),
             ),
+        }
+    }
+
+    /// A recipe or a job the world would not run.
+    pub(crate) fn job(e: JobError) -> Self {
+        match e {
+            JobError::Money(m) => Self::money(m),
+            JobError::UnknownTrader(id) => Self::unknown_trader(id),
+            JobError::Unknown(sym) => Self::not_found(&sym),
+            JobError::UnknownRecipe(_) => {
+                Self::new(StatusCode::NOT_FOUND, "unknown_recipe", e.to_string())
+            }
+            JobError::UnknownJob(_) => {
+                Self::new(StatusCode::NOT_FOUND, "unknown_job", e.to_string())
+            }
+            JobError::NotAGood(_) => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not_a_good",
+                e.to_string(),
+            ),
+            JobError::InsufficientUnits { .. } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "insufficient_inventory",
+                e.to_string(),
+            ),
+            JobError::NotRunning(_) => {
+                Self::new(StatusCode::CONFLICT, "job_finished", e.to_string())
+            }
+            JobError::Full | JobError::TooManyJobs(_) => {
+                Self::new(StatusCode::CONFLICT, "too_many", e.to_string())
+            }
+            JobError::Recipe(_) | JobError::Quantity(_) => Self::bad_request(e.to_string()),
+        }
+    }
+
+    /// A budget, a rule or a reward the world would not pay.
+    pub(crate) fn reward(e: RewardError) -> Self {
+        match e {
+            RewardError::Money(m) => Self::money(m),
+            RewardError::UnknownTrader(id) => Self::unknown_trader(id),
+            RewardError::UnknownBudget(_) => {
+                Self::new(StatusCode::NOT_FOUND, "unknown_budget", e.to_string())
+            }
+            RewardError::UnknownRule(_) => {
+                Self::new(StatusCode::NOT_FOUND, "unknown_reward_rule", e.to_string())
+            }
+            RewardError::Exhausted { .. } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "budget_exhausted",
+                e.to_string(),
+            ),
+            RewardError::Full(_) => Self::new(StatusCode::CONFLICT, "too_many", e.to_string()),
+            RewardError::Invalid(_) => Self::bad_request(e.to_string()),
         }
     }
 
@@ -1333,6 +1454,616 @@ async fn remove_catalog_item(
         Principal::Operator,
         key,
         Command::RemoveCatalogItem { symbol },
+    )
+    .await
+    .map(Committed)
+}
+
+// ---------------------------------------------------------------------------
+// Recipes and jobs. See [`crate::jobs`].
+
+/// One line of a recipe, as a request spells it.
+#[derive(Deserialize)]
+struct RecipeLineRequest {
+    /// A listed good. A company is refused: shares are floated, not made.
+    symbol: String,
+    qty: u64,
+}
+
+/// Body of `POST /api/recipes`.
+#[derive(Deserialize)]
+struct RecipeRequest {
+    /// A short name, uppercased on the way in: `SMELT`.
+    id: String,
+    /// Units consumed when a job starts. May be empty: a mine takes nothing
+    /// but time.
+    #[serde(default)]
+    inputs: Vec<RecipeLineRequest>,
+    /// Units issued when it completes. At least one.
+    outputs: Vec<RecipeLineRequest>,
+    /// What the furnace charges, paid to the venue when the job starts.
+    #[serde(default)]
+    cost_cents: i64,
+    /// How long it takes, in simulated seconds.
+    #[serde(default)]
+    duration_secs: u64,
+    /// What a cancellation gives back, in basis points of the cost.
+    #[serde(default)]
+    refund_bps: u32,
+    note: Option<String>,
+}
+
+fn recipe_lines(lines: Vec<RecipeLineRequest>) -> Vec<(String, u64)> {
+    lines.into_iter().map(|l| (l.symbol, l.qty)).collect()
+}
+
+/// What the world knows how to make.
+async fn get_recipes(State(app): State<AppState>) -> Result<Json<RecipesResponse>, ApiError> {
+    Ok(Json(RecipesResponse {
+        recipes: app
+            .market
+            .call(|m| m.recipes.recipes().cloned().collect())
+            .await?,
+    }))
+}
+
+/// Write or replace a recipe. Operator authority.
+async fn set_recipe(
+    State(app): State<AppState>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<RecipeRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::SetRecipe {
+            id: req.id,
+            inputs: recipe_lines(req.inputs),
+            outputs: recipe_lines(req.outputs),
+            cost_cents: req.cost_cents,
+            duration_secs: req.duration_secs,
+            refund_bps: req.refund_bps,
+            note: clean_text(req.note, MAX_RECIPE_NOTE),
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Stop making a thing. Jobs already running still deliver what they promised.
+async fn remove_recipe(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+) -> Result<Committed, ApiError> {
+    run(&app, Principal::Operator, key, Command::RemoveRecipe { id })
+        .await
+        .map(Committed)
+}
+
+/// Body of `POST /api/jobs`.
+#[derive(Deserialize)]
+struct JobRequest {
+    trader_id: u64,
+    /// The recipe to run.
+    recipe: String,
+}
+
+/// Start a job: the inputs and the cost now, the outputs when it is due.
+async fn start_job(
+    State(app): State<AppState>,
+    caller: Caller,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<JobRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    owned_trader(&app, caller, TraderId(req.trader_id))?;
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::StartJob {
+            trader_id: req.trader_id,
+            recipe: req.recipe,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Every job of the caller's traders, oldest first.
+async fn list_jobs(
+    State(app): State<AppState>,
+    caller: Caller,
+) -> Result<Json<JobsResponse>, ApiError> {
+    let user = caller.0;
+    let jobs = app
+        .market
+        .call(move |m| {
+            m.jobs
+                .jobs()
+                .filter(|job| {
+                    m.traders
+                        .get(&TraderId(job.trader_id))
+                        .is_some_and(|t| t.user_id == user)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .await?;
+    Ok(Json(JobsResponse { jobs }))
+}
+
+/// One job by id. Its owner's, or the operator's, to read.
+async fn get_job(
+    State(app): State<AppState>,
+    Path(job_id): Path<u64>,
+    caller: Option<Caller>,
+    admin: Option<Admin>,
+) -> Result<Json<crate::jobs::Job>, ApiError> {
+    let job = app
+        .market
+        .call(move |m| m.jobs.get(job_id).cloned())
+        .await?
+        .ok_or_else(|| ApiError::job(JobError::UnknownJob(job_id)))?;
+    if admin.is_none() {
+        let caller = caller.ok_or_else(ApiError::unauthenticated)?;
+        owned_trader(&app, caller, TraderId(job.trader_id))?;
+    }
+    Ok(Json(job))
+}
+
+/// Stop a job before it is due. Its owner's to call.
+async fn cancel_job(
+    State(app): State<AppState>,
+    Path(job_id): Path<u64>,
+    caller: Caller,
+    Idempotency(key): Idempotency,
+) -> Result<Committed, ApiError> {
+    let owner = app
+        .market
+        .call(move |m| m.jobs.get(job_id).map(|j| j.trader_id))
+        .await?
+        .ok_or_else(|| ApiError::job(JobError::UnknownJob(job_id)))?;
+    owned_trader(&app, caller, TraderId(owner))?;
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::CancelJob {
+            trader_id: owner,
+            job_id,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+// ---------------------------------------------------------------------------
+// Budgets and rewards. See [`crate::rewards`].
+
+/// Body of `POST /api/budgets`.
+#[derive(Deserialize)]
+struct BudgetRequest {
+    name: Option<String>,
+    /// What to fund it with out of treasury. A transfer, not a mint.
+    #[serde(default)]
+    cash_cents: i64,
+}
+
+/// Body of `POST /api/budgets/{wallet_id}/fund`.
+#[derive(Deserialize)]
+struct FundRequest {
+    amount_cents: i64,
+}
+
+/// What the world has set aside, and what it will pay for. Operator
+/// authority: this is the game's own budgeting, not a player's business.
+async fn get_budgets(
+    State(app): State<AppState>,
+    _admin: Admin,
+) -> Result<Json<BudgetsResponse>, ApiError> {
+    let (budgets, rules) = app
+        .market
+        .call(|m| (m.budget_views(), m.rewards.rules().cloned().collect()))
+        .await?;
+    Ok(Json(BudgetsResponse { budgets, rules }))
+}
+
+/// Open a budget, funded out of treasury.
+async fn create_budget(
+    State(app): State<AppState>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<BudgetRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::CreateBudget {
+            name: clean_text(req.name, 64),
+            cash_cents: req.cash_cents,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Pay more into a budget.
+async fn fund_budget(
+    State(app): State<AppState>,
+    Path(wallet): Path<u64>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<FundRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::FundBudget {
+            wallet,
+            cash_cents: req.amount_cents,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Body of `POST /api/rewards/rules`.
+#[derive(Deserialize)]
+struct RewardRuleRequest {
+    /// A short name: `DAILY`, `boss-kill`.
+    id: String,
+    /// The budget's wallet id.
+    budget: u64,
+    /// What one payment is worth, in cents.
+    amount_cents: i64,
+    note: Option<String>,
+}
+
+/// Write or replace what a named reward is worth.
+async fn set_reward_rule(
+    State(app): State<AppState>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<RewardRuleRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::SetRewardRule {
+            id: req.id,
+            budget: req.budget,
+            amount_cents: req.amount_cents,
+            note: clean_text(req.note, MAX_RECIPE_NOTE),
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Take a reward rule away. What it has paid stays paid.
+async fn remove_reward_rule(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+) -> Result<Committed, ApiError> {
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::RemoveRewardRule { id },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Body of `POST /api/rewards`.
+#[derive(Deserialize)]
+struct RewardRequest {
+    /// The rule that prices it.
+    rule: String,
+    /// Who is being paid.
+    trader_id: u64,
+    /// The game's own id for what happened. Paid at most once, whatever the
+    /// `Idempotency-Key` says.
+    source: String,
+}
+
+/// Pay a reward for something the game says happened.
+///
+/// The game backend's call, so it carries operator authority: a player
+/// cannot decide they have finished a quest. A `source` already paid gets
+/// the receipt it produced the first time and moves nothing.
+async fn pay_reward(
+    State(app): State<AppState>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<RewardRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::PayReward {
+            rule: req.rule,
+            trader_id: req.trader_id,
+            source: req.source,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+// ---------------------------------------------------------------------------
+// Transfers, wallets and the world.
+
+/// Body of `POST /api/transfers`.
+#[derive(Deserialize)]
+struct TransferBody {
+    from_account_id: u64,
+    to_account_id: u64,
+    amount_cents: i64,
+    memo: Option<String>,
+}
+
+/// Move currency between two accounts. The sender's owner, or the operator.
+async fn transfer(
+    State(app): State<AppState>,
+    caller: Option<Caller>,
+    admin: Option<Admin>,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<TransferBody>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let from = AccountId(req.from_account_id);
+    let principal = if admin.is_some() {
+        Principal::Operator
+    } else {
+        let caller = caller.ok_or_else(ApiError::unauthenticated)?;
+        app.market
+            .call(move |m| owned_account(m, caller, from))
+            .await??;
+        caller.into()
+    };
+    run(
+        &app,
+        principal,
+        key,
+        Command::Transfer {
+            from_account: req.from_account_id,
+            to_account: req.to_account_id,
+            amount_cents: req.amount_cents,
+            memo: clean_text(req.memo, 140),
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// One wallet: what it is, and what it holds.
+#[derive(Serialize)]
+pub struct WalletDto {
+    pub wallet: fehu::ledger::WalletId,
+    /// `player`, `treasury`, `budget`, `npc`, `issuer`, `venue`, `issuance`
+    /// or `synthetic`.
+    pub kind: &'static str,
+    pub status: &'static str,
+    pub balance_cents: i64,
+    /// Committed to resting buy orders.
+    pub reserved_cents: i64,
+    /// `balance − reserved`: what can still be spent.
+    pub available_cents: i64,
+    /// The account this wallet is the money of, if it is somebody's.
+    pub account_id: Option<u64>,
+}
+
+/// Whether the caller may look into `wallet`: it is their account's, or they
+/// are the operator.
+fn may_read_wallet(
+    m: &Market,
+    wallet: fehu::ledger::WalletId,
+    caller: Option<Caller>,
+    admin: Option<Admin>,
+) -> Result<Option<AccountId>, ApiError> {
+    let account = m
+        .accounts
+        .values()
+        .find(|a| a.wallet == wallet)
+        .map(|a| (a.id, a.user_id));
+    if admin.is_some() {
+        return Ok(account.map(|(id, _)| id));
+    }
+    match (account, caller) {
+        (Some((id, owner)), Some(caller)) if owner == caller.0 => Ok(Some(id)),
+        (_, None) => Err(ApiError::unauthenticated()),
+        _ => Err(ApiError::forbidden(format!(
+            "wallet {} is not yours to read",
+            wallet.0
+        ))),
+    }
+}
+
+/// One wallet's balance, by wallet id.
+async fn get_wallet(
+    State(app): State<AppState>,
+    Path(wallet_id): Path<u64>,
+    caller: Option<Caller>,
+    admin: Option<Admin>,
+) -> Result<Json<WalletDto>, ApiError> {
+    let wallet = fehu::ledger::WalletId(wallet_id);
+    app.market
+        .call(move |m| {
+            let account_id = may_read_wallet(m, wallet, caller, admin)?;
+            let held = m.ledger.wallet(wallet).ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "unknown_wallet",
+                    format!("no wallet {wallet_id}"),
+                )
+            })?;
+            Ok(Json(WalletDto {
+                wallet,
+                kind: held.kind.label(),
+                status: held.status.label(),
+                balance_cents: held.balance_cents(),
+                reserved_cents: held.reserved_cents(),
+                available_cents: held.available_cents(),
+                account_id: account_id.map(|a| a.0),
+            }))
+        })
+        .await?
+}
+
+/// A wallet's movements: the account's ledger, under the wallet's name.
+///
+/// The ledger keeps no transaction log of its own — a transaction is
+/// balanced and gone, and what is retained is each account's view of the
+/// postings that touched it — so this is that view, found by wallet.
+async fn get_wallet_transactions(
+    State(app): State<AppState>,
+    Path(wallet_id): Path<u64>,
+    caller: Option<Caller>,
+    admin: Option<Admin>,
+) -> Result<Json<LedgerResponse>, ApiError> {
+    let wallet = fehu::ledger::WalletId(wallet_id);
+    app.market
+        .call(move |m| {
+            let account_id = may_read_wallet(m, wallet, caller, admin)?.ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "no_account",
+                    format!(
+                        "wallet {wallet_id} is the world's, not an account's, so it has no \
+                            per-account history: read /api/supply and /api/reconcile instead"
+                    ),
+                )
+            })?;
+            let account = m
+                .accounts
+                .get(&account_id)
+                .ok_or_else(|| ApiError::unknown_account(account_id.0))?;
+            Ok(Json(LedgerResponse {
+                account: account_view(m, account),
+                entries: account.ledger(100),
+            }))
+        })
+        .await?
+}
+
+/// A trader's inventory: what it holds of the world's goods.
+#[derive(Serialize)]
+pub struct InventoryResponse {
+    pub trader_id: u64,
+    /// Goods only. A shareholding is a portfolio, and
+    /// `/api/users/{id}/holdings` is where that is.
+    pub inventory: Vec<HoldingDto>,
+}
+
+async fn get_inventory(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    caller: Caller,
+) -> Result<Json<InventoryResponse>, ApiError> {
+    let trader = TraderId(trader_id);
+    owned_trader(&app, caller, trader)?;
+    let views = app.views().await;
+    let inventory = app
+        .market
+        .call(move |m| m.trader_holdings(trader, &views, true))
+        .await?;
+    Ok(Json(InventoryResponse {
+        trader_id,
+        inventory,
+    }))
+}
+
+/// What game events are doing to production and demand right now.
+async fn world(State(app): State<AppState>) -> Result<Json<WorldResponse>, ApiError> {
+    let at = app.clock.now();
+    let (modifiers, symbols) = app
+        .market
+        .call(move |m| {
+            (
+                m.world.active(at.0).cloned().collect::<Vec<_>>(),
+                m.world_view(at),
+            )
+        })
+        .await?;
+    Ok(Json(WorldResponse {
+        at_ms: at.0,
+        modifiers,
+        symbols,
+    }))
+}
+
+/// Body of `POST /api/v1/economy/purchases` and `.../consume`: the same two
+/// commands as the trader-addressed routes, with the trader in the body
+/// because that is the shape the plan's economy surface names.
+#[derive(Deserialize)]
+struct GoodsBody {
+    trader_id: u64,
+    symbol: String,
+    qty: u64,
+}
+
+async fn purchase_body(
+    State(app): State<AppState>,
+    caller: Caller,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<GoodsBody>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    owned_trader(&app, caller, TraderId(req.trader_id))?;
+    let symbol = crate::symbol::intern(&req.symbol)
+        .ok_or_else(|| ApiError::not_found(&req.symbol))?
+        .to_string();
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::Purchase {
+            trader_id: req.trader_id,
+            symbol,
+            qty: req.qty,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+async fn consume_body(
+    State(app): State<AppState>,
+    caller: Caller,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<GoodsBody>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    owned_trader(&app, caller, TraderId(req.trader_id))?;
+    let symbol = crate::symbol::intern(&req.symbol)
+        .ok_or_else(|| ApiError::not_found(&req.symbol))?
+        .to_string();
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::Consume {
+            trader_id: req.trader_id,
+            symbol,
+            qty: req.qty,
+        },
     )
     .await
     .map(Committed)
@@ -2772,6 +3503,7 @@ async fn catalog() -> Json<Vec<CatalogEntry>> {
                 scope: kind.scope(),
                 description: kind.description(),
                 effects: kind.effects(1.0),
+                world: kind.world_effects(1.0),
             })
             .collect(),
     )

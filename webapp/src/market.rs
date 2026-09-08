@@ -76,15 +76,20 @@ use crate::catalog::{
     Catalog, CatalogError, CatalogItem, ConsumeReceipt, GoodsError, PurchaseReceipt,
 };
 use crate::events::EventRecord;
+use crate::jobs::{
+    Job, JobBook, JobDelivery, JobError, JobStatus, Line, Recipe, RecipeBook, scaled_qty,
+};
 use crate::journal::JournalError;
 use crate::limit::{Decision, Limiter, Rate};
 use crate::metrics::Metrics;
-use crate::npc::{MAX_NPCS, Npc, NpcDto, Policy};
+use crate::npc::{BPS, MAX_NPCS, Npc, NpcDto, Policy};
+use crate::rewards::{Budget, BudgetDto, RewardBook, RewardError, RewardReceipt, RewardRule};
 use crate::save::{MarketSave, STATE_VERSION, Save};
 use crate::trading::{
     BookDto, Fees, FillRecord, HoldingDto, Liquidity, MAX_STOPS_PER_TRADER, OpenOrderDto,
     OrderRecord, OrderResponse, Refused, SettledFees, StopOrder, StopRequest, TradeDto, Trader,
 };
+use crate::world::{Effect, SymbolEffects, WorldEffects};
 
 pub use crate::symbol::*;
 
@@ -441,6 +446,9 @@ pub struct SymbolView {
     pub symbol: &'static str,
     /// The reference price, which positions are marked to.
     pub mark_cents: i64,
+    /// This listing is a good rather than a company, so a position in it is
+    /// inventory rather than a shareholding.
+    pub is_good: bool,
     /// Every trader's resting orders.
     pub open_orders: Vec<OpenOrderDto>,
     /// Every trader's stops.
@@ -453,6 +461,7 @@ impl SymbolView {
         Self {
             symbol: sym,
             mark_cents: s.exchange.reference_cents(),
+            is_good: s.info.is_good(),
             open_orders: s
                 .exchange
                 .book()
@@ -562,6 +571,8 @@ pub struct SupplyDto {
     pub player_cents: i64,
     /// Sitting in the tills of the traders the world runs itself.
     pub npc_cents: i64,
+    /// Set aside in budgets, waiting to be paid out as rewards.
+    pub budget_cents: i64,
     /// What unfunded liquidity has put into players' hands beyond its float.
     pub synthetic_debt_cents: i64,
     /// Wallets open, the four the world always has included.
@@ -591,6 +602,7 @@ impl SupplyDto {
             issuer_cents: by_kind(WalletKind::Issuer),
             player_cents: by_kind(WalletKind::Player),
             npc_cents: by_kind(WalletKind::Npc),
+            budget_cents: by_kind(WalletKind::Budget),
             synthetic_debt_cents: i64::try_from(m.ledger.synthetic_debt_cents())
                 .unwrap_or(i64::MAX),
             wallets: m.ledger.len(),
@@ -627,6 +639,16 @@ pub struct Market {
     pub catalog: Catalog,
     /// The traders the world runs itself, by trader id. See [`crate::npc`].
     pub npcs: BTreeMap<TraderId, Npc>,
+    /// What the world knows how to make. See [`crate::jobs`].
+    pub recipes: RecipeBook,
+    /// What is in the furnace, and what came out of it.
+    pub jobs: JobBook,
+    /// The pools rewards are paid from, the rules that price them, and every
+    /// game event id already paid. See [`crate::rewards`].
+    pub rewards: RewardBook,
+    /// What game events are doing to production and demand right now. See
+    /// [`crate::world`].
+    pub world: WorldEffects,
     /// Settlements the ledger refused after the book had already traded.
     /// Always zero in a healthy market; see [`Market::book`].
     pub settlement_failures: u64,
@@ -1050,6 +1072,45 @@ impl Market {
                         .map_or(0, |v| v.mark_cents),
                 );
                 h
+            })
+            .collect()
+    }
+
+    /// One trader's positions, marked, with what each one has promised to a
+    /// resting sell.
+    ///
+    /// `goods_only` is what an inventory is: the units a player is holding,
+    /// as opposed to the companies they own a piece of. Both are the same
+    /// map and the same reservations — see [`crate::symbol::AssetKind`] —
+    /// so this is a filter rather than a second table.
+    pub fn trader_holdings(
+        &self,
+        trader: TraderId,
+        marks: &[SymbolView],
+        goods_only: bool,
+    ) -> Vec<HoldingDto> {
+        let Some(t) = self.traders.get(&trader) else {
+            return Vec::new();
+        };
+        t.positions
+            .keys()
+            .filter(|sym| {
+                !goods_only
+                    || marks
+                        .iter()
+                        .find(|v| v.symbol == **sym)
+                        .is_some_and(|v| v.is_good)
+            })
+            .map(|sym| {
+                let mut holding = HoldingDto::empty(sym);
+                holding.add(t);
+                holding.mark(
+                    marks
+                        .iter()
+                        .find(|v| v.symbol == *sym)
+                        .map_or(0, |v| v.mark_cents),
+                );
+                holding
             })
             .collect()
     }
@@ -2037,6 +2098,7 @@ impl Market {
             active: true,
             quoted_ref_cents: 0,
             quoted_orders: 0,
+            quoted_size: 0,
         };
         self.npcs.insert(trader, npc.clone());
         Ok(npc)
@@ -2050,6 +2112,7 @@ impl Market {
         if !active {
             npc.quoted_ref_cents = 0;
             npc.quoted_orders = 0;
+            npc.quoted_size = 0;
         }
         let npc = npc.clone();
         if !active {
@@ -2069,6 +2132,7 @@ impl Market {
             name: npc.name.clone(),
             policy: npc.policy,
             active: npc.active,
+            quoted_size: npc.quoted_size,
             cash_cents: self
                 .accounts
                 .get(&npc.account_id)
@@ -2127,8 +2191,18 @@ impl Market {
             let Ok(resting) = symbol.ask(move |s| resting_orders(s, trader)).await else {
                 continue;
             };
+            // What the world wants of this good right now. A merchant quotes
+            // its policy size scaled by that, so a hyped good is quoted for
+            // more of and a scandal thins the book out — the same event that
+            // moves the price, arriving through somebody who paid for the
+            // inventory.
+            let demand_bps = self
+                .world
+                .multiplier_bps(Effect::Demand, npc.symbol, self.now().0);
+            let size = scaled_qty(npc.policy.size, demand_bps);
             if npc.policy.still_good(npc.quoted_ref_cents, reference)
                 && resting == npc.quoted_orders
+                && size == npc.quoted_size
             {
                 continue;
             }
@@ -2141,7 +2215,7 @@ impl Market {
                         side,
                         kind: fehu::OrderKind::Limit { price_cents },
                         tif: fehu::TimeInForce::Gtc,
-                        qty: npc.policy.size,
+                        qty: size,
                     };
                     // A refusal is the answer, not an error: an NPC that
                     // cannot fund this level has nothing to say at it.
@@ -2169,6 +2243,7 @@ impl Market {
             if let Some(npc) = self.npcs.get_mut(&trader) {
                 npc.quoted_ref_cents = reference;
                 npc.quoted_orders = resting;
+                npc.quoted_size = size;
             }
         }
     }
@@ -2368,6 +2443,584 @@ impl Market {
             position_qty,
             units_outstanding,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Recipes, jobs, budgets and rewards. See [`crate::jobs`] and
+    // [`crate::rewards`].
+
+    /// The handle for a listed good, refusing anything else.
+    async fn good_handle(&self, ticker: &str) -> Result<Arc<Symbol>, JobError> {
+        let handle = self
+            .symbol(ticker)
+            .cloned()
+            .ok_or_else(|| JobError::Unknown(ticker.to_string()))?;
+        if !handle.ask(|s| s.info.is_good()).await? {
+            return Err(JobError::NotAGood(ticker.to_string()));
+        }
+        Ok(handle)
+    }
+
+    /// Write or replace a recipe.
+    ///
+    /// Every line is checked against the listings first: a recipe that names
+    /// a company, or a ticker nobody has listed, is refused rather than
+    /// written down to fail later at every job.
+    ///
+    /// # Errors
+    /// [`JobError`] naming what was wrong. A refusal leaves the book alone.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_recipe(
+        &mut self,
+        id: String,
+        inputs: Vec<Line>,
+        outputs: Vec<Line>,
+        cost_cents: i64,
+        duration_secs: u64,
+        refund_bps: u32,
+        note: Option<String>,
+    ) -> Result<Recipe, JobError> {
+        for line in inputs.iter().chain(outputs.iter()) {
+            self.good_handle(line.symbol).await?;
+        }
+        self.recipes
+            .set(
+                id,
+                inputs,
+                outputs,
+                cost_cents,
+                duration_secs,
+                refund_bps,
+                note,
+            )
+            .cloned()
+    }
+
+    /// Take a recipe out of the book. Jobs already running finish: each one
+    /// carries what it will deliver.
+    pub fn remove_recipe(&mut self, id: &str) -> Option<Recipe> {
+        self.recipes.remove(id)
+    }
+
+    /// Start a job: take the inputs, take the cost, and promise the outputs
+    /// at an instant.
+    ///
+    /// The order is the settlement order the rest of the server uses.
+    /// Everything is checked — the recipe, the listings, the units held free
+    /// of reservations, the money — then the cost is posted, and only then
+    /// are the inputs consumed. The post is the fallible half, so it goes
+    /// first; by the time it has succeeded nothing left can fail.
+    ///
+    /// What the job will deliver is decided here and written into it: the
+    /// recipe as it stands, scaled by the world's appetite for what it makes
+    /// ([`crate::world`]). A recipe rewritten afterwards, or an event that
+    /// lands halfway through, changes the next job and not this one.
+    ///
+    /// # Errors
+    /// [`JobError`] naming what was wrong. A refusal takes nothing and
+    /// promises nothing.
+    pub async fn start_job(
+        &mut self,
+        recipe_id: &str,
+        trader: TraderId,
+        now_ms: i64,
+    ) -> Result<Job, JobError> {
+        let recipe = self
+            .recipes
+            .get(recipe_id)
+            .cloned()
+            .ok_or_else(|| JobError::UnknownRecipe(recipe_id.to_owned()))?;
+        if self.jobs.running() >= crate::jobs::MAX_RUNNING_JOBS {
+            return Err(JobError::TooManyJobs(crate::jobs::MAX_RUNNING_JOBS));
+        }
+        let account_id = self
+            .traders
+            .get(&trader)
+            .ok_or(JobError::UnknownTrader(trader.0))?
+            .account_id;
+        let account =
+            self.accounts
+                .get(&account_id)
+                .ok_or(JobError::Money(MoneyError::NoWallet {
+                    account: account_id,
+                }))?;
+        account.authorise(&self.ledger, recipe.cost_cents.max(1))?;
+        let wallet = self.wallet_of(account_id)?;
+        // Every listing the recipe names, resolved before anything moves.
+        let mut inputs = Vec::with_capacity(recipe.inputs.len());
+        for line in &recipe.inputs {
+            let handle = self.good_handle(line.symbol).await?;
+            let free = self
+                .traders
+                .get(&trader)
+                .map_or(0, |t| t.free_shares(line.symbol));
+            if free < line.qty {
+                return Err(JobError::InsufficientUnits {
+                    symbol: line.symbol.to_string(),
+                    needed: line.qty,
+                    available: free,
+                });
+            }
+            inputs.push((handle, *line));
+        }
+        // The world's appetite for what this recipe makes, read once, from
+        // the instant the command was accepted at.
+        let at = self.now().0;
+        let yield_bps = recipe.outputs.first().map_or(BPS, |first| {
+            self.world
+                .multiplier_bps(Effect::Production, first.symbol, at)
+        });
+        let mut outputs = Vec::with_capacity(recipe.outputs.len());
+        for line in &recipe.outputs {
+            let handle = self.good_handle(line.symbol).await?;
+            let qty = scaled_qty(line.qty, yield_bps);
+            let issued = handle.ask(|s| s.info.units_outstanding()).await?;
+            if issued.checked_add(qty).is_none() {
+                return Err(JobError::Quantity(format!(
+                    "{} cannot issue that many more units",
+                    line.symbol
+                )));
+            }
+            outputs.push(Line {
+                symbol: line.symbol,
+                qty,
+            });
+        }
+        // Past the point of refusal.
+        let tx_id = if recipe.cost_cents > 0 {
+            let tx = self.ledger.post(
+                Draft::new(Reason::JobCost)
+                    .debit(wallet, recipe.cost_cents)
+                    .credit(self.wallets.venue, recipe.cost_cents)
+                    .memo(Some(format!("job: {}", recipe.id))),
+            )?;
+            self.write_entry(
+                account_id,
+                LedgerKind::JobCost,
+                tx.id,
+                -recipe.cost_cents,
+                Some(format!("job: {}", recipe.id)),
+                now_ms,
+            );
+            tx.id
+        } else {
+            0
+        };
+        for (handle, line) in inputs {
+            let qty = line.qty;
+            handle
+                .change(move |s| {
+                    s.info
+                        .consume(qty)
+                        .unwrap_or_else(|_| s.info.units_outstanding())
+                })
+                .await?;
+            if let Some(t) = self.traders.get_mut(&trader) {
+                t.destroy(line.symbol, qty);
+            }
+        }
+        let id = self.jobs.take_id();
+        let job = Job {
+            id,
+            recipe: recipe.id.clone(),
+            recipe_version: recipe.version,
+            trader_id: trader.0,
+            account_id: account_id.0,
+            inputs: recipe.inputs.clone(),
+            outputs,
+            yield_bps,
+            cost_cents: recipe.cost_cents,
+            tx_id,
+            started_at_ms: at,
+            due_at_ms: at.saturating_add(
+                i64::try_from(recipe.duration_secs)
+                    .unwrap_or(i64::MAX / 1_000)
+                    .saturating_mul(1_000),
+            ),
+            finished_at_ms: None,
+            status: JobStatus::Running,
+            refunded_cents: 0,
+        };
+        self.jobs.insert(job.clone());
+        Ok(job)
+    }
+
+    /// Stop a job before it is due.
+    ///
+    /// The inputs are gone: they went into the crucible when it started, and
+    /// nothing here puts them back. What comes back is whatever the recipe
+    /// said it would — [`Recipe::refund_bps`] of the cost, nothing by
+    /// default — and never more than the venue is actually holding, which is
+    /// the same rule a maker rebate learned: the venue does not pay currency
+    /// it has not collected.
+    ///
+    /// # Errors
+    /// [`JobError::UnknownJob`] for a job nobody started,
+    /// [`JobError::NotRunning`] for one that has already finished.
+    pub fn cancel_job(&mut self, job_id: u64, now_ms: i64) -> Result<Job, JobError> {
+        let job = self
+            .jobs
+            .get(job_id)
+            .cloned()
+            .ok_or(JobError::UnknownJob(job_id))?;
+        if job.status != JobStatus::Running {
+            return Err(JobError::NotRunning(job_id));
+        }
+        let account_id = AccountId(job.account_id);
+        let refund_bps = self
+            .recipes
+            .get(&job.recipe)
+            .map_or(0, |r| i64::from(r.refund_bps));
+        let asked = job.cost_cents.saturating_mul(refund_bps) / BPS;
+        let refund = asked.min(self.ledger.available(self.wallets.venue)).max(0);
+        let mut refunded = 0;
+        if refund > 0
+            && let Ok(wallet) = self.wallet_of(account_id)
+            && let Ok(tx) = self.ledger.post(
+                Draft::new(Reason::JobRefund)
+                    .debit(self.wallets.venue, refund)
+                    .credit(wallet, refund)
+                    .memo(Some(format!("job {job_id} cancelled"))),
+            )
+        {
+            let tx_id = tx.id;
+            self.write_entry(
+                account_id,
+                LedgerKind::JobRefund,
+                tx_id,
+                refund,
+                Some(format!("job {job_id} cancelled")),
+                now_ms,
+            );
+            refunded = refund;
+        }
+        let at = self.now().0;
+        let job = self
+            .jobs
+            .get_mut(job_id)
+            .ok_or(JobError::UnknownJob(job_id))?;
+        job.status = JobStatus::Cancelled;
+        job.finished_at_ms = Some(at);
+        job.refunded_cents = refunded;
+        Ok(job.clone())
+    }
+
+    /// Deliver every job due at `at`, oldest first.
+    ///
+    /// Called from the engine step, which is a journaled command, so a
+    /// replayed world delivers the same jobs at the same instant. A job whose
+    /// good has been delisted while it ran delivers that line as nothing:
+    /// there is no symbol left to issue a unit against, and the job is done
+    /// either way rather than left running forever.
+    pub async fn complete_jobs(&mut self, at: Timestamp) -> Vec<JobDelivery> {
+        let due = self.jobs.due(at.0);
+        let mut done = Vec::with_capacity(due.len());
+        for id in due {
+            let Some(job) = self.jobs.get(id).cloned() else {
+                continue;
+            };
+            let total: u64 = job
+                .outputs
+                .iter()
+                .map(|l| l.qty)
+                .fold(0u64, u64::saturating_add);
+            // What a unit is reckoned to have cost: the job's cost, spread
+            // over what it actually delivered.
+            let unit_cost = if total == 0 {
+                0
+            } else {
+                job.cost_cents / i64::try_from(total).unwrap_or(i64::MAX)
+            };
+            let trader = TraderId(job.trader_id);
+            let mut delivered = Vec::with_capacity(job.outputs.len());
+            for line in &job.outputs {
+                let Some(handle) = self.symbol(line.symbol).cloned() else {
+                    continue;
+                };
+                let qty = line.qty;
+                let is_good = handle.ask(|s| s.info.is_good()).await.unwrap_or(false);
+                if !is_good {
+                    continue;
+                }
+                if handle
+                    .change(move |s| s.info.issue(qty).is_ok())
+                    .await
+                    .unwrap_or(false)
+                {
+                    if let Some(t) = self.traders.get_mut(&trader) {
+                        t.endow(line.symbol, qty, unit_cost);
+                    }
+                    delivered.push(*line);
+                }
+            }
+            if let Some(job) = self.jobs.get_mut(id) {
+                job.status = JobStatus::Done;
+                job.finished_at_ms = Some(at.0);
+            }
+            let delivery = JobDelivery {
+                job_id: id,
+                trader_id: job.trader_id,
+                recipe: job.recipe.clone(),
+                delivered,
+                at_ms: at.0,
+            };
+            self.stream
+                .publish(StreamMessage::JobDone(delivery.clone()));
+            done.push(delivery);
+        }
+        done
+    }
+
+    /// Open a budget wallet and fund it out of treasury.
+    ///
+    /// A transfer, not a mint: a budget holds currency that already exists,
+    /// which is what makes running out of it mean something.
+    ///
+    /// # Errors
+    /// [`RewardError`] naming what was wrong. A refusal opens no wallet.
+    pub fn create_budget(
+        &mut self,
+        name: String,
+        cash_cents: i64,
+        now_ms: i64,
+    ) -> Result<Budget, RewardError> {
+        if cash_cents < 0 {
+            return Err(RewardError::Invalid(
+                "a budget is opened with nothing or more".into(),
+            ));
+        }
+        if cash_cents > 0 {
+            check_transfer(cash_cents)?;
+            let treasury = self.ledger.available(self.wallets.treasury);
+            if cash_cents > treasury {
+                return Err(RewardError::Money(MoneyError::Ledger(
+                    LedgerError::Insufficient {
+                        wallet: self.wallets.treasury,
+                        needed_cents: cash_cents,
+                        available_cents: treasury,
+                    },
+                )));
+            }
+        }
+        let wallet = self.ledger.open(WalletKind::Budget);
+        if cash_cents > 0 {
+            self.ledger.post(
+                Draft::new(Reason::Transfer)
+                    .debit(self.wallets.treasury, cash_cents)
+                    .credit(wallet, cash_cents)
+                    .memo(Some(format!("budget: {name}"))),
+            )?;
+        }
+        self.rewards
+            .add_budget(Budget {
+                wallet,
+                name,
+                created_at_ms: now_ms,
+                paid_cents: 0,
+                paid_count: 0,
+            })
+            .cloned()
+    }
+
+    /// Pay more into a budget, out of treasury.
+    ///
+    /// # Errors
+    /// [`RewardError`] naming what was wrong. A refusal moves nothing.
+    pub fn fund_budget(
+        &mut self,
+        wallet: WalletId,
+        cash_cents: i64,
+    ) -> Result<Budget, RewardError> {
+        check_transfer(cash_cents)?;
+        let budget = self
+            .rewards
+            .budget(wallet)
+            .ok_or(RewardError::UnknownBudget(wallet.0))?
+            .clone();
+        self.ledger.post(
+            Draft::new(Reason::Transfer)
+                .debit(self.wallets.treasury, cash_cents)
+                .credit(wallet, cash_cents)
+                .memo(Some(format!("budget: {}", budget.name))),
+        )?;
+        Ok(budget)
+    }
+
+    /// Write or replace a reward rule.
+    ///
+    /// # Errors
+    /// [`RewardError`] naming what was wrong.
+    pub fn set_reward_rule(
+        &mut self,
+        id: String,
+        budget: WalletId,
+        amount_cents: i64,
+        note: Option<String>,
+    ) -> Result<RewardRule, RewardError> {
+        self.rewards
+            .set_rule(id, budget, amount_cents, note)
+            .cloned()
+    }
+
+    /// Take a reward rule out of the book. What it has paid stays paid.
+    pub fn remove_reward_rule(&mut self, id: &str) -> Option<RewardRule> {
+        self.rewards.remove_rule(id)
+    }
+
+    /// Pay a reward for something the game says happened.
+    ///
+    /// `source` is the game's own id for the event — a quest completion, a
+    /// kill — and it is what stops the same thing being paid for twice by a
+    /// backend that retries with a fresh key. A source id already paid gets
+    /// the receipt it produced the first time, marked
+    /// [`RewardReceipt::duplicate`], and nothing moves.
+    ///
+    /// # Errors
+    /// [`RewardError`] naming what was wrong. A refusal pays nothing and
+    /// remembers nothing, so it can be retried once the budget is topped up.
+    pub fn pay_reward(
+        &mut self,
+        rule_id: &str,
+        trader: TraderId,
+        source: &str,
+        now_ms: i64,
+    ) -> Result<RewardReceipt, RewardError> {
+        if let Some(paid) = self.rewards.paid(source) {
+            return Ok(RewardReceipt {
+                duplicate: true,
+                ..paid.clone()
+            });
+        }
+        let rule = self
+            .rewards
+            .rule(rule_id)
+            .ok_or_else(|| RewardError::UnknownRule(rule_id.to_owned()))?
+            .clone();
+        let account_id = self
+            .traders
+            .get(&trader)
+            .ok_or(RewardError::UnknownTrader(trader.0))?
+            .account_id;
+        let wallet = self.wallet_of(account_id)?;
+        let available = self.ledger.available(rule.budget);
+        if rule.amount_cents > available {
+            return Err(RewardError::Exhausted {
+                needed_cents: rule.amount_cents,
+                available_cents: available,
+            });
+        }
+        let memo = format!("reward {}: {source}", rule.id);
+        let tx = self.ledger.post(
+            Draft::new(Reason::Reward)
+                .debit(rule.budget, rule.amount_cents)
+                .credit(wallet, rule.amount_cents)
+                .memo(Some(memo.clone())),
+        )?;
+        let entry = self.write_entry(
+            account_id,
+            LedgerKind::Reward,
+            tx.id,
+            rule.amount_cents,
+            Some(memo),
+            now_ms,
+        );
+        let receipt = RewardReceipt {
+            rule: rule.id.clone(),
+            source: source.to_owned(),
+            trader_id: trader.0,
+            account_id: account_id.0,
+            budget: rule.budget,
+            amount_cents: rule.amount_cents,
+            tx_id: tx.id,
+            balance_cents: entry.balance_cents,
+            at_ms: now_ms,
+            duplicate: false,
+        };
+        self.rewards.record(&receipt);
+        Ok(receipt)
+    }
+
+    /// Move currency from one account to another.
+    ///
+    /// One balanced transaction, so the supply is untouched: this is players
+    /// paying each other, not the world paying anybody. The sender must be
+    /// able to spend — a frozen account cannot — and the recipient must be
+    /// able to receive, which a frozen one still can.
+    ///
+    /// # Errors
+    /// [`MoneyError`] naming what was wrong. A refusal moves nothing.
+    pub fn transfer(
+        &mut self,
+        from: AccountId,
+        to: AccountId,
+        amount_cents: i64,
+        memo: Option<String>,
+        now_ms: i64,
+    ) -> Result<(LedgerEntry, LedgerEntry), MoneyError> {
+        check_transfer(amount_cents)?;
+        if from == to {
+            return Err(MoneyError::SameAccount { account: from });
+        }
+        let from_wallet = self.wallet_of(from)?;
+        let to_wallet = self.wallet_of(to)?;
+        self.accounts
+            .get(&from)
+            .ok_or(MoneyError::NoWallet { account: from })?
+            .authorise(&self.ledger, amount_cents)?;
+        let tx = self.ledger.post(
+            Draft::new(Reason::Transfer)
+                .debit(from_wallet, amount_cents)
+                .credit(to_wallet, amount_cents)
+                .memo(memo.clone()),
+        )?;
+        let sent = self.write_entry(
+            from,
+            LedgerKind::TransferOut,
+            tx.id,
+            -amount_cents,
+            memo.clone(),
+            now_ms,
+        );
+        let received = self.write_entry(
+            to,
+            LedgerKind::TransferIn,
+            tx.id,
+            amount_cents,
+            memo,
+            now_ms,
+        );
+        Ok((sent, received))
+    }
+
+    /// Every budget, with what its wallet holds now.
+    #[must_use]
+    pub fn budget_views(&self) -> Vec<BudgetDto> {
+        self.rewards
+            .budgets()
+            .map(|b| BudgetDto {
+                wallet: b.wallet,
+                name: b.name.clone(),
+                created_at_ms: b.created_at_ms,
+                balance_cents: self.ledger.balance(b.wallet),
+                paid_cents: b.paid_cents,
+                paid_count: b.paid_count,
+            })
+            .collect()
+    }
+
+    /// What production and demand multiply by, per symbol, at `at`.
+    #[must_use]
+    pub fn world_view(&self, at: Timestamp) -> Vec<SymbolEffects> {
+        self.symbols
+            .iter()
+            .map(|s| SymbolEffects {
+                symbol: s.ticker,
+                production_bps: self
+                    .world
+                    .multiplier_bps(Effect::Production, s.ticker, at.0),
+                demand_bps: self.world.multiplier_bps(Effect::Demand, s.ticker, at.0),
+            })
+            .collect()
     }
 
     /// Delist a symbol: withdraw its book, drop its stops, buy every holder
@@ -2629,6 +3282,12 @@ impl Market {
             total += stepped.ticks;
             self.settle(symbol, stepped).await;
         }
+        // What the world made while the market moved, and what the events
+        // that moved it have left to say. Both before the merchants re-quote,
+        // so a merchant quotes the world as it is after the step rather than
+        // as it was before it.
+        self.complete_jobs(target).await;
+        self.world.forget(target.0);
         self.requote_npcs().await;
         total
     }
@@ -2808,6 +3467,11 @@ impl Market {
                     .collect(),
                 catalog: self.catalog.clone(),
                 npcs: self.npcs.values().cloned().collect(),
+                recipes: self.recipes.clone(),
+                jobs: self.jobs.to_saved(),
+                next_job_id: self.jobs.next_id(),
+                rewards: self.rewards.clone(),
+                world: self.world.clone(),
                 users: self.users.values().cloned().collect(),
                 accounts: self.accounts.values().cloned().collect(),
                 traders: self.traders.values().cloned().collect(),
@@ -2861,6 +3525,10 @@ struct MarketParts {
     issuers: BTreeMap<&'static str, WalletId>,
     catalog: Catalog,
     npcs: BTreeMap<TraderId, Npc>,
+    recipes: RecipeBook,
+    jobs: JobBook,
+    rewards: RewardBook,
+    world: WorldEffects,
     symbols: Vec<SymbolState>,
     directory: Directory,
     events: VecDeque<EventRecord>,
@@ -2909,6 +3577,10 @@ impl Market {
             issuers: parts.issuers,
             catalog: parts.catalog,
             npcs: parts.npcs,
+            recipes: parts.recipes,
+            jobs: parts.jobs,
+            rewards: parts.rewards,
+            world: parts.world,
             settlement_failures: 0,
             symbols,
             listings_tx,
@@ -3068,6 +3740,10 @@ pub enum StreamMessage {
     /// A symbol was delisted. Its book and stops are gone, every holder has
     /// been bought out, and orders in it will be refused from here on.
     Delisted(Delisting),
+    /// A production job came due and delivered what it made. There is no
+    /// message for a job *starting*: that is a command with a response, and
+    /// its owner already has it.
+    JobDone(JobDelivery),
     /// A stop fired. It is held no longer: it either became the order in
     /// `order`, or was `refused` when the account was checked again.
     StopTriggered {
@@ -3309,6 +3985,10 @@ impl App {
                     .expect("the float was clamped to what treasury holds");
             }
         }
+        let (jobs, rewards) = (
+            JobBook::with_cap(options.job_log),
+            RewardBook::with_cap(options.reward_log),
+        );
         Self::assemble(
             options,
             now,
@@ -3318,6 +3998,10 @@ impl App {
                 issuers: BTreeMap::new(),
                 catalog: Catalog::default(),
                 npcs: BTreeMap::new(),
+                recipes: RecipeBook::default(),
+                jobs,
+                rewards,
+                world: WorldEffects::default(),
                 symbols,
                 directory: Directory::default(),
                 events: VecDeque::new(),
@@ -3370,6 +4054,12 @@ impl App {
                 record
             })
             .collect();
+        let jobs = JobBook::from_saved(m.jobs, m.next_job_id, options.job_log);
+        let rewards = {
+            let mut rewards = m.rewards;
+            rewards.set_cap(options.reward_log);
+            rewards
+        };
         Self::assemble(
             options,
             now,
@@ -3383,6 +4073,10 @@ impl App {
                     .collect(),
                 catalog: m.catalog,
                 npcs: m.npcs.into_iter().map(|n| (n.trader, n)).collect(),
+                recipes: m.recipes,
+                jobs,
+                rewards,
+                world: m.world,
                 symbols,
                 directory,
                 events: m.events.into_iter().collect(),
@@ -3809,6 +4503,20 @@ pub struct Options {
     /// It is saved with the market, because a snapshot may fall between any
     /// two commands.
     pub command_log: usize,
+    /// Finished jobs kept, with what each one delivered. `FEHU_JOB_LOG`.
+    ///
+    /// A *running* job is never dropped whatever this says: it is a promise
+    /// the world has already taken payment for. See [`crate::jobs::JobBook`].
+    pub job_log: usize,
+    /// Game event ids remembered, with the reward each one paid.
+    /// `FEHU_REWARD_LOG`.
+    ///
+    /// A reward names the game's own id for what happened, and that id is
+    /// what stops a quest being paid twice by a backend that retries with a
+    /// fresh `Idempotency-Key`. An id that has aged out of this would be
+    /// paid again, so it is how late a duplicate may arrive and still be
+    /// caught. See [`crate::rewards`].
+    pub reward_log: usize,
 }
 
 impl Default for Options {
@@ -3847,6 +4555,8 @@ impl Default for Options {
             taker_fee_bps: 0,
             maker_fee_bps: 0,
             command_log: 10_000,
+            job_log: crate::jobs::DEFAULT_JOB_LOG,
+            reward_log: crate::rewards::DEFAULT_REWARD_LOG,
         }
     }
 }
@@ -3919,6 +4629,8 @@ impl Options {
             taker_fee_bps: env_parse("FEHU_TAKER_FEE_BPS", d.taker_fee_bps),
             maker_fee_bps: env_parse("FEHU_MAKER_FEE_BPS", d.maker_fee_bps),
             command_log: env_parse("FEHU_COMMAND_LOG", d.command_log),
+            job_log: env_parse("FEHU_JOB_LOG", d.job_log),
+            reward_log: env_parse("FEHU_REWARD_LOG", d.reward_log),
         }
     }
 }

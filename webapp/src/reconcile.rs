@@ -43,6 +43,12 @@ pub struct Reconciliation {
     /// Not an error: it is currency the world knows about and can point at.
     /// It goes to zero when both sides of every fill are funded.
     pub synthetic_debt_cents: i128,
+    /// Jobs still in the furnace. Each one is a promise the world has taken
+    /// payment for, so a job whose owner has gone is an issue rather than a
+    /// row to drop.
+    pub jobs_running: usize,
+    /// Budget wallets rewards are paid from.
+    pub budgets_checked: usize,
     pub issues: Vec<String>,
 }
 
@@ -215,6 +221,58 @@ pub fn reconcile(save: &Save) -> Reconciliation {
             issues.push(format!("wallet {} is shared by {count} accounts", wallet.0));
         }
     }
+    // Jobs: a running one is a promise, so what it needs to be kept has to
+    // still be there. What it will deliver is its own — a good delisted
+    // under a running job delivers nothing, which is a loss and not a
+    // discrepancy — so only the owner is checked.
+    let mut jobs_running = 0;
+    for job in &save.market.jobs {
+        if job.status != crate::jobs::JobStatus::Running {
+            continue;
+        }
+        jobs_running += 1;
+        let owner = TraderId(job.trader_id);
+        if !traders.contains_key(&owner) {
+            issues.push(format!(
+                "job {} is running for missing trader {}",
+                job.id, job.trader_id
+            ));
+        }
+        if !accounts.contains_key(&AccountId(job.account_id)) {
+            issues.push(format!(
+                "job {} names missing account {}",
+                job.id, job.account_id
+            ));
+        }
+    }
+    // Budgets and the rules that spend them: a rule paying out of a wallet
+    // that is not a budget is currency arriving from somewhere nobody set
+    // aside.
+    let mut budgets_checked = 0;
+    for budget in save.market.rewards.budgets() {
+        budgets_checked += 1;
+        match ledger.wallet(budget.wallet) {
+            None => issues.push(format!(
+                "budget {:?} names wallet {} which the ledger does not have",
+                budget.name, budget.wallet.0
+            )),
+            Some(w) if w.kind != fehu::ledger::WalletKind::Budget => issues.push(format!(
+                "budget {:?} names wallet {}, which is a {} wallet",
+                budget.name,
+                budget.wallet.0,
+                w.kind.label()
+            )),
+            Some(_) => {}
+        }
+    }
+    for rule in save.market.rewards.rules() {
+        if save.market.rewards.budget(rule.budget).is_none() {
+            issues.push(format!(
+                "reward rule {} pays out of budget {}, which is not open",
+                rule.id, rule.budget.0
+            ));
+        }
+    }
     let supply = ledger.supply();
     Reconciliation {
         valid: issues.is_empty(),
@@ -228,6 +286,8 @@ pub fn reconcile(save: &Save) -> Reconciliation {
         outstanding_cents: supply.outstanding_cents(),
         circulating_cents: ledger.circulating_cents(),
         synthetic_debt_cents: ledger.synthetic_debt_cents(),
+        jobs_running,
+        budgets_checked,
         issues,
     }
 }

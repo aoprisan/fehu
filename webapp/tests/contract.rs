@@ -278,7 +278,7 @@ async fn event_shapes() {
     assert_keys(
         "CatalogEntry",
         first("catalog", &json!({ "entries": catalog }), "entries"),
-        &["kind", "label", "scope", "description", "effects"],
+        &["kind", "label", "scope", "description", "effects", "world"],
     );
 
     let record = post(
@@ -1016,6 +1016,8 @@ async fn reconciliation_contract() {
             "outstanding_cents",
             "circulating_cents",
             "synthetic_debt_cents",
+            "jobs_running",
+            "budgets_checked",
             "issues",
         ],
     );
@@ -1044,6 +1046,7 @@ async fn supply_contract() {
             "issuer_cents",
             "player_cents",
             "npc_cents",
+            "budget_cents",
             "synthetic_debt_cents",
             "wallets",
         ],
@@ -1149,6 +1152,7 @@ async fn npc_contract() {
         "name",
         "policy",
         "active",
+        "quoted_size",
         "cash_cents",
         "inventory",
         "reserved",

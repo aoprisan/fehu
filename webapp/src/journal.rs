@@ -71,6 +71,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use fehu::ledger::WalletId;
 use fehu::{Order, Owner, Timestamp, TraderId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -79,11 +80,13 @@ use sha2::{Digest, Sha256};
 use crate::account::{AccountId, AccountStatus, UserId};
 use crate::api::ApiError;
 use crate::events::{EventRecord, GameEventKind, MAX_MAGNITUDE, Prepared, Scope, SimEvent};
+use crate::jobs::{JobError, Line};
 use crate::market::{
     Amendment, AssetKind, DelistError, Market, PlaceRequest, Placed, SymbolInfo, SymbolSpec,
     wall_now_ms,
 };
 use crate::npc::Policy;
+use crate::rewards::RewardError;
 use crate::trading::{AmendRequest, AmendResponse, OpenOrderDto, OrderRequest, StopRequest};
 
 /// Format of the journal file. A file written by another version is refused
@@ -251,6 +254,68 @@ pub enum Command {
         trader_id: u64,
         active: bool,
     },
+    /// Operator: write or replace a recipe. Lines are `(ticker, units)`,
+    /// spelled as they arrived; the ticker is resolved when the command is
+    /// applied, so a replay resolves it the same way.
+    SetRecipe {
+        id: String,
+        inputs: Vec<(String, u64)>,
+        outputs: Vec<(String, u64)>,
+        cost_cents: i64,
+        duration_secs: u64,
+        refund_bps: u32,
+        note: Option<String>,
+    },
+    /// Operator: stop making a thing. Jobs already running still deliver.
+    RemoveRecipe {
+        id: String,
+    },
+    /// Run a recipe: the inputs and the cost now, the outputs when it is due.
+    StartJob {
+        trader_id: u64,
+        recipe: String,
+    },
+    /// Stop a job before it is due.
+    CancelJob {
+        trader_id: u64,
+        job_id: u64,
+    },
+    /// Operator: open a pool rewards may be paid from, funded out of
+    /// treasury.
+    CreateBudget {
+        name: Option<String>,
+        cash_cents: i64,
+    },
+    /// Operator: pay more into one.
+    FundBudget {
+        wallet: u64,
+        cash_cents: i64,
+    },
+    /// Operator: write or replace what a named reward is worth.
+    SetRewardRule {
+        id: String,
+        budget: u64,
+        amount_cents: i64,
+        note: Option<String>,
+    },
+    /// Operator: take a reward rule away. What it has paid stays paid.
+    RemoveRewardRule {
+        id: String,
+    },
+    /// Pay a reward for something the game says happened. `source` is the
+    /// game's own id for it, and it is paid at most once.
+    PayReward {
+        rule: String,
+        trader_id: u64,
+        source: String,
+    },
+    /// Move currency between two accounts.
+    Transfer {
+        from_account: u64,
+        to_account: u64,
+        amount_cents: i64,
+        memo: Option<String>,
+    },
     /// Buy units of a good at the catalogue price: the only thing that
     /// brings a unit of one into existence.
     Purchase {
@@ -328,6 +393,16 @@ impl Command {
             Self::RemoveCatalogItem { .. } => "remove_catalog_item",
             Self::CreateNpc { .. } => "create_npc",
             Self::SetNpcActive { .. } => "set_npc_active",
+            Self::SetRecipe { .. } => "set_recipe",
+            Self::RemoveRecipe { .. } => "remove_recipe",
+            Self::StartJob { .. } => "start_job",
+            Self::CancelJob { .. } => "cancel_job",
+            Self::CreateBudget { .. } => "create_budget",
+            Self::FundBudget { .. } => "fund_budget",
+            Self::SetRewardRule { .. } => "set_reward_rule",
+            Self::RemoveRewardRule { .. } => "remove_reward_rule",
+            Self::PayReward { .. } => "pay_reward",
+            Self::Transfer { .. } => "transfer",
             Self::Purchase { .. } => "purchase",
             Self::Consume { .. } => "consume",
             Self::Delist { .. } => "delist",
@@ -1366,6 +1441,147 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
             Applied::new(200, &view)
         }
 
+        Command::SetRecipe {
+            id,
+            inputs,
+            outputs,
+            cost_cents,
+            duration_secs,
+            refund_bps,
+            note,
+        } => {
+            let id = crate::jobs::clean_id(id).map_err(ApiError::job)?;
+            let recipe = m
+                .set_recipe(
+                    id,
+                    lines(inputs)?,
+                    lines(outputs)?,
+                    *cost_cents,
+                    *duration_secs,
+                    *refund_bps,
+                    note.clone(),
+                )
+                .await
+                .map_err(ApiError::job)?;
+            Applied::new(200, &recipe)
+        }
+
+        Command::RemoveRecipe { id } => {
+            let recipe = m
+                .remove_recipe(&crate::jobs::clean_id(id).map_err(ApiError::job)?)
+                .ok_or_else(|| ApiError::job(JobError::UnknownRecipe(id.clone())))?;
+            Applied::new(200, &recipe)
+        }
+
+        Command::StartJob { trader_id, recipe } => {
+            let job = m
+                .start_job(
+                    &crate::jobs::clean_id(recipe).map_err(ApiError::job)?,
+                    TraderId(*trader_id),
+                    wall_ms,
+                )
+                .await
+                .map_err(ApiError::job)?;
+            Applied::new(201, &job)
+        }
+
+        Command::CancelJob { trader_id, job_id } => {
+            // Whose job it is was checked by the route; this is the second
+            // half of it, and the half a replay also runs.
+            let owner = m.jobs.get(*job_id).map(|j| j.trader_id);
+            if owner != Some(*trader_id) {
+                return Err(ApiError::job(JobError::UnknownJob(*job_id)));
+            }
+            let job = m.cancel_job(*job_id, wall_ms).map_err(ApiError::job)?;
+            Applied::new(200, &job)
+        }
+
+        Command::CreateBudget { name, cash_cents } => {
+            let name = name.clone().unwrap_or_else(|| "budget".to_string());
+            let budget = m
+                .create_budget(name, *cash_cents, wall_ms)
+                .map_err(ApiError::reward)?;
+            let view = m
+                .budget_views()
+                .into_iter()
+                .find(|b| b.wallet == budget.wallet)
+                .ok_or_else(|| ApiError::internal("the budget vanished as it was opened"))?;
+            Applied::new(201, &view)
+        }
+
+        Command::FundBudget { wallet, cash_cents } => {
+            let budget = m
+                .fund_budget(WalletId(*wallet), *cash_cents)
+                .map_err(ApiError::reward)?;
+            let view = m
+                .budget_views()
+                .into_iter()
+                .find(|b| b.wallet == budget.wallet)
+                .ok_or_else(|| ApiError::internal("the budget vanished as it was funded"))?;
+            Applied::new(200, &view)
+        }
+
+        Command::SetRewardRule {
+            id,
+            budget,
+            amount_cents,
+            note,
+        } => {
+            let rule = m
+                .set_reward_rule(
+                    crate::rewards::clean_id(id, "reward rule id").map_err(ApiError::reward)?,
+                    WalletId(*budget),
+                    *amount_cents,
+                    note.clone(),
+                )
+                .map_err(ApiError::reward)?;
+            Applied::new(200, &rule)
+        }
+
+        Command::RemoveRewardRule { id } => {
+            let rule = m
+                .remove_reward_rule(id)
+                .ok_or_else(|| ApiError::reward(RewardError::UnknownRule(id.clone())))?;
+            Applied::new(200, &rule)
+        }
+
+        Command::PayReward {
+            rule,
+            trader_id,
+            source,
+        } => {
+            let receipt = m
+                .pay_reward(rule, TraderId(*trader_id), source, wall_ms)
+                .map_err(ApiError::reward)?;
+            Applied::new(if receipt.duplicate { 200 } else { 201 }, &receipt)
+        }
+
+        Command::Transfer {
+            from_account,
+            to_account,
+            amount_cents,
+            memo,
+        } => {
+            let (sent, received) = m
+                .transfer(
+                    AccountId(*from_account),
+                    AccountId(*to_account),
+                    *amount_cents,
+                    memo.clone(),
+                    wall_ms,
+                )
+                .map_err(ApiError::money)?;
+            Applied::new(
+                201,
+                &serde_json::json!({
+                    "from": crate::api::account_dto(m, AccountId(*from_account))?,
+                    "to_account_id": to_account,
+                    "sent": sent,
+                    "received": received,
+                }),
+            )
+        }
+
         Command::Purchase {
             trader_id,
             symbol,
@@ -1589,12 +1805,25 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                     vec![handle.ticker]
                 }
             };
+            // The other half of a game event: what the world does about the
+            // news, as opposed to what the market makes of it. A company
+            // event pulls on its own symbol, a market-wide one on every
+            // symbol at once — including any listed after it, which is what
+            // a crash should mean.
+            let event_kind = format!("game:{}", game_kind_name(*kind));
+            let scope = match kind.scope() {
+                Scope::Market => None,
+                Scope::Company => symbols.first().copied(),
+            };
+            for spec in kind.world_effects(*magnitude) {
+                m.world.push(spec, scope, at.0, &event_kind, source);
+            }
             let record = m.record(EventRecord {
                 id: 0,
                 received_at_ms: wall_ms,
                 at_ms: at.0,
                 symbols,
-                kind: format!("game:{}", game_kind_name(*kind)),
+                kind: event_kind.clone(),
                 source: source.clone(),
                 note: note.clone(),
                 magnitude: Some(*magnitude),
@@ -1625,6 +1854,20 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
 /// a delisting buys the shares back. A crate of ore has neither profits nor
 /// shareholders, so rather than inventing a meaning the route says no. What
 /// ends a good's life is consuming it.
+/// Resolve `(ticker, units)` pairs into recipe lines.
+///
+/// The ticker is interned rather than borrowed, so a replayed command
+/// resolves to the same listing this one did.
+fn lines(raw: &[(String, u64)]) -> Result<Vec<Line>, ApiError> {
+    raw.iter()
+        .map(|(symbol, qty)| {
+            let symbol =
+                crate::symbol::intern(symbol).ok_or_else(|| ApiError::not_found(symbol))?;
+            Ok(Line { symbol, qty: *qty })
+        })
+        .collect()
+}
+
 async fn stock_only(m: &Market, symbol: &str, what: &str) -> Result<(), ApiError> {
     let handle = m
         .symbol(symbol)

@@ -375,13 +375,21 @@ impl Trader {
     /// Give the trader `qty` units of `symbol` at `price_cents` a unit,
     /// with no money moving and no fill.
     ///
-    /// This is a world-start endowment, and it exists for exactly one
-    /// caller: an NPC being handed the inventory it will make a market in.
-    /// The units are not created here — a stock's shares already exist and
-    /// this is an assignment of ones nobody held, a good's have just been
-    /// issued against its count — so the audit's sentence stays true either
-    /// way. `price_cents` is the reference price at the time, so the NPC has
-    /// a cost basis to quote a margin over rather than an infinite one.
+    /// This is units arriving with no transaction behind them, and it has
+    /// exactly two callers: an NPC being handed the inventory it will make a
+    /// market in, and a production job delivering what it made
+    /// ([`crate::jobs`]). The units are not created here — a stock's shares
+    /// already exist and this is an assignment of ones nobody held, a good's
+    /// have just been issued against its count — so the audit's sentence
+    /// stays true either way. `price_cents` is what a unit is reckoned to
+    /// have cost: the reference price for an endowment, the job's cost
+    /// spread over what it delivered, so there is a basis to quote a margin
+    /// over rather than an infinite one.
+    ///
+    /// It writes no ledger row, and that is the point: no currency moved, so
+    /// a row claiming a balance the account does not have would be exactly
+    /// the inconsistency [`Account::ledger_issues`](crate::account::Account::ledger_issues)
+    /// exists to catch. A job's money moved when it started.
     ///
     /// The position's `cash_cents` is deliberately left alone: it records
     /// what trades in this symbol paid in and out, and an endowment paid

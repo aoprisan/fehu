@@ -58,6 +58,14 @@ pub type Symbol = &'static str;
 
 /// Current save format. Any other version, older or newer, is refused.
 ///
+/// Version 9 gave the world the things it makes and the things it pays for:
+/// recipes and the jobs running under them ([`crate::jobs`]), the budgets
+/// rewards are paid from and every game event id already paid
+/// ([`crate::rewards`]), and what events are still doing to production and
+/// demand ([`crate::world`]). A version 8 file carries none of it — and a
+/// world restored without its running jobs would have taken payment for
+/// promises it no longer knows about — so it is refused like the rest.
+///
 /// Version 8 gave every listing an [`AssetKind`](crate::symbol::AssetKind):
 /// a company with a fixed float, or a good with a unit and a count that
 /// production and consumption move. A version 7 file names a
@@ -84,7 +92,7 @@ pub type Symbol = &'static str;
 /// transaction out of issuance, so the currency has a recorded origin and
 /// the books still add up. It is a day's work when there is such a world.
 /// There is not: the current file is a demo, regenerated from its seeds.
-pub const STATE_VERSION: u32 = 8;
+pub const STATE_VERSION: u32 = 9;
 
 /// Everything needed to carry on where the server left off.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -150,6 +158,22 @@ pub struct MarketSave {
     /// The traders the world runs itself. Since version 8.
     #[serde(default)]
     pub npcs: Vec<crate::npc::Npc>,
+    /// What the world knows how to make. Since version 9.
+    #[serde(default)]
+    pub recipes: crate::jobs::RecipeBook,
+    /// Every job, running and finished, oldest first. Since version 9.
+    #[serde(default)]
+    pub jobs: Vec<crate::jobs::Job>,
+    /// The id the next job will take.
+    #[serde(default)]
+    pub next_job_id: u64,
+    /// Budgets, reward rules, and the game event ids already paid. Since
+    /// version 9.
+    #[serde(default)]
+    pub rewards: crate::rewards::RewardBook,
+    /// What events are still doing to production and demand. Since version 9.
+    #[serde(default)]
+    pub world: crate::world::WorldEffects,
     pub users: Vec<User>,
     pub accounts: Vec<Account>,
     pub traders: Vec<Trader>,
