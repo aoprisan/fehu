@@ -344,6 +344,7 @@ from a body field: a **player** (today's user), a **service** with scopes
 | `POST /game-events` | service:events | The existing catalogue, journaled, with a unique source id |
 | `POST /admin/mint`, `/admin/burn`, `/admin/freeze`, `/admin/unfreeze`, `/admin/recipes`, `/admin/catalog` | operator | Supply and policy changes, each with a reason string that lands in the journal |
 | `GET /supply` | any authenticated | Minted, burned, treasury, budgets, player holdings, venue |
+| `GET /overview` | operator | The whole economy in one market job: supply, what every reason has moved, every wallet and whose it is, budgets and rules, merchants, world effects, jobs, head-count, outbox cursor |
 | `GET /commands/{key}` | the principal that sent it | Recover the result of a command whose response was lost |
 | `GET /reconcile` | operator | The existing pass, extended to supply, inventory and jobs |
 
@@ -382,6 +383,7 @@ and to be replaced by measurement after the first two.
 | 4 | ✅ Recipes and jobs; rewards from budgets; game events with production and demand effects; `/api/v1/economy` routes and `types.ts`; UI panels for wallet, inventory and jobs; `just ui` | The acceptance scenario below passes, including retries and restarts at every step | weeks |
 | 5 | ✅ Tier two: outbox with cursor replay for the game backend, bounded admission, load test with a declared target, backup and restore drill. SQLite is *not* in it — see below for why the row got narrower | p95 command latency and recovery time under the declared load; restore reconciles | weeks, only if tier one is outgrown |
 | 6 | ✅ The third principal: `service` credentials with scopes, issued and revoked by the operator; `POST /players` provisioning, idempotent on the game's own player id; save version 11 | A key carrying one scope opens that route and no other, on a locked server and an unlocked one; the operator still reaches everything; services and player mappings survive a restart | days |
+| 7 | ✅ Somewhere to watch it from: a flow meter in the ledger, `GET /overview` as one consistent read, and the operator's dashboard in the UI over both, with the levers beside the readings; save version 12 | The dashboard's numbers are the numbers the detail endpoints serve; a movement is counted once and a refusal not at all; the meter survives a restart and a replay | days |
 
 Milestone 1 alone is a correct custodial token: conserved supply, operator
 mint and burn, transfers and audited history. Milestone 2 makes it safe to
@@ -831,6 +833,92 @@ Determinism is untouched a fifth time. The outbox and the admission bounds
 draw no randomness, the price process never sees either, and the golden
 hashes in `tests/determinism.rs` are unchanged.
 
+### Milestone 7 as built
+
+Done. `src/ledger.rs` gained a flow meter, `market.rs` an `overview` and a
+wallet directory, `api.rs` one route, and the UI a dashboard
+(`webapp/ui/src/panels/ops.ts`); `webapp/tests/overview.rs` holds the
+acceptance and the save format went to version 12. Six things are worth
+recording.
+
+**The economy had every number and nowhere to read them.** Everything the
+first six milestones built is reachable — supply, budgets, merchants, jobs,
+the world's effects, the audit — as eight separate endpoints, most of them
+the operator's, none of them assembled. So the state of the economy was a
+question you answered with `curl` and arithmetic. That is a fine way to
+build a server and a poor way to run a world: an operator watching one wants
+to know whether the supply is flat, where the currency is pooling and
+whether anything is stuck, and none of those is a single reading.
+
+**Balances say where currency is; nothing said how it got there.** The
+ledger posts a `Reason` on every transaction and then throws it away — a
+transaction is balanced and gone, and what is retained is each account's own
+view of the postings that touched it. There was no way to ask what rewards
+had paid out this hour, or whether fees were accruing, without walking every
+account's history and adding it up. `ledger::Flows` is the answer and it is
+sixteen counters: a count and a total of cents per reason, recorded in
+`Ledger::post`, which is the one place every transaction goes through. It
+lives in the library rather than in the webapp for the same reason the
+ledger does — it is integer arithmetic over `alloc` with no clock in it —
+and it is checked from the other side by two properties in `tests/ledger.rs`:
+the meter's mint, genesis and migration cents reproduce `Supply::minted`,
+its burn cents reproduce `Supply::burned`, and its total count equals the
+number of transaction ids the ledger has handed out, so an accepted movement
+is counted exactly once and a refused one not at all.
+
+**Counters, not a series.** `metrics.rs` already argued this for the
+server's own timings — "a game server that wants those should be scraped by
+something that keeps them" — and the same argument holds here, so the meter
+has no window, no rate and no history. Two readings and the time between
+them are what a rate is made of, and the dashboard takes them: it keeps its
+own samples and subtracts. A reload starts the record again, which is the
+honest cost of not building a time-series database into a market server.
+
+**One read, or eight?** `GET /api/overview` is one market job that assembles
+the supply, the flows, every wallet, the budgets and their rules, the
+merchants, the world's effects, the job counts, the head-count and the
+outbox cursor. It replaces eight requests, but that is not why it exists:
+the reason is that eight requests are eight instants, and a dashboard built
+on them would show a reward that had left its budget and not yet arrived in
+a wallet. An operator would be right not to trust that, and right to trust
+this. What is deliberately *not* in it is `reconcile`, which snapshots the
+whole market — it stays a button, never a poll.
+
+**The dashboard is an overlay, not a second page.** The bundle is one file
+named by `include_str!`, so a second page would be a second entry point, a
+second asset name and a second thing to keep in the committed tree. It is
+`#economy` over the trading UI instead, sharing the store, the clock and the
+stream; it reads while it is open and nothing at all while it is closed. The
+management half is entirely routes that already existed — mint, burn,
+freeze, budgets, reward rules, merchant on and off, halt and resume — which
+is the useful measure of how much of this milestone was missing UI rather
+than missing server.
+
+**Three series, and the composition is not a stack.** Six categorical hues
+that stay apart under deuteranopia against a dark panel do not exist, so
+"where the currency sits" is a labelled bar per row — identity carried by
+the row's own name — and the time chart is three series in a validated
+ramp of its own, kept apart from `--up`/`--down`, which mean a price moved
+and must not be borrowed to mean "treasury". The chart plots each series'
+*change* since the first reading rather than its level: a trillion in
+circulation and a hundred thousand in players' hands share one axis only as
+two flat lines, and a second axis would let any pair of them be made to
+cross wherever the drawing pleased.
+
+**And what is still not here.** The dashboard has no history beyond the tab
+that is open, no alerting, and no way to look at one player's ledger from
+it — the wallet directory names them, and reading one is still
+`/api/wallets/{id}/transactions`. The flow meter counts cents and
+transactions, not per-symbol or per-player volume, which is the next thing
+somebody will want and the point at which the honest answer is a
+time-series database rather than more counters. The SSE key is still in the
+query string, as it was.
+
+Determinism is untouched a seventh time. The meter is derived from
+transactions the ledger has already accepted, draws no randomness, and the
+price process never sees it; the golden hashes in `tests/determinism.rs` are
+unchanged.
+
 ### Milestone 6 as built
 
 Done. `webapp/src/service.rs` is new; `account.rs` gained the player
@@ -947,10 +1035,14 @@ freeze while an order is resting, and a job completion delivered twice.
 
 ## Save format
 
-Version 10 is current: it adds the outbox — the facts the game backend has
-not collected yet, and the cursor saying how far it has read. A version 9
-file has neither, and starting from one would tell a consumer the log begins
-at 1 when it does not, so it is refused like every other version.
+Version 12 is current: it adds the ledger's flow meter — what every reason
+has moved since genesis. A version 11 file has the balances but not the
+movements behind them, and a world restored with a full treasury and an
+empty meter would report that no currency had ever moved, which is a lie an
+audit would act on; it is refused like every other version. Version 11 added
+the service credentials and the provisioned players, and version 10 the
+outbox — the facts the game backend has not collected yet, and the cursor
+saying how far it has read.
 
 There is no production data to migrate; the current snapshot is a demo.
 Save version 6 adds the ledger, wallets, asset kinds, recipes, jobs and the
@@ -972,6 +1064,39 @@ cargo test -p fehu-webapp      # webapp: all suites pass, 0 failed
 
 `just lint`, the `no_std` path and the wasm build were not run for this
 documentation-only change; milestone 0 runs `just ci` in full.
+
+### After milestone 7
+
+Run the same way, command by command. All of it passes:
+
+```
+cargo fmt --all -- --check                                  # clean
+cargo clippy --all-targets --all-features -- -D warnings    # clean
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo clippy -p fehu-webapp --all-targets -- -D warnings    # clean
+cargo build --all-features / --no-default-features / +serde # clean
+cargo build --target wasm32-unknown-unknown (both feature sets)
+cargo test --all-features                                   # 105 passed, 0 failed
+cargo test --no-default-features --tests                    #  98 passed, 0 failed
+cargo test -p fehu-webapp                                   # 298 passed, 0 failed
+cd webapp/ui && npm ci && npm run build                     # bundle rebuilt and committed
+```
+
+The library gained two properties in `tests/ledger.rs`, on both the `std` and
+`no_std` paths: the meter counts every accepted transaction and no refusal,
+and it reproduces the supply from the movements rather than from the running
+totals. The webapp gained `tests/overview.rs` (8) — the overview is the
+operator's to read and says what the endpoints it replaces say, every wallet
+is named by whoever holds it, a mint is told from a faucet and a reward from
+a mint, a refused reward is not counted, and a world comes back knowing what
+has moved both from a snapshot and from a journal replayed onto one — and two
+contract tests, which pin the overview's key sets and, for the first time,
+`/api/health`'s.
+
+The 288 webapp tests that predate the milestone pass unchanged. The UI
+changes are a new panel and additions to `types.ts`, `api.ts`, `store.ts`,
+`actions.ts`, `index.html` and `styles.css`; `just ui` regenerated the
+committed bundle in the same commit, as the conventions require.
 
 ### After milestone 6
 

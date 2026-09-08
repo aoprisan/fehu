@@ -18,6 +18,7 @@ import { EconomyPanel } from './panels/economy.js';
 import { EventsPanel } from './panels/events.js';
 import { HeaderPanel } from './panels/header.js';
 import { IntervalBar } from './panels/interval-bar.js';
+import { OpsPanel } from './panels/ops.js';
 import { SymbolList } from './panels/symbols.js';
 import { TapePanel } from './panels/tape.js';
 import { TicketPanel } from './panels/ticket.js';
@@ -41,6 +42,9 @@ new TapePanel(store);
 new AccountPanel(store, actions);
 new EconomyPanel(store, actions);
 new EventsPanel(store, actions);
+// The operator's dashboard. It reads nothing until it is opened.
+actions.restoreAdminKey();
+new OpsPanel(store, actions);
 const intervals = new IntervalBar(store, actions);
 
 // Anything that changes what the chart shows schedules one repaint.

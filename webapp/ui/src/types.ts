@@ -1219,6 +1219,161 @@ export interface WalletDto {
   account_id: number | null;
 }
 
+/** What a wallet is for. `market::WalletRow['kind']`. */
+export type WalletKind = WalletDto['kind'];
+
+/**
+ * `market::WalletRow` — one wallet in the operator's directory: what it
+ * holds, and whose it is.
+ *
+ * The same facts as {@link WalletDto}, plus the one a list needs and a single
+ * read does not: a name to show instead of a number.
+ */
+export interface WalletRow {
+  wallet: number;
+  kind: WalletKind;
+  status: AccountStatus;
+  balance_cents: number;
+  reserved_cents: number;
+  /** `balance − reserved`, never below zero. */
+  available_cents: number;
+  account_id: number | null;
+  /**
+   * The account's name, the merchant's, the budget's, or the symbol whose
+   * payouts it funds. `null` for the four wallets the world always has.
+   */
+  owner: string | null;
+}
+
+/** `ledger::Reason`'s label: why currency moved. */
+export type FlowReason =
+  | 'genesis'
+  | 'mint'
+  | 'burn'
+  | 'transfer'
+  | 'faucet'
+  | 'reward'
+  | 'purchase'
+  | 'fee'
+  | 'rebate'
+  | 'buy'
+  | 'sell'
+  | 'dividend'
+  | 'delisting'
+  | 'job_cost'
+  | 'job_refund'
+  | 'migration';
+
+/**
+ * `market::FlowDto` — what one reason has moved since genesis.
+ *
+ * Running totals, never a rate: two readings and the time between them are
+ * what a rate is made of, and the server keeps no history to make one from.
+ */
+export interface FlowDto {
+  reason: FlowReason;
+  count: number;
+  cents: number;
+}
+
+/** `market::JobsSummary` — what is in the furnace. */
+export interface JobsSummary {
+  /** Jobs the book holds, running and finished. */
+  held: number;
+  running: number;
+  done: number;
+  cancelled: number;
+  /** When the next running job is due, or `null` if none is. */
+  next_due_ms: number | null;
+}
+
+/** `market::PeopleSummary` — who is in the world. */
+export interface PeopleSummary {
+  users: number;
+  accounts: number;
+  traders: number;
+  /** Players the game backend has provisioned. */
+  players: number;
+  /** Accounts whose wallet is frozen, and whose is closed. */
+  frozen: number;
+  closed: number;
+}
+
+/**
+ * `GET /api/overview` (`market::OverviewDto`) — the whole economy in one
+ * consistent read, for the operator's dashboard. One market job, so every
+ * number in it was true at the same instant.
+ */
+export interface OverviewDto {
+  /** Simulated time the reading was taken at. */
+  at_ms: number;
+  supply: SupplyDto;
+  /** Every reason, in a fixed order, whether it has moved anything or not. */
+  flows: FlowDto[];
+  /** Every wallet, in id order. */
+  wallets: WalletRow[];
+  budgets: BudgetDto[];
+  rules: RewardRule[];
+  npcs: NpcDto[];
+  effects: SymbolEffects[];
+  modifiers: Modifier[];
+  jobs: JobsSummary;
+  people: PeopleSummary;
+  outbox: OutboxCursor;
+  /** Commands applied since the world began. */
+  journal_seq: number;
+}
+
+/** `metrics::TimingDto` — a count, a total and a worst case since start-up. */
+export interface TimingDto {
+  count: number;
+  micros_last: number;
+  /** Never decays: it is a high-water mark. */
+  micros_max: number;
+  micros_mean: number;
+}
+
+/** `metrics::MetricsDto` — what the server has been doing, and how fast. */
+export interface MetricsDto {
+  requests: TimingDto;
+  requests_failed: number;
+  requests_limited: number;
+  /** Turned away because the server was already full. */
+  requests_shed: number;
+  engine_step: TimingDto;
+}
+
+/** `GET /api/health` — is it up, is it keeping up, and since when. */
+export interface Health {
+  status: string;
+  uptime_secs: number;
+  sim_now_ms: number;
+  time_scale: number;
+  symbols: number;
+  events_logged: number;
+  ticks_total: number;
+  trades_total: number;
+  users: number;
+  accounts: number;
+  traders: number;
+  cash_cents: number;
+  resting_orders: number;
+  stops_held: number;
+  orders_placed: number;
+  orders_refused: number;
+  fills_booked: number;
+  /** Zero in a healthy market: shares moved and money did not. */
+  settlement_failures: number;
+  stream_messages: number;
+  stream_subscribers: number;
+  requests_in_flight: number;
+  /** `0` means there is no bound. */
+  max_in_flight: number;
+  max_streams: number;
+  tracked_clients: number;
+  metrics: MetricsDto;
+}
+
 /** `api::InventoryResponse` — a trader's units of the world's goods. */
 export interface InventoryResponse {
   trader_id: number;

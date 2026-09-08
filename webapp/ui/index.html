@@ -12,6 +12,7 @@
   <span class="clock" id="clock">—</span>
   <span class="spacer"></span>
   <span id="acct-hdr">—</span>
+  <button type="button" id="ops-open" title="the operator's dashboard">Economy</button>
   <span id="conn"><span class="dot"></span>connecting</span>
 </header>
 <main>
@@ -104,6 +105,111 @@
     <ul id="log"></ul>
   </aside>
 </main>
+<section id="ops" hidden>
+  <header class="ops-bar">
+    <h1>Economy</h1>
+    <span class="clock" id="ops-clock">—</span>
+    <span id="ops-seq" class="m"></span>
+    <span class="spacer"></span>
+    <label class="row">operator key
+      <input type="password" id="ops-key" placeholder="unset on a demo server" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="row">refresh
+      <select id="ops-every">
+        <option value="2000">2s</option>
+        <option value="5000" selected>5s</option>
+        <option value="15000">15s</option>
+        <option value="60000">1m</option>
+        <option value="0">paused</option>
+      </select>
+    </label>
+    <button type="button" id="ops-close">Close</button>
+  </header>
+  <div id="ops-msg" class="m"></div>
+  <div class="ops-grid">
+    <section class="card span2">
+      <h2>Currency</h2>
+      <div class="tiles" id="ops-tiles"></div>
+      <h3>Where it sits</h3>
+      <table class="bars"><tbody id="ops-where"></tbody></table>
+      <h3>Change since the first reading</h3>
+      <div class="legend" id="ops-legend"></div>
+      <div class="spark"><canvas id="ops-chart"></canvas></div>
+    </section>
+    <section class="card">
+      <h2>Movements <span class="m">since genesis</span></h2>
+      <table class="rows">
+        <thead><tr><th>reason</th><th class="r">count</th><th class="r">moved</th><th class="r">per min</th></tr></thead>
+        <tbody id="ops-flows"></tbody>
+      </table>
+    </section>
+    <section class="card">
+      <h2>Server</h2>
+      <div class="tiles" id="ops-server"></div>
+      <h3>Audit</h3>
+      <button type="button" id="ops-audit">Run audit</button>
+      <div id="ops-audit-out" class="m">not run</div>
+    </section>
+    <section class="card span2">
+      <h2>Wallets</h2>
+      <label class="row">show
+        <select id="ops-wallet-kind"><option value="">every kind</option></select>
+      </label>
+      <table class="rows">
+        <thead><tr><th>#</th><th>kind</th><th>owner</th><th class="r">balance</th><th class="r">reserved</th><th>state</th><th></th></tr></thead>
+        <tbody id="ops-wallets"></tbody>
+      </table>
+    </section>
+    <section class="card">
+      <h2>Budgets</h2>
+      <table class="rows">
+        <thead><tr><th>name</th><th class="r">balance</th><th class="r">paid</th><th></th></tr></thead>
+        <tbody id="ops-budgets"></tbody>
+      </table>
+      <form class="ops-form" id="ops-budget-new">
+        <input type="text" name="name" placeholder="new budget" required maxlength="64">
+        <input type="number" name="amount" min="0.01" step="0.01" placeholder="amount" required>
+        <button type="submit">Open</button>
+      </form>
+      <h3>Reward rules</h3>
+      <table class="rows">
+        <thead><tr><th>rule</th><th class="r">pays</th><th>budget</th><th></th></tr></thead>
+        <tbody id="ops-rules"></tbody>
+      </table>
+      <form class="ops-form" id="ops-rule-new">
+        <input type="text" name="id" placeholder="rule id" required maxlength="64">
+        <select name="budget" id="ops-rule-budget"></select>
+        <input type="number" name="amount" min="0.01" step="0.01" placeholder="amount" required>
+        <button type="submit">Set</button>
+      </form>
+    </section>
+    <section class="card">
+      <h2>Merchants</h2>
+      <table class="rows">
+        <thead><tr><th>name</th><th>symbol</th><th class="r">cash</th><th class="r">stock</th><th></th></tr></thead>
+        <tbody id="ops-npcs"></tbody>
+      </table>
+    </section>
+    <section class="card">
+      <h2>Supply</h2>
+      <p class="m">Minting and burning are the only two movements that change how much currency exists. Everything else moves what is already here.</p>
+      <form class="ops-form" id="ops-mint">
+        <select name="account" id="ops-mint-account"></select>
+        <input type="number" name="amount" min="0.01" step="0.01" placeholder="amount" required>
+        <button type="submit">Mint</button>
+        <button type="submit" name="burn" value="1" class="danger">Burn</button>
+      </form>
+    </section>
+    <section class="card">
+      <h2>World</h2>
+      <div class="tiles" id="ops-world"></div>
+      <h3>In force</h3>
+      <ul id="ops-modifiers"></ul>
+      <h3>Trading</h3>
+      <table class="rows"><tbody id="ops-symbols"></tbody></table>
+    </section>
+  </div>
+</section>
 <script type="module" src="/src/main.ts"></script>
 </body>
 </html>

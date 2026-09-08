@@ -43,8 +43,8 @@ renders straight from a fetch response, so the stream and the REST endpoints
 cannot disagree about what is on screen.
 
 There is no framework. Views are already functions of state, so adding one
-later is a per-panel change rather than a rewrite; the 36 kB bundle
-(12 kB gzipped) is the reason not to add one yet.
+later is a per-panel change rather than a rewrite; the 51 kB bundle
+(17 kB gzipped) is the reason not to add one yet.
 
 The panels are the market's — symbols, chart, book, tape, ticket, account,
 events — plus one for the economy: `panels/economy.ts` draws the wallet the
@@ -52,6 +52,17 @@ player's money is in, the units they hold of the world's goods, and what
 they have in the furnace. The three are one panel because a job spends all
 three at once — it takes units and cents now and gives back units later —
 so three separate panels would always be read as one.
+
+`panels/ops.ts` is the operator's, and the odd one out. It is a full-page
+overlay rather than a page of its own — one bundle, named by `include_str!`,
+is the whole reason — opened from the header or by the `#economy` hash, and
+it is the only panel that polls: `GET /api/overview` and `GET /api/health`
+while it is open, nothing while it is closed. `/api/reconcile` snapshots the
+whole market, so it is a button. Rates are the panel's own arithmetic over
+the samples it keeps in the store, because the server counts and does not
+remember. Its chart draws each series' *change* since the first reading, on
+one axis, in a three-hue ramp of its own (`--series-1..3` in `styles.css`)
+that is kept apart from `--up`/`--down`: those mean a price moved.
 
 ## Keeping the types honest
 

@@ -3,12 +3,13 @@
  * user-initiated commands. Panels call these; nothing else mutates state.
  */
 
-import { api, errorMessage, setApiKey } from './api.js';
+import { api, errorMessage, ops, setAdminKey, setApiKey } from './api.js';
 import { fmtPrice } from './format.js';
 import { bucketOf } from './intervals.js';
 import { setOrderStatus, setStatus } from './status.js';
-import { MAX_EVENTS, MAX_LIVE_FILLS, MAX_TAPE, type Store } from './store.js';
+import { MAX_EVENTS, MAX_LIVE_FILLS, MAX_OPS_SAMPLES, MAX_TAPE, type Store } from './store.js';
 import type {
+  AccountStatus,
   CatalogEntry,
   EventRecord,
   FillRecord,
@@ -25,6 +26,7 @@ const BOOK_DEPTH = 8;
 const TAPE_LIMIT = 40;
 const TRADER_STORAGE_KEY = 'fehu.trader_id';
 const KEY_STORAGE_KEY = 'fehu.api_key';
+const ADMIN_KEY_STORAGE_KEY = 'fehu.admin_key';
 
 /** `localStorage` is unavailable in some privacy modes; degrade, don't crash. */
 function readStored(key: string): string | null {
@@ -329,6 +331,150 @@ export class Actions {
     } catch (e) {
       setStatus(errorMessage(e), true);
     }
+  }
+
+  // --- the operator's dashboard ---------------------------------------------
+
+  /**
+   * Take up the operator's key from the last session, if there was one.
+   *
+   * A server with no admin key set admits the operator routes to anybody —
+   * the single-player default — so the absence of one is not an error and
+   * the dashboard opens either way.
+   */
+  restoreAdminKey(): void {
+    setAdminKey(readStored(ADMIN_KEY_STORAGE_KEY));
+  }
+
+  /** Use `key` for the operator routes from here on, and remember it. */
+  useAdminKey(key: string | null): void {
+    setAdminKey(key);
+    try {
+      if (key === null || key === '') localStorage.removeItem(ADMIN_KEY_STORAGE_KEY);
+      else localStorage.setItem(ADMIN_KEY_STORAGE_KEY, key);
+    } catch {
+      // Not fatal: the key just will not survive a reload.
+    }
+    this.#store.emit('ops');
+  }
+
+  /** Open or close the dashboard. The panel starts and stops polling. */
+  setOpsOpen(open: boolean): void {
+    if (this.#state.ops.open === open) return;
+    this.#state.ops.open = open;
+    this.#store.emit('ops');
+  }
+
+  /**
+   * One reading: the whole economy, and the server's own counters.
+   *
+   * Both in one round trip each, and the pair kept as a sample so the panel
+   * can draw a rate. A failure leaves the last good reading on screen with
+   * the error beside it — a dashboard that blanked itself on a dropped
+   * request would be worse than one that says it is stale.
+   */
+  async loadOps(): Promise<void> {
+    try {
+      const [overview, health] = await Promise.all([ops.overview(), ops.health()]);
+      this.#state.ops.overview = overview;
+      this.#state.ops.health = health;
+      this.#state.ops.error = null;
+      this.#state.ops.history.push({
+        at: Date.now(),
+        supply: overview.supply,
+        flows: overview.flows,
+      });
+      if (this.#state.ops.history.length > MAX_OPS_SAMPLES) this.#state.ops.history.shift();
+    } catch (e) {
+      this.#state.ops.error = errorMessage(e);
+    }
+    this.#store.emit('ops');
+  }
+
+  /** Run the audit. Asked for, never polled: it snapshots the whole market. */
+  async runAudit(): Promise<void> {
+    try {
+      this.#state.ops.reconciliation = await ops.reconcile();
+      this.#state.ops.error = null;
+    } catch (e) {
+      this.#state.ops.error = errorMessage(e);
+    }
+    this.#store.emit('ops');
+  }
+
+  /**
+   * Run one operator command, then read the world back.
+   *
+   * Every mutation goes through here so that all of them report the same way
+   * and none of them leaves the dashboard showing the world as it was before
+   * the change.
+   */
+  async #command(what: string, run: () => Promise<unknown>): Promise<void> {
+    try {
+      await run();
+      this.#state.ops.note = what;
+      this.#state.ops.error = null;
+    } catch (e) {
+      this.#state.ops.note = null;
+      this.#state.ops.error = errorMessage(e);
+      this.#store.emit('ops');
+      return;
+    }
+    await this.loadOps();
+  }
+
+  /** Create currency into an account: the one way supply goes up. */
+  async mint(accountId: number, amountCents: number): Promise<void> {
+    await this.#command(`minted ${fmtPrice(amountCents)} into account #${accountId}`, () =>
+      ops.mint(accountId, amountCents),
+    );
+  }
+
+  /** Destroy currency out of one: the one way it goes down. */
+  async burn(accountId: number, amountCents: number): Promise<void> {
+    await this.#command(`burned ${fmtPrice(amountCents)} out of account #${accountId}`, () =>
+      ops.burn(accountId, amountCents),
+    );
+  }
+
+  async setAccountStatus(accountId: number, status: AccountStatus): Promise<void> {
+    await this.#command(`account #${accountId} is ${status}`, () =>
+      ops.setAccountStatus(accountId, status),
+    );
+  }
+
+  async createBudget(name: string, cashCents: number): Promise<void> {
+    await this.#command(`opened budget ${name} with ${fmtPrice(cashCents)}`, () =>
+      ops.createBudget(name, cashCents),
+    );
+  }
+
+  async fundBudget(wallet: number, amountCents: number): Promise<void> {
+    await this.#command(`funded budget #${wallet} with ${fmtPrice(amountCents)}`, () =>
+      ops.fundBudget(wallet, amountCents),
+    );
+  }
+
+  async setRewardRule(id: string, budget: number, amountCents: number): Promise<void> {
+    await this.#command(`${id} pays ${fmtPrice(amountCents)} from budget #${budget}`, () =>
+      ops.setRewardRule(id, budget, amountCents),
+    );
+  }
+
+  async removeRewardRule(id: string): Promise<void> {
+    await this.#command(`rule ${id} is gone`, () => ops.removeRewardRule(id));
+  }
+
+  async setNpcActive(traderId: number, active: boolean): Promise<void> {
+    await this.#command(`merchant #${traderId} is ${active ? 'quoting' : 'idle'}`, () =>
+      ops.setNpcActive(traderId, active),
+    );
+  }
+
+  async setSymbolHalted(symbol: string, halted: boolean): Promise<void> {
+    await this.#command(`${symbol} is ${halted ? 'halted' : 'trading'}`, () =>
+      halted ? ops.halt(symbol) : ops.resume(symbol),
+    );
   }
 
   // --- stream application ---------------------------------------------------

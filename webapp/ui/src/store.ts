@@ -12,18 +12,55 @@ import type {
   Candle,
   EventRecord,
   FillRecord,
+  FlowDto,
+  Health,
   HoldingDto,
   Interval,
   Job,
   Modifier,
+  OverviewDto,
   PortfolioDto,
   Quote,
   Recipe,
+  Reconciliation,
   Side,
+  SupplyDto,
   SymbolEffects,
   TradeDto,
   WalletDto,
 } from './types.js';
+
+/**
+ * One reading of the economy, kept by the page.
+ *
+ * The server counts, it does not remember: supply and flows are running
+ * totals with no window and no history behind them, deliberately. So the
+ * dashboard keeps its own readings and takes the differences — which is all a
+ * rate ever was — and a reload starts the record again.
+ */
+export interface OpsSample {
+  /** Wall-clock milliseconds the reading was taken at. */
+  at: number;
+  supply: SupplyDto;
+  flows: FlowDto[];
+}
+
+/** The operator's dashboard: what it has read, and what it is showing. */
+export interface OpsState {
+  open: boolean;
+  overview: OverviewDto | null;
+  health: Health | null;
+  /** The last audit asked for. Not polled: it snapshots the whole market. */
+  reconciliation: Reconciliation | null;
+  /** Readings oldest first, capped at {@link MAX_OPS_SAMPLES}. */
+  history: OpsSample[];
+  /** Wall milliseconds between polls while the dashboard is open. */
+  intervalMs: number;
+  /** What the last request said, if it failed. */
+  error: string | null;
+  /** What the last command did, for the line under the forms. */
+  note: string | null;
+}
 
 export type ConnectionState = 'connecting' | 'live' | 'reconnecting';
 
@@ -63,6 +100,8 @@ export interface AppState {
   pitch: number;
   /** Index into the drawn window of the hovered bar. */
   hover: number | null;
+  /** The operator's dashboard. Only polled while it is open. */
+  ops: OpsState;
   /** Latest simulated time seen, from any source. */
   simNow: number | null;
   /** Simulated seconds per wall second. */
@@ -71,6 +110,12 @@ export interface AppState {
 }
 
 export const MAX_EVENTS = 200;
+/**
+ * Readings the dashboard keeps. At the default five-second poll that is a
+ * little over half an hour of history, which is as far back as a chart the
+ * width of a panel can usefully draw.
+ */
+export const MAX_OPS_SAMPLES = 400;
 export const MAX_TAPE = 60;
 export const MAX_LIVE_FILLS = 200;
 
@@ -86,6 +131,8 @@ export type Topic =
   | 'trader'
   /** The wallet, the inventory, the recipes or the jobs changed. */
   | 'economy'
+  /** The operator's dashboard read something, or changed something. */
+  | 'ops'
   | 'events'
   | 'catalog'
   | 'clock'
@@ -112,6 +159,16 @@ export class Store {
     effects: [],
     modifiers: [],
     liveFills: [],
+    ops: {
+      open: false,
+      overview: null,
+      health: null,
+      reconciliation: null,
+      history: [],
+      intervalMs: 5_000,
+      error: null,
+      note: null,
+    },
     side: 'buy',
     pitch: 9,
     hover: null,

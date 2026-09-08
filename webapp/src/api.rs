@@ -36,9 +36,9 @@ use crate::jobs::{JobError, JobsResponse, MAX_RECIPE_NOTE, RecipesResponse};
 use crate::journal::{Command, Listing, Outcome, Principal, seed_from_ticker};
 use crate::limit::Decision;
 use crate::market::{
-    App, AssetKind, Closed, Market, OrderCheck, PayoutError, PlaceError, Quote, Sequenced,
-    SnapshotDto, StreamMessage, Subscription, SupplyDto, Symbol, SymbolInfo, SymbolStatus,
-    SymbolView, wall_now_ms,
+    App, AssetKind, Closed, Market, OrderCheck, OverviewDto, PayoutError, PlaceError, Quote,
+    Sequenced, SnapshotDto, StreamMessage, Subscription, SupplyDto, Symbol, SymbolInfo,
+    SymbolStatus, SymbolView, wall_now_ms,
 };
 use crate::npc::{NpcsResponse, Policy};
 use crate::rewards::{BudgetsResponse, RewardError};
@@ -144,6 +144,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/traders/{trader_id}/inventory", get(get_inventory))
         .route("/api/world", get(world))
         .route("/api/supply", get(supply))
+        .route("/api/overview", get(overview))
         .route("/api/commands/{key}", get(get_command))
         .route("/api/backup", get(backup))
         .route("/api/outbox", get(read_outbox))
@@ -177,6 +178,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/v1/economy/catalog", get(get_catalog))
         .route("/api/v1/economy/budgets", get(get_budgets))
         .route("/api/v1/economy/supply", get(supply))
+        .route("/api/v1/economy/overview", get(overview))
         .route("/api/v1/economy/world", get(world))
         .route("/api/v1/economy/commands/{key}", get(get_command))
         .route("/api/v1/economy/admin/backup", get(backup))
@@ -4059,6 +4061,22 @@ async fn get_command(
 /// minted less burned, and in a healthy world they are the same number —
 /// which is exactly what makes the claim checkable by anyone rather than
 /// promised by the server.
+/// The operator's dashboard, in one read.
+///
+/// Operator authority, because it names every wallet in the world and every
+/// budget behind the rewards. The aggregate half of it —
+/// [`supply`](SupplyDto) — stays public at `/api/supply`, where it says how
+/// much currency exists without saying whose it is.
+///
+/// One market job: see [`OverviewDto`] for why a dashboard that asked
+/// separately would sometimes be wrong.
+async fn overview(
+    State(app): State<AppState>,
+    _admin: Admin,
+) -> Result<Json<OverviewDto>, ApiError> {
+    Ok(Json(app.market.call(|m| m.overview()).await?))
+}
+
 async fn supply(State(app): State<AppState>) -> Json<SupplyDto> {
     Json(
         app.market

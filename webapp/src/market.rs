@@ -620,6 +620,106 @@ impl SupplyDto {
     }
 }
 
+/// One wallet in the directory the operator reads: what it holds, and whose
+/// it is.
+///
+/// Distinct from `WalletDto`, which is one wallet answering for itself. This
+/// is a row in a list of all of them, so it carries the one thing a list
+/// needs and a single read does not: a name to show instead of a number.
+#[derive(Clone, Debug, Serialize)]
+pub struct WalletRow {
+    pub wallet: WalletId,
+    /// `player`, `treasury`, `budget`, `npc`, `issuer`, `venue`, `issuance`
+    /// or `synthetic`.
+    pub kind: &'static str,
+    pub status: &'static str,
+    pub balance_cents: i64,
+    /// Committed to resting buy orders.
+    pub reserved_cents: i64,
+    /// `balance − reserved`: what can still be spent.
+    pub available_cents: i64,
+    /// The account whose money this is, if it is anybody's.
+    pub account_id: Option<u64>,
+    /// What to call it on a screen: the account's name, the merchant's, the
+    /// budget's, or the symbol whose payouts it funds. `null` for the four
+    /// wallets the world always has, whose kind is their name.
+    pub owner: Option<String>,
+}
+
+/// What one [`Reason`] has moved since genesis.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct FlowDto {
+    /// The reason's stable label: `mint`, `reward`, `fee`, `buy`, …
+    pub reason: &'static str,
+    /// Transactions posted with it.
+    pub count: u64,
+    /// What they moved, in cents.
+    pub cents: i64,
+}
+
+/// What is in the furnace, and what has come out of it.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct JobsSummary {
+    /// Jobs the book holds, running and finished.
+    pub held: usize,
+    pub running: usize,
+    pub done: usize,
+    pub cancelled: usize,
+    /// When the next running job is due, or `null` if none is.
+    pub next_due_ms: Option<i64>,
+}
+
+/// Who is in the world, and how many of them cannot move money.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct PeopleSummary {
+    pub users: usize,
+    pub accounts: usize,
+    pub traders: usize,
+    /// Players the game backend has provisioned.
+    pub players: usize,
+    /// Accounts whose wallet is frozen, and whose is closed. A frozen wallet
+    /// still takes credits; a closed one is finished.
+    pub frozen: usize,
+    pub closed: usize,
+}
+
+/// `GET /api/economy/overview`: the whole economy in one consistent read.
+///
+/// One market job, so every number in it was true at the same instant —
+/// which is the point of having it rather than the eight requests it
+/// replaces. A dashboard that assembled supply, wallets, budgets and the
+/// world separately would show a reward that had left its budget and not yet
+/// arrived in a wallet, and an operator would be right not to trust it.
+///
+/// Everything here is cheap: counters, balances and clones of lists the
+/// market already holds. Nothing that walks the books belongs in it —
+/// [`crate::reconcile`] takes a snapshot of the whole world and is asked for
+/// deliberately, not polled.
+#[derive(Clone, Debug, Serialize)]
+pub struct OverviewDto {
+    /// Simulated time the reading was taken at.
+    pub at_ms: i64,
+    pub supply: SupplyDto,
+    /// Every reason, in a fixed order, whether it has moved anything or not.
+    pub flows: Vec<FlowDto>,
+    /// Every wallet, in id order.
+    pub wallets: Vec<WalletRow>,
+    pub budgets: Vec<BudgetDto>,
+    /// What a named reward is worth.
+    pub rules: Vec<RewardRule>,
+    pub npcs: Vec<NpcDto>,
+    /// What events are doing to production and demand, per symbol, now.
+    pub effects: Vec<SymbolEffects>,
+    /// The modifiers behind those numbers, still in force.
+    pub modifiers: Vec<crate::world::Modifier>,
+    pub jobs: JobsSummary,
+    pub people: PeopleSummary,
+    /// Where the game backend has read to.
+    pub outbox: crate::outbox::Cursor,
+    /// Commands applied since the world began.
+    pub journal_seq: u64,
+}
+
 /// The market: everybody's money, every order ever sent, and the symbols
 /// those orders went to. One actor; see the module docs for why.
 pub struct Market {
@@ -3161,6 +3261,117 @@ impl Market {
             now_ms,
         );
         Ok((sent, received))
+    }
+
+    /// Every wallet in the world, in id order, with a name where there is
+    /// one to give it.
+    ///
+    /// The names come from the four places a wallet can belong to — an
+    /// account, a merchant, a budget, a symbol's payouts — and a wallet that
+    /// belongs to none of them is one of the world's own, whose kind already
+    /// says what it is.
+    #[must_use]
+    pub fn wallet_rows(&self) -> Vec<WalletRow> {
+        let accounts: BTreeMap<WalletId, &Account> =
+            self.accounts.values().map(|a| (a.wallet, a)).collect();
+        let npcs: BTreeMap<WalletId, &Npc> = self
+            .npcs
+            .values()
+            .filter_map(|npc| {
+                let account = self.accounts.get(&npc.account_id)?;
+                Some((account.wallet, npc))
+            })
+            .collect();
+        let budgets: BTreeMap<WalletId, &Budget> =
+            self.rewards.budgets().map(|b| (b.wallet, b)).collect();
+        let issuers: BTreeMap<WalletId, &'static str> =
+            self.issuers.iter().map(|(sym, id)| (*id, *sym)).collect();
+        self.ledger
+            .wallets()
+            .map(|w| {
+                // A merchant's wallet is also an account's, and the merchant
+                // is the more useful of the two names, so it is asked first.
+                let owner = npcs
+                    .get(&w.id)
+                    .map(|npc| npc.name.clone())
+                    .or_else(|| accounts.get(&w.id).map(|a| a.name.clone()))
+                    .or_else(|| budgets.get(&w.id).map(|b| b.name.clone()))
+                    .or_else(|| issuers.get(&w.id).map(|s| (*s).to_string()));
+                WalletRow {
+                    wallet: w.id,
+                    kind: w.kind.label(),
+                    status: w.status.label(),
+                    balance_cents: w.balance_cents(),
+                    reserved_cents: w.reserved_cents(),
+                    available_cents: w.available_cents(),
+                    account_id: accounts.get(&w.id).map(|a| a.id.0),
+                    owner,
+                }
+            })
+            .collect()
+    }
+
+    /// Everything the operator's dashboard reads, taken at one instant.
+    ///
+    /// See [`OverviewDto`] for why it is one call rather than eight.
+    #[must_use]
+    pub fn overview(&self) -> OverviewDto {
+        let at = self.now();
+        let mut jobs = JobsSummary {
+            held: self.jobs.len(),
+            ..JobsSummary::default()
+        };
+        for job in self.jobs.jobs() {
+            match job.status {
+                JobStatus::Running => {
+                    jobs.running += 1;
+                    jobs.next_due_ms = Some(
+                        jobs.next_due_ms
+                            .map_or(job.due_at_ms, |due| due.min(job.due_at_ms)),
+                    );
+                }
+                JobStatus::Done => jobs.done += 1,
+                JobStatus::Cancelled => jobs.cancelled += 1,
+            }
+        }
+        let mut people = PeopleSummary {
+            users: self.users.len(),
+            accounts: self.accounts.len(),
+            traders: self.traders.len(),
+            players: self.players.len(),
+            ..PeopleSummary::default()
+        };
+        for account in self.accounts.values() {
+            match self.ledger.status(account.wallet) {
+                fehu::ledger::WalletStatus::Frozen => people.frozen += 1,
+                fehu::ledger::WalletStatus::Closed => people.closed += 1,
+                fehu::ledger::WalletStatus::Active => {}
+            }
+        }
+        OverviewDto {
+            at_ms: at.0,
+            supply: SupplyDto::of(self),
+            flows: self
+                .ledger
+                .flows()
+                .iter()
+                .map(|(reason, flow)| FlowDto {
+                    reason: reason.label(),
+                    count: flow.count,
+                    cents: flow.cents,
+                })
+                .collect(),
+            wallets: self.wallet_rows(),
+            budgets: self.budget_views(),
+            rules: self.rewards.rules().cloned().collect(),
+            npcs: self.npc_views(),
+            effects: self.world_view(at),
+            modifiers: self.world.active(at.0).cloned().collect(),
+            jobs,
+            people,
+            outbox: self.outbox.position(),
+            journal_seq: self.journal.seq(),
+        }
     }
 
     /// Every budget, with what its wallet holds now.

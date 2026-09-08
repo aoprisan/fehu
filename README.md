@@ -96,6 +96,18 @@ Its output is committed to `webapp/static/` and embedded into the binary, so
 the command above needs no Node toolchain; `just ui` rebuilds it after a
 change and `just ui-dev` serves it with hot reload against a running backend.
 
+**Economy** in the header — or `http://localhost:3000/#economy` — opens the
+operator's dashboard over it: where the currency sits and what has been
+moving it, every wallet and whose it is, the budgets, the merchants, the
+jobs, the world's effects, and the server's own latency and admission
+counters; and the levers beside them — mint and burn, freeze and unfreeze,
+open and fund a budget, price a reward, start and stop a merchant, halt and
+resume a symbol. It reads `/api/overview` and `/api/health` while it is open
+and nothing at all while it is closed, and it keeps its own readings, since
+the server counts but does not remember. The audit (`/api/reconcile`) is a
+button rather than a poll: it takes a snapshot of the whole market. On a
+server with `FEHU_ADMIN_KEY` set, paste that key into the field in its bar.
+
 Market data — quotes, bars, the book, the tape, the event log — is open to
 anyone. Everything that belongs to a player needs the API key they were
 issued when they signed up, as `Authorization: Bearer <key>` (or
@@ -204,6 +216,7 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/wallets/{id}`, `/api/wallets/{id}/transactions` | One wallet: its kind, balance, reservation and history. The owner's, or the game master's |
 | `GET` | `/api/world?at_ms=` | What game events are doing to production and demand, per symbol, now or at an instant |
 | `GET` | `/api/supply` | How much currency exists and where it sits: minted, burned, outstanding, what the wallets actually hold, and whether the two agree |
+| `GET` | `/api/overview` | Game master: the whole economy in one consistent read — the supply, what every reason has *moved*, every wallet and whose it is, the budgets and their rules, the merchants, the world's effects, the jobs, who is in it and where the outbox has been read to. One market job, so it is one instant, not eight |
 | `GET` | `/api/commands/{key}` | The answer a command was given, by the `Idempotency-Key` it was sent under, for a client that lost the response |
 | `GET` | `/api/backup` | Game master: a snapshot of the whole market as the response body — `curl … > backup.json`, and restore by pointing `FEHU_STATE_FILE` at it |
 | `GET` | `/api/outbox?after=&limit=` | Game master: the facts nobody asked for — fills, jobs coming due, expiries, delistings, accepted events — numbered, retained and replayable from a cursor. Reading does not consume |
@@ -306,7 +319,13 @@ sum anyone can do:
 ```
 
 `GET /api/supply` reports both sides of it and whether they agree;
-`GET /api/reconcile` fails if they do not. Only two operations move those
+`GET /api/reconcile` fails if they do not. Balances say where the currency
+*is*; the ledger's flow meter says how it got there — a count and a total of
+cents for every reason there is, from `genesis` and `mint` through `reward`,
+`fee`, `buy` and `job_cost` — and `GET /api/overview` reports it. They are
+running totals with no window behind them, exactly like the server's own
+metrics: two readings and the time between them are all a rate is made of,
+and anything that wants history should keep it. Only two operations move those
 numbers — minting and burning — and both are the game master's. **No route a
 player can reach changes the supply.** Opening an account with `cash_cents`
 pays it out of treasury; a fee goes to a venue wallet instead of leaving the

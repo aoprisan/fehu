@@ -10,7 +10,7 @@
 //! what was burned, and nothing but a mint or a burn can move that number.
 
 use fehu::ledger::{
-    Draft, Ledger, LedgerError, MAX_WALLET_CENTS, Reason, Supply, WalletId, WalletKind,
+    Draft, Flows, Ledger, LedgerError, MAX_WALLET_CENTS, Reason, Supply, WalletId, WalletKind,
     WalletStatus, checked_notional_cents,
 };
 use proptest::prelude::*;
@@ -165,11 +165,14 @@ fn apply(ledger: &mut Ledger, wallets: &[WalletId], op: Op) {
 /// reserved out of that, and whether it may still move money.
 type WalletState = (WalletId, i64, i64, WalletStatus);
 
-/// Everything about a ledger that a refused operation must leave alone.
-fn state(ledger: &Ledger) -> (Supply, u64, Vec<WalletState>) {
+/// Everything about a ledger that a refused operation must leave alone —
+/// the flow meter included, because a refusal that was still counted would
+/// be a movement an audit could see and a balance could not.
+fn state(ledger: &Ledger) -> (Supply, u64, Flows, Vec<WalletState>) {
     (
         ledger.supply(),
         ledger.next_transaction_id(),
+        *ledger.flows(),
         ledger
             .wallets()
             .map(|w| (w.id, w.balance_cents(), w.reserved_cents(), w.status))
@@ -226,6 +229,53 @@ proptest! {
                 other => prop_assert_eq!(before, after, "{:?} moved the supply", other),
             }
         }
+    }
+
+    /// The flow meter counts transactions, not attempts: every accepted one
+    /// exactly once, and no refused one at all.
+    ///
+    /// The ledger hands transaction ids out in order and never reuses one, so
+    /// "how many were accepted" is a number the meter can be checked against
+    /// without keeping a second tally to compare it with.
+    #[test]
+    fn the_flow_meter_counts_every_accepted_transaction_and_no_refusal(
+        ops in prop::collection::vec(op_strategy(8), 1..80)
+    ) {
+        let (mut ledger, wallets, _) = world();
+        for op in ops {
+            apply(&mut ledger, &wallets, op);
+            prop_assert_eq!(
+                ledger.flows().total().count,
+                ledger.next_transaction_id() - 1,
+                "meter and transaction ids disagree after {:?}", op
+            );
+        }
+    }
+
+    /// What the meter says was minted and burned is what the supply says.
+    ///
+    /// Mint, genesis and migration are the reasons that create currency and
+    /// each moves exactly what it created; a burn destroys exactly what it
+    /// moved. So the meter reproduces the supply from the other side — from
+    /// the movements rather than the running totals — and the two agree.
+    #[test]
+    fn the_flow_meter_reproduces_the_supply(
+        ops in prop::collection::vec(op_strategy(8), 1..80)
+    ) {
+        let (mut ledger, wallets, _) = world();
+        for op in ops {
+            apply(&mut ledger, &wallets, op);
+        }
+        let flows = ledger.flows();
+        let created = [Reason::Genesis, Reason::Mint, Reason::Migration]
+            .into_iter()
+            .map(|r| flows.get(r).cents)
+            .sum::<i64>();
+        prop_assert_eq!(created, ledger.supply().minted_cents);
+        prop_assert_eq!(flows.get(Reason::Burn).cents, ledger.supply().burned_cents);
+        // And nothing that cannot touch the supply was counted as if it had.
+        prop_assert_eq!(flows.get(Reason::Reward).count, 0);
+        prop_assert_eq!(flows.get(Reason::Dividend).count, 0);
     }
 
     /// A refused operation is a no-op: not one balance, reservation, status
