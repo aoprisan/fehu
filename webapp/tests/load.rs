@@ -446,6 +446,104 @@ async fn the_burst_survives_a_restart_and_reconciles() {
     );
 }
 
+/// The backup and restore drill, end to end.
+///
+/// Take a backup while the server is running, keep trading after it, then
+/// bring a world up from the backup alone and check that it is the world as
+/// of the backup — not the one that carried on without it, and not a broken
+/// half of either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backup_taken_while_running_restores_to_the_world_it_was_taken_from() {
+    let dir = TempDir::new("fehu-backup-drill");
+    let path = dir.path().join("state.json");
+    let app = App::new(options(Some(path.clone())));
+    app.attach_journal(&journal::path_for(&path))
+        .await
+        .expect("a journal beside the state file");
+
+    let (trader_id, key) = sign_up(&app, "keeper").await;
+    for _ in 0..4 {
+        let (status, body) = post(
+            &app,
+            Some(&key),
+            "/api/symbols/ACME/orders",
+            json!({ "trader_id": trader_id, "side": "buy", "type": "market", "qty": 2 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (_, at_backup) = get(&app, Some(&key), &format!("/api/traders/{trader_id}")).await;
+
+    // `curl -H 'Authorization: …' /api/backup > backup.json`, in a test.
+    let (status, backup) = get(&app, None, "/api/backup").await;
+    assert_eq!(status, StatusCode::OK, "{backup}");
+    let backup_path = dir.path().join("backup.json");
+    std::fs::write(&backup_path, backup.to_string()).expect("a backup on disk");
+
+    // The world carries on after the backup was taken.
+    for _ in 0..4 {
+        let (status, body) = post(
+            &app,
+            Some(&key),
+            "/api/symbols/ACME/orders",
+            json!({ "trader_id": trader_id, "side": "buy", "type": "market", "qty": 2 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (_, after) = get(&app, Some(&key), &format!("/api/traders/{trader_id}")).await;
+    assert_ne!(
+        after["positions"][0]["qty"], at_backup["positions"][0]["qty"],
+        "the world moved on, so the backup is a real point in the past"
+    );
+    // Taking a backup does not disturb the live server's own persistence:
+    // the journal it needs is still there, whole.
+    let entries = journal::read(&journal::path_for(&path)).expect("a readable journal");
+    assert!(
+        entries.len() >= 9,
+        "the live journal still carries everything since its own last snapshot: \
+         {} entries",
+        entries.len()
+    );
+    drop(app);
+
+    // A world from the backup alone: no journal, because a snapshot is
+    // complete on its own.
+    let restored = save::read(&backup_path).expect("the backup reads as a snapshot");
+    let restored = App::resume(options(Some(backup_path)), restored, Vec::new()).await;
+
+    let (status, report) = get(&restored, None, "/api/reconcile").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        report["valid"], true,
+        "the restored world does not add up: {}",
+        report["issues"]
+    );
+    let (_, back) = get(&restored, Some(&key), &format!("/api/traders/{trader_id}")).await;
+    assert_eq!(
+        back["positions"][0]["qty"], at_backup["positions"][0]["qty"],
+        "and it is the world the backup was taken from, keys and all"
+    );
+}
+
+#[tokio::test]
+async fn a_backup_is_the_operators() {
+    let app = App::new(Options {
+        admin_key: Some("secret".into()),
+        ..options(None)
+    });
+    let (_, key) = sign_up(&app, "nosy").await;
+    assert_eq!(
+        get(&app, Some(&key), "/api/backup").await.0,
+        StatusCode::UNAUTHORIZED,
+        "a snapshot is every key digest and every balance in the world"
+    );
+    assert_eq!(
+        get(&app, Some("secret"), "/api/backup").await.0,
+        StatusCode::OK
+    );
+}
+
 // ---------------------------------------------------------------------------
 
 struct TempDir(PathBuf);

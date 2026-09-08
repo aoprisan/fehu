@@ -179,10 +179,11 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/world?at_ms=` | What game events are doing to production and demand, per symbol, now or at an instant |
 | `GET` | `/api/supply` | How much currency exists and where it sits: minted, burned, outstanding, what the wallets actually hold, and whether the two agree |
 | `GET` | `/api/commands/{key}` | The answer a command was given, by the `Idempotency-Key` it was sent under, for a client that lost the response |
+| `GET` | `/api/backup` | Game master: a snapshot of the whole market as the response body — `curl … > backup.json`, and restore by pointing `FEHU_STATE_FILE` at it |
 | `GET` | `/api/outbox?after=&limit=` | Game master: the facts nobody asked for — fills, jobs coming due, expiries, delistings, accepted events — numbered, retained and replayable from a cursor. Reading does not consume |
 | `POST` | `/api/outbox/ack` | Game master: `{"through":128}` — how far the game backend has read. Everything after it comes back on the next read with no `after` |
 | `GET` | `/api/reconcile` | Game master: check ownership, reservations, share supply, retained cash ledgers **and that the currency adds up**; returns `valid` and `issues` |
-| — | `/api/v1/economy/…` | The economy surface under the paths `docs/economy-engine-plan.md` names: `players`, `players/{id}/inventory`, `wallets/{id}`, `transfers`, `rewards`, `purchases`, `consume`, `jobs`, `recipes`, `catalog`, `budgets`, `supply`, `world`, `outbox`, `outbox/ack`, `commands/{key}`, `reconcile`, and `admin/{recipes,catalog,budgets,rewards}`. The same handlers as above, under a second spelling |
+| — | `/api/v1/economy/…` | The economy surface under the paths `docs/economy-engine-plan.md` names: `players`, `players/{id}/inventory`, `wallets/{id}`, `transfers`, `rewards`, `purchases`, `consume`, `jobs`, `recipes`, `catalog`, `budgets`, `supply`, `world`, `outbox`, `outbox/ack`, `commands/{key}`, `reconcile`, and `admin/{recipes,catalog,budgets,rewards,backup}`. The same handlers as above, under a second spelling |
 | `GET` | `/api/health` | Uptime, simulated time, tick/trade counters, orders placed and refused, fills booked and any that failed to settle, stream and rate-limit state, and how long requests and engine steps are taking |
 
 At start-up each symbol generates a year of daily bars in coarse mode and then
@@ -388,6 +389,28 @@ them: 32 players sending 16 mutations each, all answered, none shed, the
 whole burst through in seconds and the tail within twice the median — and
 then a restart from the snapshot and the journal that comes back, reconciles
 and still has the same facts in its outbox.
+
+### Backup and restore
+
+A snapshot is complete on its own — the journal beside a live state file only
+covers the gap since the server's own last one — so a backup is a snapshot
+taken out of band:
+
+```sh
+curl -sS -H "Authorization: Bearer $FEHU_ADMIN_KEY" \
+  http://localhost:3000/api/backup > backup.json
+FEHU_STATE_FILE=backup.json cargo run --release -p fehu-webapp
+```
+
+It is taken from one consistent market job, like `/api/reconcile`, so it is a
+real instant and not a smear across one. It truncates nothing: the live
+journal still carries everything since the running server's own last
+snapshot, because the live state file still needs it. And it is handed back
+rather than written to a path the request names — an operator route that
+wrote wherever its body said would be an arbitrary file write with a key on
+it, and `curl >` is the same drill without one. Restoring a backup that
+predates this build's `STATE_VERSION` is refused rather than guessed at, as
+any state file is.
 
 ### The outbox
 

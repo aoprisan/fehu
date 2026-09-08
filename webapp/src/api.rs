@@ -140,6 +140,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/world", get(world))
         .route("/api/supply", get(supply))
         .route("/api/commands/{key}", get(get_command))
+        .route("/api/backup", get(backup))
         .route("/api/outbox", get(read_outbox))
         .route("/api/outbox/ack", post(ack_outbox))
         // The economy surface the plan names, at the paths it names them at.
@@ -170,6 +171,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/v1/economy/supply", get(supply))
         .route("/api/v1/economy/world", get(world))
         .route("/api/v1/economy/commands/{key}", get(get_command))
+        .route("/api/v1/economy/admin/backup", get(backup))
         .route("/api/v1/economy/outbox", get(read_outbox))
         .route("/api/v1/economy/outbox/ack", post(ack_outbox))
         .route("/api/v1/economy/reconcile", get(reconcile))
@@ -3518,6 +3520,33 @@ struct CommandDto {
     /// The response body, as it was sent — except for a credential, which is
     /// shown once and is not kept. A replayed sign-up carries no `api_key`.
     result: serde_json::Value,
+}
+
+/// A snapshot of the whole market, taken out of band.
+///
+/// The same snapshot [`crate::save`] writes on its timer, from the same one
+/// consistent market job, handed back as the response body instead of
+/// written to disk. Restoring is pointing `FEHU_STATE_FILE` at a copy of it:
+/// a snapshot is complete on its own, and the journal beside a live state
+/// file only ever covers the gap since the last one.
+///
+/// Handing it back rather than taking a path to write it to is deliberate.
+/// An operator route that writes wherever its body says would be an
+/// arbitrary-file-write with a key on it, and `curl > backup.json` is the
+/// same drill without one.
+///
+/// Nothing is truncated: the live journal still carries everything since the
+/// server's own last snapshot, because the live state file still needs it.
+async fn backup(State(app): State<AppState>, _admin: Admin) -> Response {
+    let save = app.save().await;
+    let name = format!("fehu-state-{}.json", save.sim_now_ms);
+    let mut response = Json(save).into_response();
+    if let Ok(value) = format!("attachment; filename=\"{name}\"").parse() {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
 }
 
 /// Query of `GET /api/outbox`.
