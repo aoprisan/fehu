@@ -140,6 +140,8 @@ pub fn router(app: AppState) -> Router {
         .route("/api/world", get(world))
         .route("/api/supply", get(supply))
         .route("/api/commands/{key}", get(get_command))
+        .route("/api/outbox", get(read_outbox))
+        .route("/api/outbox/ack", post(ack_outbox))
         // The economy surface the plan names, at the paths it names them at.
         // Every one of these is the same handler as the route above it: one
         // implementation, two spellings, so the game backend can speak the
@@ -168,6 +170,8 @@ pub fn router(app: AppState) -> Router {
         .route("/api/v1/economy/supply", get(supply))
         .route("/api/v1/economy/world", get(world))
         .route("/api/v1/economy/commands/{key}", get(get_command))
+        .route("/api/v1/economy/outbox", get(read_outbox))
+        .route("/api/v1/economy/outbox/ack", post(ack_outbox))
         .route("/api/v1/economy/reconcile", get(reconcile))
         .route("/api/v1/economy/admin/recipes", post(set_recipe))
         .route("/api/v1/economy/admin/recipes/{id}", delete(remove_recipe))
@@ -3465,6 +3469,74 @@ struct CommandDto {
     /// The response body, as it was sent — except for a credential, which is
     /// shown once and is not kept. A replayed sign-up carries no `api_key`.
     result: serde_json::Value,
+}
+
+/// Query of `GET /api/outbox`.
+#[derive(Deserialize)]
+struct OutboxQuery {
+    /// Read everything after this sequence. Left out, the read starts from
+    /// the cursor the last acknowledgement left, which is what a backend
+    /// that keeps no cursor of its own wants.
+    after: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// The facts the game backend has not collected yet.
+///
+/// The operator's, because the log is the whole world's: one player's fills
+/// are in it beside another's. In tier one the operator key *is* the trusted
+/// game backend — one host, one process, the backend on the same network —
+/// which is the same reasoning that put rewards and budgets behind it.
+///
+/// Reading does not consume. A consumer that has acted on what it read says
+/// so with `POST /api/outbox/ack`, and until it does, the same facts come
+/// back: at-least-once, so a backend that dies between reading and acting
+/// sees them again rather than never.
+async fn read_outbox(
+    State(app): State<AppState>,
+    _admin: Admin,
+    Query(query): Query<OutboxQuery>,
+) -> Result<Json<crate::outbox::Page>, ApiError> {
+    let limit = query.limit.unwrap_or(crate::outbox::DEFAULT_PAGE);
+    Ok(Json(
+        app.market
+            .call(move |m| {
+                let after = query.after.unwrap_or_else(|| m.outbox.cursor());
+                m.outbox.page(after, limit)
+            })
+            .await?,
+    ))
+}
+
+/// Body of `POST /api/outbox/ack`.
+#[derive(Deserialize)]
+struct AckRequest {
+    /// The highest sequence the consumer has finished with.
+    through: u64,
+}
+
+/// Record how far the game backend has read.
+///
+/// A command, not a note in memory: the cursor is saved with the market, and
+/// one that moved only in memory would fall back to the snapshot's value on a
+/// restart and hand the backend facts it had already acted on.
+async fn ack_outbox(
+    State(app): State<AppState>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    body: Result<Json<AckRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = body.map_err(ApiError::bad_json)?;
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::AckOutbox {
+            through: req.through,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 /// Recover the result of a command whose response was lost.

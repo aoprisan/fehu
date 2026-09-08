@@ -21,6 +21,7 @@ pub mod limit;
 pub mod market;
 pub mod metrics;
 pub mod npc;
+pub mod outbox;
 pub mod reconcile;
 pub mod rewards;
 pub mod save;

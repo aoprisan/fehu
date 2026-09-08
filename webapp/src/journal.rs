@@ -362,6 +362,15 @@ pub enum Command {
         source: String,
         note: Option<String>,
     },
+    /// Operator: the game backend has processed the outbox through `seq`.
+    ///
+    /// A command like any other, because it changes state that is saved: a
+    /// cursor that moved only in memory would fall back to the snapshot's on
+    /// a restart, and the backend would be handed facts it had already acted
+    /// on.
+    AckOutbox {
+        through: u64,
+    },
     /// The engine tick: advance every symbol to the entry's instant.
     ///
     /// It carries no fields of its own because it needs none —
@@ -411,6 +420,7 @@ impl Command {
             Self::Resume { .. } => "resume",
             Self::SimEvent { .. } => "sim_event",
             Self::GameEvent { .. } => "game_event",
+            Self::AckOutbox { .. } => "ack_outbox",
             Self::Step => "step",
         }
     }
@@ -992,7 +1002,15 @@ impl Market {
                 replayed: true,
             });
         }
-        let applied = self.applying(at, wall_ms, &command).await?;
+        let applied = match self.applying(at, wall_ms, &command).await {
+            Ok(applied) => applied,
+            Err(e) => {
+                // A refusal changed nothing, so it published nothing worth
+                // keeping either.
+                self.discard_facts();
+                return Err(e);
+            }
+        };
         let entry = JournalEntry {
             seq: self.journal.next_seq(),
             principal,
@@ -1007,8 +1025,12 @@ impl Market {
             .append(&entry, !matches!(entry.command, Command::Step))
         {
             tracing::error!(seq = entry.seq, error = %e, "the journal stopped taking entries");
+            self.discard_facts();
             return Err(ApiError::journal_broken(&e.to_string()));
         }
+        // Only now: the outbox is a log of what was committed, so nothing
+        // reaches it before the command that caused it is on disk.
+        self.commit_facts(entry.seq, at.0, wall_ms);
         if let Some(key) = idempotency_key {
             self.commands.record(CommandRecord {
                 key,
@@ -1055,6 +1077,9 @@ impl Market {
         match self.applying(at, entry.wall_ms, &entry.command).await {
             Ok(applied) => {
                 self.journal.reached(entry.seq);
+                // The same facts, under the same sequence: a consumer's
+                // cursor means what it meant before the restart.
+                self.commit_facts(entry.seq, entry.at_ms, entry.wall_ms);
                 if let Some(key) = entry.idempotency_key {
                     self.commands.record(CommandRecord {
                         key,
@@ -1070,6 +1095,7 @@ impl Market {
             }
             Err(e) => {
                 self.journal.reached(entry.seq);
+                self.discard_facts();
                 tracing::error!(
                     seq = entry.seq,
                     command = entry.command.kind(),
@@ -1831,6 +1857,11 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 effects,
             });
             Applied::new(202, &record)
+        }
+
+        Command::AckOutbox { through } => {
+            m.outbox.ack(*through);
+            Applied::new(200, &m.outbox.position())
         }
 
         Command::Step => {

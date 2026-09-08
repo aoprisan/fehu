@@ -792,7 +792,8 @@ export type Sequenced<M> = M & { seq: number };
  */
 export type JobDoneMessage = { type: 'job_done' } & JobDelivery;
 
-export type StreamMessage = Sequenced<
+/** One published message, before the stream numbers it. */
+export type StreamPayload =
   | HelloMessage
   | TickMessage
   | EventMessage
@@ -802,8 +803,76 @@ export type StreamMessage = Sequenced<
   | OrderExpiredMessage
   | ListedMessage
   | DelistedMessage
-  | JobDoneMessage
+  | JobDoneMessage;
+
+export type StreamMessage = Sequenced<StreamPayload>;
+
+/**
+ * What the outbox carries: everything the stream publishes except the
+ * per-connection `hello` and the price `tick`.
+ */
+export type OutboxPayload = Exclude<
+  StreamPayload,
+  HelloMessage | TickMessage
 >;
+
+// --- the outbox (outbox.rs) ------------------------------------------------
+
+/**
+ * One committed fact, waiting for the game backend. The payload in `event` is
+ * the same object the SSE stream carries, minus its `seq` — the outbox
+ * numbers its entries itself.
+ */
+export interface OutboxEntry {
+  /** Dense from 1, never reused. This is the cursor. */
+  seq: number;
+  /** The journal sequence of the command that caused it. */
+  command_seq: number;
+  /** The payload's `type`, lifted out so a consumer can route without parsing. */
+  kind: string;
+  /** Simulated instant the command ran at. */
+  at_ms: number;
+  /** Wall-clock instant it arrived. */
+  wall_ms: number;
+  event: OutboxPayload;
+}
+
+/** `GET /api/outbox` (`outbox::Page`). */
+export interface OutboxPage {
+  events: OutboxEntry[];
+  /** What to send as `after` next time. */
+  next: number;
+  /** How far the server has recorded the consumer as having read. */
+  cursor: number;
+  /** The lowest sequence still held; `0` when nothing is. */
+  oldest: number;
+  /** The highest ever appended. */
+  latest: number;
+  /** Entries still waiting after `next`. */
+  pending: number;
+  /** Facts evicted before they were acknowledged, ever. */
+  dropped: number;
+  /** The read started further back than the log reaches: resynchronise. */
+  gap: boolean;
+  /** Entries this world keeps. `0` means the outbox is switched off. */
+  cap: number;
+}
+
+/** `POST /api/outbox/ack` (`outbox::Cursor`). */
+export interface OutboxCursor {
+  cursor: number;
+  oldest: number;
+  latest: number;
+  pending: number;
+  dropped: number;
+  cap: number;
+}
+
+/** Body of `POST /api/outbox/ack`. */
+export interface OutboxAckBody {
+  /** The highest sequence the consumer has finished with. */
+  through: number;
+}
 
 /** The server's error body: `{"error": {"code", "message"}}`. */
 export interface ApiErrorBody {

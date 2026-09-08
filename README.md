@@ -179,8 +179,10 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/world?at_ms=` | What game events are doing to production and demand, per symbol, now or at an instant |
 | `GET` | `/api/supply` | How much currency exists and where it sits: minted, burned, outstanding, what the wallets actually hold, and whether the two agree |
 | `GET` | `/api/commands/{key}` | The answer a command was given, by the `Idempotency-Key` it was sent under, for a client that lost the response |
+| `GET` | `/api/outbox?after=&limit=` | Game master: the facts nobody asked for — fills, jobs coming due, expiries, delistings, accepted events — numbered, retained and replayable from a cursor. Reading does not consume |
+| `POST` | `/api/outbox/ack` | Game master: `{"through":128}` — how far the game backend has read. Everything after it comes back on the next read with no `after` |
 | `GET` | `/api/reconcile` | Game master: check ownership, reservations, share supply, retained cash ledgers **and that the currency adds up**; returns `valid` and `issues` |
-| — | `/api/v1/economy/…` | The economy surface under the paths `docs/economy-engine-plan.md` names: `players`, `players/{id}/inventory`, `wallets/{id}`, `transfers`, `rewards`, `purchases`, `consume`, `jobs`, `recipes`, `catalog`, `budgets`, `supply`, `world`, `commands/{key}`, `reconcile`, and `admin/{recipes,catalog,budgets,rewards}`. The same handlers as above, under a second spelling |
+| — | `/api/v1/economy/…` | The economy surface under the paths `docs/economy-engine-plan.md` names: `players`, `players/{id}/inventory`, `wallets/{id}`, `transfers`, `rewards`, `purchases`, `consume`, `jobs`, `recipes`, `catalog`, `budgets`, `supply`, `world`, `outbox`, `outbox/ack`, `commands/{key}`, `reconcile`, and `admin/{recipes,catalog,budgets,rewards}`. The same handlers as above, under a second spelling |
 | `GET` | `/api/health` | Uptime, simulated time, tick/trade counters, orders placed and refused, fills booked and any that failed to settle, stream and rate-limit state, and how long requests and engine steps are taking |
 
 At start-up each symbol generates a year of daily bars in coarse mode and then
@@ -231,7 +233,9 @@ which is how late a retry may arrive and still be free. `FEHU_JOB_LOG`
 running one is never dropped, being a promise the world has taken payment for
 — and `FEHU_REWARD_LOG` (10 000) how many game event ids are remembered with
 the reward each one paid, which is how late a duplicate quest result may
-arrive and still be caught. `FEHU_ADMIN_KEY` locks the
+arrive and still be caught. `FEHU_OUTBOX` (10 000) is how many facts are kept
+for the game backend to collect, which is how long it may be away before
+what it missed is gone for good; `0` switches the outbox off. `FEHU_ADMIN_KEY` locks the
 game-master endpoints behind a key of your choosing: the ones that move
 prices (`POST /api/game/events`, `POST /api/symbols/{sym}/events`), the ones
 that list, halt and delist symbols, and — since currency became conserved —
@@ -350,9 +354,42 @@ If the journal cannot be written the server stops accepting changes —
 be ahead of the disk, and a market that cannot promise to remember a change
 should not accept one.
 
-What this is not is a database: one writer, one file, no history to query and
-no outbox to deliver from. That is deliberate — see `docs/economy-engine-plan.md`
-for what a live service would need instead.
+What this is not is a database: one writer, one file, and no history to query
+beyond the retained ledger views. That is deliberate — see
+`docs/economy-engine-plan.md` for what a live service would need instead.
+
+### The outbox
+
+A stream is the wrong shape for the service that owns the rest of the game.
+`/api/stream` is best-effort, its `?since=` buffer is small and in memory,
+and a backend that was restarting when a job came due has no way to find out
+that it did. So the same facts go a second way: everything the server
+publishes that **nobody asked for** — a resting order that filled, a job that
+came due, an order the venue withdrew, a stop that fired, a halt, a listing, a
+delisting, an accepted game event — is also appended to a durable **outbox**,
+numbered from 1, and handed out against a cursor.
+
+Delivery is at-least-once. `GET /api/outbox` returns the facts after a
+cursor; reading does not consume them, so a backend that dies between reading
+and acting reads them again rather than never. `POST /api/outbox/ack`
+`{"through":128}` says how far it got, and is a journaled command like
+everything else — a cursor that moved only in memory would fall back to the
+snapshot's value on a restart.
+
+What is *not* in it is anything with a requester. A purchase, a transfer, a
+reward and a job *starting* are commands: whoever sent one has its response,
+and a lost response is recovered by its `Idempotency-Key` through
+`GET /api/commands/{key}`. Ticks are not in it either — they are market data,
+the highest-volume thing the server produces, and `/api/symbols/{sym}/bars`
+has them whenever they are wanted.
+
+The log is bounded by `FEHU_OUTBOX`, and it is honest about the bound: a fact
+evicted before it was acknowledged is counted in `dropped`, and a read that
+starts further back than the log reaches comes back with `gap: true` so the
+consumer resynchronises from the snapshot endpoints instead of believing its
+own state. It is saved with the snapshot and rebuilt by replay, so a restart
+returns the same facts under the same numbers and a cursor from before it
+still means what it meant.
 
 Keys are the only credential: they are 128 bits of operating-system entropy,
 generated once at sign-up. The server keeps only a domain-separated SHA-256

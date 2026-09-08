@@ -697,6 +697,13 @@ pub struct Market {
     /// What each `Idempotency-Key` answered, so a retry is not a second
     /// command.
     pub commands: crate::journal::CommandLog,
+    /// The facts a game backend reads at its own pace. See
+    /// [`crate::outbox`].
+    pub outbox: crate::outbox::Outbox,
+    /// Facts published by the command being applied, waiting for it to be
+    /// journaled. Emptied into the outbox once it is, and thrown away if it
+    /// is refused: scratch, never saved.
+    pending_facts: Vec<(String, serde_json::Value)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,10 +1244,10 @@ impl Market {
             }
         }
         self.fills_booked = self.fills_booked.saturating_add(fills.len() as u64);
-        for fill in &fills {
-            self.stream.publish(StreamMessage::Fill {
+        for fill in fills.clone() {
+            self.announce(StreamMessage::Fill {
                 trader_id: fill.trader_id,
-                fill: fill.clone(),
+                fill,
             });
         }
         fills
@@ -1357,8 +1364,52 @@ impl Market {
             self.events.pop_front();
         }
         self.events.push_back(rec.clone());
-        self.stream.publish(StreamMessage::Event(rec.clone()));
+        self.announce(StreamMessage::Event(rec.clone()));
         rec
+    }
+
+    /// Publish a fact: out over the SSE stream now, and into the outbox for
+    /// the game backend to collect at its own pace.
+    ///
+    /// The outbox half is deliberately narrower than the stream. It takes a
+    /// fact only while a command is being applied — `pinned_now` is what says
+    /// so — because a fact published outside one is not journaled, and an
+    /// entry a restart would not reproduce is worse in a log that promises
+    /// replay than no entry at all. The facts collected here are not in the
+    /// outbox yet either: [`Market::run_command`] puts them there once the
+    /// command that caused them is on disk, so the log holds what was
+    /// committed rather than what was attempted.
+    ///
+    /// Ticks do not come through here. They are market data, they are the
+    /// highest-volume thing the server produces, and they can be had again
+    /// from the bars; see [`crate::outbox`].
+    pub(crate) fn announce(&mut self, message: StreamMessage) {
+        if self.pinned_now.is_some() && self.outbox.is_enabled() {
+            match serde_json::to_value(&message) {
+                Ok(event) => self.pending_facts.push((message.kind().to_string(), event)),
+                // A fact that will not serialise cannot be delivered, and
+                // dropping it silently would make the outbox a liar. It is
+                // still published: the stream is best-effort either way.
+                Err(e) => tracing::error!(
+                    kind = message.kind(),
+                    error = %e,
+                    "a fact could not be written to the outbox"
+                ),
+            }
+        }
+        self.stream.publish(message);
+    }
+
+    /// Move the facts of the command just journaled into the outbox, under
+    /// its sequence.
+    pub(crate) fn commit_facts(&mut self, command_seq: u64, at_ms: i64, wall_ms: i64) {
+        let facts = std::mem::take(&mut self.pending_facts);
+        self.outbox.commit(command_seq, at_ms, wall_ms, facts);
+    }
+
+    /// Throw away the facts of a command that changed nothing.
+    pub(crate) fn discard_facts(&mut self) {
+        self.pending_facts.clear();
     }
 
     /// The most recent `limit` events matching `keep`, newest first.
@@ -1760,7 +1811,7 @@ impl Market {
             .await
             .ok()
             .flatten()?;
-        self.stream.publish(StreamMessage::Status(status));
+        self.announce(StreamMessage::Status(status));
         Some(status)
     }
 
@@ -1773,7 +1824,7 @@ impl Market {
             .await
             .ok()
             .flatten()?;
-        self.stream.publish(StreamMessage::Status(status));
+        self.announce(StreamMessage::Status(status));
         self.book(symbol.ticker, &trades);
         Some(status)
     }
@@ -1988,7 +2039,7 @@ impl Market {
         self.symbols.push(Symbol::spawn(state));
         self.fund_issuer(ticker, float);
         self.publish_listings();
-        self.stream.publish(StreamMessage::Listed {
+        self.announce(StreamMessage::Listed {
             quote: quote.clone(),
         });
         Ok(quote)
@@ -2770,8 +2821,7 @@ impl Market {
                 delivered,
                 at_ms: at.0,
             };
-            self.stream
-                .publish(StreamMessage::JobDone(delivery.clone()));
+            self.announce(StreamMessage::JobDone(delivery.clone()));
             done.push(delivery);
         }
         done
@@ -3095,10 +3145,10 @@ impl Market {
         for (trader, resting) in &wound.cancelled {
             self.release(*trader, sym, resting, now_ms);
             orders_cancelled += 1;
-            if let Some(record) = self.orders.get(&resting.id.0) {
-                self.stream.publish(StreamMessage::OrderExpired {
+            if let Some(order) = self.orders.get(&resting.id.0).cloned() {
+                self.announce(StreamMessage::OrderExpired {
                     trader_id: trader.0,
-                    order: record.clone(),
+                    order,
                 });
             }
         }
@@ -3182,7 +3232,7 @@ impl Market {
         self.next_order_id = self.next_order_id.max(wound.next_order_id);
         self.symbols.remove(index);
         self.publish_listings();
-        self.stream.publish(StreamMessage::Delisted(paid.clone()));
+        self.announce(StreamMessage::Delisted(paid.clone()));
         Ok(paid)
     }
 
@@ -3306,7 +3356,7 @@ impl Market {
         }
         self.book(sym, &stepped.trades);
         if let Some(status) = stepped.status {
-            self.stream.publish(StreamMessage::Status(status));
+            self.announce(StreamMessage::Status(status));
         }
         self.book(sym, &stepped.resumed);
         // Before the stops, so a trigger cannot fire an order that would
@@ -3333,7 +3383,7 @@ impl Market {
                 Ok(placed) => (Some(placed.response().clone()), None),
                 Err(e) => (None, Some(e.to_string())),
             };
-            self.stream.publish(StreamMessage::StopTriggered {
+            self.announce(StreamMessage::StopTriggered {
                 trader_id: stop.trader_id,
                 stop,
                 price_cents: stepped.price_cents,
@@ -3365,10 +3415,10 @@ impl Market {
             let Ok(Some(_)) = self.cancel(symbol, trader, order_id).await else {
                 continue;
             };
-            if let Some(record) = self.orders.get(&order_id) {
-                self.stream.publish(StreamMessage::OrderExpired {
+            if let Some(order) = self.orders.get(&order_id).cloned() {
+                self.announce(StreamMessage::OrderExpired {
                     trader_id: trader.0,
-                    order: record.clone(),
+                    order,
                 });
             }
         }
@@ -3504,6 +3554,7 @@ impl Market {
                 next_event_id: self.next_event_id,
                 next_stop_id: self.next_stop_id,
                 next_order_id: next_order_id.0,
+                outbox: self.outbox.clone(),
                 journal_seq: self.journal.seq(),
                 commands: self.commands.records(),
             },
@@ -3553,6 +3604,8 @@ struct MarketParts {
     journal_seq: u64,
     /// What each `Idempotency-Key` answered, oldest first.
     commands: Vec<crate::journal::CommandRecord>,
+    /// The facts committed since the snapshot's consumer last acknowledged.
+    outbox: crate::outbox::Outbox,
 }
 
 impl Market {
@@ -3622,6 +3675,12 @@ impl Market {
             pinned_now: None,
             journal: crate::journal::Journal::at(parts.journal_seq),
             commands: crate::journal::CommandLog::new(options.command_log),
+            outbox: {
+                let mut outbox = parts.outbox;
+                outbox.set_cap(options.outbox);
+                outbox
+            },
+            pending_facts: Vec::new(),
         };
         market.commands.restore(parts.commands);
         // The symbols a fresh world starts with are listed by being built
@@ -3760,6 +3819,26 @@ pub enum StreamMessage {
         order: Option<OrderResponse>,
         refused: Option<String>,
     },
+}
+
+impl StreamMessage {
+    /// The `type` this serialises with: the tag a client routes on, and what
+    /// an outbox entry is filed under.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Hello { .. } => "hello",
+            Self::Tick { .. } => "tick",
+            Self::Event(_) => "event",
+            Self::Fill { .. } => "fill",
+            Self::Status(_) => "status",
+            Self::OrderExpired { .. } => "order_expired",
+            Self::Listed { .. } => "listed",
+            Self::Delisted(_) => "delisted",
+            Self::JobDone(_) => "job_done",
+            Self::StopTriggered { .. } => "stop_triggered",
+        }
+    }
 }
 
 /// A stream message with its place in the stream.
@@ -4023,6 +4102,7 @@ impl App {
                 orders: Vec::new(),
                 journal_seq: 0,
                 commands: Vec::new(),
+                outbox: crate::outbox::Outbox::default(),
             },
         )
     }
@@ -4098,6 +4178,7 @@ impl App {
                 orders,
                 journal_seq: m.journal_seq,
                 commands: m.commands,
+                outbox: m.outbox,
             },
         )
     }
@@ -4597,6 +4678,13 @@ pub struct Options {
     /// A *running* job is never dropped whatever this says: it is a promise
     /// the world has already taken payment for. See [`crate::jobs::JobBook`].
     pub job_log: usize,
+    /// Facts kept for the game backend to collect, and how far behind it
+    /// may fall before they are lost. `FEHU_OUTBOX`; `0` switches the
+    /// outbox off, and nothing is kept for anyone who was not listening.
+    ///
+    /// See [`crate::outbox`]: this is a bound on memory and therefore on how
+    /// long a backend may be away, so it is generous by default.
+    pub outbox: usize,
     /// Game event ids remembered, with the reward each one paid.
     /// `FEHU_REWARD_LOG`.
     ///
@@ -4647,6 +4735,7 @@ impl Default for Options {
             seed_merchant_cents: 0,
             job_log: crate::jobs::DEFAULT_JOB_LOG,
             reward_log: crate::rewards::DEFAULT_REWARD_LOG,
+            outbox: crate::outbox::DEFAULT_OUTBOX,
         }
     }
 }
@@ -4723,6 +4812,7 @@ impl Options {
                 .max(0),
             job_log: env_parse("FEHU_JOB_LOG", d.job_log),
             reward_log: env_parse("FEHU_REWARD_LOG", d.reward_log),
+            outbox: env_parse("FEHU_OUTBOX", d.outbox),
         }
     }
 }

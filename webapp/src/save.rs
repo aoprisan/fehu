@@ -58,6 +58,13 @@ pub type Symbol = &'static str;
 
 /// Current save format. Any other version, older or newer, is refused.
 ///
+/// Version 10 added the outbox ([`crate::outbox`]): the facts a game backend
+/// has not collected yet, and the cursor saying how far it has. A version 9
+/// file carries neither. Starting from one would be a world whose consumer
+/// is told the log begins at 1 when it does not, so the backend would either
+/// replay facts it had already acted on or believe it had missed some; the
+/// file is refused like the rest.
+///
 /// Version 9 gave the world the things it makes and the things it pays for:
 /// recipes and the jobs running under them ([`crate::jobs`]), the budgets
 /// rewards are paid from and every game event id already paid
@@ -92,7 +99,7 @@ pub type Symbol = &'static str;
 /// transaction out of issuance, so the currency has a recorded origin and
 /// the books still add up. It is a day's work when there is such a world.
 /// There is not: the current file is a demo, regenerated from its seeds.
-pub const STATE_VERSION: u32 = 9;
+pub const STATE_VERSION: u32 = 10;
 
 /// Everything needed to carry on where the server left off.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -201,6 +208,10 @@ pub struct MarketSave {
     /// symbol's book leaves behind, so its orders' ids are never reissued.
     #[serde(default)]
     pub next_order_id: u64,
+    /// The facts waiting for the game backend, and how far it has read.
+    /// Since version 10.
+    #[serde(default)]
+    pub outbox: crate::outbox::Outbox,
     /// The journal sequence this snapshot includes. Start-up replays the
     /// entries after it and nothing before it, and the journal is rewritten
     /// from here once the file is safely in place.
