@@ -120,6 +120,12 @@ directly for a read, never one from inside the other.
 | `Stream` | sequence counter and replay buffer | anyone to publish, connections to subscribe |
 | rate limiter (`limit.rs`) | token buckets | the rate-limit middleware |
 
+Admission (`limit.rs`'s `Admission`) is not an actor: it is a pair of
+semaphores, so a request that finds the server full is refused without
+waiting on anything. `FEHU_MAX_INFLIGHT` bounds concurrent mutations and
+`FEHU_MAX_STREAMS` open SSE connections; past either the answer is
+`503 overloaded`. Reads are never gated.
+
 Consequences worth knowing:
 
 - Every change to money or to a book is **one job on the market actor**, which

@@ -66,6 +66,9 @@ pub struct Metrics {
     requests_failed: AtomicU64,
     /// Requests refused by the rate limiter.
     requests_limited: AtomicU64,
+    /// Requests turned away because the server was already full: no place
+    /// left for another change, or no room for another stream.
+    requests_shed: AtomicU64,
     /// One engine step: every symbol advanced and every fill booked.
     engine_step: Timing,
 }
@@ -82,6 +85,11 @@ impl Metrics {
         }
     }
 
+    /// Book one request the server had no room for.
+    pub fn shed(&self) {
+        self.requests_shed.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Book one engine step.
     pub fn engine_step(&self, took: Duration) {
         self.engine_step.record(took);
@@ -94,6 +102,7 @@ impl Metrics {
             requests: self.requests.snapshot(),
             requests_failed: self.requests_failed.load(Ordering::Relaxed),
             requests_limited: self.requests_limited.load(Ordering::Relaxed),
+            requests_shed: self.requests_shed.load(Ordering::Relaxed),
             engine_step: self.engine_step.snapshot(),
         }
     }
@@ -105,6 +114,7 @@ pub struct MetricsDto {
     pub requests: TimingDto,
     pub requests_failed: u64,
     pub requests_limited: u64,
+    pub requests_shed: u64,
     pub engine_step: TimingDto,
 }
 
@@ -132,12 +142,24 @@ mod tests {
         assert_eq!(m.requests.micros_last, 200);
         assert_eq!(m.requests_failed, 2, "429 is a failure too");
         assert_eq!(m.requests_limited, 1);
+        assert_eq!(m.requests_shed, 0, "nothing was turned away for room");
 
         // A fast request after a slow one does not lower the high-water mark.
         metrics.request(Duration::from_micros(1), 200);
         let m = metrics.snapshot();
         assert_eq!(m.requests.micros_max, 300);
         assert_eq!(m.requests.micros_last, 1);
+    }
+
+    #[test]
+    fn shedding_is_counted_apart_from_limiting() {
+        let metrics = Metrics::default();
+        metrics.shed();
+        metrics.request(Duration::from_micros(10), 503);
+        let m = metrics.snapshot();
+        assert_eq!(m.requests_shed, 1);
+        assert_eq!(m.requests_limited, 0, "a full server is not a fast client");
+        assert_eq!(m.requests_failed, 1);
     }
 
     #[test]

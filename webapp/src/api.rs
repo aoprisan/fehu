@@ -194,6 +194,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/game/events", get(list_events).post(push_game_event))
         .route("/api/events", get(list_events))
         .route("/api/stream", get(stream))
+        .layer(middleware::from_fn_with_state(Arc::clone(&app), admit))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&app),
             rate_limit_writes,
@@ -243,6 +244,28 @@ async fn rate_limit_writes(
     }
 }
 
+/// Turn a mutating request away if the server already has as much work in
+/// flight as it will take.
+///
+/// Inside the rate limiter, so a client that is already over its own
+/// allowance never takes a place from one that is not. The place is held by
+/// this future for as long as the request runs and given back when it ends,
+/// however it ends.
+///
+/// Reads are not gated. They are cheap, they queue behind nothing on the
+/// symbol actors, and shedding them would take `/api/health` away exactly
+/// when it is worth reading. See [`crate::limit`].
+async fn admit(State(app): State<AppState>, request: Request, next: Next) -> Response {
+    if request.method().is_safe() {
+        return next.run(request).await;
+    }
+    let Some(_place) = app.admission.mutation() else {
+        app.metrics.shed();
+        return ApiError::overloaded("changes").into_response();
+    };
+    next.run(request).await
+}
+
 /// JSON error body: `{"error": {"code": ..., "message": ...}}`.
 #[derive(Debug)]
 pub struct ApiError {
@@ -276,6 +299,24 @@ impl ApiError {
                 format!(
                     "too many requests: this server takes changes at \
                      `FEHU_RATE_PER_SEC`. Try again in {secs}s"
+                ),
+            )
+        }
+    }
+
+    /// The server already has as much of this work as it will take.
+    ///
+    /// A refusal now rather than a place in a queue nothing bounds: the
+    /// client can retry, shed the request itself, or slow down, none of
+    /// which it could do while waiting.
+    pub(crate) fn overloaded(what: &str) -> Self {
+        Self {
+            retry_after_secs: Some(1),
+            ..Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded",
+                format!(
+                    "this server is already taking as many {what} at once as it will                      (`FEHU_MAX_INFLIGHT`, `FEHU_MAX_STREAMS`). Try again in 1s"
                 ),
             )
         }
@@ -1010,6 +1051,11 @@ struct Health {
     stream_messages: u64,
     /// Streams currently connected.
     stream_subscribers: usize,
+    /// Mutating requests in flight, and the bound on them. `0` for the bound
+    /// means there is none.
+    requests_in_flight: usize,
+    max_in_flight: usize,
+    max_streams: usize,
     /// Clients whose rate-limit allowance is being tracked.
     tracked_clients: usize,
     /// Request and engine-step timings since start-up.
@@ -1046,6 +1092,9 @@ async fn health(State(app): State<AppState>) -> Result<Json<Health>, ApiError> {
         settlement_failures: market.settlement_failures,
         stream_messages: app.published().await,
         stream_subscribers: app.stream.subscribers(),
+        requests_in_flight: app.admission.in_flight(),
+        max_in_flight: app.admission.max_in_flight(),
+        max_streams: app.admission.max_streams(),
         tracked_clients: app.tracked_clients().await,
         metrics: app.metrics.snapshot(),
     }))
@@ -3635,6 +3684,13 @@ async fn stream(
     State(app): State<AppState>,
     Query(q): Query<StreamQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    // A connection holds a receiver and a task for as long as it is open, and
+    // nothing else bounds how many a client opens. The place is carried by
+    // the stream below and given back when the connection ends.
+    let Some(place) = app.admission.stream() else {
+        app.metrics.shed();
+        return Err(ApiError::overloaded("stream connections"));
+    };
     let Subscription {
         rx,
         seq,
@@ -3682,6 +3738,10 @@ async fn stream(
     })
     .chain(tokio_stream::iter(missed))
     .chain(live)
-    .filter_map(|m| Event::default().json_data(&m).ok().map(Ok));
+    .filter_map(move |m| {
+        // Held here so the place lasts exactly as long as the connection.
+        let _place = &place;
+        Event::default().json_data(&m).ok().map(Ok)
+    });
     Ok(Sse::new(all).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

@@ -4009,6 +4009,8 @@ pub struct App {
     pub stream: Stream,
     /// How fast each client may change the market.
     limits: Actor<Limiter>,
+    /// How much work may be in the server at once. See [`crate::limit`].
+    pub admission: crate::limit::Admission,
     /// Counters for `GET /api/health`. Atomics, so nothing waits on them.
     pub metrics: Metrics,
 }
@@ -4356,6 +4358,7 @@ impl App {
             per_sec: options.rate_per_sec,
             burst: options.rate_burst,
         }));
+        let admission = crate::limit::Admission::new(options.max_inflight, options.max_streams);
         Arc::new(Self {
             clock,
             started_at: SystemTime::now(),
@@ -4365,6 +4368,7 @@ impl App {
             directory,
             stream,
             limits,
+            admission,
             metrics: Metrics::default(),
             options,
         })
@@ -4678,6 +4682,16 @@ pub struct Options {
     /// A *running* job is never dropped whatever this says: it is a promise
     /// the world has already taken payment for. See [`crate::jobs::JobBook`].
     pub job_log: usize,
+    /// Mutating requests the server will have in flight at once.
+    /// `FEHU_MAX_INFLIGHT`; `0` takes everything and queues it.
+    ///
+    /// Changes are serialised by the market actor and its mailbox is
+    /// unbounded, so past this the honest answer is `503 overloaded` rather
+    /// than a place in a queue nothing bounds. See [`crate::limit`].
+    pub max_inflight: usize,
+    /// Stream connections held open at once. `FEHU_MAX_STREAMS`; `0` for no
+    /// bound. Each one holds a broadcast receiver and a task.
+    pub max_streams: usize,
     /// Facts kept for the game backend to collect, and how far behind it
     /// may fall before they are lost. `FEHU_OUTBOX`; `0` switches the
     /// outbox off, and nothing is kept for anyone who was not listening.
@@ -4736,6 +4750,8 @@ impl Default for Options {
             job_log: crate::jobs::DEFAULT_JOB_LOG,
             reward_log: crate::rewards::DEFAULT_REWARD_LOG,
             outbox: crate::outbox::DEFAULT_OUTBOX,
+            max_inflight: crate::limit::DEFAULT_MAX_INFLIGHT,
+            max_streams: crate::limit::DEFAULT_MAX_STREAMS,
         }
     }
 }
@@ -4813,6 +4829,8 @@ impl Options {
             job_log: env_parse("FEHU_JOB_LOG", d.job_log),
             reward_log: env_parse("FEHU_REWARD_LOG", d.reward_log),
             outbox: env_parse("FEHU_OUTBOX", d.outbox),
+            max_inflight: env_parse("FEHU_MAX_INFLIGHT", d.max_inflight),
+            max_streams: env_parse("FEHU_MAX_STREAMS", d.max_streams),
         }
     }
 }

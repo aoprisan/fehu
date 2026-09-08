@@ -210,7 +210,11 @@ had. `FEHU_MARKET_HOURS=09:30-16:00`
 gives the market a UTC weekday session (unset, it never closes);
 `FEHU_PRICE_LIMIT_PCT` (0.10) and `FEHU_HALT_SECS` (300) set the limit move
 that halts a symbol and how long the halt lasts. `FEHU_RATE_PER_SEC` (20) and
-`FEHU_RATE_BURST` (40) set how fast one client may change things, and
+`FEHU_RATE_BURST` (40) set how fast one client may change things;
+`FEHU_MAX_INFLIGHT` (128) and `FEHU_MAX_STREAMS` (256) set how many changes
+and how many stream connections the server will have going at once, past
+which it answers `503 overloaded` at once instead of queueing (`0` for
+either takes everything); and
 `FEHU_STREAM_REPLAY` (1024) how many stream messages are kept for `?since=`.
 `FEHU_MAX_SYMBOLS` (32) caps how many symbols may be listed at once — every
 one of them is a simulator stepped on every engine tick.
@@ -357,6 +361,33 @@ should not accept one.
 What this is not is a database: one writer, one file, and no history to query
 beyond the retained ledger views. That is deliberate — see
 `docs/economy-engine-plan.md` for what a live service would need instead.
+
+### How much it will take
+
+Two bounds, answering different questions. `FEHU_RATE_PER_SEC` is *per
+client*: how fast one of them may change the market, so that none can crowd
+the rest out — over it, `429 rate_limited` with a `Retry-After`. Reads are
+never rate limited; a reverse proxy is the right place for that.
+
+`FEHU_MAX_INFLIGHT` is *global*: how many changes may be inside the server at
+once. Every mutation is one job on the market actor and its mailbox is
+unbounded, so without a bound the answer to a burst is a queue that grows
+until memory runs out, with every client in it waiting longer for a reply
+that will arrive too late to use. Past the bound the server says `503
+overloaded` immediately, with `Retry-After: 1`, which a client can act on in
+a way it could not while waiting. `FEHU_MAX_STREAMS` is the same for open SSE
+connections, each of which holds a receiver and a task for as long as it
+lasts. Reads are not gated by either: `/api/health` is exactly what is worth
+reading when the server is full. `GET /api/health` reports
+`requests_in_flight` against `max_in_flight`, and `metrics.requests_shed`
+counts what has been turned away for room — separately from
+`metrics.requests_limited`, because a full server is not a fast client.
+
+`webapp/tests/load.rs` declares a load and a target and holds the server to
+them: 32 players sending 16 mutations each, all answered, none shed, the
+whole burst through in seconds and the tail within twice the median — and
+then a restart from the snapshot and the journal that comes back, reconciles
+and still has the same facts in its outbox.
 
 ### The outbox
 
