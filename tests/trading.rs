@@ -709,3 +709,42 @@ fn advancing_without_matching_preserves_resting_orders_until_resync() {
     assert!(ex.book().get(placement.id).is_none());
     assert_eq!(ex.book().validate_state(), Ok(()));
 }
+
+#[test]
+fn an_unsynthetic_exchange_holds_only_what_traders_put_in_it() {
+    let params = TradingParams {
+        synthetic: false,
+        ..TradingParams::default()
+    };
+    let mut ex = Exchange::new(Config::default(), params, 42).unwrap();
+    let mut bare = Simulator::new(Config::default(), 42).unwrap();
+    for _ in 0..1_000 {
+        let r = ex.step();
+        let t = bare.step();
+        assert_eq!(
+            r.tick.price_cents, t.price_cents,
+            "the simulator is the reference either way"
+        );
+        assert_eq!(r.tick.volume, 0, "nothing traded, so nothing printed");
+        assert!(r.trades.is_empty());
+    }
+    assert!(
+        ex.book().orders().next().is_none(),
+        "no ladder was ever quoted"
+    );
+    assert_eq!(ex.simulator().snapshot(), bare.snapshot());
+
+    // Two traders still meet each other, and only each other.
+    let price = ex.reference_cents();
+    ex.submit(Order::limit(Owner::Trader(T), Side::Buy, price, 50))
+        .unwrap();
+    let placement = ex
+        .submit(Order::limit(Owner::Trader(OTHER), Side::Sell, price, 50))
+        .unwrap();
+    assert_eq!(placement.trades.len(), 1);
+    assert_eq!(placement.trades[0].qty, 50);
+    let r = ex.step();
+    assert_eq!(r.tick.volume, 50, "their fill is the tick's whole volume");
+    assert!(r.trades.is_empty(), "the step itself printed nothing");
+    assert!(ex.book().orders().next().is_none());
+}

@@ -14,6 +14,12 @@
 //!
 //! With no trader orders the price series is bit-identical to the bare
 //! simulator's: the synthetic flow uses its own RNG stream.
+//!
+//! Steps 3 and 4 are optional ([`TradingParams::synthetic`]). Without them
+//! the book holds only what traders put in it and the tape only what they
+//! traded, while the simulator carries on unchanged as the reference price.
+//! That is the mode an asset whose units are accounted for is quoted in: a
+//! print against liquidity nobody funded would be a unit nobody issued.
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -33,7 +39,7 @@ use crate::sim::{LoadError, Simulator, SimulatorRepr, Tick};
 use crate::time::Timestamp;
 
 /// Version of the exchange state layout and flow-RNG draw order.
-pub const EXCHANGE_VERSION: u32 = 1;
+pub const EXCHANGE_VERSION: u32 = 2;
 
 /// Largest log move a single tick's impact may apply.
 const MAX_IMPACT: f64 = 1.0;
@@ -126,7 +132,7 @@ impl Default for ImpactParams {
 }
 
 /// Everything the exchange adds on top of [`Config`].
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TradingParams {
     /// The synthetic maker ladder.
@@ -139,6 +145,38 @@ pub struct TradingParams {
     /// obey these too, so a book with a five-cent tick has five-cent levels.
     #[cfg_attr(feature = "serde", serde(default))]
     pub rules: MarketRules,
+    /// Whether the exchange quotes a synthetic ladder and prints the
+    /// simulator's volume against the book.
+    ///
+    /// On by default: it is what makes a fresh symbol tradable with nobody
+    /// else in the market. Turn it off and the book holds nothing but real
+    /// orders, the tape nothing but real trades, and the tick's volume is
+    /// whatever traders did — the simulator carries on as the reference
+    /// price either way. That is what an asset whose units are accounted
+    /// for needs, because a print against liquidity nobody funded is a unit
+    /// nobody issued.
+    #[cfg_attr(feature = "serde", serde(default = "yes"))]
+    pub synthetic: bool,
+}
+
+/// `true`: the serde default for [`TradingParams::synthetic`], because a
+/// missing field means a file written before the switch existed, and back
+/// then it was always on.
+#[cfg(feature = "serde")]
+const fn yes() -> bool {
+    true
+}
+
+impl Default for TradingParams {
+    fn default() -> Self {
+        Self {
+            liquidity: LiquidityParams::default(),
+            flow: FlowParams::default(),
+            impact: ImpactParams::default(),
+            rules: MarketRules::default(),
+            synthetic: true,
+        }
+    }
 }
 
 impl TradingParams {
@@ -370,7 +408,9 @@ impl Exchange {
     /// synthetic ladder around it. Needed only after stepping the simulator
     /// through [`simulator_mut`](Self::simulator_mut); [`step`](Self::step)
     /// does this itself. Returns the trades the new quotes executed against
-    /// traders' resting orders.
+    /// traders' resting orders — none of it when the ladder is switched off
+    /// ([`TradingParams::synthetic`]), though the reference price still
+    /// catches up.
     pub fn resync(&mut self) -> Vec<Trade> {
         self.reference_cents = self.sim.snapshot().price_cents;
         let mut trades = Vec::new();
@@ -629,9 +669,13 @@ impl Exchange {
     /// Realise `tick.volume` as prints against the current book. Draw order:
     /// one uniform for the print count, one uniform per print for its
     /// weight, one uniform per print for its side.
+    ///
+    /// Nothing at all, and no draws, when prints are switched off
+    /// ([`TradingParams::synthetic`]): the volume the simulator asked for is
+    /// simply not printed, and the tick reports what traders actually did.
     fn synthetic_flow(&mut self, tick: &Tick, p_old: i64, out: &mut Vec<Trade>) {
         let v = tick.volume;
-        if v == 0 {
+        if v == 0 || !self.params.synthetic {
             return;
         }
         let f = self.params.flow;
@@ -713,7 +757,13 @@ impl Exchange {
 
     /// Replace the synthetic ladder around the reference price. Draw order:
     /// one normal per level, bid then ask, best level first.
+    ///
+    /// Nothing at all, and no draws, when the ladder is switched off
+    /// ([`TradingParams::synthetic`]).
     fn requote(&mut self, out: &mut Vec<Trade>) {
+        if !self.params.synthetic {
+            return;
+        }
         self.book.cancel_all(Owner::Synthetic);
         let l = self.params.liquidity;
         let cfg = self.sim.config();
