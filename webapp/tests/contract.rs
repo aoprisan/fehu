@@ -637,6 +637,7 @@ async fn account_shapes() {
         "name",
         "status",
         "opened_at_ms",
+        "wallet_id",
         "balance_cents",
         "reserved_cents",
         "available_cents",
@@ -673,6 +674,7 @@ async fn account_shapes() {
             "id",
             "ts_ms",
             "kind",
+            "tx_id",
             "amount_cents",
             "balance_cents",
             "symbol",
@@ -681,6 +683,10 @@ async fn account_shapes() {
         ],
     );
     assert_eq!(ledger["entries"][0]["kind"], "deposit");
+    assert!(
+        ledger["entries"][0]["tx_id"].as_u64().unwrap() > 0,
+        "every entry names the balanced transaction behind it"
+    );
 
     let check = get_as(&app, key, &format!("/api/accounts/{account_id}/validate")).await;
     assert_keys(
@@ -1000,9 +1006,44 @@ async fn reconciliation_contract() {
             "traders_checked",
             "symbols_checked",
             "resting_orders_checked",
+            "wallets_checked",
+            "minted_cents",
+            "burned_cents",
+            "outstanding_cents",
+            "circulating_cents",
+            "synthetic_debt_cents",
             "issues",
         ],
     );
     assert_eq!(report["valid"], true);
     assert!(report["issues"].as_array().unwrap().is_empty());
+    assert_eq!(
+        report["circulating_cents"], report["outstanding_cents"],
+        "what the wallets hold is what was minted less what was burned"
+    );
+}
+
+#[tokio::test]
+async fn supply_contract() {
+    let supply = get(&test_app(), "/api/supply").await;
+    assert_keys(
+        "SupplyDto",
+        &supply,
+        &[
+            "minted_cents",
+            "burned_cents",
+            "outstanding_cents",
+            "circulating_cents",
+            "balanced",
+            "treasury_cents",
+            "venue_cents",
+            "issuer_cents",
+            "player_cents",
+            "synthetic_debt_cents",
+            "wallets",
+        ],
+    );
+    assert_eq!(supply["balanced"], true);
+    assert_eq!(supply["burned_cents"], 0);
+    assert_eq!(supply["circulating_cents"], supply["outstanding_cents"]);
 }

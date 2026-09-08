@@ -22,7 +22,7 @@
 //! target, which is then renamed over it, so a crash mid-write leaves the
 //! previous save intact.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,11 +45,21 @@ use crate::trading::{OrderRecord, StopOrder, Trader};
 /// back into one of ours.
 pub type Symbol = &'static str;
 
-/// Current save format. Version 2 is migrated by hashing its plaintext
-/// credentials, version 3 by starting the stop store empty, and version 4 by
-/// taking each symbol's metadata from the build it was written by; all other
-/// older or newer versions are refused.
-pub const STATE_VERSION: u32 = 5;
+/// Current save format. Any other version, older or newer, is refused.
+///
+/// Version 6 moved the money into the currency ledger. Every earlier version
+/// keeps a balance on each account and no supply behind it, so there is
+/// nothing to migrate one *to* without inventing where its currency came
+/// from. The migrations that used to bring versions 2, 3 and 4 forward all
+/// arrived at that shape, so they no longer lead anywhere and are gone with
+/// it.
+///
+/// The plan's answer for a world worth keeping is an importer: post the old
+/// balances as one labelled [`Migration`](fehu::ledger::Reason::Migration)
+/// transaction out of issuance, so the currency has a recorded origin and
+/// the books still add up. It is a day's work when there is such a world.
+/// There is not: the current file is a demo, regenerated from its seeds.
+pub const STATE_VERSION: u32 = 6;
 
 /// Everything needed to carry on where the server left off.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -99,6 +109,16 @@ pub struct SymbolSave {
 /// The people, their money and everything written down about them.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MarketSave {
+    /// Every wallet in the world and the supply behind them. Since version 6
+    /// this, and not the accounts, is where the money is.
+    #[serde(default)]
+    pub ledger: fehu::ledger::Ledger,
+    /// The four wallets the world always has.
+    #[serde(default)]
+    pub wallets: crate::market::Wallets,
+    /// Per symbol, the wallet its payouts come out of.
+    #[serde(default)]
+    pub issuers: Vec<(String, fehu::ledger::WalletId)>,
     pub users: Vec<User>,
     pub accounts: Vec<Account>,
     pub traders: Vec<Trader>,
@@ -139,12 +159,6 @@ pub enum SaveError {
     Invalid(Vec<String>),
     /// Written by a different version of the format.
     Version { found: u32, expected: u32 },
-    /// A version-4 file names a symbol whose metadata this build does not
-    /// have. Only migration can hit this: a version-5 file carries its own.
-    Symbols {
-        found: Vec<String>,
-        expected: Vec<String>,
-    },
 }
 
 impl std::fmt::Display for SaveError {
@@ -160,11 +174,6 @@ impl std::fmt::Display for SaveError {
             Self::Version { found, expected } => write!(
                 f,
                 "state file is version {found}, this build reads {expected}"
-            ),
-            Self::Symbols { found, expected } => write!(
-                f,
-                "state file is version 4 and lists {found:?}, whose metadata has to come from \
-                 this build, which seeds {expected:?}"
             ),
         }
     }
@@ -208,65 +217,27 @@ fn write_snapshot(writer: impl Write, save: &Save) -> Result<(), SaveError> {
 }
 
 /// Read a save from `path`, checking that this build can use it.
+///
+/// The version is read before anything else is, so a file this build cannot
+/// use is turned away saying so rather than failing somewhere in the middle
+/// of a shape that has since changed.
 pub fn read(path: &Path) -> Result<Save, SaveError> {
     let file = std::fs::File::open(path)?;
-    let mut save: Save = serde_json::from_reader(io::BufReader::new(file))?;
-    if save.version == 2 {
-        // Version 2 held the keys themselves; the digests are all this build
-        // ever wants, and hashing them here keeps every player's credential
-        // working across the upgrade.
-        for (key, _) in &mut save.market.api_keys {
-            *key = crate::auth::key_digest(key);
-        }
-        save.version = 3;
-    }
-    if save.version == 3 {
-        // Version 3 predates stops. `serde` has already defaulted the store
-        // to empty; the counter has to start where a fresh market's does.
-        save.market.next_stop_id = save.market.next_stop_id.max(1);
-        save.version = 4;
-    }
-    if save.version == 4 {
-        // Version 4 kept a symbol's metadata in the build, so a file could
-        // only ever list the build's own symbols. That is where the metadata
-        // for these has to come from — there is nowhere else — and a file
-        // naming anything else cannot be migrated.
-        adopt_build_metadata(&mut save)?;
-        save.version = 5;
-    }
-    if save.version != STATE_VERSION {
+    let value: serde_json::Value = serde_json::from_reader(io::BufReader::new(file))?;
+    let found = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0);
+    if found != STATE_VERSION {
         return Err(SaveError::Version {
-            found: save.version,
+            found,
             expected: STATE_VERSION,
         });
     }
+    let save: Save = serde_json::from_value(value)?;
     validate_accounting(&save)?;
     Ok(save)
-}
-
-/// Fill in a version-4 file's symbol metadata from the build's seeded
-/// symbols, which is where it lived when the file was written.
-fn adopt_build_metadata(save: &mut Save) -> Result<(), SaveError> {
-    let mut seeded: BTreeMap<&'static str, crate::market::SymbolInfo> =
-        crate::market::seeded_symbols(fehu::Timestamp(save.sim_now_ms))
-            .into_iter()
-            .map(|spec| (spec.info.symbol, spec.info))
-            .collect();
-    let mut unknown = Vec::new();
-    for symbol in &mut save.symbols {
-        match crate::symbols::lookup(&symbol.symbol).and_then(|t| seeded.remove(t)) {
-            Some(info) => symbol.info = Some(info),
-            None => unknown.push(symbol.symbol.clone()),
-        }
-    }
-    if unknown.is_empty() {
-        Ok(())
-    } else {
-        Err(SaveError::Symbols {
-            found: unknown,
-            expected: crate::market::TICKERS.iter().map(|s| (*s).into()).collect(),
-        })
-    }
 }
 
 /// Validate before maps can silently discard duplicate identities on restore.

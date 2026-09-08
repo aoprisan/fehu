@@ -22,9 +22,11 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::account::{
-    Account, AccountCheck, AccountDto, AccountId, CreateUserRequest, LedgerResponse, MoneyError,
-    OpenAccountRequest, StatusRequest, TransferRequest, UserDto, UserId,
+    Account, AccountCheck, AccountDto, AccountId, AccountStatus, CreateUserRequest, LedgerResponse,
+    MoneyError, OpenAccountRequest, StatusRequest, TransferRequest, UserDto, UserId,
 };
+use fehu::ledger::LedgerError;
+
 use crate::actor::Gone;
 use crate::events::{
     CatalogEntry, EventRecord, GameEventKind, GameEventRequest, MAX_MAGNITUDE, Prepared,
@@ -32,9 +34,9 @@ use crate::events::{
 };
 use crate::limit::Decision;
 use crate::market::{
-    Amendment, App, Closed, DelistError, Delisting, Market, OrderCheck, PlaceError, PlaceRequest,
-    Placed, Quote, Sequenced, SnapshotDto, StreamMessage, Subscription, Symbol, SymbolInfo,
-    SymbolSpec, SymbolStatus, SymbolView, wall_now_ms,
+    Amendment, App, Closed, DelistError, Delisting, Market, OrderCheck, PayoutError, PlaceError,
+    PlaceRequest, Placed, Quote, Sequenced, SnapshotDto, StreamMessage, Subscription, SupplyDto,
+    Symbol, SymbolInfo, SymbolSpec, SymbolStatus, SymbolView, wall_now_ms,
 };
 use crate::trading::{
     AmendRequest, AmendResponse, BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID,
@@ -109,6 +111,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/accounts/{account_id}/status", post(set_status))
         .route("/api/accounts/{account_id}/validate", get(validate_account))
         .route("/api/accounts/{account_id}/ledger", get(get_ledger))
+        .route("/api/supply", get(supply))
         .route("/api/game/catalog", get(catalog))
         .route("/api/game/events", get(list_events).post(push_game_event))
         .route("/api/events", get(list_events))
@@ -318,7 +321,7 @@ impl ApiError {
     /// An order the trader's account would not fund.
     fn refused(e: Refused) -> Self {
         match e {
-            Refused::Account(MoneyError::Status { .. }) => {
+            Refused::Account(m) if m.is_forbidden() => {
                 Self::new(StatusCode::CONFLICT, "account_not_active", e.to_string())
             }
             _ => Self::new(
@@ -389,14 +392,31 @@ impl ApiError {
             MoneyError::NotPositive { .. } | MoneyError::TooLarge { .. } => {
                 (StatusCode::BAD_REQUEST, "invalid_amount")
             }
-            MoneyError::BalanceCap { .. } => (StatusCode::UNPROCESSABLE_ENTITY, "balance_cap"),
-            MoneyError::Insufficient { .. } => {
-                (StatusCode::UNPROCESSABLE_ENTITY, "insufficient_funds")
-            }
-            MoneyError::Status { .. } => (StatusCode::CONFLICT, "account_not_active"),
-            MoneyError::Reserved { .. } => (StatusCode::CONFLICT, "cash_reserved"),
+            MoneyError::NoWallet { .. } => (StatusCode::INTERNAL_SERVER_ERROR, "no_wallet"),
+            MoneyError::Ledger(e) => match e {
+                LedgerError::BalanceCap { .. } => (StatusCode::UNPROCESSABLE_ENTITY, "balance_cap"),
+                LedgerError::Insufficient { .. } => {
+                    (StatusCode::UNPROCESSABLE_ENTITY, "insufficient_funds")
+                }
+                LedgerError::Status { .. } | LedgerError::Closed(_) => {
+                    (StatusCode::CONFLICT, "account_not_active")
+                }
+                LedgerError::NotEmpty { .. } => (StatusCode::CONFLICT, "cash_reserved"),
+                LedgerError::NotPositive { .. } => (StatusCode::BAD_REQUEST, "invalid_amount"),
+                _ => (StatusCode::UNPROCESSABLE_ENTITY, "ledger_refused"),
+            },
         };
         Self::new(status, code, e.to_string())
+    }
+
+    /// A corporate payout the issuer could not fund. Nothing was paid.
+    fn payout(e: PayoutError) -> Self {
+        match e {
+            PayoutError::Gone => Self::from(Gone),
+            PayoutError::Unfunded(_) => {
+                Self::new(StatusCode::CONFLICT, "payout_not_funded", e.to_string())
+            }
+        }
     }
 }
 
@@ -500,6 +520,27 @@ impl FromRequestParts<AppState> for Admin {
             Ok(Self)
         } else {
             Err(ApiError::invalid_api_key())
+        }
+    }
+}
+
+impl OptionalFromRequestParts<AppState> for Admin {
+    type Rejection = ApiError;
+
+    /// Whether the request carries operator authority, without turning the
+    /// lack of it into a refusal.
+    ///
+    /// For a route where the *same* call means different things depending on
+    /// who is asking — freezing an account is the operator's, closing it is
+    /// the owner's — the handler has to see both and decide, rather than be
+    /// turned away at the door.
+    async fn from_request_parts(
+        parts: &mut Parts,
+        app: &AppState,
+    ) -> Result<Option<Self>, ApiError> {
+        match <Admin as FromRequestParts<AppState>>::from_request_parts(parts, app).await {
+            Ok(admin) => Ok(Some(admin)),
+            Err(_) => Ok(None),
         }
     }
 }
@@ -609,6 +650,10 @@ struct Health {
     orders_refused: u64,
     /// Fills booked to traders' accounts since start-up.
     fills_booked: u64,
+    /// Fills the book made that the ledger then refused to settle. Zero in a
+    /// healthy market; anything else means shares moved and money did not,
+    /// and the market wants reconciling.
+    settlement_failures: u64,
     /// Messages published to the stream since start-up.
     stream_messages: u64,
     /// Streams currently connected.
@@ -646,6 +691,7 @@ async fn health(State(app): State<AppState>) -> Result<Json<Health>, ApiError> {
         orders_placed: market.orders_placed,
         orders_refused: market.orders_refused,
         fills_booked: market.fills_booked,
+        settlement_failures: market.settlement_failures,
         stream_messages: app.published().await,
         stream_subscribers: app.stream.subscribers(),
         tracked_clients: app.tracked_clients().await,
@@ -959,6 +1005,9 @@ async fn delist_symbol(
                     .map_err(|e| match e {
                         DelistError::Unknown => ApiError::not_found(&ticker),
                         DelistError::Price => ApiError::invalid_event(e.to_string()),
+                        DelistError::Unfunded(_) => {
+                            ApiError::new(StatusCode::CONFLICT, "payout_not_funded", e.to_string())
+                        }
                     })?;
                 let record = m.record(EventRecord {
                     id: 0,
@@ -1523,7 +1572,7 @@ async fn list_traders(
                 .filter(|t| t.user_id == caller.0)
                 .map(|t| {
                     let account = m.accounts.get(&t.account_id);
-                    let cash = account.map_or(0, Account::balance_cents);
+                    let cash = account.map_or(0, |a| a.balance_cents(&m.ledger));
                     let equity = cash.saturating_add(
                         t.positions
                             .iter()
@@ -1535,7 +1584,8 @@ async fn list_traders(
                         user_id: t.user_id.0,
                         account_id: t.account_id.0,
                         name: t.name.clone(),
-                        account_status: account.map(|a| a.status).unwrap_or_default(),
+                        account_status: account
+                            .map_or_else(Default::default, |a| a.status(&m.ledger)),
                         cash_cents: cash,
                         equity_cents: equity,
                         positions: t.positions.len(),
@@ -1626,11 +1676,11 @@ fn portfolio(
         account_id: t.account_id.0,
         name: t.name.clone(),
         created_at_ms: t.created_at_ms,
-        account_status: account.status,
-        cash_cents: account.balance_cents(),
-        reserved_cents: account.reserved_cents(),
-        free_cash_cents: account.available_cents(),
-        equity_cents: account.balance_cents().saturating_add(value),
+        account_status: account.status(&market.ledger),
+        cash_cents: account.balance_cents(&market.ledger),
+        reserved_cents: account.reserved_cents(&market.ledger),
+        free_cash_cents: account.available_cents(&market.ledger),
+        equity_cents: account.balance_cents(&market.ledger).saturating_add(value),
         realised_pnl_cents: realised,
         unrealised_pnl_cents: unrealised,
         positions,
@@ -1743,7 +1793,8 @@ async fn pay_dividend(
                     .ok_or_else(|| ApiError::not_found(handle.ticker))?;
                 let (paid, effects) = m
                     .pay_dividend(&handle, cents_per_share, note.clone(), now.0)
-                    .await?
+                    .await
+                    .map_err(ApiError::payout)?
                     .ok_or_else(|| {
                         ApiError::invalid_event(format!(
                             "a dividend must be between 1 and {} cents a share, one less than \
@@ -2268,12 +2319,17 @@ async fn get_account(
     ))
 }
 
-/// Add money: `{"amount_cents": 500000}`. The amount is a positive integer
-/// number of cents.
+/// Mint money into an account: `{"amount_cents": 500000}`. The amount is a
+/// positive integer number of cents.
+///
+/// **Operator authority.** This is one of the two routes that changes how
+/// much currency exists — it creates it — so it is gated the way the
+/// game-master routes are. A player cannot reach it, and no route a player
+/// can reach moves the supply at all.
 async fn deposit(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
-    caller: Caller,
+    _admin: Admin,
     payload: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<Json<LedgerResponse>, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
@@ -2282,12 +2338,11 @@ async fn deposit(
     let response = app
         .market
         .call(move |m| {
-            owned_account(m, caller, id)?;
+            if !m.accounts.contains_key(&id) {
+                return Err(ApiError::unknown_account(account_id));
+            }
             let entry = m
-                .accounts
-                .get_mut(&id)
-                .ok_or_else(|| ApiError::unknown_account(account_id))?
-                .deposit(req.amount_cents, req.memo, wall_now_ms())
+                .mint_into(id, req.amount_cents, req.memo, wall_now_ms())
                 .map_err(ApiError::money)?;
             Ok::<_, ApiError>(LedgerResponse {
                 account: account_dto(m, id)?,
@@ -2304,12 +2359,15 @@ async fn deposit(
     Ok(Json(response))
 }
 
-/// Take money out. Only the available balance can leave: cash reserved for
-/// resting orders has to be freed by cancelling them first.
+/// Burn money out of an account. Only the available balance can leave: cash
+/// reserved for resting orders has to be freed by cancelling them first.
+///
+/// **Operator authority**, and the mirror of [`deposit`]: this is the only
+/// way currency leaves the world.
 async fn withdraw(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
-    caller: Caller,
+    _admin: Admin,
     payload: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<Json<LedgerResponse>, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
@@ -2318,12 +2376,11 @@ async fn withdraw(
     let response = app
         .market
         .call(move |m| {
-            owned_account(m, caller, id)?;
+            if !m.accounts.contains_key(&id) {
+                return Err(ApiError::unknown_account(account_id));
+            }
             let entry = m
-                .accounts
-                .get_mut(&id)
-                .ok_or_else(|| ApiError::unknown_account(account_id))?
-                .withdraw(req.amount_cents, req.memo, wall_now_ms())
+                .burn_from(id, req.amount_cents, req.memo, wall_now_ms())
                 .map_err(ApiError::money)?;
             Ok::<_, ApiError>(LedgerResponse {
                 account: account_dto(m, id)?,
@@ -2341,25 +2398,59 @@ async fn withdraw(
 }
 
 /// Freeze, reopen or close an account: `{"status": "frozen"}`.
+///
+/// Two transitions with two different authorities, behind one route.
+///
+/// **Freezing and unfreezing are the operator's**: an account that could
+/// unfreeze itself is not frozen. Freezing withdraws the account's resting
+/// orders and stops in the same job, because an order that outlived a freeze
+/// would fill against a wallet that can no longer pay it.
+///
+/// **Closing is the owner's**, and needs no authority beyond owning it — but
+/// it does need an empty wallet, holding nothing and reserving nothing, so
+/// that closing an account can never strand currency out of reach.
 async fn set_status(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
-    caller: Caller,
-    payload: Result<Json<StatusRequest>, JsonRejection>,
+    caller: Option<Caller>,
+    admin: Option<Admin>,
+    payload: Option<Json<StatusRequest>>,
 ) -> Result<Json<AccountDto>, ApiError> {
-    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let Json(req) = payload.ok_or_else(|| ApiError::bad_request("a `status` is required"))?;
     let id = AccountId(account_id);
     let status = req.status;
+    // Who has to be who depends on which transition this is. An operator
+    // freezes an account that is not theirs — that is the whole point of a
+    // freeze — so they are not asked to own it; an owner closes theirs, and
+    // is not asked to be an operator.
+    let owner = match status {
+        AccountStatus::Frozen | AccountStatus::Active => {
+            if admin.is_none() {
+                return Err(ApiError::forbidden(
+                    "freezing and unfreezing an account is the operator's to do",
+                ));
+            }
+            None
+        }
+        AccountStatus::Closed => Some(caller.ok_or_else(ApiError::unauthenticated)?),
+    };
     let dto = app
         .market
-        .call(move |m| {
-            owned_account(m, caller, id)?;
-            m.accounts
-                .get_mut(&id)
-                .ok_or_else(|| ApiError::unknown_account(account_id))?
-                .set_status(status)
+        .call_async(move |m| {
+            Box::pin(async move {
+                if let Some(owner) = owner {
+                    owned_account(m, owner, id)?;
+                } else if !m.accounts.contains_key(&id) {
+                    return Err(ApiError::unknown_account(account_id));
+                }
+                match status {
+                    AccountStatus::Frozen => m.freeze_account(id).await,
+                    AccountStatus::Active => m.unfreeze_account(id),
+                    AccountStatus::Closed => m.close_account(id),
+                }
                 .map_err(ApiError::money)?;
-            account_dto(m, id)
+                account_dto(m, id)
+            })
         })
         .await??;
     tracing::info!(account = account_id, status = ?status, "account status");
@@ -2381,7 +2472,7 @@ async fn validate_account(
                     .accounts
                     .get(&id)
                     .ok_or_else(|| ApiError::unknown_account(account_id))?;
-                Ok::<_, ApiError>(AccountCheck::new(account))
+                Ok::<_, ApiError>(AccountCheck::new(account, &m.ledger))
             })
             .await??,
     ))
@@ -2421,12 +2512,11 @@ async fn get_ledger(
 async fn trader_deposit(
     State(app): State<AppState>,
     Path(trader_id): Path<u64>,
-    caller: Caller,
+    _admin: Admin,
     payload: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<Json<PortfolioDto>, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
     let trader = TraderId(trader_id);
-    owned_trader(&app, caller, trader)?;
     let views = app.views().await;
     let amount_cents = req.amount_cents;
     let (dto, account_id, balance_cents) = app
@@ -2438,10 +2528,7 @@ async fn trader_deposit(
                 .ok_or_else(|| ApiError::unknown_trader(trader_id))?
                 .account_id;
             let entry = m
-                .accounts
-                .get_mut(&account_id)
-                .ok_or_else(|| ApiError::unknown_account(account_id.0))?
-                .deposit(req.amount_cents, req.memo, wall_now_ms())
+                .mint_into(account_id, req.amount_cents, req.memo, wall_now_ms())
                 .map_err(ApiError::money)?;
             Ok::<_, ApiError>((
                 portfolio(m, &views, trader)?,
@@ -2482,7 +2569,7 @@ fn user_dto(market: &Market, views: &[SymbolView], id: UserId) -> Result<UserDto
             .accounts
             .iter()
             .filter_map(|a| market.accounts.get(a))
-            .map(Account::balance_cents)
+            .map(|a| a.balance_cents(&market.ledger))
             .fold(0i64, i64::saturating_add),
         shares_owned: holdings
             .iter()
@@ -2506,7 +2593,27 @@ fn account_dto(market: &Market, id: AccountId) -> Result<AccountDto, ApiError> {
 }
 
 fn account_view(market: &Market, account: &Account) -> AccountDto {
-    AccountDto::new(account, market.trader_on(account.id).map(|t| t.id.0))
+    AccountDto::new(
+        account,
+        &market.ledger,
+        market.trader_on(account.id).map(|t| t.id.0),
+    )
+}
+
+/// How much currency exists and where it is: `GET /api/supply`.
+///
+/// The public face of the conservation invariant. `circulating_cents` is
+/// what every wallet but issuance actually holds, `outstanding_cents` is
+/// minted less burned, and in a healthy world they are the same number —
+/// which is exactly what makes the claim checkable by anyone rather than
+/// promised by the server.
+async fn supply(State(app): State<AppState>) -> Json<SupplyDto> {
+    Json(
+        app.market
+            .call(|m| SupplyDto::of(m))
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 async fn catalog() -> Json<Vec<CatalogEntry>> {

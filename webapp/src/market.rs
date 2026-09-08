@@ -58,11 +58,18 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fehu::{Interval, MarketHours, Order, OrderStatus, Resting, Side, Timestamp, Trade, TraderId};
+use fehu::{
+    Interval, MarketHours, Order, OrderStatus, Owner, Resting, Side, Timestamp, Trade, TraderId,
+};
 use serde::Serialize;
 use tokio::sync::{broadcast, watch};
 
-use crate::account::{Account, AccountId, MoneyError, User, UserId, notional_cents};
+use fehu::ledger::{Draft, Ledger, LedgerError, Reason, WalletId, WalletKind};
+
+use crate::account::{
+    Account, AccountId, LedgerEntry, LedgerKind, MAX_BALANCE_CENTS, MoneyError, User, UserId,
+    check_transfer, settlement_draft,
+};
 use crate::actor::{Actor, Gone};
 use crate::auth::Keyring;
 use crate::events::EventRecord;
@@ -70,8 +77,8 @@ use crate::limit::{Decision, Limiter, Rate};
 use crate::metrics::Metrics;
 use crate::save::{MarketSave, STATE_VERSION, Save};
 use crate::trading::{
-    BookDto, Fees, FillRecord, HoldingDto, MAX_STOPS_PER_TRADER, OpenOrderDto, OrderRecord,
-    OrderResponse, Refused, StopOrder, StopRequest, TradeDto, Trader,
+    BookDto, Fees, FillRecord, HoldingDto, Liquidity, MAX_STOPS_PER_TRADER, OpenOrderDto,
+    OrderRecord, OrderResponse, Refused, SettledFees, StopOrder, StopRequest, TradeDto, Trader,
 };
 
 pub use crate::symbol::*;
@@ -203,6 +210,8 @@ pub enum DelistError {
     Unknown,
     /// The buy-out price is not a price.
     Price,
+    /// The issuer wallet cannot fund the buyout. Nothing was delisted.
+    Unfunded(LedgerError),
 }
 
 impl std::fmt::Display for DelistError {
@@ -210,11 +219,49 @@ impl std::fmt::Display for DelistError {
         match self {
             Self::Unknown => write!(f, "no such symbol"),
             Self::Price => write!(f, "a buy-out price cannot be negative"),
+            Self::Unfunded(e) => write!(f, "the buyout is not funded: {e}"),
         }
     }
 }
 
 impl std::error::Error for DelistError {}
+
+/// Why a corporate payout — a dividend, a delisting buyout — was refused.
+///
+/// Both are funded: the currency comes out of the symbol's issuer wallet,
+/// and if it is not there the payout does not happen. Nothing is paid to
+/// some holders and not others, and nothing is clipped at a balance cap: an
+/// obligation the issuer cannot meet is an obligation it still owes.
+#[derive(Debug)]
+pub enum PayoutError {
+    /// The issuer wallet cannot fund it, or a holder cannot be paid.
+    Unfunded(LedgerError),
+    /// The market or a symbol actor is gone.
+    Gone,
+}
+
+impl From<Gone> for PayoutError {
+    fn from(_: Gone) -> Self {
+        Self::Gone
+    }
+}
+
+impl From<LedgerError> for PayoutError {
+    fn from(e: LedgerError) -> Self {
+        Self::Unfunded(e)
+    }
+}
+
+impl std::fmt::Display for PayoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unfunded(e) => write!(f, "the payout is not funded: {e}"),
+            Self::Gone => write!(f, "the market is shutting down"),
+        }
+    }
+}
+
+impl std::error::Error for PayoutError {}
 
 /// What a delisting undid, and what it paid for the shares.
 #[derive(Clone, Debug, Serialize)]
@@ -420,7 +467,119 @@ pub struct MarketHealth {
     pub orders_placed: u64,
     pub orders_refused: u64,
     pub fills_booked: u64,
+    /// Fills the book made that the ledger then refused to settle, since
+    /// start-up. Always zero in a healthy market: everything settlement
+    /// needs is made true before it is called, because by then the book has
+    /// already traded and cannot be unwound. A number above zero means
+    /// shares moved and money did not, and the market should be reconciled.
+    pub settlement_failures: u64,
     pub events_logged: usize,
+}
+
+/// The wallets a world has exactly one of, whatever it lists or who signs
+/// up.
+///
+/// Everything else — a player's wallet, a symbol's issuer — is opened as it
+/// is needed and found through the thing that owns it. These four are found
+/// here because nothing owns them: they are the world.
+#[derive(Clone, Copy, Debug, Serialize, serde::Deserialize)]
+pub struct Wallets {
+    /// The mint and burn control account.
+    pub issuance: WalletId,
+    /// Where the genesis supply sits, and what the faucet funds new accounts
+    /// out of.
+    pub treasury: WalletId,
+    /// Where fees collect. Nothing leaves the world through a fee.
+    pub venue: WalletId,
+    /// The counterparty for fills against the simulator's unfunded
+    /// liquidity. See [`WalletKind::Synthetic`].
+    pub synthetic: WalletId,
+}
+
+impl Default for Wallets {
+    /// The ids [`Wallets::open`] hands out in a fresh ledger.
+    ///
+    /// Only for building an empty [`MarketSave`], which is then filled in;
+    /// a world's real wallet ids come from its own ledger, and the two agree
+    /// because opening them is the first thing a world does.
+    fn default() -> Self {
+        Self {
+            issuance: WalletId(1),
+            treasury: WalletId(2),
+            venue: WalletId(3),
+            synthetic: WalletId(4),
+        }
+    }
+}
+
+impl Wallets {
+    /// Open the four in a fresh ledger, in a fixed order so that a world
+    /// built from the same options twice numbers them the same way.
+    fn open(ledger: &mut Ledger) -> Self {
+        Self {
+            issuance: ledger.issuance_wallet(),
+            treasury: ledger.open(WalletKind::Treasury),
+            venue: ledger.open(WalletKind::Venue),
+            synthetic: ledger.open(WalletKind::Synthetic),
+        }
+    }
+}
+
+/// `GET /api/supply`: how much currency exists, and where it sits.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SupplyDto {
+    /// Created since genesis, genesis included.
+    pub minted_cents: i64,
+    /// Destroyed since.
+    pub burned_cents: i64,
+    /// `minted − burned`.
+    pub outstanding_cents: i64,
+    /// What the wallets actually hold. Equal to `outstanding_cents` unless
+    /// something is wrong, which `balanced` says.
+    pub circulating_cents: i64,
+    /// The two agree: currency is conserved.
+    pub balanced: bool,
+    /// Waiting in treasury to be handed out.
+    pub treasury_cents: i64,
+    /// Collected in fees.
+    pub venue_cents: i64,
+    /// Set aside to fund dividends and buyouts, across every symbol.
+    pub issuer_cents: i64,
+    /// Held by players, across every account.
+    pub player_cents: i64,
+    /// What unfunded liquidity has put into players' hands beyond its float.
+    pub synthetic_debt_cents: i64,
+    /// Wallets open, the four the world always has included.
+    pub wallets: usize,
+}
+
+impl SupplyDto {
+    /// Read it off a market.
+    pub fn of(m: &Market) -> Self {
+        let supply = m.ledger.supply();
+        let circulating = m.ledger.circulating_cents();
+        let by_kind = |kind: WalletKind| {
+            m.ledger
+                .wallets()
+                .filter(|w| w.kind == kind)
+                .map(|w| w.balance_cents())
+                .fold(0i64, i64::saturating_add)
+        };
+        Self {
+            minted_cents: supply.minted_cents,
+            burned_cents: supply.burned_cents,
+            outstanding_cents: supply.outstanding_cents(),
+            circulating_cents: i64::try_from(circulating).unwrap_or(i64::MAX),
+            balanced: circulating == i128::from(supply.outstanding_cents()),
+            treasury_cents: by_kind(WalletKind::Treasury),
+            venue_cents: by_kind(WalletKind::Venue),
+            issuer_cents: by_kind(WalletKind::Issuer),
+            player_cents: by_kind(WalletKind::Player),
+            synthetic_debt_cents: i64::try_from(m.ledger.synthetic_debt_cents())
+                .unwrap_or(i64::MAX),
+            wallets: m.ledger.len(),
+        }
+    }
 }
 
 /// The market: everybody's money, every order ever sent, and the symbols
@@ -438,6 +597,18 @@ pub struct Market {
     events: VecDeque<EventRecord>,
     event_cap: usize,
     next_event_id: u64,
+    /// Every wallet in the world and the supply behind them. The one
+    /// authority on who holds what: an account is an identity and a history,
+    /// and its balance is a wallet in here.
+    pub ledger: Ledger,
+    /// The four wallets the world always has.
+    pub wallets: Wallets,
+    /// Per symbol, the wallet its dividends and its delisting buyout are
+    /// paid out of. A payout it cannot fund is refused, never clipped.
+    pub issuers: BTreeMap<&'static str, WalletId>,
+    /// Settlements the ledger refused after the book had already traded.
+    /// Always zero in a healthy market; see [`Market::book`].
+    pub settlement_failures: u64,
     pub users: BTreeMap<UserId, User>,
     next_user_id: u64,
     pub accounts: BTreeMap<AccountId, Account>,
@@ -468,6 +639,8 @@ pub struct Market {
     pub fills_booked: u64,
     /// What the venue charges for a fill.
     pub fees: Fees,
+    /// What a newly listed symbol's issuer wallet is funded with.
+    issuer_float_cents: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -530,9 +703,14 @@ impl Market {
         key
     }
 
-    /// Open an account for `user_id` with an opening balance of
-    /// `cash_cents`. The user must exist and the balance must be a
-    /// non-negative number of cents no larger than the balance cap.
+    /// Open an account for `user_id` and pay it `cash_cents` out of treasury.
+    ///
+    /// The account itself opens empty and is then funded by the faucet, which
+    /// is a *transfer*: opening an account moves currency that already
+    /// exists rather than creating any, so no route a player can reach
+    /// changes the supply. A treasury that cannot cover the request refuses
+    /// it — a dry faucet is an operator's problem, and saying so is better
+    /// than printing money or quietly handing out less than was asked for.
     pub fn open_account(
         &mut self,
         user_id: UserId,
@@ -541,21 +719,157 @@ impl Market {
         now_ms: i64,
     ) -> Result<AccountId, MoneyError> {
         debug_assert!(self.users.contains_key(&user_id), "unknown user");
+        if cash_cents < 0 {
+            return Err(MoneyError::NotPositive {
+                amount_cents: cash_cents,
+            });
+        }
+        if cash_cents > 0 {
+            check_transfer(cash_cents)?;
+            // Before the account exists, so a refusal leaves nothing behind.
+            let available = self.ledger.available(self.wallets.treasury);
+            if cash_cents > available {
+                return Err(MoneyError::Ledger(LedgerError::Insufficient {
+                    wallet: self.wallets.treasury,
+                    needed_cents: cash_cents,
+                    available_cents: available,
+                }));
+            }
+        }
         let id = AccountId(self.next_account_id);
+        let wallet = self.ledger.open(WalletKind::Player);
         let account = Account::open(
             id,
             user_id,
             clean(name, 64).unwrap_or_else(|| format!("account-{}", id.0)),
-            cash_cents,
+            wallet,
             self.ledger_log,
             now_ms,
-        )?;
+        );
         self.next_account_id += 1;
         self.accounts.insert(id, account);
         if let Some(user) = self.users.get_mut(&user_id) {
             user.accounts.push(id);
         }
+        if cash_cents > 0 {
+            self.fund_account(id, cash_cents, Some("opening balance".into()), now_ms)?;
+        }
         Ok(id)
+    }
+
+    /// Pay `cents` into `account` out of treasury.
+    ///
+    /// The faucet. It moves currency rather than making it, so it can run
+    /// dry, and when it does it says so.
+    pub fn fund_account(
+        &mut self,
+        account: AccountId,
+        cents: i64,
+        memo: Option<String>,
+        now_ms: i64,
+    ) -> Result<LedgerEntry, MoneyError> {
+        let treasury = self.wallets.treasury;
+        self.move_in(account, Reason::Faucet, treasury, cents, memo, now_ms)
+    }
+
+    /// Create `cents` and put them in `account`. Operator authority: this is
+    /// the only way currency enters the world after genesis.
+    pub fn mint_into(
+        &mut self,
+        account: AccountId,
+        cents: i64,
+        memo: Option<String>,
+        now_ms: i64,
+    ) -> Result<LedgerEntry, MoneyError> {
+        check_transfer(cents)?;
+        let wallet = self.wallet_of(account)?;
+        let tx = self.ledger.mint(wallet, cents, Reason::Mint)?;
+        Ok(self.write_entry(account, LedgerKind::Deposit, tx.id, cents, memo, now_ms))
+    }
+
+    /// Destroy `cents` out of `account`. Operator authority: the only way
+    /// currency leaves the world.
+    pub fn burn_from(
+        &mut self,
+        account: AccountId,
+        cents: i64,
+        memo: Option<String>,
+        now_ms: i64,
+    ) -> Result<LedgerEntry, MoneyError> {
+        check_transfer(cents)?;
+        let wallet = self.wallet_of(account)?;
+        let tx = self.ledger.burn(wallet, cents)?;
+        Ok(self.write_entry(account, LedgerKind::Withdrawal, tx.id, -cents, memo, now_ms))
+    }
+
+    /// Move `cents` from one wallet into `account`, and write the row.
+    fn move_in(
+        &mut self,
+        account: AccountId,
+        reason: Reason,
+        from: WalletId,
+        cents: i64,
+        memo: Option<String>,
+        now_ms: i64,
+    ) -> Result<LedgerEntry, MoneyError> {
+        // What the account's history calls a movement follows from why it
+        // happened, so the caller does not get to say both.
+        let kind = match reason {
+            Reason::Burn => LedgerKind::Withdrawal,
+            Reason::Dividend => LedgerKind::Dividend,
+            Reason::Delisting => LedgerKind::Delisting,
+            _ => LedgerKind::Deposit,
+        };
+        check_transfer(cents)?;
+        let wallet = self.wallet_of(account)?;
+        let tx = self
+            .ledger
+            .post(Draft::new(reason).debit(from, cents).credit(wallet, cents))?;
+        Ok(self.write_entry(account, kind, tx.id, cents, memo, now_ms))
+    }
+
+    /// The wallet `account`'s money lives in.
+    fn wallet_of(&self, account: AccountId) -> Result<WalletId, MoneyError> {
+        self.accounts
+            .get(&account)
+            .map(|a| a.wallet)
+            .ok_or(MoneyError::NoWallet { account })
+    }
+
+    /// Write an account's view of a transaction that has already posted.
+    fn write_entry(
+        &mut self,
+        account: AccountId,
+        kind: LedgerKind,
+        tx_id: u64,
+        amount_cents: i64,
+        memo: Option<String>,
+        now_ms: i64,
+    ) -> LedgerEntry {
+        let Self {
+            ledger, accounts, ..
+        } = self;
+        accounts.get_mut(&account).expect("resolved above").record(
+            ledger,
+            kind,
+            tx_id,
+            amount_cents,
+            now_ms,
+            None,
+            None,
+            memo,
+        )
+    }
+
+    /// The wallet a symbol's dividends and buyout are paid out of, opening
+    /// one the first time it is asked for.
+    pub fn issuer_wallet(&mut self, symbol: &'static str) -> WalletId {
+        if let Some(id) = self.issuers.get(symbol) {
+            return *id;
+        }
+        let id = self.ledger.open(WalletKind::Issuer);
+        self.issuers.insert(symbol, id);
+        id
     }
 
     /// Create a trader for `user_id` that trades on `account_id`.
@@ -579,7 +893,8 @@ impl Market {
     }
 
     /// The one-call sign-up behind `POST /api/traders`: a user, an account
-    /// funded with `cash_cents`, and a trader that trades on it.
+    /// funded out of treasury with `cash_cents`, and a trader that trades on
+    /// it.
     pub fn sign_up(
         &mut self,
         name: Option<String>,
@@ -611,6 +926,24 @@ impl Market {
         let t = traders.get_mut(&trader)?;
         let a = accounts.get_mut(&t.account_id)?;
         Some((t, a))
+    }
+
+    /// A trader, its account and the ledger, all three at once.
+    ///
+    /// Every money movement needs all of them — the ledger to post to, the
+    /// account to write the row in, the trader for the position — and they
+    /// live in three fields of one struct, so this is the borrow that lets a
+    /// caller have them together.
+    fn settling(&mut self, trader: TraderId) -> Option<(&mut Trader, &mut Account, &mut Ledger)> {
+        let Self {
+            traders,
+            accounts,
+            ledger,
+            ..
+        } = self;
+        let t = traders.get_mut(&trader)?;
+        let a = accounts.get_mut(&t.account_id)?;
+        Some((t, a, ledger))
     }
 
     /// Shares of `sym` the traders hold between them.
@@ -713,8 +1046,9 @@ impl Market {
     /// Give back what a withdrawn order reserved and mark its record
     /// cancelled.
     fn release(&mut self, trader: TraderId, sym: &'static str, cancelled: &Resting, now_ms: i64) {
-        if let Some((t, account)) = self.trader_and_account(trader) {
+        if let Some((t, account, ledger)) = self.settling(trader) {
             t.release(
+                ledger,
                 account,
                 sym,
                 cancelled.side,
@@ -729,8 +1063,17 @@ impl Market {
         }
     }
 
-    /// Book every trade in `trades` (for symbol `sym`) to the traders
-    /// involved and publish the fills. Returns how many there were.
+    /// Book every trade in `trades` (for symbol `sym`): settle the money,
+    /// update the traders involved, publish the fills. Returns how many there
+    /// were.
+    ///
+    /// **One transaction per trade, not one per party.** A fill moves
+    /// currency between the two sides and the venue at once, and posting it
+    /// per party would move it twice. Whichever side is not a trader — the
+    /// simulator's ladder, its printed flow — posts against the synthetic
+    /// wallet, so the transaction balances and the currency that unfunded
+    /// liquidity puts into a player's hands is visible as that wallet's debt
+    /// instead of appearing from nowhere.
     fn book(&mut self, sym: &'static str, trades: &[Trade]) -> Vec<FillRecord> {
         let fees = self.fees;
         let mut fills = Vec::new();
@@ -744,13 +1087,27 @@ impl Market {
                     record.fill(t.qty, t.price_cents, t.ts.0);
                 }
             }
+            // Give back what the resting side reserved *before* settling it.
+            // The cash a resting buy holds back is exactly the cash that pays
+            // for its own fill, so a trader who committed their whole balance
+            // to an order would look insolvent at the moment it filled — and
+            // the settlement would be refused after the book had traded.
+            if let Some(id) = t.maker.owner.trader()
+                && let Some((trader, account, ledger)) = self.settling(id)
+            {
+                let side = t.taker_side.opposite();
+                trader.release(ledger, account, sym, side, t.qty, t.price_cents);
+            }
+            let Some((tx_id, settled)) = self.settle_trade(sym, t, fees) else {
+                continue;
+            };
             let mut parties = [t.taker.owner.trader(), t.maker.owner.trader()];
             if parties[0] == parties[1] {
                 parties[1] = None;
             }
             for id in parties.into_iter().flatten() {
-                if let Some((trader, account)) = self.trader_and_account(id) {
-                    fills.extend(trader.apply_trade(account, sym, t, fees));
+                if let Some((trader, account, ledger)) = self.settling(id) {
+                    fills.extend(trader.apply_trade(ledger, account, sym, t, settled, tx_id));
                 }
             }
         }
@@ -762,6 +1119,108 @@ impl Market {
             });
         }
         fills
+    }
+
+    /// Move the currency one trade owes, as a single balanced transaction:
+    /// the buyer's side, the seller's side, and the venue's cut of each.
+    /// Returns the transaction id, or `None` if the ledger refused it.
+    ///
+    /// A refusal here is a bug, not a case to handle: the book has already
+    /// traded and cannot be unwound, so the shares have moved and the money
+    /// has not. Everything that could cause one is prevented upstream — a
+    /// buy is authorised with its fee before it is submitted, a resting buy
+    /// holds a reservation, and freezing an account cancels its resting
+    /// orders in the same job. What is left is the balance cap on a very
+    /// large sell. So this counts the refusal, logs it loudly and leaves the
+    /// drift for [`crate::reconcile`] to report, rather than papering over it
+    /// with currency nobody minted.
+    fn settle_trade(
+        &mut self,
+        sym: &'static str,
+        trade: &Trade,
+        fees: Fees,
+    ) -> Option<(u64, SettledFees)> {
+        let synthetic = self.wallets.synthetic;
+        let wallet_of = |owner: Owner| match owner.trader() {
+            Some(id) => self
+                .traders
+                .get(&id)
+                .and_then(|t| self.accounts.get(&t.account_id))
+                .map_or(synthetic, |a| a.wallet),
+            None => synthetic,
+        };
+        let taker = wallet_of(trade.taker.owner);
+        let maker = wallet_of(trade.maker.owner);
+        let value = match fehu::ledger::checked_notional_cents(trade.price_cents, trade.qty) {
+            Ok(value) => value,
+            Err(e) => {
+                self.settlement_failures = self.settlement_failures.saturating_add(1);
+                tracing::error!(symbol = sym, error = %e, "fill notional does not fit");
+                return None;
+            }
+        };
+        // Only a real account is charged: synthetic liquidity has no wallet
+        // of its own to pay out of, and a fee it "paid" would be currency
+        // conjured into the venue's.
+        let fee_for = |owner: Owner, liquidity| {
+            if owner.trader().is_some() {
+                fees.on(liquidity, value)
+            } else {
+                0
+            }
+        };
+        let taker_fee = fee_for(trade.taker.owner, Liquidity::Taker);
+        let venue = self.wallets.venue;
+        // A rebate comes out of what the venue has taken, and no further.
+        // Nothing else caps it: a taker fee smaller than the maker rebate,
+        // or a taker with no wallet to charge, would otherwise ask the venue
+        // to pay currency it never collected — which is the same money from
+        // nowhere that fees leaving the world used to be, pointing the other
+        // way. What it cannot pay, it does not pay.
+        let purse = self
+            .ledger
+            .available(venue)
+            .saturating_add(-taker_fee)
+            .max(0);
+        let maker_fee = fee_for(trade.maker.owner, Liquidity::Maker).min(purse);
+        let settled = SettledFees {
+            taker_cents: taker_fee,
+            maker_cents: maker_fee,
+        };
+        if maker_fee < fee_for(trade.maker.owner, Liquidity::Maker) {
+            tracing::warn!(
+                symbol = sym,
+                purse,
+                "maker rebate capped at what the venue has collected"
+            );
+        }
+        let draft = settlement_draft(
+            taker,
+            maker,
+            venue,
+            trade.taker_side,
+            value,
+            taker_fee,
+            trade.ts.0,
+        )
+        // The maker's fee is the other half of the same transaction: its
+        // rebate comes out of the venue's takings, not out of thin air.
+        .posting(maker, maker_fee)
+        .posting(venue, -maker_fee);
+        match self.ledger.post(draft) {
+            Ok(tx) => Some((tx.id, settled)),
+            Err(e) => {
+                self.settlement_failures = self.settlement_failures.saturating_add(1);
+                tracing::error!(
+                    symbol = sym,
+                    price_cents = trade.price_cents,
+                    qty = trade.qty,
+                    error = %e,
+                    "settlement refused after the book had already traded"
+                );
+                None
+            }
+        }
     }
 
     /// Assign the next id to `rec`, append it to the log, publish it and
@@ -891,7 +1350,9 @@ impl Market {
         let account = self
             .account_of(trader)
             .ok_or(PlaceError::UnknownTrader(trader.0))?;
-        if let Err(e) = self.traders[&trader].check(account, sym, order.side, order.qty, cost) {
+        if let Err(e) =
+            self.traders[&trader].check(&self.ledger, account, sym, order.side, order.qty, cost)
+        {
             self.orders_refused = self.orders_refused.saturating_add(1);
             return Err(PlaceError::Refused(e));
         }
@@ -917,9 +1378,16 @@ impl Market {
         self.book(sym, &placement.trades);
         if placement.status == OrderStatus::Resting
             && let fehu::OrderKind::Limit { price_cents } = order.kind
-            && let Some((t, account)) = self.trader_and_account(trader)
+            && let Some((t, account, ledger)) = self.settling(trader)
         {
-            t.reserve(account, sym, order.side, placement.remaining, price_cents);
+            t.reserve(
+                ledger,
+                account,
+                sym,
+                order.side,
+                placement.remaining,
+                price_cents,
+            );
         }
         let response = OrderResponse::new(sym, trader, order.side, order.qty, &placement);
         self.record_order(
@@ -1095,7 +1563,7 @@ impl Market {
             .ok_or(PlaceError::UnknownTrader(trader.0))?;
         let fees = self.fees;
         self.traders[&trader]
-            .check(account, sym, req.side, req.qty, {
+            .check(&self.ledger, account, sym, req.side, req.qty, {
                 // The order it fires will take liquidity, so the advisory
                 // check counts the taker fee too.
                 let cost = stop.cost_cents();
@@ -1162,14 +1630,16 @@ impl Market {
     /// A frozen account is paid too: it still owns its shares.
     ///
     /// # Errors
-    /// `None` if the dividend is not between one cent and the price.
+    /// `Ok(None)` if the dividend is not between one cent and the price;
+    /// [`PayoutError::Unfunded`] if the symbol's issuer wallet cannot pay it,
+    /// in which case nothing at all was paid.
     pub async fn pay_dividend(
         &mut self,
         symbol: &Symbol,
         cents_per_share: i64,
         note: Option<String>,
         now_ms: i64,
-    ) -> Result<Option<(Dividend, Vec<crate::events::SimEvent>)>, Gone> {
+    ) -> Result<Option<(Dividend, Vec<crate::events::SimEvent>)>, PayoutError> {
         let sym = symbol.ticker;
         let Some(price_cents) = symbol.ask_listed(|s| s.price_cents()).await? else {
             return Ok(None);
@@ -1182,7 +1652,8 @@ impl Market {
             .values()
             .filter_map(|t| {
                 let qty = u64::try_from(t.positions.get(sym).map_or(0, |p| p.qty)).ok()?;
-                (qty > 0).then(|| (t.account_id, notional_cents(cents_per_share, qty), qty))
+                let amount = fehu::ledger::checked_notional_cents(cents_per_share, qty).ok()?;
+                (qty > 0).then_some((t.account_id, amount, qty))
             })
             .collect();
         let mut paid = Dividend {
@@ -1193,14 +1664,42 @@ impl Market {
             accounts_paid: 0,
             total_cents: 0,
         };
-        for (account_id, amount, qty) in owed {
-            let Some(account) = self.accounts.get_mut(&account_id) else {
-                continue;
+        // One transaction: the issuer pays, every holder is credited. Either
+        // it funds the whole dividend or none of it is paid — a payout that
+        // reaches some holders and not others is not a dividend, and one
+        // clipped at a balance cap is currency the issuer still owes.
+        if !owed.is_empty() {
+            let issuer = self.issuer_wallet(sym);
+            let mut draft = Draft::new(Reason::Dividend)
+                .at(u64::try_from(now_ms).unwrap_or(0))
+                .memo(note.clone());
+            for (account_id, amount, _) in &owed {
+                let Some(wallet) = self.accounts.get(account_id).map(|a| a.wallet) else {
+                    continue;
+                };
+                draft = draft.debit(issuer, *amount).credit(wallet, *amount);
+            }
+            let tx = match self.ledger.post(draft) {
+                Ok(tx) => tx,
+                Err(e) => return Err(PayoutError::Unfunded(e)),
             };
-            if account
-                .pay_dividend(amount, sym, note.clone(), now_ms)
-                .is_some()
-            {
+            for (account_id, amount, qty) in owed {
+                let Self {
+                    ledger, accounts, ..
+                } = self;
+                let Some(account) = accounts.get_mut(&account_id) else {
+                    continue;
+                };
+                account.record(
+                    ledger,
+                    LedgerKind::Dividend,
+                    tx.id,
+                    amount,
+                    now_ms,
+                    Some(sym),
+                    None,
+                    note.clone(),
+                );
                 paid.accounts_paid += 1;
                 paid.shares_paid = paid.shares_paid.saturating_add(qty);
                 paid.total_cents = paid.total_cents.saturating_add(amount);
@@ -1281,6 +1780,31 @@ impl Market {
     /// # Errors
     /// [`ListingError`] if the ticker is already listed, or the market
     /// already has `max_symbols` of them.
+    /// Give a symbol's issuer wallet its float out of treasury, so that the
+    /// dividends and the buyout it may owe are funded before it lists.
+    ///
+    /// Nothing is minted: an issuer's money is the world's money, set aside.
+    /// A treasury too thin to cover the float funds what it can — a listing
+    /// is not a payout, and an underfunded issuer refuses its own dividends
+    /// loudly enough without also refusing to exist.
+    fn fund_issuer(&mut self, symbol: &'static str, float_cents: i64) {
+        if float_cents <= 0 {
+            return;
+        }
+        let treasury = self.wallets.treasury;
+        let issuer = self.issuer_wallet(symbol);
+        let amount = float_cents.min(self.ledger.available(treasury));
+        if amount <= 0 {
+            return;
+        }
+        let _ = self.ledger.post(
+            Draft::new(Reason::Transfer)
+                .debit(treasury, amount)
+                .credit(issuer, amount)
+                .memo(Some(format!("{symbol} issuer float"))),
+        );
+    }
+
     pub fn list(&mut self, state: SymbolState) -> Result<Quote, ListingError> {
         let ticker = state.info.symbol;
         if self.symbol(ticker).is_some() {
@@ -1292,7 +1816,9 @@ impl Market {
             });
         }
         let quote = state.quote();
+        let float = self.issuer_float_cents;
         self.symbols.push(Symbol::spawn(state));
+        self.fund_issuer(ticker, float);
         self.publish_listings();
         self.stream.publish(StreamMessage::Listed {
             quote: quote.clone(),
@@ -1350,6 +1876,13 @@ impl Market {
         if cents_per_share.is_some_and(|c| c < 0) {
             return Err(DelistError::Price);
         }
+        // What the buyout will cost, before anything is wound up. A symbol
+        // whose issuer cannot buy its holders out must stay listed: winding
+        // the book up first and discovering it afterwards would leave the
+        // shares cancelled and unpaid for.
+        if let Some(price) = cents_per_share {
+            self.check_buyout(sym, price)?;
+        }
         let wound = symbol
             .change(|s| s.wind_up())
             .await
@@ -1376,31 +1909,69 @@ impl Market {
             accounts_paid: 0,
             total_cents: 0,
         };
+        // Who is owed what. The shares go either way — the company is gone —
+        // but the money for them is one transaction out of the issuer's
+        // wallet, so every holder is paid or the delisting does not happen.
+        let owed: Vec<(TraderId, AccountId, i64, u64)> = self
+            .traders
+            .values()
+            .filter_map(|t| {
+                let qty = u64::try_from(t.positions.get(sym).map_or(0, |p| p.qty)).ok()?;
+                (qty > 0).then_some(())?;
+                let amount = fehu::ledger::checked_notional_cents(cents_per_share, qty).ok()?;
+                Some((t.id, t.account_id, amount, qty))
+            })
+            .collect();
+        let tx_id = if owed.iter().any(|(_, _, amount, _)| *amount > 0) {
+            let issuer = self.issuer_wallet(sym);
+            let mut draft = Draft::new(Reason::Delisting)
+                .at(u64::try_from(now_ms).unwrap_or(0))
+                .memo(note.clone());
+            for (_, account_id, amount, _) in &owed {
+                let Some(wallet) = self.accounts.get(account_id).map(|a| a.wallet) else {
+                    continue;
+                };
+                draft = draft.debit(issuer, *amount).credit(wallet, *amount);
+            }
+            Some(self.ledger.post(draft).map_err(DelistError::Unfunded)?.id)
+        } else {
+            // A company can be worth nothing. Nothing moves, and a zero-cent
+            // row in a ledger records only that it was.
+            None
+        };
         let holders: Vec<TraderId> = self.traders.keys().copied().collect();
         for id in holders {
-            let Some((trader, account)) = self.trader_and_account(id) else {
+            let Some(trader) = self.traders.get_mut(&id) else {
                 continue;
             };
             // Every resting sell in this symbol was cancelled above, so
             // nothing is still promised to one.
             trader.reserved_shares.remove(sym);
-            let Some(position) = trader.positions.remove(sym) else {
-                continue;
-            };
-            let Ok(qty) = u64::try_from(position.qty) else {
-                continue;
-            };
-            if qty == 0 {
-                continue;
-            }
-            let amount = notional_cents(cents_per_share, qty);
+            trader.positions.remove(sym);
+        }
+        for (_, account_id, amount, qty) in owed {
             paid.shares_bought_out = paid.shares_bought_out.saturating_add(qty);
-            // The shares are gone either way; what was actually credited is
-            // what the ledger says, which is what gets reported.
-            if let Some(entry) = account.pay_delisting(amount, sym, note.clone(), now_ms) {
-                paid.accounts_paid += 1;
-                paid.total_cents = paid.total_cents.saturating_add(entry.amount_cents);
-            }
+            let (Some(tx_id), true) = (tx_id, amount > 0) else {
+                continue;
+            };
+            let Self {
+                ledger, accounts, ..
+            } = self;
+            let Some(account) = accounts.get_mut(&account_id) else {
+                continue;
+            };
+            account.record(
+                ledger,
+                LedgerKind::Delisting,
+                tx_id,
+                amount,
+                now_ms,
+                Some(sym),
+                None,
+                note.clone(),
+            );
+            paid.accounts_paid += 1;
+            paid.total_cents = paid.total_cents.saturating_add(amount);
         }
         // The book goes, and its order-id counter with it. The ids it handed
         // out are still in the log, so the counter keeps the next order from
@@ -1410,6 +1981,84 @@ impl Market {
         self.publish_listings();
         self.stream.publish(StreamMessage::Delisted(paid.clone()));
         Ok(paid)
+    }
+
+    /// What a buyout at `cents_per_share` would cost, checked against the
+    /// symbol's issuer wallet without moving anything.
+    fn check_buyout(&self, sym: &str, cents_per_share: i64) -> Result<(), DelistError> {
+        let Some(&issuer) = self.issuers.get(sym) else {
+            // No issuer wallet yet means nothing has ever been paid out of
+            // one; a buyout of nothing needs no funding.
+            return if self.held_shares(sym) == 0 || cents_per_share == 0 {
+                Ok(())
+            } else {
+                Err(DelistError::Unfunded(LedgerError::UnknownWallet(WalletId(
+                    0,
+                ))))
+            };
+        };
+        let total = fehu::ledger::checked_notional_cents(cents_per_share, self.held_shares(sym))
+            .map_err(DelistError::Unfunded)?;
+        let available = self.ledger.available(issuer);
+        if total > available {
+            return Err(DelistError::Unfunded(LedgerError::Insufficient {
+                wallet: issuer,
+                needed_cents: total,
+                available_cents: available,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Freeze an account: its resting orders and stops are withdrawn, and
+    /// then nothing more leaves it.
+    ///
+    /// The cancels are not a courtesy — they are what makes the freeze safe.
+    /// A resting order outliving a freeze would fill against a wallet that
+    /// can no longer pay, and the book cannot be unwound after the fact. So
+    /// the withdrawal and the freeze are one job on the market, and a frozen
+    /// account has nothing outstanding to settle.
+    ///
+    /// Credits still land: a frozen holder is still paid their dividend,
+    /// because they still own the shares it is paid on.
+    pub async fn freeze_account(&mut self, account: AccountId) -> Result<(), MoneyError> {
+        let wallet = self.wallet_of(account)?;
+        let traders: Vec<TraderId> = self
+            .traders
+            .values()
+            .filter(|t| t.account_id == account)
+            .map(|t| t.id)
+            .collect();
+        for trader in traders {
+            self.cancel_all(trader).await;
+            for stop in self.stops_of(trader).await {
+                let Some(symbol) = self.symbol(stop.symbol).cloned() else {
+                    continue;
+                };
+                self.cancel_stop(&symbol, trader, stop.stop_id).await;
+            }
+        }
+        self.ledger.freeze(wallet)?;
+        Ok(())
+    }
+
+    /// Let a frozen account move money again.
+    pub fn unfreeze_account(&mut self, account: AccountId) -> Result<(), MoneyError> {
+        let wallet = self.wallet_of(account)?;
+        self.ledger.unfreeze(wallet)?;
+        Ok(())
+    }
+
+    /// Close an account for good.
+    ///
+    /// A separate transition from freezing, with a precondition instead of
+    /// an authority: the wallet must be empty, holding nothing and reserving
+    /// nothing, so closing can never strand currency where nothing can reach
+    /// it. Withdraw the balance and cancel the orders first.
+    pub fn close_account(&mut self, account: AccountId) -> Result<(), MoneyError> {
+        let wallet = self.wallet_of(account)?;
+        self.ledger.close(wallet)?;
+        Ok(())
     }
 
     /// One engine step: advance every symbol to `target` — all of them at
@@ -1535,11 +2184,12 @@ impl Market {
             cash_cents: self
                 .accounts
                 .values()
-                .map(Account::balance_cents)
+                .map(|a| a.balance_cents(&self.ledger))
                 .fold(0i64, i64::saturating_add),
             orders_placed: self.orders_placed,
             orders_refused: self.orders_refused,
             fills_booked: self.fills_booked,
+            settlement_failures: self.settlement_failures,
             events_logged: self.events.len(),
             ..MarketHealth::default()
         };
@@ -1603,6 +2253,13 @@ impl Market {
             sim_now_ms,
             symbols,
             market: MarketSave {
+                ledger: self.ledger.clone(),
+                wallets: self.wallets,
+                issuers: self
+                    .issuers
+                    .iter()
+                    .map(|(sym, id)| ((*sym).to_string(), *id))
+                    .collect(),
                 users: self.users.values().cloned().collect(),
                 accounts: self.accounts.values().cloned().collect(),
                 traders: self.traders.values().cloned().collect(),
@@ -1636,6 +2293,9 @@ impl Market {
 
 /// What a market is built with.
 struct MarketParts {
+    ledger: Ledger,
+    wallets: Wallets,
+    issuers: BTreeMap<&'static str, WalletId>,
     symbols: Vec<SymbolState>,
     directory: Directory,
     events: VecDeque<EventRecord>,
@@ -1675,6 +2335,10 @@ impl Market {
             events.pop_front();
         }
         let mut market = Self {
+            ledger: parts.ledger,
+            wallets: parts.wallets,
+            issuers: parts.issuers,
+            settlement_failures: 0,
             symbols,
             listings_tx,
             directory: parts.directory,
@@ -1704,7 +2368,18 @@ impl Market {
             orders_refused: 0,
             fills_booked: 0,
             fees: options.fees(),
+            issuer_float_cents: options.issuer_float_cents,
         };
+        // The symbols a fresh world starts with are listed by being built
+        // rather than through `list`, so their issuers are funded here. A
+        // restored world already has both, and funding them again would be
+        // paying the same float twice.
+        let tickers: Vec<&'static str> = market.symbols.iter().map(|s| s.ticker).collect();
+        for ticker in tickers {
+            if !market.issuers.contains_key(ticker) {
+                market.fund_issuer(ticker, options.issuer_float_cents);
+            }
+        }
         // Through the same door as a live order, so the client-id index and
         // the eviction order come out the same.
         for record in parts.orders {
@@ -1996,10 +2671,35 @@ impl App {
                 s
             })
             .collect();
+        // Genesis. Every cent the world will ever hold without an operator
+        // minting more, in treasury, minus the float the synthetic
+        // counterparty starts with so that trading against unfunded
+        // liquidity does not start in debt on the first fill.
+        let mut ledger = Ledger::new();
+        let wallets = Wallets::open(&mut ledger);
+        let genesis = options.genesis_cents.clamp(0, MAX_BALANCE_CENTS);
+        if genesis > 0 {
+            ledger
+                .mint(wallets.treasury, genesis, Reason::Genesis)
+                .expect("a fresh ledger takes its own genesis");
+            let float = options.synthetic_float_cents.clamp(0, genesis);
+            if float > 0 {
+                ledger
+                    .post(
+                        Draft::new(Reason::Transfer)
+                            .debit(wallets.treasury, float)
+                            .credit(wallets.synthetic, float),
+                    )
+                    .expect("the float was clamped to what treasury holds");
+            }
+        }
         Self::assemble(
             options,
             now,
             MarketParts {
+                ledger,
+                wallets,
+                issuers: BTreeMap::new(),
                 symbols,
                 directory: Directory::default(),
                 events: VecDeque::new(),
@@ -2054,6 +2754,13 @@ impl App {
             options,
             now,
             MarketParts {
+                ledger: m.ledger,
+                wallets: m.wallets,
+                issuers: m
+                    .issuers
+                    .into_iter()
+                    .filter_map(|(sym, id)| Some((crate::symbols::lookup(&sym)?, id)))
+                    .collect(),
                 symbols,
                 directory,
                 events: m.events.into_iter().collect(),
@@ -2299,7 +3006,35 @@ pub struct Options {
     pub order_log: usize,
     /// Cash a new account is opened with, in cents.
     /// `FEHU_STARTING_CASH_CENTS`.
+    ///
+    /// Paid out of treasury, not minted: opening an account moves currency
+    /// that already exists. A treasury with less than this left refuses the
+    /// account rather than printing the difference.
     pub starting_cash_cents: i64,
+    /// The world's opening supply, minted into treasury at start-up.
+    /// `FEHU_GENESIS_CENTS`.
+    ///
+    /// Every cent the world will hold unless an operator mints more. It caps
+    /// how many accounts the faucet can fund and how much an issuer can be
+    /// given to pay dividends out of.
+    pub genesis_cents: i64,
+    /// What the synthetic counterparty starts with, out of the genesis
+    /// supply. `FEHU_SYNTHETIC_FLOAT_CENTS`.
+    ///
+    /// The simulator's ladder and printed flow are not funded by anyone, so
+    /// a wallet stands in for them. Starting it with a float means the
+    /// ordinary case — players buying before they sell — settles out of real
+    /// currency; past the float it goes into debt, which
+    /// [`crate::reconcile`] reports rather than hides. It is retired when
+    /// both sides of every fill are funded.
+    pub synthetic_float_cents: i64,
+    /// What each newly listed symbol's issuer wallet is funded with out of
+    /// treasury, in cents. `FEHU_ISSUER_FLOAT_CENTS`.
+    ///
+    /// Dividends and delisting buyouts are paid out of it, and a payout it
+    /// cannot fund is refused rather than clipped. Zero leaves issuers empty,
+    /// so every payout has to be funded by an operator first.
+    pub issuer_float_cents: i64,
     /// Key the game-master endpoints (pushing events into the simulation)
     /// require. `FEHU_ADMIN_KEY`; unset leaves them open, which is what a
     /// single-player game on localhost wants and a shared server does not.
@@ -2365,6 +3100,12 @@ impl Default for Options {
             ledger_log: 500,
             order_log: 2_000,
             starting_cash_cents: 10_000_000,
+            // $1 trillion: enough that the demo never notices a limit, and
+            // two orders of magnitude under the cap on one wallet, so
+            // treasury itself can hold it.
+            genesis_cents: 100_000_000_000_000,
+            synthetic_float_cents: 50_000_000_000_000,
+            issuer_float_cents: 100_000_000_000,
             admin_key: None,
             state_file: None,
             save_secs: 30,
@@ -2421,6 +3162,11 @@ impl Options {
             ledger_log: env_parse("FEHU_LEDGER_LOG", d.ledger_log),
             order_log: env_parse("FEHU_ORDER_LOG", d.order_log),
             starting_cash_cents: env_parse("FEHU_STARTING_CASH_CENTS", d.starting_cash_cents),
+            genesis_cents: env_parse("FEHU_GENESIS_CENTS", d.genesis_cents)
+                .clamp(0, MAX_BALANCE_CENTS),
+            synthetic_float_cents: env_parse("FEHU_SYNTHETIC_FLOAT_CENTS", d.synthetic_float_cents)
+                .max(0),
+            issuer_float_cents: env_parse("FEHU_ISSUER_FLOAT_CENTS", d.issuer_float_cents).max(0),
             admin_key: std::env::var("FEHU_ADMIN_KEY")
                 .ok()
                 .map(|k| k.trim().to_string())

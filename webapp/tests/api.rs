@@ -838,7 +838,12 @@ async fn users_open_accounts_and_add_money() {
         .iter()
         .map(|e| e["kind"].as_str().unwrap())
         .collect();
-    assert_eq!(kinds, ["withdrawal", "deposit", "open"]);
+    assert_eq!(
+        kinds,
+        ["withdrawal", "deposit", "deposit", "open"],
+        "the opening balance is a faucet payment out of treasury, not part of \
+         `open`: opening an account moves currency rather than creating it"
+    );
 
     let (_, user) = get(&ada, "/api/users/1").await;
     assert_eq!(user["accounts"], json!([id]));
@@ -945,7 +950,11 @@ async fn orders_settle_through_the_account() {
     assert_eq!(ledger["account"]["balance_cents"], 5_000_000 - notional);
     assert_eq!(ledger["account"]["trader_id"], id);
     let entries = ledger["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), prints + 1, "one per print, plus `open`");
+    assert_eq!(
+        entries.len(),
+        prints + 2,
+        "one per print, plus `open` and the faucet that funded it"
+    );
     assert_eq!(entries[0]["kind"], "buy");
     assert_eq!(entries[0]["symbol"], "ACME");
     assert!(entries[0]["amount_cents"].as_i64().unwrap() < 0);
@@ -1062,13 +1071,37 @@ async fn a_frozen_account_cannot_trade() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // A closed account is terminal.
-    post(
+    // Closing needs an empty wallet: currency left in a closed account is
+    // currency nothing can reach again, so the balance has to go first.
+    let (_, before) = get(&player, "/api/accounts/1").await;
+    let (status, body) = post(
         &player,
         "/api/accounts/1/status",
         json!({ "status": "closed" }),
     )
     .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "an account still holding money cannot be closed: {body}"
+    );
+    let (status, body) = post(
+        &player,
+        "/api/accounts/1/withdraw",
+        json!({ "amount_cents": before["balance_cents"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &player,
+        "/api/accounts/1/status",
+        json!({ "status": "closed" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "closed");
+
+    // And a closed account is terminal.
     let (status, body) = post(
         &player,
         "/api/accounts/1/status",
@@ -1660,14 +1693,6 @@ async fn private_endpoints_need_the_users_own_key() {
         (
             "/api/symbols/ACME/orders".to_string(),
             json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market" }),
-        ),
-        (
-            format!("/api/traders/{id}/deposit"),
-            json!({ "amount_cents": 1_000 }),
-        ),
-        (
-            format!("/api/accounts/{account}/withdraw"),
-            json!({ "amount_cents": 1_000 }),
         ),
         (
             format!("/api/accounts/{account}/status"),
@@ -2687,7 +2712,7 @@ async fn reconciliation_checks_a_busy_market_and_detects_broken_reservations() {
         let (status, body) = post(&player, "/api/symbols/ACME/orders", order).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
     }
-    engine::step(&app);
+    engine::step(&app).await;
     let (status, report) = get(&app, "/api/reconcile").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(report["valid"], true, "{report}");
@@ -2699,7 +2724,8 @@ async fn reconciliation_checks_a_busy_market_and_detects_broken_reservations() {
     app.market
         .call(move |market| {
             let account_id = market.traders[&trader].account_id;
-            market.accounts.get_mut(&account_id).unwrap().reserve(1);
+            let account = market.accounts[&account_id].wallet;
+            let _ = market.ledger.reserve(account, 1);
             market
                 .traders
                 .get_mut(&trader)

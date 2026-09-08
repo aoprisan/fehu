@@ -14,6 +14,7 @@ mod candles;
 mod config;
 mod event;
 mod exchange;
+pub mod ledger;
 mod math;
 mod sim;
 mod time;
@@ -30,5 +31,10 @@ pub use exchange::{
     EXCHANGE_VERSION, Exchange, ExchangeRepr, FlowParams, ImpactParams, LiquidityParams, Position,
     StepReport, TradingParams,
 };
+// `ledger` is the one module exported whole rather than flattened: its
+// fifteen types read as one namespace (`ledger::Draft`, `ledger::Reason`),
+// and names that general belong behind it rather than beside `Order` and
+// `Tick`. The two a caller needs before they need the rest are here.
+pub use ledger::{Ledger, MAX_WALLET_CENTS};
 pub use sim::{LoadError, STATE_VERSION, Simulator, SimulatorRepr, Snapshot, Tick};
 pub use time::{MarketHours, Timestamp};

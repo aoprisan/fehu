@@ -2,8 +2,17 @@
 //! of orders, trades and the book.
 //!
 //! A trader is a market-facing identity, not a wallet: its cash lives in the
-//! [`Account`](crate::account::Account) it trades on, so every method that
-//! touches money takes that account and books the movement through it.
+//! [`Account`](crate::account::Account) it trades on, and that account's
+//! money lives in the market's [`Ledger`]. So every method that touches money
+//! takes both — the ledger it must post to, and the account whose history it
+//! writes a row in.
+//!
+//! Nothing here posts a settlement. A fill moves currency between two parties
+//! and the venue, and that is *one* balanced transaction; posting it once per
+//! party would move it twice. [`Market::book`](crate::market::Market::book)
+//! posts it, then hands each side its transaction id and asks the trader to
+//! record what its share of it was — which is what [`Trader::apply_trade`]
+//! does.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -13,7 +22,11 @@ use fehu::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::account::{Account, AccountId, AccountStatus, MoneyError, UserId, notional_cents};
+use fehu::ledger::Ledger;
+
+use crate::account::{
+    Account, AccountId, AccountStatus, LedgerKind, MoneyError, UserId, notional_cents,
+};
 use crate::save::Symbol;
 
 /// Which side of the book a fill came from: `maker` if the trader's order
@@ -89,6 +102,30 @@ impl Fees {
     #[must_use]
     pub fn taker_cost(&self, notional_cents: i64) -> i64 {
         -self.on(Liquidity::Taker, notional_cents)
+    }
+}
+
+/// What the venue actually charged and paid on one fill.
+///
+/// Not the same thing as [`Fees`], which says what it *would* charge: a
+/// rebate is capped at what the venue can pay, so the two differ whenever
+/// the venue is asked for more than it holds. This is the number that was
+/// posted, and so the number a trader is told.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SettledFees {
+    /// Charged to whoever took liquidity, signed the way the ledger is.
+    pub taker_cents: i64,
+    /// Paid to whoever provided it, signed the way the ledger is.
+    pub maker_cents: i64,
+}
+
+impl SettledFees {
+    /// This side's share of it.
+    pub fn on(self, liquidity: Liquidity) -> i64 {
+        match liquidity {
+            Liquidity::Taker => self.taker_cents,
+            Liquidity::Maker => self.maker_cents,
+        }
     }
 }
 
@@ -230,6 +267,7 @@ impl Trader {
     /// — the position less whatever earlier resting sells already promised.
     pub fn check(
         &self,
+        ledger: &Ledger,
         account: &Account,
         symbol: &str,
         side: Side,
@@ -237,9 +275,9 @@ impl Trader {
         cost_cents: i64,
     ) -> Result<(), Refused> {
         match side {
-            Side::Buy => account.authorise(cost_cents)?,
+            Side::Buy => account.authorise(ledger, cost_cents)?,
             Side::Sell => {
-                account.check_tradable()?;
+                account.check_tradable(ledger)?;
                 let available = self.free_shares(symbol);
                 if qty > available {
                     return Err(Refused::InsufficientShares {
@@ -256,7 +294,8 @@ impl Trader {
     /// the account for a buy, shares here for a sell.
     pub fn reserve(
         &mut self,
-        account: &mut Account,
+        ledger: &mut Ledger,
+        account: &Account,
         symbol: &'static str,
         side: Side,
         remaining: u64,
@@ -266,7 +305,7 @@ impl Trader {
             return;
         }
         match side {
-            Side::Buy => account.reserve(notional_cents(price_cents, remaining)),
+            Side::Buy => account.reserve(ledger, notional_cents(price_cents, remaining)),
             Side::Sell => {
                 let r = self.reserved_shares.entry(symbol).or_insert(0);
                 *r = r.saturating_add(remaining);
@@ -278,14 +317,15 @@ impl Trader {
     /// resting order, or a cancel).
     pub fn release(
         &mut self,
-        account: &mut Account,
+        ledger: &mut Ledger,
+        account: &Account,
         symbol: &str,
         side: Side,
         qty: u64,
         price_cents: i64,
     ) {
         match side {
-            Side::Buy => account.release(notional_cents(price_cents, qty)),
+            Side::Buy => account.release(ledger, notional_cents(price_cents, qty)),
             Side::Sell => {
                 if let Some(r) = self.reserved_shares.get_mut(symbol) {
                     *r = r.saturating_sub(qty);
@@ -297,15 +337,24 @@ impl Trader {
         }
     }
 
-    /// Book a trade this trader took part in: cash moves through `account`,
-    /// the position and the fill log are updated here. Returns the fill
-    /// records created (two for a self-trade).
+    /// Record a trade this trader took part in: the position, the reservation
+    /// its resting order held, and the rows in the account's history.
+    ///
+    /// The currency has already moved, and so has the reservation that was
+    /// holding it back — `tx_id` names the one balanced transaction that
+    /// moved it, which
+    /// [`Market::book`](crate::market::Market::book) posted for both sides
+    /// and the venue at once. What is left is each side's own view of it, and
+    /// that is what this writes. Returns the fill records created (two for a
+    /// self-trade).
     pub fn apply_trade(
         &mut self,
+        ledger: &mut Ledger,
         account: &mut Account,
         symbol: &'static str,
         trade: &Trade,
-        fees: Fees,
+        fees: SettledFees,
+        tx_id: u64,
     ) -> Vec<FillRecord> {
         let me = self.owner();
         let mut out = Vec::new();
@@ -313,6 +362,7 @@ impl Trader {
         let maker_is_trader = matches!(trade.maker.owner, Owner::Trader(_));
         if trade.taker.owner == me {
             let fee = self.book_fill(
+                ledger,
                 account,
                 symbol,
                 trade.taker_side,
@@ -320,6 +370,7 @@ impl Trader {
                 trade.taker.order,
                 fees,
                 Liquidity::Taker,
+                tx_id,
             );
             out.push(self.record(
                 symbol,
@@ -332,9 +383,12 @@ impl Trader {
             ));
         }
         if trade.maker.owner == me {
+            // The reservation behind this fill was released before the
+            // settlement was posted — see `Market::book` for why it has to
+            // be, and why it cannot be done here.
             let side = trade.taker_side.opposite();
-            self.release(account, symbol, side, trade.qty, trade.price_cents);
             let fee = self.book_fill(
+                ledger,
                 account,
                 symbol,
                 side,
@@ -342,6 +396,7 @@ impl Trader {
                 trade.maker.order,
                 fees,
                 Liquidity::Maker,
+                tx_id,
             );
             out.push(self.record(
                 symbol,
@@ -356,24 +411,45 @@ impl Trader {
         out
     }
 
-    /// Settle one side of a trade and charge the venue's fee on it, as two
-    /// ledger entries: the trade, then the fee. Returns the fee, signed the
-    /// way the ledger is.
+    /// Write one side of a settled trade into the account's history and the
+    /// trader's position: the trade, then the fee, as two rows of the one
+    /// transaction. Returns the fee, signed the way the ledger is.
     #[allow(clippy::too_many_arguments)]
     fn book_fill(
         &mut self,
+        ledger: &Ledger,
         account: &mut Account,
         symbol: &'static str,
         side: Side,
         trade: &Trade,
         order: OrderId,
-        fees: Fees,
+        fees: SettledFees,
         liquidity: Liquidity,
+        tx_id: u64,
     ) -> i64 {
         let value = notional_cents(trade.price_cents, trade.qty);
-        account.settle(side, value, symbol, order.0, trade.ts.0);
-        let fee = fees.on(liquidity, value);
-        account.charge_fee(fee, symbol, order.0, trade.ts.0);
+        let fee = fees.on(liquidity);
+        let (kind, signed) = match side {
+            Side::Buy => (LedgerKind::Buy, -value),
+            Side::Sell => (LedgerKind::Sell, value),
+        };
+        // The tape stays the price and the ledger stays the money: a fee is
+        // never folded into what the fill was worth. Both rows belong to the
+        // one transaction, so they are written together and the running
+        // balance is laid out across them.
+        let mut rows = vec![(kind, signed)];
+        if fee != 0 {
+            rows.push((LedgerKind::Fee, fee));
+        }
+        account.record_split(
+            ledger,
+            tx_id,
+            trade.ts.0,
+            Some(symbol),
+            Some(order.0),
+            None,
+            &rows,
+        );
         let pos = self.positions.entry(symbol).or_default();
         pos.apply(side, trade.qty, trade.price_cents);
         if pos.qty == 0 && pos.realised_pnl_cents == 0 && pos.cash_cents == 0 {
@@ -1057,31 +1133,111 @@ pub struct TraderSummary {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::account::{AccountId, settlement_draft};
+    use fehu::ledger::{Draft, Reason, WalletId, WalletKind};
+    use fehu::{Party, Timestamp};
 
-    /// The settlement path with the venue charging nothing, which is what
-    /// most of these check. Fees have their own tests over the HTTP surface.
+    const ME: TraderId = TraderId(1);
+
+    /// The ledger these tests settle in, and the wallets a fill needs
+    /// besides the trader's: the venue that takes the fee, and the stand-in
+    /// for liquidity nobody funded.
+    struct World {
+        ledger: Ledger,
+        venue: WalletId,
+        synthetic: WalletId,
+    }
+
+    /// A world, a trader, and the account it trades on, funded with
+    /// `cash_cents` out of treasury.
+    fn trader(cash_cents: i64) -> (World, Trader, Account) {
+        let mut ledger = Ledger::new();
+        let treasury = ledger.open(WalletKind::Treasury);
+        let venue = ledger.open(WalletKind::Venue);
+        let synthetic = ledger.open(WalletKind::Synthetic);
+        ledger
+            .mint(treasury, 1_000_000_000, Reason::Genesis)
+            .unwrap();
+        let wallet = ledger.open(WalletKind::Player);
+        let mut account = Account::open(AccountId(1), UserId(1), "main".into(), wallet, 100, 0);
+        if cash_cents > 0 {
+            let tx = ledger
+                .post(
+                    Draft::new(Reason::Faucet)
+                        .debit(treasury, cash_cents)
+                        .credit(wallet, cash_cents),
+                )
+                .unwrap();
+            account.record(
+                &ledger,
+                LedgerKind::Deposit,
+                tx.id,
+                cash_cents,
+                0,
+                None,
+                None,
+                None,
+            );
+        }
+        let world = World {
+            ledger,
+            venue,
+            synthetic,
+        };
+        (
+            world,
+            Trader::new(ME, UserId(1), AccountId(1), "p".into(), 10, 0),
+            account,
+        )
+    }
+
+    /// Settle a trade the way [`crate::market::Market::book`] does — one
+    /// balanced transaction for both sides and the venue — then record the
+    /// trader's view of it.
+    ///
+    /// The venue charges nothing here, which is what most of these check;
+    /// fees have their own tests over the HTTP surface.
     fn apply(
+        w: &mut World,
         trader: &mut Trader,
         account: &mut Account,
         symbol: &'static str,
         trade: &Trade,
     ) -> Vec<FillRecord> {
-        trader.apply_trade(account, symbol, trade, Fees::default())
-    }
-    use super::*;
-    use crate::account::AccountId;
-    use fehu::{Party, Timestamp};
-
-    const ME: TraderId = TraderId(1);
-
-    /// A trader and the account it trades on, funded with `cash_cents`.
-    fn trader(cash_cents: i64) -> (Trader, Account) {
-        let account = Account::open(AccountId(1), UserId(1), "main".into(), cash_cents, 100, 0)
-            .expect("valid opening balance");
-        (
-            Trader::new(ME, UserId(1), AccountId(1), "p".into(), 10, 0),
-            account,
-        )
+        let fees = SettledFees::default();
+        let wallet_of = |owner: Owner| match owner {
+            Owner::Trader(_) => account.wallet,
+            _ => w.synthetic,
+        };
+        // The maker's reservation goes back before the settlement is posted,
+        // exactly as `Market::book` does it: the cash a resting buy holds is
+        // the cash that pays for its own fill.
+        if trade.maker.owner == trader.owner() {
+            let side = trade.taker_side.opposite();
+            trader.release(
+                &mut w.ledger,
+                account,
+                symbol,
+                side,
+                trade.qty,
+                trade.price_cents,
+            );
+        }
+        let value = notional_cents(trade.price_cents, trade.qty);
+        let tx = w
+            .ledger
+            .post(settlement_draft(
+                wallet_of(trade.taker.owner),
+                wallet_of(trade.maker.owner),
+                w.venue,
+                trade.taker_side,
+                value,
+                0,
+                trade.ts.0,
+            ))
+            .expect("the fixture funds every fill it books");
+        trader.apply_trade(&mut w.ledger, account, symbol, trade, fees, tx.id)
     }
 
     fn trade(taker: Owner, maker: Owner, side: Side, qty: u64, price: i64) -> Trade {
@@ -1103,15 +1259,20 @@ mod tests {
 
     #[test]
     fn reservations_and_fills() {
-        let (mut t, mut a) = trader(100_000);
-        assert!(t.check(&a, "ACME", Side::Buy, 10, 100_001).is_err());
-        assert!(t.check(&a, "ACME", Side::Sell, 1, 0).is_err());
-        t.check(&a, "ACME", Side::Buy, 10, 50_000).unwrap();
+        let (mut w, mut t, mut a) = trader(100_000);
+        assert!(
+            t.check(&w.ledger, &a, "ACME", Side::Buy, 10, 100_001)
+                .is_err()
+        );
+        assert!(t.check(&w.ledger, &a, "ACME", Side::Sell, 1, 0).is_err());
+        t.check(&w.ledger, &a, "ACME", Side::Buy, 10, 50_000)
+            .unwrap();
         // Rest a buy of 10 @ 5000.
-        t.reserve(&mut a, "ACME", Side::Buy, 10, 5_000);
-        assert_eq!(a.available_cents(), 50_000);
+        t.reserve(&mut w.ledger, &a, "ACME", Side::Buy, 10, 5_000);
+        assert_eq!(a.available_cents(&w.ledger), 50_000);
         // Half of it fills as maker.
         let fills = apply(
+            &mut w,
             &mut t,
             &mut a,
             "ACME",
@@ -1120,49 +1281,56 @@ mod tests {
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].liquidity, Liquidity::Maker);
         assert_eq!(fills[0].side, Side::Buy);
-        assert_eq!(a.balance_cents(), 75_000);
-        assert_eq!(a.reserved_cents(), 25_000);
-        assert_eq!(a.available_cents(), 50_000);
+        assert_eq!(a.balance_cents(&w.ledger), 75_000);
+        assert_eq!(a.reserved_cents(&w.ledger), 25_000);
+        assert_eq!(a.available_cents(&w.ledger), 50_000);
         assert_eq!(t.positions["ACME"].qty, 5);
         // Cancel the rest.
-        t.release(&mut a, "ACME", Side::Buy, 5, 5_000);
-        assert_eq!(a.reserved_cents(), 0);
+        t.release(&mut w.ledger, &a, "ACME", Side::Buy, 5, 5_000);
+        assert_eq!(a.reserved_cents(&w.ledger), 0);
         // Sell 3 as taker at 6000.
-        assert!(t.check(&a, "ACME", Side::Sell, 6, 0).is_err());
-        t.check(&a, "ACME", Side::Sell, 3, 0).unwrap();
+        assert!(t.check(&w.ledger, &a, "ACME", Side::Sell, 6, 0).is_err());
+        t.check(&w.ledger, &a, "ACME", Side::Sell, 3, 0).unwrap();
         let fills = apply(
+            &mut w,
             &mut t,
             &mut a,
             "ACME",
             &trade(Owner::Trader(ME), Owner::Synthetic, Side::Sell, 3, 6_000),
         );
         assert_eq!(fills[0].liquidity, Liquidity::Taker);
-        assert_eq!(a.balance_cents(), 93_000);
+        assert_eq!(a.balance_cents(&w.ledger), 93_000);
         assert_eq!(t.positions["ACME"].qty, 2);
         assert_eq!(t.positions["ACME"].realised_pnl_cents, 3_000);
         // A self-trade books both sides and nets to nothing.
-        t.reserve(&mut a, "ACME", Side::Sell, 2, 7_000);
+        t.reserve(&mut w.ledger, &a, "ACME", Side::Sell, 2, 7_000);
         assert_eq!(t.free_shares("ACME"), 0);
         let fills = apply(
+            &mut w,
             &mut t,
             &mut a,
             "ACME",
             &trade(Owner::Trader(ME), Owner::Trader(ME), Side::Buy, 2, 7_000),
         );
         assert_eq!(fills.len(), 2);
-        assert_eq!(a.balance_cents(), 93_000);
+        assert_eq!(a.balance_cents(&w.ledger), 93_000);
         assert_eq!(t.positions["ACME"].qty, 2);
         assert_eq!(t.free_shares("ACME"), 2);
         // Every movement is on the ledger, and the account stays valid.
-        assert!(a.is_valid());
-        assert_eq!(a.ledger(100).len(), 5, "open + four settlements");
+        assert!(a.is_valid(&w.ledger));
+        assert_eq!(
+            a.ledger(100).len(),
+            6,
+            "open, the faucet that funded it, and four settlements"
+        );
     }
 
     #[test]
     fn a_sell_can_never_exceed_what_is_held() {
-        let (mut t, mut a) = trader(1_000_000);
+        let (mut w, mut t, mut a) = trader(1_000_000);
         // Buy 100 as taker.
         apply(
+            &mut w,
             &mut t,
             &mut a,
             "ACME",
@@ -1170,38 +1338,40 @@ mod tests {
         );
         assert_eq!(t.held_shares("ACME"), 100);
         assert_eq!(t.free_shares("ACME"), 100);
-        assert!(t.check(&a, "ACME", Side::Sell, 101, 0).is_err());
-        t.check(&a, "ACME", Side::Sell, 100, 0).unwrap();
+        assert!(t.check(&w.ledger, &a, "ACME", Side::Sell, 101, 0).is_err());
+        t.check(&w.ledger, &a, "ACME", Side::Sell, 100, 0).unwrap();
         // 60 of them rest in a sell, so only 40 are still sellable.
-        t.reserve(&mut a, "ACME", Side::Sell, 60, 6_000);
+        t.reserve(&mut w.ledger, &a, "ACME", Side::Sell, 60, 6_000);
         assert_eq!(t.held_shares("ACME"), 100, "reserving sells nothing");
         assert_eq!(t.free_shares("ACME"), 40);
         assert_eq!(
-            t.check(&a, "ACME", Side::Sell, 41, 0).unwrap_err(),
+            t.check(&w.ledger, &a, "ACME", Side::Sell, 41, 0)
+                .unwrap_err(),
             Refused::InsufficientShares {
                 needed: 41,
                 available: 40,
             }
         );
-        t.check(&a, "ACME", Side::Sell, 40, 0).unwrap();
+        t.check(&w.ledger, &a, "ACME", Side::Sell, 40, 0).unwrap();
         // Another symbol is a separate pot, empty here.
         assert_eq!(t.free_shares("NBLA"), 0);
-        assert!(t.check(&a, "NBLA", Side::Sell, 1, 0).is_err());
+        assert!(t.check(&w.ledger, &a, "NBLA", Side::Sell, 1, 0).is_err());
     }
 
     #[test]
     fn holdings_add_up_across_traders() {
-        let (mut one, mut a) = trader(1_000_000);
+        let (mut w, mut one, mut a) = trader(1_000_000);
         let mut two = Trader::new(TraderId(2), UserId(1), AccountId(1), "two".into(), 10, 0);
         for t in [&mut one, &mut two] {
             apply(
+                &mut w,
                 t,
                 &mut a,
                 "ACME",
                 &trade(Owner::Trader(t.id), Owner::Synthetic, Side::Buy, 50, 4_000),
             );
         }
-        two.reserve(&mut a, "ACME", Side::Sell, 20, 5_000);
+        two.reserve(&mut w.ledger, &a, "ACME", Side::Sell, 20, 5_000);
 
         let mut h = HoldingDto::empty("ACME");
         h.add(&one);
@@ -1232,15 +1402,16 @@ mod tests {
 
     #[test]
     fn a_frozen_account_cannot_trade_at_all() {
-        let (t, mut a) = trader(100_000);
-        a.set_status(AccountStatus::Frozen).unwrap();
+        let (w, t, a) = trader(100_000);
+        let mut w = w;
+        w.ledger.freeze(a.wallet).unwrap();
         assert!(matches!(
-            t.check(&a, "ACME", Side::Buy, 1, 1).unwrap_err(),
-            Refused::Account(MoneyError::Status { .. })
+            t.check(&w.ledger, &a, "ACME", Side::Buy, 1, 1).unwrap_err(),
+            Refused::Account(e) if e.is_forbidden()
         ));
         assert!(matches!(
-            t.check(&a, "ACME", Side::Sell, 1, 0).unwrap_err(),
-            Refused::Account(MoneyError::Status { .. })
+            t.check(&w.ledger, &a, "ACME", Side::Sell, 1, 0).unwrap_err(),
+            Refused::Account(e) if e.is_forbidden()
         ));
     }
 }

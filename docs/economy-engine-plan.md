@@ -373,8 +373,8 @@ and to be replaced by measurement after the first two.
 
 | # | Scope | Done when | Size |
 |---|---|---|---|
-| 0 | Baseline: run `just ci`, record the results here | Green | hours |
-| 1 | `src/ledger.rs` with property tests on the `no_std` path; `account.rs` rewired to it; funding routes made operator-only; fees to venue; payouts funded; freeze split from close; save version 6 | Contract tests show no player route changes supply; reconcile reports zero drift after the existing API tests | days |
+| 0 | ✅ Baseline: run `just ci`, record the results here | Green | hours |
+| 1 | ✅ `src/ledger.rs` with property tests on the `no_std` path; `account.rs` rewired to it; funding routes made operator-only; fees to venue; payouts funded; freeze split from close; save version 6 | Contract tests show no player route changes supply; reconcile reports zero drift after the existing API tests | days |
 | 2 | `webapp/src/journal.rs`; every mutation journaled inside its market job; `Idempotency-Key`; replay on start; engine tick journaled with its wall input; `GET /commands/{key}` | Kill the process at random points under the concurrency test; restart reproduces the last acknowledged state and no duplicate reward | week |
 | 3 | `AssetKind`; goods in holdings; NPC wallets and policies; synthetic ladder and prints disabled on the server; catalogue, purchase and consume routes | Player-to-player and player-to-NPC fills, partial fills, IOC/FOK, amendments, stops, dividends and delistings conserve currency and units | weeks |
 | 4 | Recipes and jobs; rewards from budgets; game events with production and demand effects; `/api/v1/economy` routes and `types.ts`; UI panels for wallet, inventory and jobs; `just ui` | The acceptance scenario below passes, including retries and restarts at every step | weeks |
@@ -383,6 +383,82 @@ and to be replaced by measurement after the first two.
 Milestone 1 alone is a correct custodial token: conserved supply, operator
 mint and burn, transfers and audited history. Milestone 2 makes it safe to
 rely on. Milestones 3 and 4 make it an economy.
+
+### Milestones 0 and 1 as built
+
+Both are done. What was built follows the plan above; four things are worth
+recording because they are decisions the plan left open or got slightly
+wrong, and the code is now the reference for them.
+
+**The baseline was not green.** `cargo clippy -p fehu-webapp --all-targets
+-- -D warnings` failed on `main`: the engine step in
+`reconciliation_checks_a_busy_market_and_detects_broken_reservations` was
+never awaited, so that test asserted against a market that had not moved.
+Fixed as part of milestone 0. The library and webapp test suites did pass.
+
+**Opening an account is a faucet, not a mint.** The plan says the opening
+balance becomes zero and `cash_cents` is removed. It is instead paid out of
+treasury against a genesis supply — a transfer, so the supply is untouched,
+which is the property the milestone is actually judged on and the stronger
+of the two. It keeps the demo playable and the existing suites meaningful,
+and it is the "operator faucet" the decisions section already assumes. A
+treasury that cannot cover a request refuses it rather than printing the
+difference.
+
+**Unfunded liquidity is measured rather than removed.** Milestone 3 turns
+off the synthetic ladder; until then, a fill against it has to settle
+against *something* or the transaction cannot balance. It settles against a
+`Synthetic` wallet, started with a float out of genesis and allowed to go
+negative past it. Its debt is carried inside the conservation sum and
+reported by `/api/reconcile` and `/api/supply`, so currency that unfunded
+liquidity puts into players' hands is visible instead of quietly minted.
+Retiring that debt is exactly what milestone 3 does; it should reach zero
+there.
+
+**Reservations are amounts, not handles.** The ledger sketch has
+`hold`/`release(HoldId)`. What is implemented is amount-based
+`reserve`/`release`, which is what the order path actually does and what
+satisfies every invariant listed above. Handles that name *what* a
+reservation is for belong with jobs and NPC inventory, and should arrive
+with them in milestones 3 and 4.
+
+Two bugs in the plan's own model, found by the property tests and fixed in
+the ledger: `burned <= minted` is not an invariant while unfunded liquidity
+is in debt (that debt is the slack), and a wallet allowed to hold a negative
+balance must not be allowed to hold a reservation, or it can be drained
+straight through one.
+
+And one the plan does not mention at all, which conserved currency turns
+from a leak into a hole: **a maker rebate has to come from somewhere.** With
+`FEHU_MAKER_FEE_BPS` set and no taker fee to fund it — or with a taker that
+has no wallet to charge, which every fill against synthetic liquidity is —
+the venue is asked to pay currency it has never collected. Before the
+ledger that money simply appeared. With it, the settlement was refused
+*after* the book had traded: the shares moved and nothing was booked, an
+empty fill log against an order the book had already worked down. A rebate
+is now capped at what the venue holds plus what it collects on that same
+fill, and what it cannot pay it does not pay. That is what `SettledFees`
+is: what the venue actually charged, as opposed to what its schedule says
+it would.
+
+That fix exposed a second of the same shape, and a far more ordinary one:
+**a resting buy's reservation was still held when its own fill was
+posted.** The reserved cash *is* the cash that pays for the fill, so a
+trader who had committed most of their balance to an order looked
+insolvent at the moment it filled, and the settlement was refused — again
+after the book had traded. A bid for 1212 shares worked down to 791
+remaining with an empty fill log, no position and an untouched balance.
+The reservation is now released before the settlement is posted rather
+than after it.
+
+Both were invisible before the ledger, because settlement could not fail:
+the account was simply credited or debited whatever it held. Being unable
+to fail quietly is most of what a balanced transaction is for. The general
+lesson for milestones 2 and 3: settlement runs *after* the book has
+traded and cannot be unwound, so everything it needs must be true before
+it is called. `Market::settle_trade` counts and logs a refusal it cannot
+prevent, and `/api/reconcile` reports the drift, but that is a smoke alarm
+rather than a design.
 
 ## Acceptance scenario
 
@@ -422,3 +498,31 @@ cargo test -p fehu-webapp      # webapp: all suites pass, 0 failed
 
 `just lint`, the `no_std` path and the wasm build were not run for this
 documentation-only change; milestone 0 runs `just ci` in full.
+
+### After milestone 1
+
+`just` is not installed in the environment this was built in, so the `ci`
+recipe was run command by command. All of it passes:
+
+```
+cargo fmt --all -- --check                                  # clean
+cargo clippy --all-targets --all-features -- -D warnings    # clean
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo clippy -p fehu-webapp --all-targets -- -D warnings    # clean (was red)
+cargo build --all-features / --no-default-features / +serde # clean
+cargo test --all-features                                   # 102 passed, 0 failed
+cargo test --no-default-features --tests                    #  95 passed, 0 failed
+cargo test -p fehu-webapp                                   # 136 passed, 0 failed
+cargo build --release --target wasm32-unknown-unknown …     # clean, both feature sets
+cd webapp/ui && npm ci && npm run build                     # bundle unchanged
+```
+
+The determinism goldens in `tests/determinism.rs` and the exchange
+invariants in `tests/trading.rs` are untouched and still pass: the ledger
+draws no randomness and the price process never sees it, so neither
+`STATE_VERSION` nor `EXCHANGE_VERSION` moves.
+
+New suites: `tests/ledger.rs` (property tests, on both the `std` and
+`no_std` paths) and `webapp/tests/economy.rs` (conservation across
+sign-ups, fills, fees, dividends, delistings, freezes and restarts, and
+that only an operator can mint or burn).
