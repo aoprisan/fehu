@@ -230,7 +230,9 @@ mod tests {
         let (first, second, account) = app
             .market
             .call(|m| {
-                let first = m.sign_up(None, None, 10000, 0).unwrap();
+                let first = m
+                    .sign_up(None, None, 10000, 0, "sha256:test".into())
+                    .unwrap();
                 let account = m.traders[&first].account_id;
                 let user = m.traders[&first].user_id;
                 let second = m.create_trader(user, account, None, 0);
@@ -280,7 +282,9 @@ mod tests {
         let (trader, account) = app
             .market
             .call(|m| {
-                let trader = m.sign_up(None, None, 10000, 0).unwrap();
+                let trader = m
+                    .sign_up(None, None, 10000, 0, "sha256:test".into())
+                    .unwrap();
                 (trader, m.traders[&trader].account_id)
             })
             .await

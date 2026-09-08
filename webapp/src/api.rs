@@ -14,7 +14,7 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use fehu::{Candle, Config, Interval, Order, Owner, TraderId};
+use fehu::{Candle, Config, Interval, Owner, TraderId};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
@@ -28,20 +28,18 @@ use crate::account::{
 use fehu::ledger::LedgerError;
 
 use crate::actor::Gone;
-use crate::events::{
-    CatalogEntry, EventRecord, GameEventKind, GameEventRequest, MAX_MAGNITUDE, Prepared,
-    PushEventRequest, Scope, SimEvent,
-};
+use crate::events::{CatalogEntry, EventRecord, GameEventKind, GameEventRequest, PushEventRequest};
+use crate::journal::{Command, Listing, Outcome, Principal, seed_from_ticker};
 use crate::limit::Decision;
 use crate::market::{
-    Amendment, App, Closed, DelistError, Delisting, Market, OrderCheck, PayoutError, PlaceError,
-    PlaceRequest, Placed, Quote, Sequenced, SnapshotDto, StreamMessage, Subscription, SupplyDto,
-    Symbol, SymbolInfo, SymbolSpec, SymbolStatus, SymbolView, wall_now_ms,
+    App, Closed, Market, OrderCheck, PayoutError, PlaceError, Quote, Sequenced, SnapshotDto,
+    StreamMessage, Subscription, SupplyDto, Symbol, SymbolInfo, SymbolStatus, SymbolView,
+    wall_now_ms,
 };
 use crate::trading::{
-    AmendRequest, AmendResponse, BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID,
-    OpenOrderDto, OrderRecord, OrderRequest, OrderResponse, PortfolioDto, PositionDto, Refused,
-    StopOrder, StopRequest, TradeDto, TraderSummary, UserHoldingsResponse,
+    AmendRequest, BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID, OpenOrderDto,
+    OrderRecord, OrderRequest, PortfolioDto, PositionDto, Refused, StopOrder, StopRequest,
+    TradeDto, TraderSummary, UserHoldingsResponse,
 };
 
 type AppState = Arc<App>;
@@ -112,6 +110,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/accounts/{account_id}/validate", get(validate_account))
         .route("/api/accounts/{account_id}/ledger", get(get_ledger))
         .route("/api/supply", get(supply))
+        .route("/api/commands/{key}", get(get_command))
         .route("/api/game/catalog", get(catalog))
         .route("/api/game/events", get(list_events).post(push_game_event))
         .route("/api/events", get(list_events))
@@ -176,7 +175,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
             code,
@@ -186,7 +185,7 @@ impl ApiError {
     }
 
     /// The client is changing things faster than the server will take.
-    fn rate_limited(retry_after: std::time::Duration) -> Self {
+    pub(crate) fn rate_limited(retry_after: std::time::Duration) -> Self {
         // Never advise waiting zero seconds: a client that obeys it would
         // spin. The bucket refills continuously, so a second is honest.
         let secs = retry_after.as_secs_f64().ceil().max(1.0) as u64;
@@ -203,7 +202,7 @@ impl ApiError {
         }
     }
 
-    fn not_found(symbol: &str) -> Self {
+    pub(crate) fn not_found(symbol: &str) -> Self {
         Self::new(
             StatusCode::NOT_FOUND,
             "unknown_symbol",
@@ -211,25 +210,25 @@ impl ApiError {
         )
     }
 
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message)
     }
 
     /// The request is well formed but the market is not in a state to take
     /// it: a ticker already listed, a market with no room for another.
-    fn conflict(message: impl Into<String>) -> Self {
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "conflict", message)
     }
 
-    fn invalid_event(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_event(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_event", message)
     }
 
-    fn bad_json(rej: JsonRejection) -> Self {
+    pub(crate) fn bad_json(rej: JsonRejection) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_json", rej.body_text())
     }
 
-    fn unknown_trader(id: u64) -> Self {
+    pub(crate) fn unknown_trader(id: u64) -> Self {
         Self::new(
             StatusCode::NOT_FOUND,
             "unknown_trader",
@@ -237,7 +236,7 @@ impl ApiError {
         )
     }
 
-    fn unknown_order(id: u64) -> Self {
+    pub(crate) fn unknown_order(id: u64) -> Self {
         Self::new(
             StatusCode::NOT_FOUND,
             "unknown_order",
@@ -245,7 +244,7 @@ impl ApiError {
         )
     }
 
-    fn unknown_stop(id: u64) -> Self {
+    pub(crate) fn unknown_stop(id: u64) -> Self {
         Self::new(
             StatusCode::NOT_FOUND,
             "unknown_stop",
@@ -253,12 +252,12 @@ impl ApiError {
         )
     }
 
-    fn invalid_order(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_order(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_order", message)
     }
 
     /// The order would have traded with the trader's own resting order.
-    fn self_trade(crossing: &[u64]) -> Self {
+    pub(crate) fn self_trade(crossing: &[u64]) -> Self {
         Self::new(
             StatusCode::CONFLICT,
             "self_trade",
@@ -270,7 +269,7 @@ impl ApiError {
     }
 
     /// A post-only order that would have taken liquidity instead of adding it.
-    fn would_cross(price_cents: i64, best_cents: i64) -> Self {
+    pub(crate) fn would_cross(price_cents: i64, best_cents: i64) -> Self {
         Self::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "post_only_would_cross",
@@ -282,7 +281,7 @@ impl ApiError {
     }
 
     /// The `client_order_id` was used before, for a different order.
-    fn duplicate_client_order_id(client_order_id: &str, order_id: u64) -> Self {
+    pub(crate) fn duplicate_client_order_id(client_order_id: &str, order_id: u64) -> Self {
         Self::new(
             StatusCode::CONFLICT,
             "duplicate_client_order_id",
@@ -295,7 +294,7 @@ impl ApiError {
 
     /// A submission the market would not place. `symbol` is the ticker it
     /// was sent to, for the messages that name it.
-    fn place(symbol: &str, e: PlaceError) -> Self {
+    pub(crate) fn place(symbol: &str, e: PlaceError) -> Self {
         match e {
             PlaceError::UnknownSymbol => Self::not_found(symbol),
             PlaceError::Check(OrderCheck::Invalid(message)) | PlaceError::Invalid(message) => {
@@ -319,7 +318,7 @@ impl ApiError {
     }
 
     /// An order the trader's account would not fund.
-    fn refused(e: Refused) -> Self {
+    pub(crate) fn refused(e: Refused) -> Self {
         match e {
             Refused::Account(m) if m.is_forbidden() => {
                 Self::new(StatusCode::CONFLICT, "account_not_active", e.to_string())
@@ -333,7 +332,7 @@ impl ApiError {
     }
 
     /// No API key on a request that needs one.
-    fn unauthenticated() -> Self {
+    pub(crate) fn unauthenticated() -> Self {
         Self::new(
             StatusCode::UNAUTHORIZED,
             "unauthenticated",
@@ -343,7 +342,7 @@ impl ApiError {
     }
 
     /// A key that is not one the server issued.
-    fn invalid_api_key() -> Self {
+    pub(crate) fn invalid_api_key() -> Self {
         Self::new(
             StatusCode::UNAUTHORIZED,
             "invalid_api_key",
@@ -352,12 +351,12 @@ impl ApiError {
     }
 
     /// A valid key, but for somebody else's property.
-    fn forbidden(what: impl Into<String>) -> Self {
+    pub(crate) fn forbidden(what: impl Into<String>) -> Self {
         Self::new(StatusCode::FORBIDDEN, "forbidden", what)
     }
 
     /// The market will not take an order for this symbol right now.
-    fn closed(symbol: &str, closed: Closed) -> Self {
+    pub(crate) fn closed(symbol: &str, closed: Closed) -> Self {
         let code = match closed {
             Closed::Session { .. } => "market_closed",
             Closed::Halted(_) => "symbol_halted",
@@ -369,7 +368,7 @@ impl ApiError {
         )
     }
 
-    fn unknown_user(id: u64) -> Self {
+    pub(crate) fn unknown_user(id: u64) -> Self {
         Self::new(
             StatusCode::NOT_FOUND,
             "unknown_user",
@@ -377,7 +376,7 @@ impl ApiError {
         )
     }
 
-    fn unknown_account(id: u64) -> Self {
+    pub(crate) fn unknown_account(id: u64) -> Self {
         Self::new(
             StatusCode::NOT_FOUND,
             "unknown_account",
@@ -387,7 +386,7 @@ impl ApiError {
 
     /// A refused money movement: the amount, the balance or the account's
     /// status made it impossible.
-    fn money(e: MoneyError) -> Self {
+    pub(crate) fn money(e: MoneyError) -> Self {
         let (status, code) = match e {
             MoneyError::NotPositive { .. } | MoneyError::TooLarge { .. } => {
                 (StatusCode::BAD_REQUEST, "invalid_amount")
@@ -409,8 +408,63 @@ impl ApiError {
         Self::new(status, code, e.to_string())
     }
 
+    /// The server could not do its own job. Never the client's fault, and
+    /// never something they can fix by changing the request.
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
+    }
+
+    /// A corporate payout the issuer could not fund.
+    pub(crate) fn payout_not_funded(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "payout_not_funded", message)
+    }
+
+    /// A cancellation the book would not take.
+    pub(crate) fn cancel(order_id: u64, e: fehu::CancelError) -> Self {
+        match e {
+            fehu::CancelError::Unknown => Self::unknown_order(order_id),
+            fehu::CancelError::NotOwner => {
+                Self::new(StatusCode::FORBIDDEN, "not_owner", e.to_string())
+            }
+            _ => Self::bad_request(e.to_string()),
+        }
+    }
+
+    /// The same `Idempotency-Key` over a different request. Answering it
+    /// with the first request's result would be answering a question that
+    /// was not asked, and applying it would make the key meaningless.
+    pub(crate) fn idempotency_conflict(key: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "idempotency_conflict",
+            format!(
+                "Idempotency-Key {key:?} was used for a different request. \
+                 Use a new key, or resend the original request unchanged"
+            ),
+        )
+    }
+
+    /// The journal stopped taking entries, so the market in memory is ahead
+    /// of the disk. Nothing further may change until the process restarts
+    /// and replays what did reach it.
+    pub(crate) fn journal_broken(why: &str) -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "journal_unavailable",
+            format!(
+                "this server is not writing its journal ({why}), so it will not \
+                 accept changes it cannot promise to keep"
+            ),
+        )
+    }
+
+    /// The message a client would be given, for a log line.
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
     /// A corporate payout the issuer could not fund. Nothing was paid.
-    fn payout(e: PayoutError) -> Self {
+    pub(crate) fn payout(e: PayoutError) -> Self {
         match e {
             PayoutError::Gone => Self::from(Gone),
             PayoutError::Unfunded(_) => {
@@ -545,6 +599,136 @@ impl OptionalFromRequestParts<AppState> for Admin {
     }
 }
 
+/// The longest `Idempotency-Key` this server will remember.
+const MAX_IDEMPOTENCY_KEY: usize = 128;
+
+/// The `Idempotency-Key` header on a mutating request, if it carries one.
+///
+/// A key makes a retry free: the first request is applied and its response
+/// recorded, and every later request with the same key and the same body is
+/// answered with that response instead of doing the work twice. The same key
+/// over a *different* body is a mistake on the client's part and is refused.
+///
+/// It is optional. Without one a retry is simply a second request — which
+/// for an order is still covered by `client_order_id`, and for a deposit is
+/// a second deposit. That is why anything that moves money should send one.
+#[derive(Clone, Debug)]
+pub struct Idempotency(pub Option<String>);
+
+impl FromRequestParts<AppState> for Idempotency {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _: &AppState) -> Result<Self, ApiError> {
+        let Some(value) = parts.headers.get("idempotency-key") else {
+            return Ok(Self(None));
+        };
+        let key = value
+            .to_str()
+            .map_err(|_| ApiError::bad_request("`Idempotency-Key` must be printable ASCII"))?
+            .trim();
+        if key.is_empty() {
+            return Ok(Self(None));
+        }
+        if key.chars().count() > MAX_IDEMPOTENCY_KEY {
+            return Err(ApiError::bad_request(format!(
+                "`Idempotency-Key` is longer than {MAX_IDEMPOTENCY_KEY} characters"
+            )));
+        }
+        Ok(Self(Some(key.to_owned())))
+    }
+}
+
+impl From<Caller> for Principal {
+    fn from(caller: Caller) -> Self {
+        Self::User { id: caller.0.0 }
+    }
+}
+
+/// A command that was applied and written down, on its way back to the
+/// client.
+///
+/// The body is whatever the command produced; the headers say where it
+/// landed in the journal (`Fehu-Journal-Seq`) and whether this request did
+/// the work or was answered from an earlier one (`Fehu-Idempotent-Replay`).
+pub struct Committed(Outcome);
+
+impl IntoResponse for Committed {
+    fn into_response(self) -> Response {
+        let status = StatusCode::from_u16(self.0.status).unwrap_or(StatusCode::OK);
+        let mut response = (status, Json(self.0.body)).into_response();
+        let headers = response.headers_mut();
+        if let Ok(seq) = self.0.seq.to_string().parse() {
+            headers.insert("fehu-journal-seq", seq);
+        }
+        if self.0.replayed {
+            headers.insert(
+                "fehu-idempotent-replay",
+                header::HeaderValue::from_static("true"),
+            );
+        }
+        response
+    }
+}
+
+/// Put the key just generated into the response that created its user.
+///
+/// The credential is added here rather than by the command, so that neither
+/// the journal nor the idempotency index ever holds one. The cost is
+/// deliberate: a *replayed* sign-up comes back without a key, because the
+/// only copy went out with the first response. A client that loses that
+/// response has to create another user.
+fn with_key(mut out: Outcome, api_key: String) -> Committed {
+    if !out.replayed
+        && let Some(map) = out.body.as_object_mut()
+    {
+        map.insert("api_key".into(), serde_json::Value::String(api_key));
+    }
+    Committed(out)
+}
+
+/// Send a command to the market: apply it, journal it, and answer with what
+/// it did — or with what it did the first time, if this is a retry.
+///
+/// Every mutation in this module goes through here. The simulated instant is
+/// read once, here, and travels with the command, so the market applies it
+/// at the moment the request arrived whether that happens now or on the next
+/// start-up.
+async fn run(
+    app: &App,
+    principal: Principal,
+    key: Option<String>,
+    command: Command,
+) -> Result<Outcome, ApiError> {
+    run_at(app, principal, key, app.clock.now(), command).await
+}
+
+/// [`run`], for a command whose caller chose the simulated instant: a game
+/// event scheduled for a moment other than now.
+async fn run_at(
+    app: &App,
+    principal: Principal,
+    key: Option<String>,
+    at: fehu::Timestamp,
+    command: Command,
+) -> Result<Outcome, ApiError> {
+    let kind = command.kind();
+    let wall_ms = wall_now_ms();
+    let outcome = app
+        .market
+        .call_async(move |m| {
+            Box::pin(async move { m.run_command(principal, key, at, wall_ms, command).await })
+        })
+        .await??;
+    tracing::info!(
+        command = kind,
+        seq = outcome.seq,
+        status = outcome.status,
+        replayed = outcome.replayed,
+        "command"
+    );
+    Ok(outcome)
+}
+
 /// Compare two secrets without giving their common prefix away in the time
 /// taken.
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -558,7 +742,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 /// The caller owns `trader`. Answered from the published directory, before
 /// anything is sent anywhere: a request for somebody else's trader is turned
 /// away without waiting on the market.
-fn owned_trader(app: &App, caller: Caller, trader: TraderId) -> Result<(), ApiError> {
+pub(crate) fn owned_trader(app: &App, caller: Caller, trader: TraderId) -> Result<(), ApiError> {
     let owner = app
         .owner_of(trader)
         .ok_or_else(|| ApiError::unknown_trader(trader.0))?;
@@ -573,7 +757,11 @@ fn owned_trader(app: &App, caller: Caller, trader: TraderId) -> Result<(), ApiEr
 }
 
 /// The caller owns `account`.
-fn owned_account(market: &Market, caller: Caller, account: AccountId) -> Result<(), ApiError> {
+pub(crate) fn owned_account(
+    market: &Market,
+    caller: Caller,
+    account: AccountId,
+) -> Result<(), ApiError> {
     let held = market
         .accounts
         .get(&account)
@@ -589,7 +777,7 @@ fn owned_account(market: &Market, caller: Caller, account: AccountId) -> Result<
 }
 
 /// The caller is `user` themselves.
-fn owned_user(caller: Caller, user: UserId) -> Result<(), ApiError> {
+pub(crate) fn owned_user(caller: Caller, user: UserId) -> Result<(), ApiError> {
     if caller.0 == user {
         Ok(())
     } else {
@@ -863,13 +1051,6 @@ struct ListingRequest {
     source: Option<String>,
 }
 
-/// A new listing, and the event it was recorded as.
-#[derive(Serialize)]
-struct ListingResponse {
-    quote: Quote,
-    event: EventRecord,
-}
-
 /// List a symbol: from this call on it is quoted, it ticks, and orders in it
 /// are accepted like any other.
 ///
@@ -880,81 +1061,41 @@ struct ListingResponse {
 async fn list_symbol(
     State(app): State<AppState>,
     _admin: Admin,
+    Idempotency(key): Idempotency,
     payload: Result<Json<ListingRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<ListingResponse>), ApiError> {
+) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
     let symbol =
         crate::symbols::register(&req.symbol).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    if req.shares_outstanding == 0 {
-        return Err(ApiError::bad_request(
-            "a listing needs shares: shares_outstanding must be positive",
-        ));
-    }
-    let now = app.clock.now();
     // Cheap answer first: warming a year of history up only to find the
     // ticker taken would be a waste of the caller's time and this server's.
     if app.symbol(symbol).is_some() {
         return Err(ApiError::conflict(format!("{symbol} is already listed")));
     }
-    let info = SymbolInfo {
-        symbol,
-        name: clean_text(req.name, 64).unwrap_or_else(|| symbol.to_string()),
-        sector: clean_text(req.sector, 64).unwrap_or_else(|| "Uncategorised".into()),
-        description: clean_text(req.description, 280).unwrap_or_default(),
-        shares_outstanding: req.shares_outstanding,
-        seed: req.seed.unwrap_or_else(|| seed_from_ticker(symbol)),
-    };
-    let spec = SymbolSpec {
-        info,
-        config: Config {
-            start_price_cents: req.start_price_cents,
-            drift: req.drift.unwrap_or(Config::default().drift),
-            volatility: req.volatility.unwrap_or(Config::default().volatility),
-            ..Config::default()
+    let defaults = Config::default();
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::ListSymbol {
+            listing: Listing {
+                symbol: symbol.to_string(),
+                name: clean_text(req.name, 64).unwrap_or_else(|| symbol.to_string()),
+                sector: clean_text(req.sector, 64).unwrap_or_else(|| "Uncategorised".into()),
+                description: clean_text(req.description, 280).unwrap_or_default(),
+                shares_outstanding: req.shares_outstanding,
+                seed: req.seed.unwrap_or_else(|| seed_from_ticker(symbol)),
+                start_price_cents: req.start_price_cents,
+                drift: req.drift.unwrap_or(defaults.drift),
+                volatility: req.volatility.unwrap_or(defaults.volatility),
+                history_days: req.history_days.unwrap_or(0),
+                source: req.source.unwrap_or_else(|| "api".into()),
+                note: req.note,
+            },
         },
-        trading: fehu::TradingParams::default(),
-    };
-    let state = app
-        .prepare_listing(spec, req.history_days.unwrap_or(0), now)
-        .map_err(|e| ApiError::invalid_event(e.to_string()))?;
-    let (source, note) = (req.source.unwrap_or_else(|| "api".into()), req.note);
-    let (quote, record) = app
-        .market
-        .call(move |m| {
-            let quote = m
-                .list(state)
-                .map_err(|e| ApiError::conflict(e.to_string()))?;
-            let record = m.record(EventRecord {
-                id: 0,
-                received_at_ms: wall_now_ms(),
-                at_ms: now.0,
-                symbols: vec![symbol],
-                kind: "corporate:listing".into(),
-                source,
-                note,
-                magnitude: None,
-                effects: Vec::new(),
-                summary: vec![format!(
-                    "{symbol} listed at {} cents, {} shares outstanding",
-                    quote.price_cents, quote.shares_outstanding
-                )],
-            });
-            Ok::<_, ApiError>((quote, record))
-        })
-        .await??;
-    tracing::info!(
-        symbol,
-        price_cents = quote.price_cents,
-        shares_outstanding = quote.shares_outstanding,
-        "symbol listed"
-    );
-    Ok((
-        StatusCode::CREATED,
-        Json(ListingResponse {
-            quote,
-            event: record,
-        }),
-    ))
+    )
+    .await
+    .map(Committed)
 }
 
 /// Body of `POST /api/symbols/{symbol}/delist`.
@@ -965,13 +1106,6 @@ struct DelistRequest {
     cents_per_share: Option<i64>,
     note: Option<String>,
     source: Option<String>,
-}
-
-/// What a delisting undid, and the event it was recorded as.
-#[derive(Serialize)]
-struct DelistResponse {
-    delisting: Delisting,
-    event: EventRecord,
 }
 
 /// Delist a symbol: withdraw its book, drop its stops, buy every holder out,
@@ -985,82 +1119,23 @@ async fn delist_symbol(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
     _admin: Admin,
+    Idempotency(key): Idempotency,
     payload: Result<Json<DelistRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<DelistResponse>), ApiError> {
+) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
-    let now = app.clock.now();
-    let (source, note, cents_per_share) = (
-        req.source.unwrap_or_else(|| "api".into()),
-        req.note,
-        req.cents_per_share,
-    );
-    let ticker = symbol.clone();
-    let (delisting, record) = app
-        .market
-        .call_async(move |m| {
-            Box::pin(async move {
-                let delisting = m
-                    .delist(&ticker, cents_per_share, note.clone(), now.0)
-                    .await
-                    .map_err(|e| match e {
-                        DelistError::Unknown => ApiError::not_found(&ticker),
-                        DelistError::Price => ApiError::invalid_event(e.to_string()),
-                        DelistError::Unfunded(_) => {
-                            ApiError::new(StatusCode::CONFLICT, "payout_not_funded", e.to_string())
-                        }
-                    })?;
-                let record = m.record(EventRecord {
-                    id: 0,
-                    received_at_ms: wall_now_ms(),
-                    at_ms: now.0,
-                    symbols: vec![delisting.symbol],
-                    kind: "corporate:delisting".into(),
-                    source,
-                    note,
-                    magnitude: None,
-                    effects: Vec::new(),
-                    summary: vec![format!(
-                        "{} delisted at {} cents a share: {} shares bought out for {} cents \
-                         across {} account(s), {} resting order(s) and {} stop(s) withdrawn",
-                        delisting.symbol,
-                        delisting.cents_per_share,
-                        delisting.shares_bought_out,
-                        delisting.total_cents,
-                        delisting.accounts_paid,
-                        delisting.orders_cancelled,
-                        delisting.stops_cancelled,
-                    )],
-                });
-                Ok::<_, ApiError>((delisting, record))
-            })
-        })
-        .await??;
-    tracing::info!(
-        symbol = delisting.symbol,
-        cents_per_share = delisting.cents_per_share,
-        shares = delisting.shares_bought_out,
-        total_cents = delisting.total_cents,
-        "symbol delisted"
-    );
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(DelistResponse {
-            delisting,
-            event: record,
-        }),
-    ))
-}
-
-/// A seed from a ticker, so a listing without one is still reproducible: the
-/// same ticker on two servers gives the same company. FNV-1a, which is
-/// nothing but a spread of the letters — it is a seed, not a digest.
-fn seed_from_ticker(ticker: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in ticker.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::Delist {
+            symbol,
+            cents_per_share: req.cents_per_share,
+            source: req.source.unwrap_or_else(|| "api".into()),
+            note: req.note,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 /// Trim a caller's text, cap it at `max` characters, and treat an empty
@@ -1076,17 +1151,11 @@ async fn halt_symbol(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
     _admin: Admin,
-) -> Result<Json<SymbolStatus>, ApiError> {
-    let handle = app
-        .symbol(&symbol)
-        .ok_or_else(|| ApiError::not_found(&symbol))?;
-    let status = app
-        .market
-        .call_async(move |m| Box::pin(async move { m.halt(&handle).await }))
-        .await?
-        .ok_or_else(|| ApiError::not_found(&symbol))?;
-    tracing::info!(symbol = status.symbol, "trading halted");
-    Ok(Json(status))
+    Idempotency(key): Idempotency,
+) -> Result<Committed, ApiError> {
+    run(&app, Principal::Operator, key, Command::Halt { symbol })
+        .await
+        .map(Committed)
 }
 
 /// Start trading again, whatever stopped it.
@@ -1094,17 +1163,11 @@ async fn resume_symbol(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
     _admin: Admin,
-) -> Result<Json<SymbolStatus>, ApiError> {
-    let handle = app
-        .symbol(&symbol)
-        .ok_or_else(|| ApiError::not_found(&symbol))?;
-    let status = app
-        .market
-        .call_async(move |m| Box::pin(async move { m.resume(&handle).await }))
-        .await?
-        .ok_or_else(|| ApiError::not_found(&symbol))?;
-    tracing::info!(symbol = status.symbol, "trading resumed");
-    Ok(Json(status))
+    Idempotency(key): Idempotency,
+) -> Result<Committed, ApiError> {
+    run(&app, Principal::Operator, key, Command::Resume { symbol })
+        .await
+        .map(Committed)
 }
 
 async fn get_shares(
@@ -1226,146 +1289,61 @@ async fn push_sim_event(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
     _admin: Admin,
+    Idempotency(key): Idempotency,
     payload: Result<Json<PushEventRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<EventRecord>), ApiError> {
+) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
-    let prepared = req
-        .event
+    // Rejected here as well as in the command, so a malformed event is
+    // answered without waiting on the market.
+    req.event
         .prepare()
         .map_err(|e| ApiError::invalid_event(e.to_string()))?;
-    let now = app.clock.now();
-    let at = req.timing.resolve(now).map_err(ApiError::bad_request)?;
-
-    // A simulator event is the market's to apply: it is a change to a
-    // symbol, and every change to a symbol is one job on the market.
-    let handle = app
-        .symbol(&symbol)
-        .ok_or_else(|| ApiError::not_found(&symbol))?;
-    let (source, note, event) = (
-        req.source.unwrap_or_else(|| "api".into()),
-        req.note,
-        req.event,
-    );
-    let record = app
-        .market
-        .call_async(move |m| {
-            Box::pin(async move {
-                let ticker = handle.ticker;
-                m.apply_events(&handle, vec![prepared], at)
-                    .await?
-                    .ok_or_else(|| ApiError::not_found(ticker))?
-                    .map_err(ApiError::invalid_event)?;
-                Ok::<_, ApiError>(m.record(EventRecord {
-                    id: 0,
-                    received_at_ms: wall_now_ms(),
-                    at_ms: at.0,
-                    symbols: vec![ticker],
-                    kind: format!("sim:{}", sim_event_name(&event)),
-                    source,
-                    note,
-                    magnitude: None,
-                    effects: vec![event],
-                    summary: vec![event.summary()],
-                }))
-            })
-        })
-        .await??;
-    tracing::info!(id = record.id, symbol = %symbol, kind = %record.kind, "event accepted");
-    Ok((StatusCode::ACCEPTED, Json(record)))
-}
-
-fn sim_event_name(e: &SimEvent) -> &'static str {
-    match e {
-        SimEvent::Jump { .. } => "jump",
-        SimEvent::DriftShift { .. } => "drift_shift",
-        SimEvent::DriftForTotalMove { .. } => "drift_for_total_move",
-        SimEvent::VolShift { .. } => "vol_shift",
-        SimEvent::FundamentalShift { .. } => "fundamental_shift",
-        SimEvent::FundamentalTarget { .. } => "fundamental_target",
-    }
+    let at = req
+        .timing
+        .resolve(app.clock.now())
+        .map_err(ApiError::bad_request)?;
+    run_at(
+        &app,
+        Principal::Operator,
+        key,
+        at,
+        Command::SimEvent {
+            symbol,
+            event: req.event,
+            source: req.source.unwrap_or_else(|| "api".into()),
+            note: req.note,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 async fn push_game_event(
     State(app): State<AppState>,
     _admin: Admin,
+    Idempotency(key): Idempotency,
     payload: Result<Json<GameEventRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<EventRecord>), ApiError> {
+) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
-    let magnitude = req.magnitude.unwrap_or(1.0);
-    if !(magnitude.is_finite() && magnitude > 0.0 && magnitude <= MAX_MAGNITUDE) {
-        return Err(ApiError::invalid_event(format!(
-            "`magnitude` must be in (0, {MAX_MAGNITUDE}]"
-        )));
-    }
-    let effects = req.kind.effects(magnitude);
-    let prepared: Vec<Prepared> = effects
-        .iter()
-        .map(|e| {
-            e.prepare()
-                .map_err(|e| ApiError::invalid_event(e.to_string()))
-        })
-        .collect::<Result<_, _>>()?;
-    let now = app.clock.now();
-    let at = req.timing.resolve(now).map_err(ApiError::bad_request)?;
-
-    // A company event touches one symbol; a market event touches every
-    // symbol at the same simulated moment. Either way it is one job on the
-    // market, so nothing trades in between.
-    let target = match req.kind.scope() {
-        Scope::Market => None,
-        Scope::Company => {
-            let sym = req.symbol.as_deref().ok_or_else(|| {
-                ApiError::bad_request("`symbol` is required for a company-scoped event")
-            })?;
-            Some(app.symbol(sym).ok_or_else(|| ApiError::not_found(sym))?)
-        }
-    };
-    let (kind, source, note) = (
-        req.kind,
-        req.source.unwrap_or_else(|| "game".into()),
-        req.note,
-    );
-    let record = app
-        .market
-        .call_async(move |m| {
-            Box::pin(async move {
-                let symbols = match target {
-                    Some(handle) => {
-                        m.apply_events(&handle, prepared, at)
-                            .await?
-                            .ok_or_else(|| ApiError::not_found(handle.ticker))?
-                            .map_err(ApiError::invalid_event)?;
-                        vec![handle.ticker]
-                    }
-                    None => m
-                        .apply_events_everywhere(prepared, at)
-                        .await
-                        .map_err(ApiError::invalid_event)?,
-                };
-                Ok::<_, ApiError>(m.record(EventRecord {
-                    id: 0,
-                    received_at_ms: wall_now_ms(),
-                    at_ms: at.0,
-                    symbols,
-                    kind: format!("game:{}", game_kind_name(kind)),
-                    source,
-                    note,
-                    magnitude: Some(magnitude),
-                    summary: effects.iter().map(SimEvent::summary).collect(),
-                    effects,
-                }))
-            })
-        })
-        .await??;
-    tracing::info!(id = record.id, symbols = ?record.symbols, kind = %record.kind, magnitude, "game event accepted");
-    Ok((StatusCode::ACCEPTED, Json(record)))
-}
-
-fn game_kind_name(kind: GameEventKind) -> String {
-    serde_json::to_value(kind)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_default()
+    let at = req
+        .timing
+        .resolve(app.clock.now())
+        .map_err(ApiError::bad_request)?;
+    run_at(
+        &app,
+        Principal::Operator,
+        key,
+        at,
+        Command::GameEvent {
+            kind: req.kind,
+            magnitude: req.magnitude.unwrap_or(1.0),
+            symbol: req.symbol,
+            source: req.source.unwrap_or_else(|| "game".into()),
+            note: req.note,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1462,80 +1440,44 @@ async fn get_trades(
 async fn create_trader(
     State(app): State<AppState>,
     caller: Option<Caller>,
+    Idempotency(key): Idempotency,
     payload: Option<Json<CreateTraderRequest>>,
-) -> Result<(StatusCode, Json<PortfolioDto>), ApiError> {
+) -> Result<Committed, ApiError> {
     let req = payload.map(|Json(r)| r).unwrap_or_default();
-    let cash = req.cash_cents.unwrap_or(app.options.starting_cash_cents);
-    if cash < 0 {
+    let cash_cents = req.cash_cents.unwrap_or(app.options.starting_cash_cents);
+    if cash_cents < 0 {
         return Err(ApiError::bad_request("`cash_cents` must not be negative"));
     }
     let email = check_email(req.email)?;
-    let now = wall_now_ms();
-    // Joining an existing user is that user's business alone.
-    if let Some(user_id) = req.user_id {
-        owned_user(
-            caller.ok_or_else(ApiError::unauthenticated)?,
-            UserId(user_id),
-        )?;
-    }
-    let views = app.views().await;
-    let (dto, user_id, account_id) = app
-        .market
-        .call(move |m| {
-            let id = match (req.user_id, req.account_id) {
-                (None, None) => m
-                    .sign_up(req.name, email, cash, now)
-                    .map_err(ApiError::money)?,
-                (None, Some(_)) => {
-                    return Err(ApiError::bad_request(
-                        "`account_id` needs the `user_id` that owns it",
-                    ));
-                }
-                (Some(user_id), account_id) => {
-                    let user = UserId(user_id);
-                    if !m.users.contains_key(&user) {
-                        return Err(ApiError::unknown_user(user_id));
-                    }
-                    let account = match account_id {
-                        Some(account_id) => {
-                            let account = AccountId(account_id);
-                            let held = m
-                                .accounts
-                                .get(&account)
-                                .ok_or_else(|| ApiError::unknown_account(account_id))?;
-                            if held.user_id != user {
-                                return Err(ApiError::bad_request(format!(
-                                    "account {account_id} belongs to user {}",
-                                    held.user_id.0
-                                )));
-                            }
-                            account
-                        }
-                        None => m
-                            .open_account(user, req.name.clone(), cash, now)
-                            .map_err(ApiError::money)?,
-                    };
-                    m.create_trader(user, account, req.name, now)
-                }
-            };
-            let mut dto = portfolio(m, &views, id)?;
-            if req.user_id.is_none() {
-                // A new user was created for the trader: hand over their
-                // key, once.
-                dto.api_key = m.take_issued_key(UserId(dto.user_id));
-            }
-            let (user_id, account_id) = (dto.user_id, dto.account_id);
-            Ok((dto, user_id, account_id))
-        })
-        .await??;
-    tracing::info!(
-        trader = dto.id,
-        user = user_id,
-        account = account_id,
-        cash = dto.cash_cents,
-        "trader created"
-    );
-    Ok((StatusCode::CREATED, Json(dto)))
+    // Joining an existing user is that user's business alone; a sign-up
+    // belongs to nobody yet and needs a key of its own.
+    let (owner, api_key) = match req.user_id {
+        Some(user_id) => {
+            let caller = caller.ok_or_else(ApiError::unauthenticated)?;
+            owned_user(caller, UserId(user_id))?;
+            (Some(caller.0.0), None)
+        }
+        None => (None, Some(crate::auth::new_api_key())),
+    };
+    let out = run(
+        &app,
+        owner.map_or(Principal::Anonymous, |id| Principal::User { id }),
+        key,
+        Command::CreateTrader {
+            caller: owner,
+            user_id: req.user_id,
+            account_id: req.account_id,
+            name: req.name,
+            email,
+            cash_cents,
+            key_digest: api_key.as_deref().map(crate::auth::key_digest),
+        },
+    )
+    .await?;
+    Ok(match api_key {
+        Some(api_key) => with_key(out, api_key),
+        None => Committed(out),
+    })
 }
 
 /// An email is optional, but if given it has to look like one.
@@ -1614,7 +1556,7 @@ async fn get_trader(
 
 /// The reference price of `sym` in `views`, or zero for a symbol no longer
 /// listed.
-fn mark_of(views: &[SymbolView], sym: &str) -> i64 {
+pub(crate) fn mark_of(views: &[SymbolView], sym: &str) -> i64 {
     views
         .iter()
         .find(|v| v.symbol.eq_ignore_ascii_case(sym))
@@ -1628,7 +1570,7 @@ async fn fetch_portfolio(app: &App, id: TraderId) -> Result<PortfolioDto, ApiErr
     app.market.call(move |m| portfolio(m, &views, id)).await?
 }
 
-fn portfolio(
+pub(crate) fn portfolio(
     market: &Market,
     views: &[SymbolView],
     id: TraderId,
@@ -1701,49 +1643,23 @@ async fn submit_order(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
     caller: Caller,
+    Idempotency(key): Idempotency,
     payload: Result<Json<OrderRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<OrderResponse>), ApiError> {
+) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
-    let trader = TraderId(req.trader_id);
-    owned_trader(&app, caller, trader)?;
-    let handle = app
-        .symbol(&symbol)
-        .ok_or_else(|| ApiError::not_found(&symbol))?;
-    let request = PlaceRequest {
-        order: Order {
-            owner: Owner::Trader(trader),
-            side: req.side,
-            kind: req.kind,
-            tif: req.tif,
-            qty: req.qty,
-        },
+    owned_trader(&app, caller, TraderId(req.trader_id))?;
+    let order = OrderRequest {
         client_order_id: clean_client_order_id(req.client_order_id)?,
-        post_only: req.post_only,
-        day: req.day,
-        expires_at_ms: req.expires_at_ms,
-        display_qty: req.display_qty,
+        ..req
     };
-    let placed = app
-        .market
-        .call_async(move |m| Box::pin(async move { m.place(&handle, trader, request).await }))
-        .await?
-        .map_err(|e| ApiError::place(&symbol, e))?;
-    let response = match placed {
-        // Same order, second delivery: nothing new happened.
-        Placed::Replayed(response) => return Ok((StatusCode::OK, Json(response))),
-        Placed::New(response) => response,
-    };
-    tracing::info!(
-        trader = trader.0,
-        symbol = response.symbol,
-        order = response.order_id,
-        side = ?response.side,
-        qty = response.qty,
-        filled = response.filled,
-        status = ?response.status,
-        "order"
-    );
-    Ok((StatusCode::CREATED, Json(response)))
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::PlaceOrder { symbol, order },
+    )
+    .await
+    .map(Committed)
 }
 
 #[derive(Deserialize)]
@@ -1771,80 +1687,23 @@ async fn pay_dividend(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
     _admin: Admin,
+    Idempotency(key): Idempotency,
     payload: Result<Json<DividendRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<DividendResponse>), ApiError> {
+) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
-    let now = app.clock.now();
-    let handle = app
-        .symbol(&symbol)
-        .ok_or_else(|| ApiError::not_found(&symbol))?;
-    let (source, note, cents_per_share) = (
-        req.source.unwrap_or_else(|| "api".into()),
-        req.note,
-        req.cents_per_share,
-    );
-    let (paid, record) = app
-        .market
-        .call_async(move |m| {
-            Box::pin(async move {
-                let price = handle
-                    .ask_listed(|s| s.price_cents())
-                    .await?
-                    .ok_or_else(|| ApiError::not_found(handle.ticker))?;
-                let (paid, effects) = m
-                    .pay_dividend(&handle, cents_per_share, note.clone(), now.0)
-                    .await
-                    .map_err(ApiError::payout)?
-                    .ok_or_else(|| {
-                        ApiError::invalid_event(format!(
-                            "a dividend must be between 1 and {} cents a share, one less than \
-                             the price it is declared against",
-                            price - 1
-                        ))
-                    })?;
-                let record = m.record(EventRecord {
-                    id: 0,
-                    received_at_ms: wall_now_ms(),
-                    at_ms: now.0,
-                    symbols: vec![paid.symbol],
-                    kind: "corporate:dividend".into(),
-                    source,
-                    note,
-                    magnitude: Some(paid.cents_per_share as f64 / 100.0),
-                    effects,
-                    summary: vec![format!(
-                        "dividend of {} cents a share on {} shares, {} cents to {} account(s)",
-                        paid.cents_per_share,
-                        paid.shares_paid,
-                        paid.total_cents,
-                        paid.accounts_paid
-                    )],
-                });
-                Ok::<_, ApiError>((paid, record))
-            })
-        })
-        .await??;
-    tracing::info!(
-        symbol = paid.symbol,
-        cents_per_share = paid.cents_per_share,
-        total_cents = paid.total_cents,
-        accounts = paid.accounts_paid,
-        "dividend paid"
-    );
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(DividendResponse {
-            dividend: paid,
-            event: record,
-        }),
-    ))
-}
-
-/// What a dividend paid, and the event it was recorded as.
-#[derive(Serialize)]
-struct DividendResponse {
-    dividend: crate::market::Dividend,
-    event: EventRecord,
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::Dividend {
+            symbol,
+            cents_per_share: req.cents_per_share,
+            source: req.source.unwrap_or_else(|| "api".into()),
+            note: req.note,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 /// Arm a stop: a trigger the engine watches, not an order in the book.
@@ -1855,32 +1714,23 @@ async fn submit_stop(
     State(app): State<AppState>,
     Path(symbol): Path<String>,
     caller: Caller,
+    Idempotency(key): Idempotency,
     payload: Result<Json<StopRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<StopOrder>), ApiError> {
+) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
-    let req = StopRequest {
+    owned_trader(&app, caller, TraderId(req.trader_id))?;
+    let stop = StopRequest {
         client_order_id: clean_client_order_id(req.client_order_id)?,
         ..req
     };
-    owned_trader(&app, caller, TraderId(req.trader_id))?;
-    let handle = app
-        .symbol(&symbol)
-        .ok_or_else(|| ApiError::not_found(&symbol))?;
-    let stop = app
-        .market
-        .call_async(move |m| Box::pin(async move { m.place_stop(&handle, req).await }))
-        .await?
-        .map_err(|e| ApiError::place(&symbol, e))?;
-    tracing::info!(
-        trader = stop.trader_id,
-        symbol = stop.symbol,
-        stop = stop.stop_id,
-        side = ?stop.side,
-        qty = stop.qty,
-        at = stop.stop_price_cents,
-        "stop armed"
-    );
-    Ok((StatusCode::CREATED, Json(stop)))
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::PlaceStop { symbol, stop },
+    )
+    .await
+    .map(Committed)
 }
 
 /// A trader's stops on one symbol. Stops are private: they say what a trader
@@ -1921,24 +1771,22 @@ async fn cancel_stop(
     Path((symbol, stop_id)): Path<(String, u64)>,
     Query(q): Query<TraderQuery>,
     caller: Caller,
-) -> Result<Json<StopOrder>, ApiError> {
+    Idempotency(key): Idempotency,
+) -> Result<Committed, ApiError> {
     let trader = TraderId(q.trader_id);
     owned_trader(&app, caller, trader)?;
-    let handle = app
-        .symbol(&symbol)
-        .ok_or_else(|| ApiError::not_found(&symbol))?;
-    let stop = app
-        .market
-        .call_async(move |m| Box::pin(async move { m.cancel_stop(&handle, trader, stop_id).await }))
-        .await?
-        .ok_or_else(|| ApiError::unknown_stop(stop_id))?;
-    tracing::info!(
-        trader = stop.trader_id,
-        symbol = stop.symbol,
-        stop = stop.stop_id,
-        "stop cancelled"
-    );
-    Ok(Json(stop))
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::CancelStop {
+            symbol,
+            trader_id: trader.0,
+            stop_id,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 /// Trim a caller-supplied `client_order_id`; an empty one counts as absent.
@@ -2072,40 +1920,27 @@ async fn amend_order(
     State(app): State<AppState>,
     Path((symbol, order_id)): Path<(String, u64)>,
     caller: Caller,
+    Idempotency(key): Idempotency,
     payload: Result<Json<AmendRequest>, JsonRejection>,
-) -> Result<Json<AmendResponse>, ApiError> {
+) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
-    let trader = TraderId(req.trader_id);
-    owned_trader(&app, caller, trader)?;
-    let client_order_id = clean_client_order_id(req.client_order_id)?;
-    let handle = app
-        .symbol(&symbol)
-        .ok_or_else(|| ApiError::not_found(&symbol))?;
-    let amendment = Amendment {
-        order_id,
-        price_cents: req.price_cents,
-        qty: req.qty,
-        post_only: req.post_only,
-        client_order_id,
+    owned_trader(&app, caller, TraderId(req.trader_id))?;
+    let amend = AmendRequest {
+        client_order_id: clean_client_order_id(req.client_order_id)?,
+        ..req
     };
-    let amended = app
-        .market
-        .call_async(move |m| Box::pin(async move { m.amend(&handle, trader, amendment).await }))
-        .await?
-        .map_err(|e| ApiError::place(&symbol, e))?;
-    tracing::info!(
-        trader = trader.0,
-        symbol = amended.order.symbol,
-        replaced = order_id,
-        order = amended.order.order_id,
-        qty = amended.order.qty,
-        "order amended"
-    );
-    Ok(Json(AmendResponse {
-        replaced_order_id: amended.replaced_order_id,
-        replaced_filled: amended.replaced_filled,
-        order: amended.order,
-    }))
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::AmendOrder {
+            symbol,
+            order_id,
+            amend,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 async fn cancel_order(
@@ -2113,46 +1948,34 @@ async fn cancel_order(
     Path((symbol, order_id)): Path<(String, u64)>,
     Query(q): Query<TraderQuery>,
     caller: Caller,
-) -> Result<Json<OpenOrderDto>, ApiError> {
+    Idempotency(key): Idempotency,
+) -> Result<Committed, ApiError> {
     let trader = TraderId(q.trader_id);
     owned_trader(&app, caller, trader)?;
-    let handle = app
-        .symbol(&symbol)
-        .ok_or_else(|| ApiError::not_found(&symbol))?;
-    let sym = handle.ticker;
-    let cancelled = app
-        .market
-        .call_async(move |m| Box::pin(async move { m.cancel(&handle, trader, order_id).await }))
-        .await?
-        .map_err(|e| match e {
-            fehu::CancelError::Unknown => ApiError::unknown_order(order_id),
-            fehu::CancelError::NotOwner => {
-                ApiError::new(StatusCode::FORBIDDEN, "not_owner", e.to_string())
-            }
-            _ => ApiError::bad_request(e.to_string()),
-        })?
-        .ok_or_else(|| ApiError::not_found(&symbol))?;
-    tracing::info!(
-        trader = trader.0,
-        symbol = sym,
-        order = order_id,
-        "order cancelled"
-    );
-    Ok(Json(OpenOrderDto::from_resting(sym, &cancelled)))
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::CancelOrder {
+            symbol,
+            trader_id: trader.0,
+            order_id,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 async fn cancel_all(
     State(app): State<AppState>,
     Path(trader_id): Path<u64>,
     caller: Caller,
-) -> Result<Json<Vec<OpenOrderDto>>, ApiError> {
-    let trader = TraderId(trader_id);
-    owned_trader(&app, caller, trader)?;
-    Ok(Json(
-        app.market
-            .call_async(move |m| Box::pin(m.cancel_all(trader)))
-            .await?,
-    ))
+    Idempotency(key): Idempotency,
+) -> Result<Committed, ApiError> {
+    owned_trader(&app, caller, TraderId(trader_id))?;
+    run(&app, caller.into(), key, Command::CancelAll { trader_id })
+        .await
+        .map(Committed)
 }
 
 // ---------------------------------------------------------------------------
@@ -2163,23 +1986,24 @@ async fn cancel_all(
 
 async fn create_user(
     State(app): State<AppState>,
+    Idempotency(key): Idempotency,
     payload: Option<Json<CreateUserRequest>>,
-) -> Result<(StatusCode, Json<UserDto>), ApiError> {
+) -> Result<Committed, ApiError> {
     let req = payload.map(|Json(r)| r).unwrap_or_default();
     let email = check_email(req.email)?;
-    let views = app.views().await;
-    let dto = app
-        .market
-        .call(move |m| {
-            let id = m.create_user(req.name, email, wall_now_ms());
-            let mut dto = user_dto(m, &views, id)?;
-            // The one and only time the key is handed out.
-            dto.api_key = m.take_issued_key(id);
-            Ok::<_, ApiError>(dto)
-        })
-        .await??;
-    tracing::info!(user = dto.id, "user created");
-    Ok((StatusCode::CREATED, Json(dto)))
+    let api_key = crate::auth::new_api_key();
+    let out = run(
+        &app,
+        Principal::Anonymous,
+        key,
+        Command::CreateUser {
+            name: req.name,
+            email,
+            key_digest: crate::auth::key_digest(&api_key),
+        },
+    )
+    .await?;
+    Ok(with_key(out, api_key))
 }
 
 /// The caller, as a list of one: a user is not told about the others.
@@ -2240,26 +2064,23 @@ async fn open_account(
     State(app): State<AppState>,
     Path(user_id): Path<u64>,
     caller: Caller,
+    Idempotency(key): Idempotency,
     payload: Option<Json<OpenAccountRequest>>,
-) -> Result<(StatusCode, Json<AccountDto>), ApiError> {
+) -> Result<Committed, ApiError> {
     let req = payload.map(|Json(r)| r).unwrap_or_default();
-    let cash = req.cash_cents.unwrap_or(app.options.starting_cash_cents);
-    let user = UserId(user_id);
-    owned_user(caller, user)?;
-    let dto = app
-        .market
-        .call(move |m| {
-            if !m.users.contains_key(&user) {
-                return Err(ApiError::unknown_user(user_id));
-            }
-            let id = m
-                .open_account(user, req.name, cash, wall_now_ms())
-                .map_err(ApiError::money)?;
-            account_dto(m, id)
-        })
-        .await??;
-    tracing::info!(user = user_id, account = dto.id, cash, "account opened");
-    Ok((StatusCode::CREATED, Json(dto)))
+    owned_user(caller, UserId(user_id))?;
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::OpenAccount {
+            user_id,
+            name: req.name,
+            cash_cents: req.cash_cents.unwrap_or(app.options.starting_cash_cents),
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 async fn list_user_accounts(
@@ -2330,33 +2151,22 @@ async fn deposit(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
     _admin: Admin,
+    Idempotency(key): Idempotency,
     payload: Result<Json<TransferRequest>, JsonRejection>,
-) -> Result<Json<LedgerResponse>, ApiError> {
+) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
-    let id = AccountId(account_id);
-    let amount_cents = req.amount_cents;
-    let response = app
-        .market
-        .call(move |m| {
-            if !m.accounts.contains_key(&id) {
-                return Err(ApiError::unknown_account(account_id));
-            }
-            let entry = m
-                .mint_into(id, req.amount_cents, req.memo, wall_now_ms())
-                .map_err(ApiError::money)?;
-            Ok::<_, ApiError>(LedgerResponse {
-                account: account_dto(m, id)?,
-                entries: vec![entry],
-            })
-        })
-        .await??;
-    tracing::info!(
-        account = account_id,
-        amount_cents,
-        balance_cents = response.entries[0].balance_cents,
-        "deposit"
-    );
-    Ok(Json(response))
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::Mint {
+            account_id,
+            amount_cents: req.amount_cents,
+            memo: req.memo,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 /// Burn money out of an account. Only the available balance can leave: cash
@@ -2368,33 +2178,22 @@ async fn withdraw(
     State(app): State<AppState>,
     Path(account_id): Path<u64>,
     _admin: Admin,
+    Idempotency(key): Idempotency,
     payload: Result<Json<TransferRequest>, JsonRejection>,
-) -> Result<Json<LedgerResponse>, ApiError> {
+) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
-    let id = AccountId(account_id);
-    let amount_cents = req.amount_cents;
-    let response = app
-        .market
-        .call(move |m| {
-            if !m.accounts.contains_key(&id) {
-                return Err(ApiError::unknown_account(account_id));
-            }
-            let entry = m
-                .burn_from(id, req.amount_cents, req.memo, wall_now_ms())
-                .map_err(ApiError::money)?;
-            Ok::<_, ApiError>(LedgerResponse {
-                account: account_dto(m, id)?,
-                entries: vec![entry],
-            })
-        })
-        .await??;
-    tracing::info!(
-        account = account_id,
-        amount_cents,
-        balance_cents = response.entries[0].balance_cents,
-        "withdrawal"
-    );
-    Ok(Json(response))
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::Burn {
+            account_id,
+            amount_cents: req.amount_cents,
+            memo: req.memo,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 /// Freeze, reopen or close an account: `{"status": "frozen"}`.
@@ -2414,47 +2213,40 @@ async fn set_status(
     Path(account_id): Path<u64>,
     caller: Option<Caller>,
     admin: Option<Admin>,
+    Idempotency(key): Idempotency,
     payload: Option<Json<StatusRequest>>,
-) -> Result<Json<AccountDto>, ApiError> {
+) -> Result<Committed, ApiError> {
     let Json(req) = payload.ok_or_else(|| ApiError::bad_request("a `status` is required"))?;
-    let id = AccountId(account_id);
-    let status = req.status;
     // Who has to be who depends on which transition this is. An operator
     // freezes an account that is not theirs — that is the whole point of a
     // freeze — so they are not asked to own it; an owner closes theirs, and
     // is not asked to be an operator.
-    let owner = match status {
+    let (owner, principal) = match req.status {
         AccountStatus::Frozen | AccountStatus::Active => {
             if admin.is_none() {
                 return Err(ApiError::forbidden(
                     "freezing and unfreezing an account is the operator's to do",
                 ));
             }
-            None
+            (None, Principal::Operator)
         }
-        AccountStatus::Closed => Some(caller.ok_or_else(ApiError::unauthenticated)?),
+        AccountStatus::Closed => {
+            let caller = caller.ok_or_else(ApiError::unauthenticated)?;
+            (Some(caller.0.0), caller.into())
+        }
     };
-    let dto = app
-        .market
-        .call_async(move |m| {
-            Box::pin(async move {
-                if let Some(owner) = owner {
-                    owned_account(m, owner, id)?;
-                } else if !m.accounts.contains_key(&id) {
-                    return Err(ApiError::unknown_account(account_id));
-                }
-                match status {
-                    AccountStatus::Frozen => m.freeze_account(id).await,
-                    AccountStatus::Active => m.unfreeze_account(id),
-                    AccountStatus::Closed => m.close_account(id),
-                }
-                .map_err(ApiError::money)?;
-                account_dto(m, id)
-            })
-        })
-        .await??;
-    tracing::info!(account = account_id, status = ?status, "account status");
-    Ok(Json(dto))
+    run(
+        &app,
+        principal,
+        key,
+        Command::SetAccountStatus {
+            account_id,
+            status: req.status,
+            owner,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 /// Check an account: its status, what it can do, and any broken invariant.
@@ -2513,41 +2305,29 @@ async fn trader_deposit(
     State(app): State<AppState>,
     Path(trader_id): Path<u64>,
     _admin: Admin,
+    Idempotency(key): Idempotency,
     payload: Result<Json<TransferRequest>, JsonRejection>,
-) -> Result<Json<PortfolioDto>, ApiError> {
+) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
-    let trader = TraderId(trader_id);
-    let views = app.views().await;
-    let amount_cents = req.amount_cents;
-    let (dto, account_id, balance_cents) = app
-        .market
-        .call(move |m| {
-            let account_id = m
-                .traders
-                .get(&trader)
-                .ok_or_else(|| ApiError::unknown_trader(trader_id))?
-                .account_id;
-            let entry = m
-                .mint_into(account_id, req.amount_cents, req.memo, wall_now_ms())
-                .map_err(ApiError::money)?;
-            Ok::<_, ApiError>((
-                portfolio(m, &views, trader)?,
-                account_id,
-                entry.balance_cents,
-            ))
-        })
-        .await??;
-    tracing::info!(
-        trader = trader_id,
-        account = account_id.0,
-        amount_cents,
-        balance_cents,
-        "deposit"
-    );
-    Ok(Json(dto))
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::MintToTrader {
+            trader_id,
+            amount_cents: req.amount_cents,
+            memo: req.memo,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
-fn user_dto(market: &Market, views: &[SymbolView], id: UserId) -> Result<UserDto, ApiError> {
+pub(crate) fn user_dto(
+    market: &Market,
+    views: &[SymbolView],
+    id: UserId,
+) -> Result<UserDto, ApiError> {
     let user = market
         .users
         .get(&id)
@@ -2584,7 +2364,7 @@ fn user_dto(market: &Market, views: &[SymbolView], id: UserId) -> Result<UserDto
     })
 }
 
-fn account_dto(market: &Market, id: AccountId) -> Result<AccountDto, ApiError> {
+pub(crate) fn account_dto(market: &Market, id: AccountId) -> Result<AccountDto, ApiError> {
     let account = market
         .accounts
         .get(&id)
@@ -2592,12 +2372,76 @@ fn account_dto(market: &Market, id: AccountId) -> Result<AccountDto, ApiError> {
     Ok(account_view(market, account))
 }
 
-fn account_view(market: &Market, account: &Account) -> AccountDto {
+pub(crate) fn account_view(market: &Market, account: &Account) -> AccountDto {
     AccountDto::new(
         account,
         &market.ledger,
         market.trader_on(account.id).map(|t| t.id.0),
     )
+}
+
+/// `GET /api/commands/{key}`: the answer a command was given, for a client
+/// that lost it.
+#[derive(Serialize)]
+struct CommandDto {
+    /// The `Idempotency-Key` it was sent under.
+    key: String,
+    /// Where it landed in the journal.
+    seq: u64,
+    /// Which command it was: `place_order`, `mint`, and so on.
+    command: String,
+    /// The HTTP status it was answered with.
+    status: u16,
+    received_at_ms: i64,
+    /// The response body, as it was sent — except for a credential, which is
+    /// shown once and is not kept. A replayed sign-up carries no `api_key`.
+    result: serde_json::Value,
+}
+
+/// Recover the result of a command whose response was lost.
+///
+/// Who may ask: the operator, for anything; a player, for their own
+/// commands. A command sent by nobody — a sign-up, which has no credential
+/// yet — is answered to whoever knows its key, because there is no other
+/// way to recover one; the key is the only thing proving it was theirs, so
+/// a client that wants that recovery has to choose keys nobody can guess.
+async fn get_command(
+    State(app): State<AppState>,
+    Path(key): Path<String>,
+    caller: Option<Caller>,
+    admin: Option<Admin>,
+) -> Result<Json<CommandDto>, ApiError> {
+    let unknown = || {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_command",
+            "no command was recorded under that key (it may never have been sent, \
+             may have been refused, or may have been evicted from the log)",
+        )
+    };
+    let record = app
+        .market
+        .call(move |m| m.commands.get(&key).cloned())
+        .await?
+        .ok_or_else(unknown)?;
+    let mine = match record.principal {
+        Principal::Anonymous => true,
+        Principal::User { id } => caller.is_some_and(|c| c.0.0 == id),
+        Principal::Operator | Principal::Engine => admin.is_some(),
+    };
+    if !mine {
+        // Not "forbidden": whether a key exists is itself the answer to a
+        // question the caller has no business asking.
+        return Err(unknown());
+    }
+    Ok(Json(CommandDto {
+        key: record.key,
+        seq: record.seq,
+        command: record.kind,
+        status: record.status,
+        received_at_ms: record.wall_ms,
+        result: record.result,
+    }))
 }
 
 /// How much currency exists and where it is: `GET /api/supply`.

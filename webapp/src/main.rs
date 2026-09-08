@@ -8,12 +8,12 @@
 //! `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`, `FEHU_MAX_BARS`, `FEHU_EVENT_LOG`,
 //! `FEHU_TAPE`, `FEHU_FILL_LOG`, `FEHU_ORDER_LOG`, `FEHU_LEDGER_LOG`,
 //! `FEHU_STARTING_CASH_CENTS`, `FEHU_ADMIN_KEY`, `FEHU_STATE_FILE`,
-//! `FEHU_SAVE_SECS`, `FEHU_MAX_SYMBOLS`, `RUST_LOG`.
+//! `FEHU_SAVE_SECS`, `FEHU_COMMAND_LOG`, `FEHU_MAX_SYMBOLS`, `RUST_LOG`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fehu_webapp::{App, Options, engine, router, save};
+use fehu_webapp::{App, Options, engine, journal, router, save};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -37,13 +37,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => None,
     };
+    // The journal holds everything acknowledged since that snapshot was
+    // written. A file that cannot be read stops the server for the same
+    // reason an unreadable snapshot does: carrying on would serve a market
+    // that is missing changes it promised to keep.
+    let journal_path = options.state_file.as_deref().map(journal::path_for);
+    let entries = match (&saved, journal_path.as_deref()) {
+        (Some(_), Some(path)) if path.exists() => {
+            let entries = journal::read(path)?;
+            tracing::info!(path = %path.display(), entries = entries.len(), "replaying journal");
+            entries
+        }
+        // No snapshot to replay onto: a journal beside a market that is
+        // being warmed up fresh describes a different world, and applying it
+        // to this one would be worse than losing it.
+        (None, Some(path)) if path.exists() => {
+            tracing::warn!(path = %path.display(), "no state file to replay onto; the journal is discarded");
+            std::fs::remove_file(path)?;
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
     let app = match saved {
-        Some(save) => App::restore(options, save),
+        Some(save) => App::resume(options, save, entries).await,
         None => {
             tracing::info!(?options, "warming up");
             App::new(options)
         }
     };
+    // Only now, with the replay done: a journal attached before it would
+    // write every replayed command down a second time.
+    if let Some(path) = journal_path.as_deref() {
+        app.attach_journal(path).await?;
+        tracing::info!(path = %path.display(), "journaling commands");
+    }
     for symbol in app.listings().all() {
         let Ok((q, daily_bars, minute_bars, ticks)) = symbol
             .ask(|s| {
