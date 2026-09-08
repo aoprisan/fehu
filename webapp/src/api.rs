@@ -1246,7 +1246,15 @@ async fn list_symbol(
         crate::symbols::register(&req.symbol).map_err(|e| ApiError::bad_request(e.to_string()))?;
     // Cheap answer first: warming a year of history up only to find the
     // ticker taken would be a waste of the caller's time and this server's.
-    if app.symbol(symbol).is_some() {
+    //
+    // Unless this is a retry of the very request that listed it. The ticker
+    // being taken is then the proof that the first attempt worked, and the
+    // answer the caller is owed is the one it was given — so the idempotency
+    // index is consulted before the conflict is raised, exactly as
+    // `Market::run_command` would have consulted it. Short-circuiting past
+    // that would make a lost response unrecoverable for the one command that
+    // cannot be sent twice.
+    if app.symbol(symbol).is_some() && !retried(&app, key.as_deref()).await {
         return Err(ApiError::conflict(format!("{symbol} is already listed")));
     }
     let asset = match req.kind.as_deref().map(str::trim).unwrap_or("stock") {
@@ -1990,9 +1998,23 @@ async fn get_inventory(
     }))
 }
 
-/// What game events are doing to production and demand right now.
-async fn world(State(app): State<AppState>) -> Result<Json<WorldResponse>, ApiError> {
-    let at = app.clock.now();
+/// Body of `GET /api/world?at_ms=`.
+#[derive(Deserialize)]
+struct WorldQuery {
+    /// The simulated instant to read at. Defaults to now.
+    ///
+    /// A modifier ramps down over its window, so "what will the forge yield
+    /// when my job lands" is a different question from "what does it yield
+    /// now" — and both are worth asking before starting the job.
+    at_ms: Option<i64>,
+}
+
+/// What game events are doing to production and demand.
+async fn world(
+    State(app): State<AppState>,
+    Query(q): Query<WorldQuery>,
+) -> Result<Json<WorldResponse>, ApiError> {
+    let at = q.at_ms.map_or_else(|| app.clock.now(), fehu::Timestamp);
     let (modifiers, symbols) = app
         .market
         .call(move |m| {
@@ -2511,6 +2533,20 @@ async fn create_trader(
         Some(api_key) => with_key(out, api_key),
         None => Committed(out),
     })
+}
+
+/// Whether `key` names a command this server has already answered.
+///
+/// Only for a handler that refuses a request before `run` would reach the
+/// idempotency index; everything else lets [`Market::run_command`] answer.
+async fn retried(app: &App, key: Option<&str>) -> bool {
+    let Some(key) = key.map(str::to_owned) else {
+        return false;
+    };
+    app.market
+        .call(move |m| m.commands.get(&key).is_some())
+        .await
+        .unwrap_or(false)
 }
 
 /// An email is optional, but if given it has to look like one.
