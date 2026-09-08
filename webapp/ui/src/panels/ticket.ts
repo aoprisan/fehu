@@ -73,7 +73,10 @@ export class TicketPanel {
     const free = position?.free_shares ?? 0;
     const parts = [`own ${qty}`, `sellable ${free}`];
     const quote = this.#store.currentQuote();
-    if (quote !== null) parts.push(`of ${fmtVol(quote.shares_outstanding)} shares`);
+    if (quote !== null) {
+      const unit = quote.unit === null ? 'shares' : `${quote.unit}`;
+      parts.push(`of ${fmtVol(quote.shares_outstanding)} ${unit}`);
+    }
     this.#holding.textContent = `${symbol}: ${parts.join(' · ')}`;
   }
 

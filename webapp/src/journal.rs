@@ -80,13 +80,15 @@ use crate::account::{AccountId, AccountStatus, UserId};
 use crate::api::ApiError;
 use crate::events::{EventRecord, GameEventKind, MAX_MAGNITUDE, Prepared, Scope, SimEvent};
 use crate::market::{
-    Amendment, DelistError, Market, PlaceRequest, Placed, SymbolInfo, SymbolSpec, wall_now_ms,
+    Amendment, AssetKind, DelistError, Market, PlaceRequest, Placed, SymbolInfo, SymbolSpec,
+    wall_now_ms,
 };
+use crate::npc::Policy;
 use crate::trading::{AmendRequest, AmendResponse, OpenOrderDto, OrderRequest, StopRequest};
 
 /// Format of the journal file. A file written by another version is refused
 /// rather than half-understood, exactly as a save file is.
-pub const JOURNAL_VERSION: u32 = 1;
+pub const JOURNAL_VERSION: u32 = 2;
 
 /// Who asked for a command.
 ///
@@ -125,7 +127,9 @@ pub struct Listing {
     pub name: String,
     pub sector: String,
     pub description: String,
-    pub shares_outstanding: u64,
+    /// What is being listed: a company with a fixed float, or a good with a
+    /// unit and a count that production and consumption move.
+    pub asset: AssetKind,
     pub seed: u64,
     pub start_price_cents: i64,
     pub drift: f64,
@@ -223,6 +227,43 @@ pub enum Command {
     ListSymbol {
         listing: Listing,
     },
+    /// Operator: write or replace what a good costs from the catalogue.
+    SetCatalogItem {
+        symbol: String,
+        price_cents: i64,
+        available: Option<u64>,
+        note: Option<String>,
+    },
+    /// Operator: stop making a good. What was issued off the line stays.
+    RemoveCatalogItem {
+        symbol: String,
+    },
+    /// Operator: put a funded trader in the market that the world runs.
+    CreateNpc {
+        symbol: String,
+        name: Option<String>,
+        policy: Policy,
+        cash_cents: i64,
+        inventory: u64,
+    },
+    /// Operator: start or stop an NPC quoting.
+    SetNpcActive {
+        trader_id: u64,
+        active: bool,
+    },
+    /// Buy units of a good at the catalogue price: the only thing that
+    /// brings a unit of one into existence.
+    Purchase {
+        trader_id: u64,
+        symbol: String,
+        qty: u64,
+    },
+    /// Use units up. They leave the world; no currency moves.
+    Consume {
+        trader_id: u64,
+        symbol: String,
+        qty: u64,
+    },
     Delist {
         symbol: String,
         cents_per_share: Option<i64>,
@@ -283,6 +324,12 @@ impl Command {
             Self::PlaceStop { .. } => "place_stop",
             Self::CancelStop { .. } => "cancel_stop",
             Self::ListSymbol { .. } => "list_symbol",
+            Self::SetCatalogItem { .. } => "set_catalog_item",
+            Self::RemoveCatalogItem { .. } => "remove_catalog_item",
+            Self::CreateNpc { .. } => "create_npc",
+            Self::SetNpcActive { .. } => "set_npc_active",
+            Self::Purchase { .. } => "purchase",
+            Self::Consume { .. } => "consume",
             Self::Delist { .. } => "delist",
             Self::Dividend { .. } => "dividend",
             Self::Halt { .. } => "halt",
@@ -1158,6 +1205,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 day: order.day,
                 expires_at_ms: order.expires_at_ms,
                 display_qty: order.display_qty,
+                logged: true,
             };
             let placed = m
                 .place(&handle, trader, request)
@@ -1255,6 +1303,101 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
 
         Command::ListSymbol { listing } => apply_listing(m, wall_ms, listing).await,
 
+        Command::SetCatalogItem {
+            symbol,
+            price_cents,
+            available,
+            note,
+        } => {
+            let handle = m
+                .symbol(symbol)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(symbol))?;
+            let item = m
+                .set_catalog_item(&handle, *price_cents, *available, note.clone())
+                .await
+                .map_err(ApiError::goods)?;
+            Applied::new(200, &item)
+        }
+
+        Command::RemoveCatalogItem { symbol } => {
+            let sym = crate::symbol::intern(symbol).ok_or_else(|| ApiError::not_found(symbol))?;
+            let item = m
+                .remove_catalog_item(sym)
+                .ok_or_else(|| ApiError::not_found(symbol))?;
+            Applied::new(200, &item)
+        }
+
+        Command::CreateNpc {
+            symbol,
+            name,
+            policy,
+            cash_cents,
+            inventory,
+        } => {
+            let handle = m
+                .symbol(symbol)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(symbol))?;
+            let npc = m
+                .create_npc(
+                    &handle,
+                    name.clone(),
+                    *policy,
+                    *cash_cents,
+                    *inventory,
+                    wall_ms,
+                )
+                .await
+                .map_err(ApiError::goods)?;
+            let view = m
+                .npc_view(npc.trader)
+                .ok_or_else(|| ApiError::internal("the NPC vanished as it was made"))?;
+            Applied::new(201, &view)
+        }
+
+        Command::SetNpcActive { trader_id, active } => {
+            m.set_npc_active(TraderId(*trader_id), *active)
+                .await
+                .ok_or_else(|| ApiError::unknown_trader(*trader_id))?;
+            let view = m
+                .npc_view(TraderId(*trader_id))
+                .ok_or_else(|| ApiError::unknown_trader(*trader_id))?;
+            Applied::new(200, &view)
+        }
+
+        Command::Purchase {
+            trader_id,
+            symbol,
+            qty,
+        } => {
+            let handle = m
+                .symbol(symbol)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(symbol))?;
+            let receipt = m
+                .purchase(&handle, TraderId(*trader_id), *qty, wall_ms)
+                .await
+                .map_err(ApiError::goods)?;
+            Applied::new(201, &receipt)
+        }
+
+        Command::Consume {
+            trader_id,
+            symbol,
+            qty,
+        } => {
+            let handle = m
+                .symbol(symbol)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(symbol))?;
+            let receipt = m
+                .consume(&handle, TraderId(*trader_id), *qty)
+                .await
+                .map_err(ApiError::goods)?;
+            Applied::new(200, &receipt)
+        }
+
         Command::Delist {
             symbol,
             cents_per_share,
@@ -1262,6 +1405,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
             note,
         } => {
             let at = m.now();
+            stock_only(m, symbol, "delisted").await?;
             let delisting = m
                 .delist(symbol, *cents_per_share, note.clone(), at.0)
                 .await
@@ -1310,6 +1454,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 .ask_listed(|s| s.price_cents())
                 .await?
                 .ok_or_else(|| ApiError::not_found(handle.ticker))?;
+            stock_only(m, symbol, "paid a dividend").await?;
             let (paid, effects) = m
                 .pay_dividend(&handle, *cents_per_share, note.clone(), at.0)
                 .await
@@ -1474,6 +1619,26 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
 /// it takes to generate its history, during which nothing else changes the
 /// market — but it is what makes the listing a command like any other, and
 /// so replayable. Listing is rare and an operator's; a fill is neither.
+/// Refuse a corporate action on a good.
+///
+/// Both belong to a company: a dividend hands out a share of the profits and
+/// a delisting buys the shares back. A crate of ore has neither profits nor
+/// shareholders, so rather than inventing a meaning the route says no. What
+/// ends a good's life is consuming it.
+async fn stock_only(m: &Market, symbol: &str, what: &str) -> Result<(), ApiError> {
+    let handle = m
+        .symbol(symbol)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found(symbol))?;
+    if handle.ask(|s| s.info.is_good()).await? {
+        return Err(ApiError::invalid_event(format!(
+            "{} is a good: its units are issued and consumed, so it is never {what}",
+            handle.ticker
+        )));
+    }
+    Ok(())
+}
+
 async fn apply_listing(
     m: &mut Market,
     wall_ms: i64,
@@ -1481,10 +1646,20 @@ async fn apply_listing(
 ) -> Result<Applied, ApiError> {
     let symbol = crate::symbols::register(&listing.symbol)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    if listing.shares_outstanding == 0 {
-        return Err(ApiError::bad_request(
-            "a listing needs shares: shares_outstanding must be positive",
-        ));
+    match &listing.asset {
+        AssetKind::Stock {
+            shares_outstanding: 0,
+        } => {
+            return Err(ApiError::bad_request(
+                "a listing needs shares: shares_outstanding must be positive",
+            ));
+        }
+        AssetKind::Good { consumed, .. } if *consumed > 0 => {
+            return Err(ApiError::bad_request(
+                "a good is listed with nothing consumed yet",
+            ));
+        }
+        _ => {}
     }
     let at = m.now();
     if m.symbol(symbol).is_some() {
@@ -1496,7 +1671,7 @@ async fn apply_listing(
             name: listing.name.clone(),
             sector: listing.sector.clone(),
             description: listing.description.clone(),
-            shares_outstanding: listing.shares_outstanding,
+            asset: listing.asset.clone(),
             seed: listing.seed,
         },
         config: fehu::Config {
@@ -1505,6 +1680,9 @@ async fn apply_listing(
             volatility: listing.volatility,
             ..fehu::Config::default()
         },
+        // Whether this listing is quoted synthetically is the venue's
+        // decision, not the request's: `prepare_listing` sets it from the
+        // world's options and the asset kind together.
         trading: fehu::TradingParams::default(),
     };
     let state = m
@@ -1524,8 +1702,11 @@ async fn apply_listing(
         magnitude: None,
         effects: Vec::new(),
         summary: vec![format!(
-            "{symbol} listed at {} cents, {} shares outstanding",
-            quote.price_cents, quote.shares_outstanding
+            "{symbol} listed as a {} at {} cents, {} {} outstanding",
+            quote.asset_kind,
+            quote.price_cents,
+            quote.shares_outstanding,
+            quote.unit.as_deref().unwrap_or("shares")
         )],
     });
     Applied::new(201, &ListingResponse { quote, event })

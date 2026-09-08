@@ -28,14 +28,16 @@ use crate::account::{
 use fehu::ledger::LedgerError;
 
 use crate::actor::Gone;
+use crate::catalog::{CatalogError, CatalogResponse, GoodsError, MAX_NOTE_LEN};
 use crate::events::{CatalogEntry, EventRecord, GameEventKind, GameEventRequest, PushEventRequest};
 use crate::journal::{Command, Listing, Outcome, Principal, seed_from_ticker};
 use crate::limit::Decision;
 use crate::market::{
-    App, Closed, Market, OrderCheck, PayoutError, PlaceError, Quote, Sequenced, SnapshotDto,
-    StreamMessage, Subscription, SupplyDto, Symbol, SymbolInfo, SymbolStatus, SymbolView,
-    wall_now_ms,
+    App, AssetKind, Closed, Market, OrderCheck, PayoutError, PlaceError, Quote, Sequenced,
+    SnapshotDto, StreamMessage, Subscription, SupplyDto, Symbol, SymbolInfo, SymbolStatus,
+    SymbolView, wall_now_ms,
 };
+use crate::npc::{NpcsResponse, Policy};
 use crate::trading::{
     AmendRequest, BookDto, CreateTraderRequest, HolderDto, MAX_CLIENT_ORDER_ID, OpenOrderDto,
     OrderRecord, OrderRequest, PortfolioDto, PositionDto, Refused, StopOrder, StopRequest,
@@ -109,6 +111,12 @@ pub fn router(app: AppState) -> Router {
         .route("/api/accounts/{account_id}/status", post(set_status))
         .route("/api/accounts/{account_id}/validate", get(validate_account))
         .route("/api/accounts/{account_id}/ledger", get(get_ledger))
+        .route("/api/npcs", get(list_npcs).post(create_npc))
+        .route("/api/npcs/{trader_id}/active", post(set_npc_active))
+        .route("/api/catalog", get(get_catalog).post(set_catalog_item))
+        .route("/api/catalog/{symbol}", delete(remove_catalog_item))
+        .route("/api/traders/{trader_id}/purchases", post(purchase))
+        .route("/api/traders/{trader_id}/consume", post(consume))
         .route("/api/supply", get(supply))
         .route("/api/commands/{key}", get(get_command))
         .route("/api/game/catalog", get(catalog))
@@ -412,6 +420,37 @@ impl ApiError {
     /// never something they can fix by changing the request.
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
+    }
+
+    /// A purchase or a consumption the world would not carry out.
+    pub(crate) fn goods(e: GoodsError) -> Self {
+        match e {
+            GoodsError::Money(m) => Self::money(m),
+            GoodsError::UnknownTrader(id) => Self::unknown_trader(id),
+            GoodsError::Unknown(sym) => Self::not_found(&sym),
+            GoodsError::NotAGood(_) => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not_a_good",
+                e.to_string(),
+            ),
+            GoodsError::Quantity(_) => Self::bad_request(e.to_string()),
+            GoodsError::Catalog(CatalogError::Unknown(sym)) => Self::new(
+                StatusCode::NOT_FOUND,
+                "not_in_catalog",
+                CatalogError::Unknown(sym).to_string(),
+            ),
+            GoodsError::Catalog(CatalogError::Exhausted { .. }) => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "catalog_exhausted",
+                e.to_string(),
+            ),
+            GoodsError::Catalog(_) => Self::bad_request(e.to_string()),
+            GoodsError::InsufficientUnits { .. } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "insufficient_inventory",
+                e.to_string(),
+            ),
+        }
     }
 
     /// A corporate payout the issuer could not fund.
@@ -916,7 +955,11 @@ struct SymbolDetail {
 #[derive(Serialize)]
 struct SharesDto {
     symbol: &'static str,
-    /// Shares in existence.
+    /// `stock` or `good`.
+    asset_kind: &'static str,
+    /// What one unit of a good is called; `null` for a stock.
+    unit: Option<String>,
+    /// Units in existence.
     shares_outstanding: u64,
     /// Held by traders.
     held_shares: u64,
@@ -939,17 +982,20 @@ impl SharesDto {
     /// holds them. Two actors, asked in turn.
     async fn fetch(app: &App, symbol: &Symbol, caller: Option<Caller>) -> Result<Self, ApiError> {
         let sym = symbol.ticker;
-        let (shares_outstanding, bid_shares, price_cents, market_cap_cents) = symbol
-            .ask_listed(|s| {
-                (
-                    s.info.shares_outstanding,
-                    s.bid_shares(),
-                    s.price_cents(),
-                    s.market_cap_cents(),
-                )
-            })
-            .await?
-            .ok_or_else(|| ApiError::not_found(sym))?;
+        let (asset_kind, unit, shares_outstanding, bid_shares, price_cents, market_cap_cents) =
+            symbol
+                .ask_listed(|s| {
+                    (
+                        s.info.asset.label(),
+                        s.info.asset.unit().map(str::to_owned),
+                        s.info.units_outstanding(),
+                        s.bid_shares(),
+                        s.price_cents(),
+                        s.market_cap_cents(),
+                    )
+                })
+                .await?
+                .ok_or_else(|| ApiError::not_found(sym))?;
         let (held_shares, mut holders) = app
             .market
             .call(move |m| {
@@ -965,6 +1011,8 @@ impl SharesDto {
         holders.sort_by_key(|h| (std::cmp::Reverse(h.qty), h.trader_id));
         Ok(Self {
             symbol: sym,
+            asset_kind,
+            unit,
             shares_outstanding,
             held_shares,
             bid_shares,
@@ -1031,9 +1079,17 @@ struct ListingRequest {
     name: Option<String>,
     sector: Option<String>,
     description: Option<String>,
-    /// Shares in existence. The market never creates or destroys them, so
-    /// this is the ceiling on what every trader can hold between them.
+    /// `stock`, the default, or `good`.
+    kind: Option<String>,
+    /// Shares in existence, for a stock. The market never creates or
+    /// destroys them, so this is the ceiling on what every trader can hold
+    /// between them. A good has no such number: its units are issued and
+    /// consumed one command at a time, and it is listed holding none.
+    #[serde(default)]
     shares_outstanding: u64,
+    /// What one unit of a good is called: `kg`, `crate`, `ingot`. Ignored
+    /// for a stock, whose unit is a share.
+    unit: Option<String>,
     /// Where the price starts, in cents.
     start_price_cents: i64,
     /// Annual log drift and annualised volatility; the simulator's defaults
@@ -1072,6 +1128,17 @@ async fn list_symbol(
     if app.symbol(symbol).is_some() {
         return Err(ApiError::conflict(format!("{symbol} is already listed")));
     }
+    let asset = match req.kind.as_deref().map(str::trim).unwrap_or("stock") {
+        "stock" => AssetKind::stock(req.shares_outstanding),
+        "good" => AssetKind::good(
+            clean_text(req.unit, crate::symbol::MAX_UNIT_LEN).unwrap_or_else(|| "unit".into()),
+        ),
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "unknown asset kind {other:?}: a listing is a \"stock\" or a \"good\""
+            )));
+        }
+    };
     let defaults = Config::default();
     run(
         &app,
@@ -1083,7 +1150,7 @@ async fn list_symbol(
                 name: clean_text(req.name, 64).unwrap_or_else(|| symbol.to_string()),
                 sector: clean_text(req.sector, 64).unwrap_or_else(|| "Uncategorised".into()),
                 description: clean_text(req.description, 280).unwrap_or_default(),
-                shares_outstanding: req.shares_outstanding,
+                asset,
                 seed: req.seed.unwrap_or_else(|| seed_from_ticker(symbol)),
                 start_price_cents: req.start_price_cents,
                 drift: req.drift.unwrap_or(defaults.drift),
@@ -1092,6 +1159,241 @@ async fn list_symbol(
                 source: req.source.unwrap_or_else(|| "api".into()),
                 note: req.note,
             },
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+// ---------------------------------------------------------------------------
+// NPCs: the traders the world runs itself.
+
+/// `GET /api/npcs`: who the world is trading as, and what each has left.
+async fn list_npcs(State(app): State<AppState>) -> Result<Json<NpcsResponse>, ApiError> {
+    Ok(Json(NpcsResponse {
+        npcs: app.market.call(|m| m.npc_views()).await?,
+    }))
+}
+
+/// Body of `POST /api/npcs`.
+#[derive(Deserialize)]
+struct NpcRequest {
+    /// The symbol it makes a market in.
+    symbol: String,
+    name: Option<String>,
+    /// Currency it is funded with, out of treasury. Nothing is minted.
+    cash_cents: i64,
+    /// Units it starts holding: shares of a stock nobody held, or units of a
+    /// good issued to it.
+    #[serde(default)]
+    inventory: u64,
+    /// How it quotes. The defaults are a 25 bp half-spread over five levels.
+    #[serde(default)]
+    half_spread_bps: Option<u32>,
+    #[serde(default)]
+    levels: Option<u32>,
+    #[serde(default)]
+    level_step_bps: Option<u32>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    requote_bps: Option<u32>,
+}
+
+/// Put a funded trader in the market that the world runs.
+async fn create_npc(
+    State(app): State<AppState>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<NpcRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let symbol = crate::symbol::intern(&req.symbol)
+        .ok_or_else(|| ApiError::not_found(&req.symbol))?
+        .to_string();
+    let base = Policy::default();
+    let policy = Policy {
+        half_spread_bps: req.half_spread_bps.unwrap_or(base.half_spread_bps),
+        levels: req.levels.unwrap_or(base.levels),
+        level_step_bps: req.level_step_bps.unwrap_or(base.level_step_bps),
+        size: req.size.unwrap_or(base.size),
+        requote_bps: req.requote_bps.unwrap_or(base.requote_bps),
+    };
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::CreateNpc {
+            symbol,
+            name: clean_text(req.name, 64),
+            policy,
+            cash_cents: req.cash_cents,
+            inventory: req.inventory,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Body of `POST /api/npcs/{trader_id}/active`.
+#[derive(Deserialize)]
+struct ActiveRequest {
+    active: bool,
+}
+
+/// Start or stop an NPC quoting. Its money and inventory stay where they are.
+async fn set_npc_active(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<ActiveRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::SetNpcActive {
+            trader_id,
+            active: req.active,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+// ---------------------------------------------------------------------------
+// The catalogue: goods, and the two things that are done to them besides
+// trading them.
+
+/// `GET /api/catalog`: what the world will make and what it charges.
+async fn get_catalog(State(app): State<AppState>) -> Result<Json<CatalogResponse>, ApiError> {
+    Ok(Json(CatalogResponse {
+        items: app
+            .market
+            .call(|m| m.catalog.items().cloned().collect())
+            .await?,
+    }))
+}
+
+/// Body of `POST /api/catalog`.
+#[derive(Deserialize)]
+struct CatalogRequest {
+    /// The good this line sells. It has to be listed, and it has to be a
+    /// good.
+    symbol: String,
+    /// What one unit costs, in cents. At least one: a free good would be a
+    /// way of making units out of nothing.
+    price_cents: i64,
+    /// Units this line may still issue. Omit it for a seam that never runs
+    /// out, which is what a demo wants and a scarce world does not.
+    available: Option<u64>,
+    note: Option<String>,
+}
+
+/// Write or replace one line of the catalogue.
+async fn set_catalog_item(
+    State(app): State<AppState>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<CatalogRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let symbol = crate::symbol::intern(&req.symbol)
+        .ok_or_else(|| ApiError::not_found(&req.symbol))?
+        .to_string();
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::SetCatalogItem {
+            symbol,
+            price_cents: req.price_cents,
+            available: req.available,
+            note: clean_text(req.note, MAX_NOTE_LEN),
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Stop making a good. Units already issued off the line stay in the world.
+async fn remove_catalog_item(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+) -> Result<Committed, ApiError> {
+    let symbol = crate::symbol::intern(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?
+        .to_string();
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::RemoveCatalogItem { symbol },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Body of `POST /api/traders/{id}/purchases` and `.../consume`.
+#[derive(Deserialize)]
+struct GoodsRequest {
+    symbol: String,
+    qty: u64,
+}
+
+/// Buy units of a good at the catalogue price: currency to the good's
+/// issuer, units to the buyer, in one command.
+async fn purchase(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    caller: Caller,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<GoodsRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    owned_trader(&app, caller, TraderId(trader_id))?;
+    let symbol = crate::symbol::intern(&req.symbol)
+        .ok_or_else(|| ApiError::not_found(&req.symbol))?
+        .to_string();
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::Purchase {
+            trader_id,
+            symbol,
+            qty: req.qty,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Use units up. They leave the world and nothing comes back.
+async fn consume(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    caller: Caller,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<GoodsRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    owned_trader(&app, caller, TraderId(trader_id))?;
+    let symbol = crate::symbol::intern(&req.symbol)
+        .ok_or_else(|| ApiError::not_found(&req.symbol))?
+        .to_string();
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::Consume {
+            trader_id,
+            symbol,
+            qty: req.qty,
         },
     )
     .await

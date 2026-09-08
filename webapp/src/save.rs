@@ -58,6 +58,14 @@ pub type Symbol = &'static str;
 
 /// Current save format. Any other version, older or newer, is refused.
 ///
+/// Version 8 gave every listing an [`AssetKind`](crate::symbol::AssetKind):
+/// a company with a fixed float, or a good with a unit and a count that
+/// production and consumption move. A version 7 file names a
+/// `shares_outstanding` and nothing else, which is a stock — but its
+/// exchange also predates the switch that stops synthetic liquidity
+/// printing units nobody issued, so the file is refused rather than read as
+/// half a world.
+///
 /// Version 7 added the command journal's sequence and its idempotency index,
 /// so a snapshot says exactly which commands it already contains and a retry
 /// that arrives after a restart is still a retry. A version 6 file has
@@ -76,7 +84,7 @@ pub type Symbol = &'static str;
 /// transaction out of issuance, so the currency has a recorded origin and
 /// the books still add up. It is a day's work when there is such a world.
 /// There is not: the current file is a demo, regenerated from its seeds.
-pub const STATE_VERSION: u32 = 7;
+pub const STATE_VERSION: u32 = 8;
 
 /// Everything needed to carry on where the server left off.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -136,6 +144,12 @@ pub struct MarketSave {
     /// Per symbol, the wallet its payouts come out of.
     #[serde(default)]
     pub issuers: Vec<(String, fehu::ledger::WalletId)>,
+    /// What the world will make and what it charges. Since version 8.
+    #[serde(default)]
+    pub catalog: crate::catalog::Catalog,
+    /// The traders the world runs itself. Since version 8.
+    #[serde(default)]
+    pub npcs: Vec<crate::npc::Npc>,
     pub users: Vec<User>,
     pub accounts: Vec<Account>,
     pub traders: Vec<Trader>,
@@ -371,8 +385,15 @@ fn validate_accounting(save: &Save) -> Result<(), SaveError> {
             issues.push("API key digest has an invalid format".into());
         }
     }
-    if users != key_users {
-        issues.push("every user must have exactly one API key digest".into());
+    // Every user has exactly one key, except the ones nobody can sign in
+    // as: an NPC's identity is created without a credential on purpose, so
+    // that there is none to leak and no request can arrive claiming to be
+    // it. A user with no key and no NPC behind it is a user nothing can
+    // reach, which is a broken file rather than a design.
+    let house: BTreeSet<u64> = save.market.npcs.iter().map(|n| n.user_id.0).collect();
+    let keyless: BTreeSet<u64> = users.difference(&key_users).copied().collect();
+    if !keyless.is_subset(&house) {
+        issues.push("every user must have exactly one API key digest, or be an NPC's".into());
     }
     if !issues.is_empty() {
         return Err(SaveError::Invalid(issues));

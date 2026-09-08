@@ -645,3 +645,80 @@ impl Drop for TempDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+#[tokio::test]
+async fn goods_survive_a_stop_between_the_making_and_the_eating() {
+    let dir = TempDir::new("fehu-journal-goods");
+    let (app, path) = boot(&dir).await;
+    let r = post(
+        &app,
+        None,
+        None,
+        "/api/symbols",
+        json!({
+            "symbol": "ORE", "kind": "good", "unit": "kg",
+            "name": "Iron Ore", "start_price_cents": 250,
+        }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let r = post(
+        &app,
+        None,
+        None,
+        "/api/catalog",
+        json!({ "symbol": "ORE", "price_cents": 250, "available": 500 }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let player = sign_up(&app, "wanda", None).await;
+    let r = post(
+        &app,
+        Some(&player.key),
+        Some("buy-ore"),
+        &format!("/api/traders/{}/purchases", player.trader_id),
+        json!({ "symbol": "ORE", "qty": 80 }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let r = post(
+        &app,
+        Some(&player.key),
+        None,
+        &format!("/api/traders/{}/consume", player.trader_id),
+        json!({ "symbol": "ORE", "qty": 30 }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+
+    // Nothing has been snapshotted: the journal is the only record, and
+    // listing a good, stocking the catalogue, buying and eating are four
+    // commands in it.
+    save::write(&app, &path)
+        .await
+        .expect("a snapshot to start from");
+    let before = get(&app, None, "/api/symbols/ORE").await.body;
+    let app = restart(app, &path).await;
+    let after = get(&app, None, "/api/symbols/ORE").await.body;
+    assert_eq!(after["info"], before["info"], "issued and consumed");
+    assert_eq!(after["info"]["asset"]["issued"], 80);
+    assert_eq!(after["info"]["asset"]["consumed"], 30);
+
+    // The retry of a purchase whose response was lost is still not a second
+    // purchase, on the far side of a restart.
+    let r = post(
+        &app,
+        Some(&player.key),
+        Some("buy-ore"),
+        &format!("/api/traders/{}/purchases", player.trader_id),
+        json!({ "symbol": "ORE", "qty": 80 }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    assert!(r.replayed, "the recorded answer, not another 80 kg");
+    let detail = get(&app, None, "/api/symbols/ORE").await.body;
+    assert_eq!(detail["info"]["asset"]["issued"], 80);
+
+    let report = get(&app, None, "/api/reconcile").await.body;
+    assert_eq!(report["valid"], true, "{report}");
+}

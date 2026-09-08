@@ -45,6 +45,12 @@ export interface Level {
 
 // --- webapp/src/market.rs --------------------------------------------------
 
+/**
+ * `symbol::AssetKind` — what a listing is. A `stock` has a fixed float and
+ * pays dividends; a `good` is issued and consumed and has neither.
+ */
+export type AssetKind = 'stock' | 'good';
+
 /** `market::Quote`. */
 export interface Quote {
   symbol: string;
@@ -63,7 +69,11 @@ export interface Quote {
   pending_events: number;
   bid_cents: number | null;
   ask_cents: number | null;
-  /** Shares in existence for this symbol. */
+  /** What this listing is. */
+  asset_kind: AssetKind;
+  /** What one unit of a good is called; `null` for a stock. */
+  unit: string | null;
+  /** Units in existence: a stock's shares, or a good's issued less consumed. */
   shares_outstanding: number;
   /** `price × shares_outstanding`. */
   market_cap_cents: number;
@@ -120,6 +130,9 @@ export interface HolderDto {
  */
 export interface SharesResponse {
   symbol: string;
+  asset_kind: AssetKind;
+  /** What one unit of a good is called; `null` for a stock. */
+  unit: string | null;
   shares_outstanding: number;
   /** Held by traders. */
   held_shares: number;
@@ -815,6 +828,108 @@ export interface SupplyDto {
   venue_cents: number;
   issuer_cents: number;
   player_cents: number;
+  /** Sitting in the tills of the traders the world runs itself. */
+  npc_cents: number;
   synthetic_debt_cents: number;
   wallets: number;
+}
+
+// --- webapp/src/catalog.rs -------------------------------------------------
+
+/**
+ * `catalog::CatalogItem` — one line of the catalogue: a good, its price, and
+ * how much of it is left to make.
+ */
+export interface CatalogItem {
+  symbol: string;
+  /** What one unit costs. Always at least a cent. */
+  price_cents: number;
+  /** Units this line may still issue; `null` for a seam that never runs out. */
+  available: number | null;
+  /** Units it has issued since the line was written. */
+  issued: number;
+  note: string | null;
+}
+
+/** `GET /api/catalog` (`catalog::CatalogResponse`). */
+export interface CatalogResponse {
+  items: CatalogItem[];
+}
+
+/**
+ * `POST /api/traders/{id}/purchases` (`catalog::PurchaseReceipt`): currency
+ * to the good's issuer, units that did not exist to the buyer.
+ */
+export interface PurchaseReceipt {
+  trader_id: number;
+  symbol: string;
+  qty: number;
+  unit_price_cents: number;
+  /** `qty × unit_price_cents`, the amount that moved. */
+  total_cents: number;
+  /** The balanced transaction that moved it. */
+  tx_id: number;
+  /** What the trader holds of the good now. */
+  position_qty: number;
+  /** Units of the good in existence now. */
+  units_outstanding: number;
+  /** What the line has left to make, or `null` for a seam. */
+  available: number | null;
+}
+
+/**
+ * `POST /api/traders/{id}/consume` (`catalog::ConsumeReceipt`). No currency
+ * moves: a thing used up is not a thing sold, so there is no transaction to
+ * name.
+ */
+export interface ConsumeReceipt {
+  trader_id: number;
+  symbol: string;
+  qty: number;
+  position_qty: number;
+  units_outstanding: number;
+}
+
+// --- webapp/src/npc.rs -----------------------------------------------------
+
+/**
+ * `npc::Policy` — how an NPC quotes: a ladder of its own, in basis points of
+ * the reference price.
+ */
+export interface NpcPolicy {
+  /** Half the spread. The best bid sits this far below the reference. */
+  half_spread_bps: number;
+  levels: number;
+  level_step_bps: number;
+  /** Units quoted at each level. */
+  size: number;
+  /** How far the reference must move before the quotes are redrawn. */
+  requote_bps: number;
+}
+
+/**
+ * `npc::NpcDto` — one of the traders the world runs itself, and what it has
+ * left. Its bid disappears when its wallet is empty and its ask when its
+ * inventory is.
+ */
+export interface NpcDto {
+  trader_id: number;
+  user_id: number;
+  account_id: number;
+  symbol: string;
+  name: string;
+  policy: NpcPolicy;
+  /** Quoting is on. Off, it keeps its money and stock and stops offering them. */
+  active: boolean;
+  /** Currency it can still bid with. */
+  cash_cents: number;
+  /** Units it holds. */
+  inventory: number;
+  /** Units already promised to resting sells. */
+  reserved: number;
+}
+
+/** `GET /api/npcs` (`npc::NpcsResponse`). */
+export interface NpcsResponse {
+  npcs: NpcDto[];
 }

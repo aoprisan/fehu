@@ -376,7 +376,7 @@ and to be replaced by measurement after the first two.
 | 0 | ✅ Baseline: run `just ci`, record the results here | Green | hours |
 | 1 | ✅ `src/ledger.rs` with property tests on the `no_std` path; `account.rs` rewired to it; funding routes made operator-only; fees to venue; payouts funded; freeze split from close; save version 6 | Contract tests show no player route changes supply; reconcile reports zero drift after the existing API tests | days |
 | 2 | ✅ `webapp/src/journal.rs`; every mutation journaled inside its market job; `Idempotency-Key`; replay on start; engine tick journaled with its wall input; `GET /commands/{key}`; save version 7 | Kill the process at random points under the concurrency test; restart reproduces the last acknowledged state and no duplicate reward | week |
-| 3 | `AssetKind`; goods in holdings; NPC wallets and policies; synthetic ladder and prints disabled on the server; catalogue, purchase and consume routes | Player-to-player and player-to-NPC fills, partial fills, IOC/FOK, amendments, stops, dividends and delistings conserve currency and units | weeks |
+| 3 | ✅ `AssetKind`; goods in holdings; NPC wallets and policies; synthetic ladder and prints disabled on the server; catalogue, purchase and consume routes; save version 8 | Player-to-player and player-to-NPC fills, partial fills, IOC/FOK, amendments, stops, dividends and delistings conserve currency and units | weeks |
 | 4 | Recipes and jobs; rewards from budgets; game events with production and demand effects; `/api/v1/economy` routes and `types.ts`; UI panels for wallet, inventory and jobs; `just ui` | The acceptance scenario below passes, including retries and restarts at every step | weeks |
 | 5 | Tier two: SQLite journal and history, outbox with cursor replay for the game backend, bounded admission and quotas, load test with a declared target, backup and restore drill | p95 command latency and recovery time under the declared load; restore reconciles | weeks, only if tier one is outgrown |
 
@@ -521,6 +521,88 @@ Determinism is untouched again: the journal draws no randomness and the price
 process never sees it, so neither `STATE_VERSION` nor `EXCHANGE_VERSION`
 moves, and `tests/determinism.rs` and `tests/trading.rs` pass unchanged.
 
+### Milestone 3 as built
+
+Done. `src/exchange.rs` gained the switch, `webapp/src/symbol.rs` the asset
+kind, `webapp/src/catalog.rs` and `webapp/src/npc.rs` are new, and
+`webapp/tests/goods.rs`, `webapp/tests/npc.rs` and
+`webapp/tests/economy_goods.rs` hold the acceptance. Six things are worth
+recording.
+
+**The ladder is a library capability, not a server policy.**
+`TradingParams::synthetic` turns the synthetic maker ladder and the printed
+flow off; `requote` and `synthetic_flow` then return without drawing
+anything, so the book holds only real orders, the tape only real trades, and
+the tick's volume is whatever traders did. The simulator carries on untouched
+as the reference price — which is what its own `long_jump`ed stream was
+always for — so the bare price series is identical either way and neither
+`STATE_VERSION` nor the golden hashes move. `EXCHANGE_VERSION` moves to 2 for
+the field.
+
+**The supply ceiling belongs to the ladder, not to the asset.** The plan says
+a buy is bounded by the units no trader holds or is already bidding for.
+That rule exists because the ladder will sell what nobody holds. Without a
+ladder it is not merely unnecessary but wrong: every fill then comes from a
+holder who has reserved the units, so a bid can no more conjure one than a
+wish can, and enforcing the ceiling would stop two players bidding for the
+same good at once. The check is now conditional on the symbol quoting
+synthetically, and the audit branches the same way — for a stock with a
+ladder, holdings plus resting bids against the float; without one, holdings
+alone; for a good, the stricter equality: every issued unit that has not been
+consumed is held by somebody.
+
+**A good is listed holding nothing.** The plan's `Good { issued, consumed }`
+could have taken an opening `issued` at the listing, and that would have been
+a hole: units nobody holds and nobody can buy, because there is no ladder to
+sell them. So a listing issues none, and the only things that make a unit are
+a catalogue purchase and an NPC endowment — both of which hand the units to a
+holder in the same command that creates them.
+
+**The catalogue separates the two conservation laws.** A purchase moves
+currency (buyer to the good's issuer wallet, one balanced transaction, supply
+untouched) *and* creates units. Keeping those apart is what makes it
+auditable: `/api/supply` reads the same before and after, and the unit count
+is checked by its own sentence. Consuming is the mirror and simpler still —
+units leave, no currency moves, because a thing that has been used up is not
+a thing that has been sold. A good's issuer wallet therefore takes no float
+out of treasury: it is where money arrives, not a payout waiting to happen.
+
+**An NPC is an ordinary trader, and two decisions make it a cheap one.** It
+has a wallet of its own kind, a position, reservations, and orders that go
+through the same command path a player's do; a fill against it settles,
+charges fees and reconciles like any other, which is why nothing needed
+special-casing. What is new is when it quotes. Redrawing every tick would put
+an order on the book four times a second per level per side and take it off
+again, so quotes are redrawn when the reference leaves a band *or* when fewer
+orders are resting than the NPC left behind — the band stops it redrawing a
+book that has not moved, the count stops it *not* redrawing one that has been
+eaten, and levels it still cannot fund are refused and not counted, so an NPC
+that can afford nothing settles at zero rather than trying forever. And its
+orders are not written to the order log: nobody asks after them by id, and
+logging them would evict every player's record within a minute. The book, the
+reservations and the audit do not read that log.
+
+**A user with no key is now legal, in exactly one case.** An NPC needs an
+identity — a trader belongs to a user and every audit walks that link — but
+no player is behind it, so it is created with no credential at all: there is
+none to leak and no request can arrive claiming to be it. The save
+invariant that every user has exactly one API key digest is relaxed to
+"…or is an NPC's", and no further.
+
+What is *not* done, deliberately: the ladder is still on by default.
+`FEHU_SYNTHETIC=0` turns it off world-wide and is tested — with it off, every
+fill has a funded counterparty and `synthetic_debt_cents` stays at zero,
+which is the number this milestone exists to retire — but a world with no
+merchants and no players would otherwise have an empty book, and the demo is
+a world with no merchants and no players. Seeding merchants for the four
+seeded symbols is a change to what the demo *is*, and belongs with milestone
+4's world configuration rather than smuggled in here. A good is always
+quoted without a ladder regardless, because its units are counted.
+
+Determinism is untouched a third time. Quoting reads the market and the
+symbol and nothing else — no clock, no randomness — and happens inside
+`Command::Step`, so a replayed step draws the same book.
+
 ## Acceptance scenario
 
 Initialise a world with a genesis supply in treasury. Onboard two players.
@@ -559,6 +641,41 @@ cargo test -p fehu-webapp      # webapp: all suites pass, 0 failed
 
 `just lint`, the `no_std` path and the wasm build were not run for this
 documentation-only change; milestone 0 runs `just ci` in full.
+
+### After milestone 3
+
+Run the same way, command by command. All of it passes:
+
+```
+cargo fmt --all -- --check                                  # clean
+cargo clippy --all-targets --all-features -- -D warnings    # clean
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo clippy -p fehu-webapp --all-targets -- -D warnings    # clean
+cargo build --all-features / --no-default-features / +serde # clean
+cargo test --all-features                                   # 103 passed, 0 failed
+cargo test --no-default-features --tests                    #  96 passed, 0 failed
+cargo test -p fehu-webapp                                   # 179 passed, 0 failed
+```
+
+Three new suites. `webapp/tests/goods.rs`: a good listed holding nothing and
+quoting nothing, a good with neither shareholders nor a buyout, the
+catalogue running out and being taken away, units promised to a resting sell
+that cannot be eaten, a purchase not paid for twice by a retry, and a world
+with goods in it coming back whole. `webapp/tests/npc.rs`: a merchant funded
+out of treasury without making currency, quoting both sides, running out and
+falling silent on the side it has run out of, switched off and back on,
+given shares of a stock nobody held, coming back quoting what it was
+quoting, and a world with no synthetic liquidity that owes nobody anything.
+`webapp/tests/economy_goods.rs` is the milestone's own acceptance: every
+kind of fill the venue accepts — partial, IOC, FOK, amended, player to
+merchant, player to player, a stop that fired — and then dividends and a
+delisting, each followed by the same two questions, does the currency add up
+and is every unit somewhere.
+
+One library test joins them: an exchange with the ladder off holds only what
+traders put in it, and its price series is the bare simulator's.
+
+The 145 webapp tests that predate the milestone are unchanged and pass.
 
 ### After milestone 2
 

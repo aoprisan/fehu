@@ -27,8 +27,105 @@ use crate::trading::{BookDto, StopOrder, StopRequest, TradeDto};
 /// Milliseconds in one day.
 pub const DAY_MS: i64 = 86_400_000;
 
-/// What a listing is, apart from its price process: who it claims to be and
-/// how many shares of it exist.
+/// The longest unit name a good may be measured in.
+pub const MAX_UNIT_LEN: usize = 16;
+
+/// What a listing *is*, and where its units come from.
+///
+/// Both kinds are traded through the same book, held in the same
+/// [`Trader::positions`](crate::trading::Trader::positions) and reserved the
+/// same way; the kind says only how many units exist and what may be done to
+/// them besides trading. Every rule that follows from it is a refusal
+/// somewhere: a good has no dividend and no buyout, a stock is not bought
+/// from a catalogue and not consumed.
+///
+/// The audit is the same sentence for both — what traders hold plus what
+/// resting bids speak for may not exceed the units in existence — over two
+/// different counts of what exists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AssetKind {
+    /// A company. Its shares are fixed at the flotation: nothing creates or
+    /// destroys them, so what the traders hold plus what is still out in the
+    /// market adds up to `shares_outstanding` for as long as it is listed.
+    /// It pays dividends and can be delisted with a buyout.
+    Stock {
+        /// Shares in existence.
+        shares_outstanding: u64,
+    },
+    /// A thing. Its units are produced and consumed, so its supply is
+    /// `issued − consumed` and moves — but only ever through a command that
+    /// says which: nothing else creates a unit of a good, which is why a
+    /// good is quoted without synthetic liquidity
+    /// ([`TradingParams::synthetic`](fehu::TradingParams)).
+    Good {
+        /// Units brought into the world since it was listed.
+        issued: u64,
+        /// Units destroyed by consuming them.
+        consumed: u64,
+        /// What one unit is, for display: `kg`, `crate`, `ingot`.
+        unit: String,
+    },
+}
+
+impl AssetKind {
+    /// A stock with `shares` shares.
+    #[must_use]
+    pub fn stock(shares: u64) -> Self {
+        Self::Stock {
+            shares_outstanding: shares,
+        }
+    }
+
+    /// A good measured in `unit`, with nothing issued yet.
+    #[must_use]
+    pub fn good(unit: impl Into<String>) -> Self {
+        Self::Good {
+            issued: 0,
+            consumed: 0,
+            unit: unit.into(),
+        }
+    }
+
+    /// A short, stable name for JSON and for logs.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Stock { .. } => "stock",
+            Self::Good { .. } => "good",
+        }
+    }
+
+    /// Units in existence: the shares of a stock, or what has been issued
+    /// less what has been consumed of a good.
+    #[must_use]
+    pub fn units_outstanding(&self) -> u64 {
+        match self {
+            Self::Stock { shares_outstanding } => *shares_outstanding,
+            Self::Good {
+                issued, consumed, ..
+            } => issued.saturating_sub(*consumed),
+        }
+    }
+
+    /// What one unit is called, for a good.
+    #[must_use]
+    pub fn unit(&self) -> Option<&str> {
+        match self {
+            Self::Stock { .. } => None,
+            Self::Good { unit, .. } => Some(unit),
+        }
+    }
+
+    /// This is a good: it is produced and consumed rather than floated.
+    #[must_use]
+    pub fn is_good(&self) -> bool {
+        matches!(self, Self::Good { .. })
+    }
+}
+
+/// What a listing is, apart from its price process: who it claims to be, what
+/// kind of thing it is, and how many units of it exist.
 ///
 /// This travels in the save file. It used to come from the build — the four
 /// literals below — but a symbol listed while the server runs has no build to
@@ -43,19 +140,86 @@ pub struct SymbolInfo {
     /// so `serde` does not read it as data borrowed from the input.
     #[serde(with = "crate::save::symbol")]
     pub symbol: Symbol,
-    /// Company name.
+    /// Company name, or what the good is called.
     pub name: String,
     /// Sector label.
     pub sector: String,
     /// One-line flavour text.
     pub description: String,
-    /// Shares in existence. Nothing creates or destroys them: what the
-    /// traders hold plus what is still out in the market adds up to this, so
-    /// a buy cannot ask for more than is left (see
-    /// [`Market::available_shares`]).
-    pub shares_outstanding: u64,
+    /// A company's shares, or a good's issued and consumed units. What the
+    /// traders hold plus what is still out in the market adds up to
+    /// [`AssetKind::units_outstanding`], so a buy cannot ask for more than
+    /// is left.
+    pub asset: AssetKind,
     /// RNG seed. Same seed + same events ⇒ same prices, every run.
     pub seed: u64,
+}
+
+impl SymbolInfo {
+    /// Units in existence. See [`AssetKind::units_outstanding`].
+    #[must_use]
+    pub fn units_outstanding(&self) -> u64 {
+        self.asset.units_outstanding()
+    }
+
+    /// This listing is a good.
+    #[must_use]
+    pub fn is_good(&self) -> bool {
+        self.asset.is_good()
+    }
+
+    /// Bring `qty` units of a good into the world. Refuses a stock, whose
+    /// shares are fixed, and refuses to overflow the count.
+    ///
+    /// # Errors
+    /// A message naming why nothing was issued.
+    pub fn issue(&mut self, qty: u64) -> Result<u64, String> {
+        match &mut self.asset {
+            AssetKind::Stock { .. } => Err(format!(
+                "{} is a stock: its shares are fixed at the flotation",
+                self.symbol
+            )),
+            AssetKind::Good {
+                issued, consumed, ..
+            } => {
+                let next = issued
+                    .checked_add(qty)
+                    .ok_or_else(|| format!("{} cannot issue that many units", self.symbol))?;
+                *issued = next;
+                Ok(next.saturating_sub(*consumed))
+            }
+        }
+    }
+
+    /// Destroy `qty` units of a good. The caller has already taken them off
+    /// a holder; this is the world's count of what is left.
+    ///
+    /// # Errors
+    /// A message naming why nothing was consumed.
+    pub fn consume(&mut self, qty: u64) -> Result<u64, String> {
+        match &mut self.asset {
+            AssetKind::Stock { .. } => Err(format!(
+                "{} is a stock: shares are sold, not consumed",
+                self.symbol
+            )),
+            AssetKind::Good {
+                issued, consumed, ..
+            } => {
+                let next = consumed
+                    .checked_add(qty)
+                    .filter(|next| *next <= *issued)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} has only {} units to consume",
+                            self.symbol,
+                            issued.saturating_sub(*consumed)
+                        )
+                    })?;
+                *consumed = next;
+                Ok(issued.saturating_sub(next))
+            }
+        }
+    }
 }
 
 /// A symbol's metadata plus the simulator config and trading parameters it
@@ -109,7 +273,7 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
                 sector: "Industrials".into(),
                 description: "Century-old conglomerate. Low volatility, steady drift, rare jumps."
                     .into(),
-                shares_outstanding: 240_000_000,
+                asset: AssetKind::stock(240_000_000),
                 seed: 0xACE,
             },
             config: Config {
@@ -134,7 +298,7 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
                 description:
                     "Pre-profit robotics darling. High volatility, big drift, frequent jumps."
                         .into(),
-                shares_outstanding: 85_000_000,
+                asset: AssetKind::stock(85_000_000),
                 seed: 0x4E42,
             },
             config: Config {
@@ -168,7 +332,7 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
                 sector: "Energy".into(),
                 description: "Solar and storage utility. Commodity-driven, moderate volatility."
                     .into(),
-                shares_outstanding: 610_000_000,
+                asset: AssetKind::stock(610_000_000),
                 seed: 0x4845,
             },
             config: Config {
@@ -192,7 +356,7 @@ pub fn seeded_symbols(start_ts: Timestamp) -> Vec<SymbolSpec> {
                 sector: "Consumer Staples".into(),
                 description: "Household brands. Defensive: low volatility, shocks fade slowly."
                     .into(),
-                shares_outstanding: 150_000_000,
+                asset: AssetKind::stock(150_000_000),
                 seed: 0x5058,
             },
             config: Config {
@@ -359,7 +523,13 @@ pub struct Quote {
     pub pending_events: usize,
     pub bid_cents: Option<i64>,
     pub ask_cents: Option<i64>,
-    /// Shares in existence for this symbol.
+    /// `stock` or `good`: what this listing is.
+    pub asset_kind: &'static str,
+    /// What one unit of a good is called; `null` for a stock, whose unit is
+    /// a share.
+    pub unit: Option<String>,
+    /// Units in existence: a stock's shares, or a good's issued units less
+    /// its consumed ones.
     pub shares_outstanding: u64,
     /// `price × shares_outstanding`.
     pub market_cap_cents: i64,
@@ -709,7 +879,7 @@ impl SymbolState {
 
     /// The whole company at the last traded price.
     pub fn market_cap_cents(&self) -> i64 {
-        notional_cents(self.price_cents(), self.info.shares_outstanding)
+        notional_cents(self.price_cents(), self.info.units_outstanding())
     }
 
     /// Current quote.
@@ -742,8 +912,10 @@ impl SymbolState {
             pending_events: snap.pending_events,
             bid_cents: self.exchange.book().best_bid(),
             ask_cents: self.exchange.book().best_ask(),
-            shares_outstanding: self.info.shares_outstanding,
-            market_cap_cents: notional_cents(price, self.info.shares_outstanding),
+            asset_kind: self.info.asset.label(),
+            unit: self.info.asset.unit().map(str::to_owned),
+            shares_outstanding: self.info.units_outstanding(),
+            market_cap_cents: notional_cents(price, self.info.units_outstanding()),
             market_open: self.is_open(Timestamp(self.last_tick.map_or(snap.ts.0, |t| t.ts.0))),
             halted: self.halt.is_some(),
         }

@@ -154,6 +154,9 @@ pub enum LedgerKind {
     /// liquidity. Always its own entry: the tape stays the price and the
     /// ledger stays the money.
     Fee,
+    /// A good bought from the catalogue: the cash left the account and
+    /// units of the good arrived that did not exist before.
+    Purchase,
     /// A dividend paid on shares held when it was declared.
     Dividend,
     /// A delisting bought the holder out: the shares are gone and this is

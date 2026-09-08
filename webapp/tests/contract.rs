@@ -153,6 +153,8 @@ async fn market_data_shapes() {
             "pending_events",
             "bid_cents",
             "ask_cents",
+            "asset_kind",
+            "unit",
             "shares_outstanding",
             "market_cap_cents",
             "market_open",
@@ -166,6 +168,8 @@ async fn market_data_shapes() {
         &shares,
         &[
             "symbol",
+            "asset_kind",
+            "unit",
             "shares_outstanding",
             "held_shares",
             "bid_shares",
@@ -1039,6 +1043,7 @@ async fn supply_contract() {
             "venue_cents",
             "issuer_cents",
             "player_cents",
+            "npc_cents",
             "synthetic_debt_cents",
             "wallets",
         ],
@@ -1046,4 +1051,132 @@ async fn supply_contract() {
     assert_eq!(supply["balanced"], true);
     assert_eq!(supply["burned_cents"], 0);
     assert_eq!(supply["circulating_cents"], supply["outstanding_cents"]);
+}
+
+#[tokio::test]
+async fn goods_contract() {
+    let app = test_app();
+    post(
+        &app,
+        "/api/symbols",
+        json!({
+            "symbol": "ORE", "kind": "good", "unit": "kg",
+            "name": "Iron Ore", "start_price_cents": 250,
+        }),
+    )
+    .await;
+    let item = post(
+        &app,
+        "/api/catalog",
+        json!({ "symbol": "ORE", "price_cents": 250, "available": 500 }),
+    )
+    .await;
+    let item_keys = ["symbol", "price_cents", "available", "issued", "note"];
+    assert_keys("CatalogItem", &item, &item_keys);
+
+    let catalog = get(&app, "/api/catalog").await;
+    assert_keys("CatalogResponse", &catalog, &["items"]);
+    assert_keys(
+        "CatalogItem",
+        first("CatalogResponse", &catalog, "items"),
+        &item_keys,
+    );
+
+    let player = post(
+        &app,
+        "/api/traders",
+        json!({ "name": "wanda", "cash_cents": 1_000_000 }),
+    )
+    .await;
+    let key = api_key_of(&player);
+    let id = player["id"].as_u64().unwrap();
+    let receipt = post_as(
+        &app,
+        Some(&key),
+        &format!("/api/traders/{id}/purchases"),
+        json!({ "symbol": "ORE", "qty": 10 }),
+    )
+    .await;
+    assert_keys(
+        "PurchaseReceipt",
+        &receipt,
+        &[
+            "trader_id",
+            "symbol",
+            "qty",
+            "unit_price_cents",
+            "total_cents",
+            "tx_id",
+            "position_qty",
+            "units_outstanding",
+            "available",
+        ],
+    );
+    let consumed = post_as(
+        &app,
+        Some(&key),
+        &format!("/api/traders/{id}/consume"),
+        json!({ "symbol": "ORE", "qty": 4 }),
+    )
+    .await;
+    assert_keys(
+        "ConsumeReceipt",
+        &consumed,
+        &[
+            "trader_id",
+            "symbol",
+            "qty",
+            "position_qty",
+            "units_outstanding",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn npc_contract() {
+    let app = test_app();
+    let npc = post(
+        &app,
+        "/api/npcs",
+        json!({ "symbol": "ACME", "name": "Acme Merchant", "cash_cents": 1_000_000, "inventory": 500 }),
+    )
+    .await;
+    let npc_keys = [
+        "trader_id",
+        "user_id",
+        "account_id",
+        "symbol",
+        "name",
+        "policy",
+        "active",
+        "cash_cents",
+        "inventory",
+        "reserved",
+    ];
+    assert_keys("NpcDto", &npc, &npc_keys);
+    assert_keys(
+        "Policy",
+        &npc["policy"],
+        &[
+            "half_spread_bps",
+            "levels",
+            "level_step_bps",
+            "size",
+            "requote_bps",
+        ],
+    );
+
+    let npcs = get(&app, "/api/npcs").await;
+    assert_keys("NpcsResponse", &npcs, &["npcs"]);
+    assert_keys("NpcDto", first("NpcsResponse", &npcs, "npcs"), &npc_keys);
+
+    let off = post_as(
+        &app,
+        None,
+        &format!("/api/npcs/{}/active", npc["trader_id"]),
+        json!({ "active": false }),
+    )
+    .await;
+    assert_keys("NpcDto", &off, &npc_keys);
+    assert_eq!(off["active"], false);
 }
