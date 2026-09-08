@@ -58,6 +58,16 @@ pub type Symbol = &'static str;
 
 /// Current save format. Any other version, older or newer, is refused.
 ///
+/// Version 12 added the ledger's flow meter ([`fehu::ledger::Flows`]): what
+/// every reason has moved since genesis, which is what the operator's
+/// dashboard reads to say where the currency is *going* rather than only
+/// where it sits. A version 11 file has the balances but not the movements
+/// behind them. Nothing in the world would misbehave without it — the meter
+/// is derived and the balances are authoritative — but a world restored with
+/// an empty meter and a full treasury would report that no currency has ever
+/// moved, which is a lie an audit would act on, so the file is refused like
+/// the rest.
+///
 /// Version 11 added the third principal ([`crate::service`]): the service
 /// credentials the game backend speaks with, and the players it has
 /// provisioned. A version 10 file carries neither. Starting from one would
@@ -107,7 +117,7 @@ pub type Symbol = &'static str;
 /// transaction out of issuance, so the currency has a recorded origin and
 /// the books still add up. It is a day's work when there is such a world.
 /// There is not: the current file is a demo, regenerated from its seeds.
-pub const STATE_VERSION: u32 = 11;
+pub const STATE_VERSION: u32 = 12;
 
 /// Everything needed to carry on where the server left off.
 #[derive(Clone, Debug, Serialize, Deserialize)]

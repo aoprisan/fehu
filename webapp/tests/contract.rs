@@ -1095,6 +1095,156 @@ async fn supply_contract() {
 }
 
 #[tokio::test]
+async fn health_contract() {
+    let health = get(&test_app(), "/api/health").await;
+    assert_keys(
+        "Health",
+        &health,
+        &[
+            "status",
+            "uptime_secs",
+            "sim_now_ms",
+            "time_scale",
+            "symbols",
+            "events_logged",
+            "ticks_total",
+            "trades_total",
+            "users",
+            "accounts",
+            "traders",
+            "cash_cents",
+            "resting_orders",
+            "stops_held",
+            "orders_placed",
+            "orders_refused",
+            "fills_booked",
+            "settlement_failures",
+            "stream_messages",
+            "stream_subscribers",
+            "requests_in_flight",
+            "max_in_flight",
+            "max_streams",
+            "tracked_clients",
+            "metrics",
+        ],
+    );
+    assert_keys(
+        "MetricsDto",
+        &health["metrics"],
+        &[
+            "requests",
+            "requests_failed",
+            "requests_limited",
+            "requests_shed",
+            "engine_step",
+        ],
+    );
+    assert_keys(
+        "TimingDto",
+        &health["metrics"]["requests"],
+        &["count", "micros_last", "micros_max", "micros_mean"],
+    );
+}
+
+#[tokio::test]
+async fn overview_contract() {
+    let app = test_app();
+    // A world with something in every list the overview carries.
+    post(
+        &app,
+        "/api/traders",
+        json!({ "name": "wren", "cash_cents": 50_000 }),
+    )
+    .await;
+    let budget = post(
+        &app,
+        "/api/budgets",
+        json!({ "name": "quests", "cash_cents": 100_000 }),
+    )
+    .await;
+    post(
+        &app,
+        "/api/rewards/rules",
+        json!({ "id": "boss", "budget": budget["wallet"], "amount_cents": 5_000 }),
+    )
+    .await;
+    post(
+        &app,
+        "/api/npcs",
+        json!({ "symbol": "ACME", "name": "acme desk", "cash_cents": 1_000_000 }),
+    )
+    .await;
+
+    let overview = get(&app, "/api/overview").await;
+    assert_keys(
+        "OverviewDto",
+        &overview,
+        &[
+            "at_ms",
+            "supply",
+            "flows",
+            "wallets",
+            "budgets",
+            "rules",
+            "npcs",
+            "effects",
+            "modifiers",
+            "jobs",
+            "people",
+            "outbox",
+            "journal_seq",
+        ],
+    );
+    assert_keys(
+        "FlowDto",
+        first("OverviewDto", &overview, "flows"),
+        &["reason", "count", "cents"],
+    );
+    assert_keys(
+        "WalletRow",
+        first("OverviewDto", &overview, "wallets"),
+        &[
+            "wallet",
+            "kind",
+            "status",
+            "balance_cents",
+            "reserved_cents",
+            "available_cents",
+            "account_id",
+            "owner",
+        ],
+    );
+    assert_keys(
+        "JobsSummary",
+        &overview["jobs"],
+        &["held", "running", "done", "cancelled", "next_due_ms"],
+    );
+    assert_keys(
+        "PeopleSummary",
+        &overview["people"],
+        &[
+            "users", "accounts", "traders", "players", "frozen", "closed",
+        ],
+    );
+    assert_keys(
+        "OutboxCursor",
+        &overview["outbox"],
+        &["cursor", "oldest", "latest", "pending", "dropped", "cap"],
+    );
+    // The nested lists are the same shapes their own endpoints serve, which
+    // the tests above pin; here it is enough that they arrived.
+    assert!(!overview["budgets"].as_array().unwrap().is_empty());
+    assert!(!overview["rules"].as_array().unwrap().is_empty());
+    assert!(!overview["npcs"].as_array().unwrap().is_empty());
+    assert!(!overview["effects"].as_array().unwrap().is_empty());
+    assert_eq!(
+        overview["flows"].as_array().unwrap().len(),
+        16,
+        "every reason has a row, moved or not"
+    );
+}
+
+#[tokio::test]
 async fn goods_contract() {
     let app = test_app();
     post(

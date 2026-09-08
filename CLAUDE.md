@@ -70,7 +70,7 @@ below follows from that:
   price series. `tests/trading.rs` holds that invariant.
 - Version constants that gate save compatibility: `fehu::STATE_VERSION`
   (simulator), `fehu::EXCHANGE_VERSION`, `fehu_webapp::save::STATE_VERSION`
-  (the whole market file, currently 11) and
+  (the whole market file, currently 12) and
   `fehu_webapp::journal::JOURNAL_VERSION` (the command journal beside it,
   currently 2). Loading a mismatched version is refused rather than guessed
   at.
@@ -93,7 +93,8 @@ below follows from that:
 - `book.rs` — a standalone price–time-priority limit order book. Whole cents,
   integer shares, sequential ids. It knows nothing about the price process.
 - `ledger.rs` — the conserved currency ledger: wallets, balanced
-  transactions, supply. Pure integer arithmetic, no clock and no globals.
+  transactions, supply, and a flow meter counting what each `Reason` has
+  moved. Pure integer arithmetic, no clock and no globals.
 - `exchange.rs` — composes the two: trader net flow becomes a square-root
   price-impact event on the simulator, the simulator steps, the tick volume
   prints as synthetic flow against the book, and a synthetic maker ladder is
@@ -221,3 +222,10 @@ reserve shares; a cancel gives them back. No margin, no shorting.
 - UI data flow is one-way: `actions.ts` is the only writer, it mutates
   `store.ts` and emits topics, panels subscribe and re-render. Nothing renders
   straight from a fetch response.
+- The operator's dashboard (`panels/ops.ts`, opened by `#economy`) is the one
+  panel that polls. It reads `GET /api/overview` — one market job, assembled
+  in `Market::overview`, so the whole reading is one instant — and only while
+  it is open. Anything expensive stays off that path: `/api/reconcile`
+  snapshots the world and is a button. Rates are the page's own arithmetic
+  over the samples it keeps, because neither the ledger's flow meter nor
+  `metrics.rs` keeps history, deliberately.

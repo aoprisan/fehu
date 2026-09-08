@@ -28,6 +28,15 @@
 //! is real currency, and the debt behind it belongs in the same sum, where an
 //! audit can see it — see [`WalletKind`].
 //!
+//! # Where it sits, and how it got there
+//!
+//! Balances answer the first question and [`Flows`] answers the second: a
+//! count and a total of cents per [`Reason`], moved by every transaction the
+//! ledger has accepted. It is the one place all of them are seen, so it is
+//! kept here rather than derived by whatever journals them, and it is a
+//! running total rather than a series — two readings and the time between
+//! them are a rate, and anything wanting history should keep its own.
+//!
 //! # What it does not do
 //!
 //! No floating point, anywhere — currency is an integer count of cents and
@@ -332,6 +341,56 @@ impl Reason {
             Self::Genesis | Self::Mint | Self::Burn | Self::Migration
         )
     }
+
+    /// Every reason there is, in declaration order.
+    ///
+    /// Declaration order is the order an audit reads them in — supply first,
+    /// then the ways currency moves between wallets — and it is the order
+    /// [`Flows`] indexes by, so a new variant goes at the end of the list
+    /// rather than in the middle of it.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Genesis,
+        Self::Mint,
+        Self::Burn,
+        Self::Transfer,
+        Self::Faucet,
+        Self::Reward,
+        Self::Purchase,
+        Self::Fee,
+        Self::Rebate,
+        Self::Buy,
+        Self::Sell,
+        Self::Dividend,
+        Self::Delisting,
+        Self::JobCost,
+        Self::JobRefund,
+        Self::Migration,
+    ];
+
+    /// How many reasons there are.
+    pub const COUNT: usize = 16;
+
+    /// This reason's place in [`Reason::ALL`].
+    pub fn index(self) -> usize {
+        match self {
+            Self::Genesis => 0,
+            Self::Mint => 1,
+            Self::Burn => 2,
+            Self::Transfer => 3,
+            Self::Faucet => 4,
+            Self::Reward => 5,
+            Self::Purchase => 6,
+            Self::Fee => 7,
+            Self::Rebate => 8,
+            Self::Buy => 9,
+            Self::Sell => 10,
+            Self::Dividend => 11,
+            Self::Delisting => 12,
+            Self::JobCost => 13,
+            Self::JobRefund => 14,
+            Self::Migration => 15,
+        }
+    }
 }
 
 /// A transaction that has not been posted yet: the postings, and why.
@@ -484,6 +543,67 @@ impl Supply {
     /// both sides of every fill are funded it is the plain supply.
     pub fn outstanding_cents(self) -> i64 {
         self.minted_cents.saturating_sub(self.burned_cents)
+    }
+}
+
+/// How much one reason has moved, and how often.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Flow {
+    /// Transactions posted with this reason.
+    pub count: u64,
+    /// What they moved, in cents: the credit side of each, which for a
+    /// balanced transaction is also the debit side.
+    pub cents: i64,
+}
+
+/// What every reason has moved since genesis.
+///
+/// Balances say where the currency *is*; this says how it got there. The two
+/// answer different questions and a dashboard needs both: a treasury that has
+/// not moved all day and one that has paid out and been topped up twice look
+/// identical from the balance alone.
+///
+/// It is a counter per reason and nothing more — no window, no rate, no
+/// history — for the reason [`crate`]'s webapp gives for its own metrics: a
+/// running total is exact, costs one add on a path that already does far
+/// more work, and anything that wants a rate can subtract two readings. The
+/// numbers only ever grow, so two readings and the time between them are all
+/// a rate needs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Flows {
+    by_reason: [Flow; Reason::COUNT],
+}
+
+impl Flows {
+    /// What `reason` has moved.
+    pub fn get(&self, reason: Reason) -> Flow {
+        self.by_reason[reason.index()]
+    }
+
+    /// Every reason and its flow, in [`Reason::ALL`] order, the ones that
+    /// have never moved anything included — a dashboard that hid them would
+    /// change shape as the world ran.
+    pub fn iter(&self) -> impl Iterator<Item = (Reason, Flow)> + '_ {
+        Reason::ALL.into_iter().map(|r| (r, self.get(r)))
+    }
+
+    /// Every transaction ever posted, and everything they moved.
+    pub fn total(&self) -> Flow {
+        self.by_reason.iter().fold(Flow::default(), |acc, f| Flow {
+            count: acc.count.saturating_add(f.count),
+            cents: acc.cents.saturating_add(f.cents),
+        })
+    }
+
+    /// Count one posted transaction. Saturating: a meter is a reading, and
+    /// losing the top of an implausible one is better than refusing a
+    /// movement the ledger has already checked.
+    fn record(&mut self, reason: Reason, cents: i64) {
+        let flow = &mut self.by_reason[reason.index()];
+        flow.count = flow.count.saturating_add(1);
+        flow.cents = flow.cents.saturating_add(cents);
     }
 }
 
@@ -653,6 +773,9 @@ impl std::error::Error for LedgerError {}
 pub struct Ledger {
     wallets: BTreeMap<WalletId, Wallet>,
     supply: Supply,
+    /// What every reason has moved. Derived from the transactions the ledger
+    /// has accepted, and kept here because nothing else sees all of them.
+    flows: Flows,
     next_wallet: u64,
     next_tx: u64,
 }
@@ -674,6 +797,7 @@ impl Ledger {
         let mut ledger = Self {
             wallets: BTreeMap::new(),
             supply: Supply::default(),
+            flows: Flows::default(),
             next_wallet: 1,
             next_tx: 1,
         };
@@ -747,6 +871,15 @@ impl Ledger {
             .map_or(WalletStatus::Closed, |w| w.status)
     }
 
+    /// What every reason has moved since genesis.
+    ///
+    /// The counterpart to [`supply`](Self::supply) and the balances: those
+    /// say how much currency exists and where it sits, this says what has
+    /// been happening to it.
+    pub fn flows(&self) -> &Flows {
+        &self.flows
+    }
+
     /// How much currency exists.
     pub fn supply(&self) -> Supply {
         self.supply
@@ -811,7 +944,13 @@ impl Ledger {
         // credit it back — and that intermediate balance is an artefact of
         // the order the sides were written in, not something the ledger
         // should be able to see, let alone trip over.
-        for (id, amount) in net_postings(&postings) {
+        let net = net_postings(&postings);
+        // What the transaction moved, for the flow meter: the credit side of
+        // the *net* postings, so a transaction that debits and credits the
+        // same wallet on its way through counts what actually went anywhere.
+        let volume_cents =
+            i64::try_from(net.values().filter(|c| **c > 0).sum::<i128>()).unwrap_or(i64::MAX);
+        for (id, amount) in net {
             let wallet = self.wallets.get_mut(&id).expect("validated above");
             wallet.balance_cents += i64::try_from(amount).expect("validated above");
         }
@@ -836,6 +975,7 @@ impl Ledger {
             }
             _ => {}
         }
+        self.flows.record(reason, volume_cents);
         let id = self.next_tx;
         self.next_tx += 1;
         Ok(Transaction {
