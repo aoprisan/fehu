@@ -1030,6 +1030,43 @@ async fn reconciliation_contract() {
 }
 
 #[tokio::test]
+async fn outbox_contract() {
+    let app = test_app();
+    let page_keys = [
+        "events", "next", "cursor", "oldest", "latest", "pending", "dropped", "gap", "cap",
+    ];
+    assert_keys("OutboxPage", &get(&app, "/api/outbox").await, &page_keys);
+
+    post(
+        &app,
+        "/api/game/events",
+        json!({ "kind": "scandal", "magnitude": 0.4, "symbol": "ACME", "source": "quest-1" }),
+    )
+    .await;
+    let page = get(&app, "/api/v1/economy/outbox?after=0").await;
+    assert_keys("OutboxPage", &page, &page_keys);
+    let entry = first("OutboxPage", &page, "events");
+    assert_keys(
+        "OutboxEntry",
+        entry,
+        &["seq", "command_seq", "kind", "at_ms", "wall_ms", "event"],
+    );
+    assert_eq!(entry["kind"], "event");
+    assert_eq!(
+        entry["event"]["type"], "event",
+        "the payload is the stream message, tag and all"
+    );
+
+    let cursor = post(&app, "/api/outbox/ack", json!({ "through": 1 })).await;
+    assert_keys(
+        "OutboxCursor",
+        &cursor,
+        &["cursor", "oldest", "latest", "pending", "dropped", "cap"],
+    );
+    assert_eq!(cursor["cursor"], 1);
+}
+
+#[tokio::test]
 async fn supply_contract() {
     let supply = get(&test_app(), "/api/supply").await;
     assert_keys(

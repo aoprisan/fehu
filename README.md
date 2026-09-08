@@ -179,8 +179,11 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/world?at_ms=` | What game events are doing to production and demand, per symbol, now or at an instant |
 | `GET` | `/api/supply` | How much currency exists and where it sits: minted, burned, outstanding, what the wallets actually hold, and whether the two agree |
 | `GET` | `/api/commands/{key}` | The answer a command was given, by the `Idempotency-Key` it was sent under, for a client that lost the response |
+| `GET` | `/api/backup` | Game master: a snapshot of the whole market as the response body — `curl … > backup.json`, and restore by pointing `FEHU_STATE_FILE` at it |
+| `GET` | `/api/outbox?after=&limit=` | Game master: the facts nobody asked for — fills, jobs coming due, expiries, delistings, accepted events — numbered, retained and replayable from a cursor. Reading does not consume |
+| `POST` | `/api/outbox/ack` | Game master: `{"through":128}` — how far the game backend has read. Everything after it comes back on the next read with no `after` |
 | `GET` | `/api/reconcile` | Game master: check ownership, reservations, share supply, retained cash ledgers **and that the currency adds up**; returns `valid` and `issues` |
-| — | `/api/v1/economy/…` | The economy surface under the paths `docs/economy-engine-plan.md` names: `players`, `players/{id}/inventory`, `wallets/{id}`, `transfers`, `rewards`, `purchases`, `consume`, `jobs`, `recipes`, `catalog`, `budgets`, `supply`, `world`, `commands/{key}`, `reconcile`, and `admin/{recipes,catalog,budgets,rewards}`. The same handlers as above, under a second spelling |
+| — | `/api/v1/economy/…` | The economy surface under the paths `docs/economy-engine-plan.md` names: `players`, `players/{id}/inventory`, `wallets/{id}`, `transfers`, `rewards`, `purchases`, `consume`, `jobs`, `recipes`, `catalog`, `budgets`, `supply`, `world`, `outbox`, `outbox/ack`, `commands/{key}`, `reconcile`, and `admin/{recipes,catalog,budgets,rewards,backup}`. The same handlers as above, under a second spelling |
 | `GET` | `/api/health` | Uptime, simulated time, tick/trade counters, orders placed and refused, fills booked and any that failed to settle, stream and rate-limit state, and how long requests and engine steps are taking |
 
 At start-up each symbol generates a year of daily bars in coarse mode and then
@@ -208,7 +211,11 @@ had. `FEHU_MARKET_HOURS=09:30-16:00`
 gives the market a UTC weekday session (unset, it never closes);
 `FEHU_PRICE_LIMIT_PCT` (0.10) and `FEHU_HALT_SECS` (300) set the limit move
 that halts a symbol and how long the halt lasts. `FEHU_RATE_PER_SEC` (20) and
-`FEHU_RATE_BURST` (40) set how fast one client may change things, and
+`FEHU_RATE_BURST` (40) set how fast one client may change things;
+`FEHU_MAX_INFLIGHT` (128) and `FEHU_MAX_STREAMS` (256) set how many changes
+and how many stream connections the server will have going at once, past
+which it answers `503 overloaded` at once instead of queueing (`0` for
+either takes everything); and
 `FEHU_STREAM_REPLAY` (1024) how many stream messages are kept for `?since=`.
 `FEHU_MAX_SYMBOLS` (32) caps how many symbols may be listed at once — every
 one of them is a simulator stepped on every engine tick.
@@ -231,7 +238,9 @@ which is how late a retry may arrive and still be free. `FEHU_JOB_LOG`
 running one is never dropped, being a promise the world has taken payment for
 — and `FEHU_REWARD_LOG` (10 000) how many game event ids are remembered with
 the reward each one paid, which is how late a duplicate quest result may
-arrive and still be caught. `FEHU_ADMIN_KEY` locks the
+arrive and still be caught. `FEHU_OUTBOX` (10 000) is how many facts are kept
+for the game backend to collect, which is how long it may be away before
+what it missed is gone for good; `0` switches the outbox off. `FEHU_ADMIN_KEY` locks the
 game-master endpoints behind a key of your choosing: the ones that move
 prices (`POST /api/game/events`, `POST /api/symbols/{sym}/events`), the ones
 that list, halt and delist symbols, and — since currency became conserved —
@@ -350,9 +359,91 @@ If the journal cannot be written the server stops accepting changes —
 be ahead of the disk, and a market that cannot promise to remember a change
 should not accept one.
 
-What this is not is a database: one writer, one file, no history to query and
-no outbox to deliver from. That is deliberate — see `docs/economy-engine-plan.md`
-for what a live service would need instead.
+What this is not is a database: one writer, one file, and no history to query
+beyond the retained ledger views. That is deliberate — see
+`docs/economy-engine-plan.md` for what a live service would need instead.
+
+### How much it will take
+
+Two bounds, answering different questions. `FEHU_RATE_PER_SEC` is *per
+client*: how fast one of them may change the market, so that none can crowd
+the rest out — over it, `429 rate_limited` with a `Retry-After`. Reads are
+never rate limited; a reverse proxy is the right place for that.
+
+`FEHU_MAX_INFLIGHT` is *global*: how many changes may be inside the server at
+once. Every mutation is one job on the market actor and its mailbox is
+unbounded, so without a bound the answer to a burst is a queue that grows
+until memory runs out, with every client in it waiting longer for a reply
+that will arrive too late to use. Past the bound the server says `503
+overloaded` immediately, with `Retry-After: 1`, which a client can act on in
+a way it could not while waiting. `FEHU_MAX_STREAMS` is the same for open SSE
+connections, each of which holds a receiver and a task for as long as it
+lasts. Reads are not gated by either: `/api/health` is exactly what is worth
+reading when the server is full. `GET /api/health` reports
+`requests_in_flight` against `max_in_flight`, and `metrics.requests_shed`
+counts what has been turned away for room — separately from
+`metrics.requests_limited`, because a full server is not a fast client.
+
+`webapp/tests/load.rs` declares a load and a target and holds the server to
+them: 32 players sending 16 mutations each, all answered, none shed, the
+whole burst through in seconds and the tail within twice the median — and
+then a restart from the snapshot and the journal that comes back, reconciles
+and still has the same facts in its outbox.
+
+### Backup and restore
+
+A snapshot is complete on its own — the journal beside a live state file only
+covers the gap since the server's own last one — so a backup is a snapshot
+taken out of band:
+
+```sh
+curl -sS -H "Authorization: Bearer $FEHU_ADMIN_KEY" \
+  http://localhost:3000/api/backup > backup.json
+FEHU_STATE_FILE=backup.json cargo run --release -p fehu-webapp
+```
+
+It is taken from one consistent market job, like `/api/reconcile`, so it is a
+real instant and not a smear across one. It truncates nothing: the live
+journal still carries everything since the running server's own last
+snapshot, because the live state file still needs it. And it is handed back
+rather than written to a path the request names — an operator route that
+wrote wherever its body said would be an arbitrary file write with a key on
+it, and `curl >` is the same drill without one. Restoring a backup that
+predates this build's `STATE_VERSION` is refused rather than guessed at, as
+any state file is.
+
+### The outbox
+
+A stream is the wrong shape for the service that owns the rest of the game.
+`/api/stream` is best-effort, its `?since=` buffer is small and in memory,
+and a backend that was restarting when a job came due has no way to find out
+that it did. So the same facts go a second way: everything the server
+publishes that **nobody asked for** — a resting order that filled, a job that
+came due, an order the venue withdrew, a stop that fired, a halt, a listing, a
+delisting, an accepted game event — is also appended to a durable **outbox**,
+numbered from 1, and handed out against a cursor.
+
+Delivery is at-least-once. `GET /api/outbox` returns the facts after a
+cursor; reading does not consume them, so a backend that dies between reading
+and acting reads them again rather than never. `POST /api/outbox/ack`
+`{"through":128}` says how far it got, and is a journaled command like
+everything else — a cursor that moved only in memory would fall back to the
+snapshot's value on a restart.
+
+What is *not* in it is anything with a requester. A purchase, a transfer, a
+reward and a job *starting* are commands: whoever sent one has its response,
+and a lost response is recovered by its `Idempotency-Key` through
+`GET /api/commands/{key}`. Ticks are not in it either — they are market data,
+the highest-volume thing the server produces, and `/api/symbols/{sym}/bars`
+has them whenever they are wanted.
+
+The log is bounded by `FEHU_OUTBOX`, and it is honest about the bound: a fact
+evicted before it was acknowledged is counted in `dropped`, and a read that
+starts further back than the log reaches comes back with `gap: true` so the
+consumer resynchronises from the snapshot endpoints instead of believing its
+own state. It is saved with the snapshot and rebuilt by replay, so a restart
+returns the same facts under the same numbers and a cursor from before it
+still means what it meant.
 
 Keys are the only credential: they are 128 bits of operating-system entropy,
 generated once at sign-up. The server keeps only a domain-separated SHA-256

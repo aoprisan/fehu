@@ -70,7 +70,7 @@ below follows from that:
   price series. `tests/trading.rs` holds that invariant.
 - Version constants that gate save compatibility: `fehu::STATE_VERSION`
   (simulator), `fehu::EXCHANGE_VERSION`, `fehu_webapp::save::STATE_VERSION`
-  (the whole market file, currently 9) and
+  (the whole market file, currently 10) and
   `fehu_webapp::journal::JOURNAL_VERSION` (the command journal beside it,
   currently 2). Loading a mismatched version is refused rather than guessed
   at.
@@ -119,6 +119,12 @@ directly for a read, never one from inside the other.
 | `Market` (`market.rs`) | users, accounts, traders, order log, event log, symbol table, order-id counter | request handlers and the engine |
 | `Stream` | sequence counter and replay buffer | anyone to publish, connections to subscribe |
 | rate limiter (`limit.rs`) | token buckets | the rate-limit middleware |
+
+Admission (`limit.rs`'s `Admission`) is not an actor: it is a pair of
+semaphores, so a request that finds the server full is refused without
+waiting on anything. `FEHU_MAX_INFLIGHT` bounds concurrent mutations and
+`FEHU_MAX_STREAMS` open SSE connections; past either the answer is
+`503 overloaded`. Reads are never gated.
 
 Consequences worth knowing:
 
@@ -176,7 +182,9 @@ event id, not only on the `Idempotency-Key`), `world.rs` (what a game event
 does to production and demand, in integer basis points ramping down in a
 straight line), `npc.rs`
 (the funded traders the world runs itself, re-quoted inside the engine
-step), `account.rs` (users, accounts, cash ledger), `trading.rs`
+step), `outbox.rs` (the durable, cursor-replayable log of the facts nobody
+asked for — what the game backend reads instead of the SSE stream),
+`account.rs` (users, accounts, cash ledger), `trading.rs`
 (traders, positions, share reservations, wire DTOs), `auth.rs` (API keys —
 issued once, stored as domain-separated SHA-256 digests), `events.rs` (raw
 simulator events and the semantic game-event catalogue), `symbols.rs`

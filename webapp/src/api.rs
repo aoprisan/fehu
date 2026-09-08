@@ -140,6 +140,9 @@ pub fn router(app: AppState) -> Router {
         .route("/api/world", get(world))
         .route("/api/supply", get(supply))
         .route("/api/commands/{key}", get(get_command))
+        .route("/api/backup", get(backup))
+        .route("/api/outbox", get(read_outbox))
+        .route("/api/outbox/ack", post(ack_outbox))
         // The economy surface the plan names, at the paths it names them at.
         // Every one of these is the same handler as the route above it: one
         // implementation, two spellings, so the game backend can speak the
@@ -168,6 +171,9 @@ pub fn router(app: AppState) -> Router {
         .route("/api/v1/economy/supply", get(supply))
         .route("/api/v1/economy/world", get(world))
         .route("/api/v1/economy/commands/{key}", get(get_command))
+        .route("/api/v1/economy/admin/backup", get(backup))
+        .route("/api/v1/economy/outbox", get(read_outbox))
+        .route("/api/v1/economy/outbox/ack", post(ack_outbox))
         .route("/api/v1/economy/reconcile", get(reconcile))
         .route("/api/v1/economy/admin/recipes", post(set_recipe))
         .route("/api/v1/economy/admin/recipes/{id}", delete(remove_recipe))
@@ -190,6 +196,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/game/events", get(list_events).post(push_game_event))
         .route("/api/events", get(list_events))
         .route("/api/stream", get(stream))
+        .layer(middleware::from_fn_with_state(Arc::clone(&app), admit))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&app),
             rate_limit_writes,
@@ -239,6 +246,28 @@ async fn rate_limit_writes(
     }
 }
 
+/// Turn a mutating request away if the server already has as much work in
+/// flight as it will take.
+///
+/// Inside the rate limiter, so a client that is already over its own
+/// allowance never takes a place from one that is not. The place is held by
+/// this future for as long as the request runs and given back when it ends,
+/// however it ends.
+///
+/// Reads are not gated. They are cheap, they queue behind nothing on the
+/// symbol actors, and shedding them would take `/api/health` away exactly
+/// when it is worth reading. See [`crate::limit`].
+async fn admit(State(app): State<AppState>, request: Request, next: Next) -> Response {
+    if request.method().is_safe() {
+        return next.run(request).await;
+    }
+    let Some(_place) = app.admission.mutation() else {
+        app.metrics.shed();
+        return ApiError::overloaded("changes").into_response();
+    };
+    next.run(request).await
+}
+
 /// JSON error body: `{"error": {"code": ..., "message": ...}}`.
 #[derive(Debug)]
 pub struct ApiError {
@@ -272,6 +301,24 @@ impl ApiError {
                 format!(
                     "too many requests: this server takes changes at \
                      `FEHU_RATE_PER_SEC`. Try again in {secs}s"
+                ),
+            )
+        }
+    }
+
+    /// The server already has as much of this work as it will take.
+    ///
+    /// A refusal now rather than a place in a queue nothing bounds: the
+    /// client can retry, shed the request itself, or slow down, none of
+    /// which it could do while waiting.
+    pub(crate) fn overloaded(what: &str) -> Self {
+        Self {
+            retry_after_secs: Some(1),
+            ..Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded",
+                format!(
+                    "this server is already taking as many {what} at once as it will                      (`FEHU_MAX_INFLIGHT`, `FEHU_MAX_STREAMS`). Try again in 1s"
                 ),
             )
         }
@@ -1006,6 +1053,11 @@ struct Health {
     stream_messages: u64,
     /// Streams currently connected.
     stream_subscribers: usize,
+    /// Mutating requests in flight, and the bound on them. `0` for the bound
+    /// means there is none.
+    requests_in_flight: usize,
+    max_in_flight: usize,
+    max_streams: usize,
     /// Clients whose rate-limit allowance is being tracked.
     tracked_clients: usize,
     /// Request and engine-step timings since start-up.
@@ -1042,6 +1094,9 @@ async fn health(State(app): State<AppState>) -> Result<Json<Health>, ApiError> {
         settlement_failures: market.settlement_failures,
         stream_messages: app.published().await,
         stream_subscribers: app.stream.subscribers(),
+        requests_in_flight: app.admission.in_flight(),
+        max_in_flight: app.admission.max_in_flight(),
+        max_streams: app.admission.max_streams(),
         tracked_clients: app.tracked_clients().await,
         metrics: app.metrics.snapshot(),
     }))
@@ -3467,6 +3522,101 @@ struct CommandDto {
     result: serde_json::Value,
 }
 
+/// A snapshot of the whole market, taken out of band.
+///
+/// The same snapshot [`crate::save`] writes on its timer, from the same one
+/// consistent market job, handed back as the response body instead of
+/// written to disk. Restoring is pointing `FEHU_STATE_FILE` at a copy of it:
+/// a snapshot is complete on its own, and the journal beside a live state
+/// file only ever covers the gap since the last one.
+///
+/// Handing it back rather than taking a path to write it to is deliberate.
+/// An operator route that writes wherever its body says would be an
+/// arbitrary-file-write with a key on it, and `curl > backup.json` is the
+/// same drill without one.
+///
+/// Nothing is truncated: the live journal still carries everything since the
+/// server's own last snapshot, because the live state file still needs it.
+async fn backup(State(app): State<AppState>, _admin: Admin) -> Response {
+    let save = app.save().await;
+    let name = format!("fehu-state-{}.json", save.sim_now_ms);
+    let mut response = Json(save).into_response();
+    if let Ok(value) = format!("attachment; filename=\"{name}\"").parse() {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
+}
+
+/// Query of `GET /api/outbox`.
+#[derive(Deserialize)]
+struct OutboxQuery {
+    /// Read everything after this sequence. Left out, the read starts from
+    /// the cursor the last acknowledgement left, which is what a backend
+    /// that keeps no cursor of its own wants.
+    after: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// The facts the game backend has not collected yet.
+///
+/// The operator's, because the log is the whole world's: one player's fills
+/// are in it beside another's. In tier one the operator key *is* the trusted
+/// game backend — one host, one process, the backend on the same network —
+/// which is the same reasoning that put rewards and budgets behind it.
+///
+/// Reading does not consume. A consumer that has acted on what it read says
+/// so with `POST /api/outbox/ack`, and until it does, the same facts come
+/// back: at-least-once, so a backend that dies between reading and acting
+/// sees them again rather than never.
+async fn read_outbox(
+    State(app): State<AppState>,
+    _admin: Admin,
+    Query(query): Query<OutboxQuery>,
+) -> Result<Json<crate::outbox::Page>, ApiError> {
+    let limit = query.limit.unwrap_or(crate::outbox::DEFAULT_PAGE);
+    Ok(Json(
+        app.market
+            .call(move |m| {
+                let after = query.after.unwrap_or_else(|| m.outbox.cursor());
+                m.outbox.page(after, limit)
+            })
+            .await?,
+    ))
+}
+
+/// Body of `POST /api/outbox/ack`.
+#[derive(Deserialize)]
+struct AckRequest {
+    /// The highest sequence the consumer has finished with.
+    through: u64,
+}
+
+/// Record how far the game backend has read.
+///
+/// A command, not a note in memory: the cursor is saved with the market, and
+/// one that moved only in memory would fall back to the snapshot's value on a
+/// restart and hand the backend facts it had already acted on.
+async fn ack_outbox(
+    State(app): State<AppState>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    body: Result<Json<AckRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = body.map_err(ApiError::bad_json)?;
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::AckOutbox {
+            through: req.through,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
 /// Recover the result of a command whose response was lost.
 ///
 /// Who may ask: the operator, for anything; a player, for their own
@@ -3563,6 +3713,13 @@ async fn stream(
     State(app): State<AppState>,
     Query(q): Query<StreamQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    // A connection holds a receiver and a task for as long as it is open, and
+    // nothing else bounds how many a client opens. The place is carried by
+    // the stream below and given back when the connection ends.
+    let Some(place) = app.admission.stream() else {
+        app.metrics.shed();
+        return Err(ApiError::overloaded("stream connections"));
+    };
     let Subscription {
         rx,
         seq,
@@ -3610,6 +3767,10 @@ async fn stream(
     })
     .chain(tokio_stream::iter(missed))
     .chain(live)
-    .filter_map(|m| Event::default().json_data(&m).ok().map(Ok));
+    .filter_map(move |m| {
+        // Held here so the place lasts exactly as long as the connection.
+        let _place = &place;
+        Event::default().json_data(&m).ok().map(Ok)
+    });
     Ok(Sse::new(all).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

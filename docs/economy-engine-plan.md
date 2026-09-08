@@ -299,8 +299,10 @@ This is tier one. It loses at most the mutations after the last successful
 `fsync`, which is none if the append is awaited before acknowledging. What
 it does not provide is concurrent writers, a queryable history beyond the
 retained ledger views, or an outbox for at-least-once delivery to the game
-backend. Those are tier two and replace the journal file with SQLite
-without changing the command model.
+backend. Those were written down as tier two, to be had by replacing the
+journal file with SQLite without changing the command model. Milestone 5
+built the outbox and left the file where it is; the reasoning is under
+"Milestone 5 as built".
 
 Determinism under funded markets: skipping the synthetic ladder and prints
 does not perturb the bare price series because that flow already draws from
@@ -378,7 +380,7 @@ and to be replaced by measurement after the first two.
 | 2 | ✅ `webapp/src/journal.rs`; every mutation journaled inside its market job; `Idempotency-Key`; replay on start; engine tick journaled with its wall input; `GET /commands/{key}`; save version 7 | Kill the process at random points under the concurrency test; restart reproduces the last acknowledged state and no duplicate reward | week |
 | 3 | ✅ `AssetKind`; goods in holdings; NPC wallets and policies; synthetic ladder and prints disabled on the server; catalogue, purchase and consume routes; save version 8 | Player-to-player and player-to-NPC fills, partial fills, IOC/FOK, amendments, stops, dividends and delistings conserve currency and units | weeks |
 | 4 | ✅ Recipes and jobs; rewards from budgets; game events with production and demand effects; `/api/v1/economy` routes and `types.ts`; UI panels for wallet, inventory and jobs; `just ui` | The acceptance scenario below passes, including retries and restarts at every step | weeks |
-| 5 | Tier two: SQLite journal and history, outbox with cursor replay for the game backend, bounded admission and quotas, load test with a declared target, backup and restore drill | p95 command latency and recovery time under the declared load; restore reconciles | weeks, only if tier one is outgrown |
+| 5 | ✅ Tier two: outbox with cursor replay for the game backend, bounded admission, load test with a declared target, backup and restore drill. SQLite is *not* in it — see below for why the row got narrower | p95 command latency and recovery time under the declared load; restore reconciles | weeks, only if tier one is outgrown |
 
 Milestone 1 alone is a correct custodial token: conserved supply, operator
 mint and burn, transfers and audited history. Milestone 2 makes it safe to
@@ -706,6 +708,128 @@ the price process never sees them, and the world's modifiers are integers, so
 neither `STATE_VERSION` nor `EXCHANGE_VERSION` moves and the golden hashes in
 `tests/determinism.rs` are unchanged.
 
+### Milestone 5 as built
+
+Done, and narrower than the row it was written into. `webapp/src/outbox.rs`
+is new; `limit.rs` gained an `Admission`; `webapp/tests/outbox.rs` and
+`webapp/tests/load.rs` hold the acceptance; the save format went to version
+10. Ten things are worth recording, and the first is why SQLite is not here.
+
+**Tier two turned out to mean delivery, admission and drills — not a
+database.** The plan's tier two replaces the journal file with SQLite, and
+that was written down as one decision because the three things it was meant
+to buy arrived together in the sentence. Taken apart, they do not:
+
+- *Crash-safe commits.* Already had. An entry a client is waiting on is
+  `fsync`ed before the response goes out, so an acknowledged command is on
+  disk; the milestone-2 acceptance kills the process at arbitrary points and
+  gets it back. SQLite would change how that durability is spelled, not
+  whether it exists.
+- *Concurrent writers.* Not wanted. This server has exactly one writer by
+  design — every change to money or to a book is one job on the market actor,
+  which is what keeps reservations and fills consistent without a mutex, and
+  is the property the whole architecture above it rests on. A second writer
+  is not an upgrade to that; it is a different server.
+- *A queryable history.* The only one left, and it is a reporting need rather
+  than a serving one. A snapshot is a complete, self-describing JSON world,
+  and `GET /api/backup` now hands one over to whatever wants to query it.
+
+So the file stays and the milestone is what remained: an outbox, a bound on
+concurrent work, a declared load, and a drill. Adding a C dependency and a
+second persistence model to a webapp whose whole persistence story fits in
+two files, for a serving need that turned out not to exist, would have been
+the expensive half of a plan written before the cheap half was built.
+
+**The outbox carries what nobody asked for.** The plan says "outbox with
+cursor replay" and leaves the contents open. The line drawn is: a fact with a
+*requester* is already recoverable — the sender has its response, and a lost
+response comes back from `GET /api/commands/{key}` under its
+`Idempotency-Key`. A fact with no requester is recoverable from nothing. So a
+purchase, a transfer, a reward and a job *starting* are not in the outbox,
+and a fill, a job coming due, an order the venue withdrew, a stop that fired,
+a halt, a listing, a delisting and an accepted game event are. That line was
+already in the code before this milestone — `StreamMessage::JobDone`'s own
+comment says exactly it about a job starting — so the outbox is the stream's
+message kinds minus `hello` and `tick`, and no new vocabulary had to be
+invented for it.
+
+**Ticks are left out on purpose.** They are the highest-volume thing the
+server produces, they are market data rather than economy, and
+`/api/symbols/{sym}/bars` has them whenever they are wanted. A durable log of
+them would be a time-series database, which is a different project.
+
+**The outbox is state, not a side-channel.** Entries are appended inside the
+command that caused them and committed only once that command is in the
+journal, so the log holds what was *committed* rather than what was
+attempted; they are saved with the snapshot and rebuilt by replay, so a
+restart returns the same facts under the same numbers. Everything else
+follows from that: the acknowledgement is a `Command` like any other, because
+a cursor that moved only in memory would fall back to the snapshot's value on
+a restart and hand the backend facts it had already acted on; and a fact
+published *outside* a command is refused entry, because an entry replay would
+not reproduce is worse in a log that promises replay than no entry at all.
+The guard is `Market::pinned_now` — the same field that keeps a command off
+the clock.
+
+**A fact is stored as it will be sent.** An entry keeps its payload as
+rendered JSON rather than as the typed message. Nothing in the server reads
+one back — it is written once, handed on unchanged and dropped — so
+rendering at the point it is noted keeps the outbox from becoming a second
+reason for every DTO on the stream to grow a `Deserialize` impl and a
+`&'static str` interning module. `CommandRecord::result` keeps a response the
+same way, for the same reason.
+
+**Bounded admission is a semaphore, not an actor.** Everything else in this
+server that is shared is an actor; this one must not be, because its whole
+purpose is to answer *without waiting on anything*. A request that finds the
+server full is refused on the spot with `503 overloaded` and a
+`Retry-After` — a "later" the client can act on, which is precisely what it
+could not do while sitting in a queue. It sits inside the rate limiter, so a
+client already over its own allowance never takes a place from one that is
+not.
+
+**Reads are not gated.** `/api/health` is the single most useful thing to be
+able to read when a server is full, and shedding it would take the
+instrumentation away exactly when it is wanted. Reads are also cheap: they go
+to the symbol actors and queue behind nothing. Only mutations and new stream
+connections take a place.
+
+**The steadier of the two declared numbers is throughput.** The plan's done-
+when is p95 latency, and `webapp/tests/load.rs` asserts one — but a p95
+measured in a debug build on shared CI, beside every other test binary, is
+noisy, and a test that fails when the machine is busy is a test nobody
+trusts. So the file declares both: the whole 512-mutation burst through in
+under five seconds, and the p95 of one request under 750 ms. The first is the
+real bound and the second is the shape. Measured while writing this: p50
+around 60 ms, p95 around 125 ms, max around 140 ms, no request shed, about
+four thousand commands a second; recovery from a snapshot plus a journal of
+the whole burst, about 230 ms.
+
+**A backup is a snapshot, taken out of band and handed back.** A snapshot is
+complete on its own — the journal beside a live state file only covers the
+gap since the server's own last one — so backing up needs no new format and
+no journal, just a snapshot at a moment of the operator's choosing, taken
+from one consistent market job like `/api/reconcile` is. It truncates
+nothing, because the live state file still needs the journal it has. And it
+is *handed back* rather than written to a path the request names: an operator
+route that wrote wherever its body said would be an arbitrary file write with
+a key on it, and `curl > backup.json` is the same drill without one.
+
+**And what is still not here.** Delivery is pull, not push: the backend polls
+`GET /api/outbox` and there are no webhooks, which is the right default when
+the backend is on the same network and the wrong one across a WAN. Quotas
+beyond the rate limiter and the two admission bounds — a cap on one trader's
+resting orders, say — are not built; nothing measured has asked for them yet.
+The plan's `service` principal with scopes is still unbuilt for the reason
+milestone 4 gave: the operator key is the trusted game backend in tier one.
+And the outbox's retention is a ring, not a history: what a consumer misses
+past `FEHU_OUTBOX` is gone, and the read says so rather than pretending
+otherwise.
+
+Determinism is untouched a fifth time. The outbox and the admission bounds
+draw no randomness, the price process never sees either, and the golden
+hashes in `tests/determinism.rs` are unchanged.
+
 ## Acceptance scenario
 
 Initialise a world with a genesis supply in treasury. Onboard two players.
@@ -723,6 +847,11 @@ an empty budget, an NPC out of stock, a recipient at the balance cap, a
 freeze while an order is resting, and a job completion delivered twice.
 
 ## Save format
+
+Version 10 is current: it adds the outbox — the facts the game backend has
+not collected yet, and the cursor saying how far it has read. A version 9
+file has neither, and starting from one would tell a consumer the log begins
+at 1 when it does not, so it is refused like every other version.
 
 There is no production data to migrate; the current snapshot is a demo.
 Save version 6 adds the ledger, wallets, asset kinds, recipes, jobs and the
@@ -744,6 +873,31 @@ cargo test -p fehu-webapp      # webapp: all suites pass, 0 failed
 
 `just lint`, the `no_std` path and the wasm build were not run for this
 documentation-only change; milestone 0 runs `just ci` in full.
+
+### After milestone 5
+
+Run the same way, command by command. All of it passes:
+
+```
+cargo fmt --all -- --check                                  # clean
+cargo clippy --all-targets --all-features -- -D warnings    # clean
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo clippy -p fehu-webapp --all-targets -- -D warnings    # clean
+cargo build --all-features / --no-default-features / +serde # clean
+cargo build --target wasm32-unknown-unknown (both feature sets)
+cargo test --all-features                                   # 103 passed, 0 failed
+cargo test --no-default-features --tests                    #  96 passed, 0 failed
+cargo test -p fehu-webapp                                   # 265 passed, 0 failed
+```
+
+The webapp gained `tests/outbox.rs` (14) and `tests/load.rs` (8), and the
+declared load reported, on the machine this was written on:
+
+```
+burst:      n=512 in 1.09s p50=57ms p95=122ms p99=133ms max=137ms shed=0
+saturated:  n=512 in 0.83s p50=12ms p95=128ms max=160ms shed=491  (max_inflight=1)
+recovery:   227ms, and the restored world reconciles
+```
 
 ### After milestone 4
 
