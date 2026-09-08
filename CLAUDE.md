@@ -70,7 +70,7 @@ below follows from that:
   price series. `tests/trading.rs` holds that invariant.
 - Version constants that gate save compatibility: `fehu::STATE_VERSION`
   (simulator), `fehu::EXCHANGE_VERSION`, `fehu_webapp::save::STATE_VERSION`
-  (the whole market file, currently 10) and
+  (the whole market file, currently 11) and
   `fehu_webapp::journal::JOURNAL_VERSION` (the command journal beside it,
   currently 2). Loading a mismatched version is refused rather than guessed
   at.
@@ -184,9 +184,12 @@ straight line), `npc.rs`
 (the funded traders the world runs itself, re-quoted inside the engine
 step), `outbox.rs` (the durable, cursor-replayable log of the facts nobody
 asked for — what the game backend reads instead of the SSE stream),
-`account.rs` (users, accounts, cash ledger), `trading.rs`
+`account.rs` (users, accounts, cash ledger, and the mapping from the game's
+own player id onto them), `trading.rs`
 (traders, positions, share reservations, wire DTOs), `auth.rs` (API keys —
-issued once, stored as domain-separated SHA-256 digests), `events.rs` (raw
+issued once, stored as domain-separated SHA-256 digests), `service.rs` (the
+third principal: the game backend's own credentials and the scopes each
+carries — a scope narrows a credential, never the operator), `events.rs` (raw
 simulator events and the semantic game-event catalogue), `symbols.rs`
 (tickers registered and `Box::leak`ed to `&'static str`, capped and length-
 bounded), `api.rs` (all HTTP handlers and the SSE stream), `journal.rs`

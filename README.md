@@ -106,6 +106,32 @@ read that portfolio, cancel those orders or move that money. The key is shown
 the only copy there will ever be: the server keeps a hash of it and nothing
 more.
 
+There are three kinds of caller. A **player** is a user key, as above. The
+**operator** is `FEHU_ADMIN_KEY`, and may do anything. A **service** is the
+game backend: a key issued by `POST /api/v1/economy/admin/services` that
+carries a fixed set of *scopes* and nothing else —
+
+| Scope | Opens |
+|---|---|
+| `provision` | `POST /api/v1/economy/players`, and the roster that reads it back |
+| `reward` | `POST /api/v1/economy/rewards` |
+| `inventory` | `POST /api/v1/economy/purchases` and `.../consume`, for any player |
+| `events` | `POST /api/game/events` |
+
+so a backend that pays quest rewards need not hold the key that can also mint
+currency, freeze accounts and rewrite the catalogue. A scope **narrows a
+credential; it does not narrow the operator** — every route above stays open
+to the operator on exactly the terms it always was, so issuing a service
+takes nothing away from a world that never issues one, and a server with no
+services behaves as it did before there were any. Issuing and revoking are
+the operator's alone and reachable through no scope: a credential that could
+grant one could grant itself a wider one. A service key is judged as that
+service wherever it is presented, so a scope it does not carry is refused
+with `missing_scope` even on a server that has no `FEHU_ADMIN_KEY` set.
+Raw simulator events (`POST /api/symbols/{sym}/events`) are deliberately not
+a scope: they are a lever on the price process rather than a fact about the
+game.
+
 Every request that changes something may carry an **`Idempotency-Key`**
 header, and should if it moves money: the same key over the same body is
 applied once and answered twice. Responses carry `Fehu-Journal-Seq`, and a
@@ -183,7 +209,12 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/outbox?after=&limit=` | Game master: the facts nobody asked for — fills, jobs coming due, expiries, delistings, accepted events — numbered, retained and replayable from a cursor. Reading does not consume |
 | `POST` | `/api/outbox/ack` | Game master: `{"through":128}` — how far the game backend has read. Everything after it comes back on the next read with no `after` |
 | `GET` | `/api/reconcile` | Game master: check ownership, reservations, share supply, retained cash ledgers **and that the currency adds up**; returns `valid` and `issues` |
-| — | `/api/v1/economy/…` | The economy surface under the paths `docs/economy-engine-plan.md` names: `players`, `players/{id}/inventory`, `wallets/{id}`, `transfers`, `rewards`, `purchases`, `consume`, `jobs`, `recipes`, `catalog`, `budgets`, `supply`, `world`, `outbox`, `outbox/ack`, `commands/{key}`, `reconcile`, and `admin/{recipes,catalog,budgets,rewards,backup}`. The same handlers as above, under a second spelling |
+| `POST` | `/api/v1/economy/admin/services` | Operator: issue a credential for the game backend — `{"name":"quests","scopes":["reward"]}`. The key is in that one response and nowhere else |
+| `GET` | `/api/v1/economy/admin/services` | Operator: every service credential, revoked ones included. Digests are not in the answer |
+| `DELETE` | `/api/v1/economy/admin/services/{id}` | Operator: take a service's key away. What it did stays done |
+| `POST` | `/api/v1/economy/players` | `service:provision`: map the game's own id for a player onto a user, an account and a trader — `{"external_id":"steam:42","name":"Ada"}`. Idempotent on `external_id`, so it is safe on every login; the account opens empty |
+| `GET` | `/api/v1/economy/players?external_id=` | `service:provision`: who has been provisioned. A player nobody has is an empty list, not a 404 |
+| — | `/api/v1/economy/…` | The rest of the economy surface under the paths `docs/economy-engine-plan.md` names: `players/{id}/inventory`, `wallets/{id}`, `transfers`, `rewards`, `purchases`, `consume`, `jobs`, `recipes`, `catalog`, `budgets`, `supply`, `world`, `outbox`, `outbox/ack`, `commands/{key}`, `reconcile`, and `admin/{recipes,catalog,budgets,rewards,backup}`. The same handlers as above, under a second spelling |
 | `GET` | `/api/health` | Uptime, simulated time, tick/trade counters, orders placed and refused, fills booked and any that failed to settle, stream and rate-limit state, and how long requests and engine steps are taking |
 
 At start-up each symbol generates a year of daily bars in coarse mode and then
@@ -247,7 +278,8 @@ that list, halt and delist symbols, and — since currency became conserved —
 the only two that change how much of it there is, `POST
 /api/accounts/{id}/deposit` and `.../withdraw`. Unset, they stay open, which
 is what a single-player game on localhost wants and a shared server does
-not. Same seeds and same events give the
+not. A shared server that does not want its game backend holding *that* key
+issues it a scoped service credential instead; see above. Same seeds and same events give the
 same prices on every run; trading adds impact on top, so a market with no
 orders replays the bare simulation.
 

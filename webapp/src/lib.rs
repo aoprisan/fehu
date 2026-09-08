@@ -25,6 +25,7 @@ pub mod outbox;
 pub mod reconcile;
 pub mod rewards;
 pub mod save;
+pub mod service;
 pub mod symbol;
 pub mod symbols;
 pub mod trading;

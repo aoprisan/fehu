@@ -900,6 +900,9 @@ export interface Reconciliation {
   jobs_running: number;
   /** Budget wallets rewards are paid from. */
   budgets_checked: number;
+  /** Players the game backend has provisioned, each checked against the
+   *  user, account, trader and wallet its mapping names. */
+  players_checked: number;
   issues: string[];
 }
 
@@ -1228,4 +1231,77 @@ export interface TransferBody {
   to_account_id: number;
   amount_cents: number;
   memo?: string | null;
+}
+
+// --- webapp/src/service.rs -------------------------------------------------
+
+/**
+ * One thing a service credential may do (`service::Scope`).
+ *
+ * Named `ServiceScope` here and not `Scope`, because `events::Scope` — what a
+ * game event reaches — already has that name and TypeScript has no modules
+ * to keep the two apart.
+ *
+ * A scope narrows a credential; it does not narrow the operator, which
+ * reaches every route a scope opens exactly as it did before there were any.
+ */
+export type ServiceScope = 'provision' | 'reward' | 'inventory' | 'events';
+
+/**
+ * `service::ServiceDto` — a credential the game backend speaks with.
+ *
+ * The digest it is stored as is never in the response, and `api_key` holds
+ * the key only in the one response that issued it.
+ */
+export interface ServiceDto {
+  id: number;
+  name: string;
+  scopes: ServiceScope[];
+  revoked: boolean;
+  created_ms: number;
+  revoked_ms: number | null;
+  /** Shown once, in the response that issued it; `null` everywhere after. */
+  api_key: string | null;
+}
+
+/** `GET /api/v1/economy/admin/services` (`service::ServicesResponse`). */
+export interface ServicesResponse {
+  services: ServiceDto[];
+}
+
+/** Body of `POST /api/v1/economy/admin/services`. */
+export interface ServiceRequest {
+  name: string;
+  scopes: ServiceScope[];
+}
+
+/**
+ * `account::PlayerDto` — a player the game already has, mapped onto this
+ * world's ids. `POST /api/v1/economy/players` is idempotent on
+ * `external_id`, so a repeat answers `created: false` and no key.
+ */
+export interface PlayerDto {
+  /** The game's own id for this player. */
+  external_id: string;
+  user_id: number;
+  account_id: number;
+  trader_id: number;
+  wallet_id: number;
+  created_at_ms: number;
+  /** Whether this call is what made the mapping. */
+  created: boolean;
+  /** Shown once, in the response that provisioned them; `null` on a repeat. */
+  api_key: string | null;
+}
+
+/** `GET /api/v1/economy/players` (`account::PlayersResponse`). */
+export interface PlayersResponse {
+  players: PlayerDto[];
+}
+
+/** Body of `POST /api/v1/economy/players`. */
+export interface ProvisionRequest {
+  external_id: string;
+  name?: string | null;
+  email?: string | null;
 }

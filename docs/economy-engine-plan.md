@@ -381,6 +381,7 @@ and to be replaced by measurement after the first two.
 | 3 | ✅ `AssetKind`; goods in holdings; NPC wallets and policies; synthetic ladder and prints disabled on the server; catalogue, purchase and consume routes; save version 8 | Player-to-player and player-to-NPC fills, partial fills, IOC/FOK, amendments, stops, dividends and delistings conserve currency and units | weeks |
 | 4 | ✅ Recipes and jobs; rewards from budgets; game events with production and demand effects; `/api/v1/economy` routes and `types.ts`; UI panels for wallet, inventory and jobs; `just ui` | The acceptance scenario below passes, including retries and restarts at every step | weeks |
 | 5 | ✅ Tier two: outbox with cursor replay for the game backend, bounded admission, load test with a declared target, backup and restore drill. SQLite is *not* in it — see below for why the row got narrower | p95 command latency and recovery time under the declared load; restore reconciles | weeks, only if tier one is outgrown |
+| 6 | ✅ The third principal: `service` credentials with scopes, issued and revoked by the operator; `POST /players` provisioning, idempotent on the game's own player id; save version 11 | A key carrying one scope opens that route and no other, on a locked server and an unlocked one; the operator still reaches everything; services and player mappings survive a restart | days |
 
 Milestone 1 alone is a correct custodial token: conserved supply, operator
 mint and burn, transfers and audited history. Milestone 2 makes it safe to
@@ -830,6 +831,104 @@ Determinism is untouched a fifth time. The outbox and the admission bounds
 draw no randomness, the price process never sees either, and the golden
 hashes in `tests/determinism.rs` are unchanged.
 
+### Milestone 6 as built
+
+Done. `webapp/src/service.rs` is new; `account.rs` gained the player
+mapping, `market.rs` the registry behind the published directory, `api.rs`
+the `Trusted<Scope>` extractor and five routes; `webapp/tests/service.rs`
+holds the acceptance; the save format went to version 11. Seven things are
+worth recording.
+
+**This is the row the plan kept deferring.** Milestone 4 left the `service`
+principal unbuilt "on the assumption that the operator key is the trusted
+game backend in tier one", and milestone 5 repeated it word for word. That
+assumption is fine for a single-player game on localhost and wrong for
+anything shared, because it is not a statement about *authentication* — it is
+one about blast radius. A backend that has to pay a quest reward held the
+credential that can also mint currency, burn it, freeze accounts and rewrite
+the catalogue, so every bug and every leak in the backend was a bug in the
+mint. Nothing about that needed a new deployment tier to become worth
+fixing.
+
+**A scope narrows a credential; it does not narrow the operator.** This is
+the decision the whole milestone rests on, and it is what made it cheap.
+Every route a scope opens is still open to the operator on exactly the terms
+`Admin` always applied — an unset `FEHU_ADMIN_KEY` included, which stays
+open because that is what the repository documents a single-player game on
+localhost gets. So a service credential is an *additional, weaker* way in
+rather than a new requirement, a world that never issues one behaves exactly
+as it did before there were any, and every one of the 265 tests that predate
+the milestone passes untouched, bar the one line noted below. A design that had made scopes mandatory would have
+rewritten every one of them, for no security a world with one operator does
+not already have.
+
+**A key the registry knows is judged as that service, and only as that
+service.** The resolution order is the safety property, not a detail. The
+obvious spelling — try the operator first, fall back to the service — is
+wrong on an unlocked server, where `Admin` accepts anything: a key carrying
+`reward` alone would be silently promoted to operator authority by the *lack*
+of configuration, which is precisely the deployment least likely to notice.
+So the registry is asked first, and a scope the key does not carry is refused
+with `missing_scope` even where nothing is locked. `a_service_key_is_never_promoted_to_the_operators` is that
+test.
+
+**Issuing is the operator's, reachable through no scope.** There is no
+`services` scope and there will not be one: a credential that could issue a
+credential could issue itself a wider one, which would make every other scope
+advisory. Granting authority stays with the credential that already has all
+of it. Revoking is a tombstone rather than a delete, so a key that was taken
+away is refused as *revoked* rather than as unknown, and the service id in a
+journal entry still resolves to the thing that sent it.
+
+**Provisioning is idempotent on the game's id, not on the
+`Idempotency-Key`.** Same shape as `PayReward`'s `source`, and for the same
+reason: the backend already has an id for every player and should not have to
+remember a second one, or remember whether it has called before. So a repeat
+answers `200` with the same ids and `created: false`, and the account opens
+*empty* — arriving in the world creates no currency, which is the invariant
+the ledger rests on and is checked at the one route that makes people. The
+`api_key` on a repeat is `null`, and that cost one small change: `with_key`
+now attaches a credential only to a `201`, because a command that answered
+`200` created nothing and the key generated for it was never installed.
+Handing it back would have been handing out a credential that opens nothing.
+
+**The registry lives in the published directory, not beside it.** It was
+written as a field on `Market` first, and every service key was refused as
+unknown — the directory a request is authorised against is a *snapshot* the
+market publishes, so a second copy is a second thing to keep in step and the
+one a request never reads. The API keys were already right about this. Held
+in the directory, authorising a game-backend request sends no job anywhere,
+which is the property that made the actor topology worth having.
+
+**One route changed shape, deliberately.** `POST /api/v1/economy/players` was
+an alias for `create_trader` — a sign-up under an economy path, with no
+external id anywhere in it. It is now the provisioning route the plan
+specified. `POST /api/traders` is untouched, so nothing lost a way in, but a
+client calling the v1 path with `cash_cents` and no `external_id` now gets a
+`400`. Making the alias real is the point of the milestone; leaving it to
+mean something else would have left the plan's own API section describing a
+route that did not exist.
+
+**And what is still not here.** The SSE key still travels in the query
+string. The plan lists moving it into a header or a short-lived stream ticket
+in the same section as the service principal, and it is a real weakness —
+query strings reach proxy logs — but it is about how a credential *travels*
+rather than what it may *do*, and it drags the committed UI bundle into a
+change that otherwise touches no TypeScript. It is its own milestone. Nor is
+there key rotation: a service that loses its key is issued a new service,
+because the registry kept only a digest. And a service has no rate-limit
+bucket of its own: the limiter keys on a *user* id, so a service key falls
+into the shared anonymous bucket — which is exactly where the operator key
+already was, so nothing regressed, but a busy backend and an unauthenticated
+client now spend the same allowance for a reason that is no longer true.
+Giving a service its own bucket is a small change and the right one as soon
+as anything measures it. Quotas beyond that are still the rate limiter and
+the two admission bounds.
+
+Determinism is untouched a sixth time. Services, scopes and player mappings
+draw no randomness, the price process never sees any of them, and the golden
+hashes in `tests/determinism.rs` are unchanged.
+
 ## Acceptance scenario
 
 Initialise a world with a genesis supply in treasury. Onboard two players.
@@ -873,6 +972,35 @@ cargo test -p fehu-webapp      # webapp: all suites pass, 0 failed
 
 `just lint`, the `no_std` path and the wasm build were not run for this
 documentation-only change; milestone 0 runs `just ci` in full.
+
+### After milestone 6
+
+Run the same way, command by command. All of it passes:
+
+```
+cargo fmt --all -- --check                                  # clean
+cargo clippy --all-targets --all-features -- -D warnings    # clean
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo clippy -p fehu-webapp --all-targets -- -D warnings    # clean
+cargo build --all-features / --no-default-features / +serde # clean
+cargo build --target wasm32-unknown-unknown (both feature sets)
+just ui-check                                               # bundle unchanged
+cargo test --all-features                                   # 103 passed, 0 failed
+cargo test --no-default-features --tests                    #  96 passed, 0 failed
+cargo test -p fehu-webapp                                   # 288 passed, 0 failed
+```
+
+The webapp gained `tests/service.rs` (14) and `service.rs`'s own unit tests
+(7), plus one contract test and one reconcile test. `just ui-check` reports
+the committed bundle unchanged: the only UI change is `types.ts`, and types
+are erased before anything is emitted.
+
+The 265 webapp tests that predate the milestone pass unchanged, with one
+exception: `reconciliation_contract` gained `players_checked`, because the
+reconciliation now counts provisioned players and that test exists to fail
+when a response's key set moves. Nothing about authorisation was edited to
+make a predating test pass, which is the claim "a scope narrows a credential,
+not the operator" makes — checked rather than asserted.
 
 ### After milestone 5
 

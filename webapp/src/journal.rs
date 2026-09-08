@@ -87,6 +87,7 @@ use crate::market::{
 };
 use crate::npc::Policy;
 use crate::rewards::RewardError;
+use crate::service::{ScopeSet, ServiceId};
 use crate::trading::{AmendRequest, AmendResponse, OpenOrderDto, OrderRequest, StopRequest};
 
 /// Format of the journal file. A file written by another version is refused
@@ -105,6 +106,9 @@ pub enum Principal {
     User { id: u64 },
     /// The operator, proved by `FEHU_ADMIN_KEY` (or by there being none).
     Operator,
+    /// The game backend, proved by a service key, acting inside the scopes
+    /// that key carries. See [`crate::service`].
+    Service { id: u64 },
     /// Nobody: a route that needs no credential, such as signing up.
     Anonymous,
     /// The engine loop. Only ever [`Command::Step`].
@@ -362,6 +366,26 @@ pub enum Command {
         source: String,
         note: Option<String>,
     },
+    /// Operator: issue a credential for the game backend, carrying `scopes`
+    /// and nothing else. The key is never journaled — only the digest
+    /// generated for it, exactly as a sign-up's is.
+    CreateService {
+        name: String,
+        scopes: ScopeSet,
+        key_digest: String,
+    },
+    /// Operator: take a service's key away. What it did stays done.
+    RevokeService {
+        id: u64,
+    },
+    /// Map a player the game already has onto a user, an account and a
+    /// trader. Idempotent on `external_id`, so a repeat creates nothing.
+    ProvisionPlayer {
+        external_id: String,
+        name: Option<String>,
+        email: Option<String>,
+        key_digest: String,
+    },
     /// Operator: the game backend has processed the outbox through `seq`.
     ///
     /// A command like any other, because it changes state that is saved: a
@@ -420,6 +444,9 @@ impl Command {
             Self::Resume { .. } => "resume",
             Self::SimEvent { .. } => "sim_event",
             Self::GameEvent { .. } => "game_event",
+            Self::CreateService { .. } => "create_service",
+            Self::RevokeService { .. } => "revoke_service",
+            Self::ProvisionPlayer { .. } => "provision_player",
             Self::AckOutbox { .. } => "ack_outbox",
             Self::Step => "step",
         }
@@ -453,6 +480,9 @@ impl Command {
         match &mut asked {
             Self::CreateUser { key_digest, .. } => key_digest.clear(),
             Self::CreateTrader { key_digest, .. } => *key_digest = None,
+            Self::CreateService { key_digest, .. } | Self::ProvisionPlayer { key_digest, .. } => {
+                key_digest.clear();
+            }
             _ => {}
         }
         asked
@@ -1857,6 +1887,53 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 effects,
             });
             Applied::new(202, &record)
+        }
+
+        Command::CreateService {
+            name,
+            scopes,
+            key_digest,
+        } => {
+            let id = m
+                .create_service(name, *scopes, key_digest.clone(), wall_ms)
+                .map_err(ApiError::service)?;
+            let dto = crate::api::service_dto(m, id)?;
+            // The key went out with the response; what is recorded is the
+            // service without it, as a sign-up's is.
+            Applied::new(201, &dto).map(|a| a.without("api_key"))
+        }
+
+        Command::RevokeService { id } => {
+            let service = ServiceId(*id);
+            if !m.revoke_service(service, wall_ms) {
+                return Err(ApiError::unknown_service(*id));
+            }
+            Applied::new(200, &crate::api::service_dto(m, service)?)
+        }
+
+        Command::ProvisionPlayer {
+            external_id,
+            name,
+            email,
+            key_digest,
+        } => {
+            let external_id = crate::account::clean_external_id(external_id)
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            let (player, created) = m
+                .provision_player(
+                    &external_id,
+                    name.clone(),
+                    email.clone(),
+                    wall_ms,
+                    key_digest.clone(),
+                )
+                .map_err(ApiError::money)?;
+            let dto = crate::api::player_dto(&player, created);
+            // 201 the first time, 200 for a player who already had a
+            // mapping: a repeat made nothing, and carries no key because the
+            // only copy went out with the response that did.
+            let status = if created { 201 } else { 200 };
+            Applied::new(status, &dto).map(|a| a.without("api_key"))
         }
 
         Command::AckOutbox { through } => {

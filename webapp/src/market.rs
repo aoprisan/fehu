@@ -67,8 +67,8 @@ use tokio::sync::{broadcast, watch};
 use fehu::ledger::{Draft, Ledger, LedgerError, Reason, WalletId, WalletKind};
 
 use crate::account::{
-    Account, AccountId, LedgerEntry, LedgerKind, MAX_BALANCE_CENTS, MoneyError, User, UserId,
-    check_transfer, settlement_draft,
+    Account, AccountId, LedgerEntry, LedgerKind, MAX_BALANCE_CENTS, MoneyError, Player, User,
+    UserId, check_transfer, settlement_draft,
 };
 use crate::actor::{Actor, Gone};
 use crate::auth::Keyring;
@@ -85,6 +85,7 @@ use crate::metrics::Metrics;
 use crate::npc::{BPS, MAX_NPCS, Npc, NpcDto, Policy};
 use crate::rewards::{Budget, BudgetDto, RewardBook, RewardError, RewardReceipt, RewardRule};
 use crate::save::{MarketSave, STATE_VERSION, Save};
+use crate::service::{ScopeSet, Service, ServiceAuth, ServiceError, ServiceId, Services};
 use crate::trading::{
     BookDto, Fees, FillRecord, HoldingDto, Liquidity, MAX_STOPS_PER_TRADER, OpenOrderDto,
     OrderRecord, OrderResponse, Refused, SettledFees, StopOrder, StopRequest, TradeDto, Trader,
@@ -172,12 +173,14 @@ impl Listings {
     }
 }
 
-/// Who is who: the API keys, and who owns which trader. Published by the
-/// market as an immutable snapshot; read on every authenticated request,
-/// by the rate limiter and by every open stream without sending anything.
+/// Who is who: the API keys, the service credentials, and who owns which
+/// trader. Published by the market as an immutable snapshot; read on every
+/// authenticated request, by the rate limiter and by every open stream
+/// without sending anything.
 #[derive(Clone, Debug, Default)]
 pub struct Directory {
     keys: Keyring,
+    services: Services,
     owners: BTreeMap<TraderId, UserId>,
 }
 
@@ -185,6 +188,13 @@ impl Directory {
     /// The user `key` speaks for, if it is one of ours.
     pub fn user_of(&self, key: &str) -> Option<UserId> {
         self.keys.user_of(key)
+    }
+
+    /// The service `key` speaks for, if it is one of ours — revoked or not,
+    /// so a credential that was taken away is refused as revoked rather than
+    /// as unknown. See [`crate::service`].
+    pub fn service_of(&self, key: &str) -> Option<ServiceAuth> {
+        self.services.resolve(key)
     }
 
     /// The user `trader` belongs to, if the trader exists.
@@ -652,6 +662,10 @@ pub struct Market {
     /// Settlements the ledger refused after the book had already traded.
     /// Always zero in a healthy market; see [`Market::book`].
     pub settlement_failures: u64,
+    /// The players the game backend has provisioned, by the external id it
+    /// knows each of them by. See [`Market::provision_player`].
+    pub players: BTreeMap<String, Player>,
+    next_service_id: u64,
     pub users: BTreeMap<UserId, User>,
     next_user_id: u64,
     pub accounts: BTreeMap<AccountId, Account>,
@@ -998,6 +1012,107 @@ impl Market {
         let user = self.create_user(name.clone(), email, now_ms, key_digest);
         let account = self.open_account(user, name.clone(), cash_cents, now_ms)?;
         Ok(self.create_trader(user, account, name, now_ms))
+    }
+
+    /// The credentials the game backend speaks with.
+    ///
+    /// They live in the published [`Directory`] rather than beside it, for
+    /// the same reason the API keys do: every request that presents one is
+    /// authorised from the published snapshot without sending a job
+    /// anywhere, so a second copy here would be a second thing to keep in
+    /// step and the one a stale request would read.
+    pub fn services(&self) -> &Services {
+        &self.directory.services
+    }
+
+    /// Issue a service credential: a key the game backend speaks with that
+    /// carries `scopes` and nothing else. See [`crate::service`].
+    ///
+    /// The key itself never reaches here. The route that issues one
+    /// generates it, journals the digest and returns the only copy, exactly
+    /// as a user's sign-up does.
+    pub fn create_service(
+        &mut self,
+        name: &str,
+        scopes: ScopeSet,
+        digest: String,
+        now_ms: i64,
+    ) -> Result<ServiceId, ServiceError> {
+        let name = crate::service::clean_name(name)?;
+        if scopes.is_empty() {
+            return Err(ServiceError::NoScopes);
+        }
+        let id = ServiceId(self.next_service_id);
+        self.next_service_id += 1;
+        self.directory.services.install(Service {
+            id,
+            name,
+            scopes,
+            digest,
+            revoked: false,
+            created_ms: now_ms,
+            revoked_ms: None,
+        });
+        self.publish_directory();
+        Ok(id)
+    }
+
+    /// Take a service's key away. Returns whether there was such a service;
+    /// revoking a revoked one changes nothing and is not an error.
+    pub fn revoke_service(&mut self, id: ServiceId, now_ms: i64) -> bool {
+        let revoked = self.directory.services.revoke(id, now_ms);
+        if revoked {
+            self.publish_directory();
+        }
+        revoked
+    }
+
+    /// Map a player the game already has onto a user, an account and a
+    /// trader, and hand back what was created — or what already was.
+    ///
+    /// Idempotent on `external_id`: the second call for a player finds the
+    /// mapping and creates nothing, so the backend may provision on every
+    /// login without keeping a record of whether it has. The account opens
+    /// empty, because currency is minted by the operator and paid as
+    /// rewards; nothing about arriving in the world creates any.
+    ///
+    /// `Err` is only a name or an id the world would not take; a repeat is
+    /// `Ok` with `created` false.
+    pub fn provision_player(
+        &mut self,
+        external_id: &str,
+        name: Option<String>,
+        email: Option<String>,
+        now_ms: i64,
+        key_digest: String,
+    ) -> Result<(Player, bool), MoneyError> {
+        let external_id = external_id.to_owned();
+        if let Some(player) = self.players.get(&external_id) {
+            return Ok((player.clone(), false));
+        }
+        let user = self.create_user(name.clone(), email, now_ms, key_digest);
+        let account = self.open_account(user, name.clone(), 0, now_ms)?;
+        let trader = self.create_trader(user, account, name, now_ms);
+        let wallet = self
+            .accounts
+            .get(&account)
+            .map(|a| a.wallet)
+            .ok_or(MoneyError::NoWallet { account })?;
+        let player = Player {
+            external_id: external_id.clone(),
+            user_id: user,
+            account_id: account,
+            trader_id: trader,
+            wallet,
+            created_at_ms: now_ms,
+        };
+        self.players.insert(external_id, player.clone());
+        Ok((player, true))
+    }
+
+    /// The player the game knows by `external_id`, if this world has them.
+    pub fn player(&self, external_id: &str) -> Option<&Player> {
+        self.players.get(external_id)
     }
 
     /// The account a trader trades on.
@@ -3548,6 +3663,9 @@ impl Market {
                     .collect(),
                 events: self.events.iter().cloned().collect(),
                 api_keys: self.directory.keys.pairs(),
+                players: self.players.values().cloned().collect(),
+                services: self.directory.services.to_saved(),
+                next_service_id: self.next_service_id,
                 next_user_id: self.next_user_id,
                 next_account_id: self.next_account_id,
                 next_trader_id: self.next_trader_id,
@@ -3590,6 +3708,8 @@ struct MarketParts {
     directory: Directory,
     events: VecDeque<EventRecord>,
     next_event_id: u64,
+    players: BTreeMap<String, Player>,
+    next_service_id: u64,
     users: BTreeMap<UserId, User>,
     next_user_id: u64,
     accounts: BTreeMap<AccountId, Account>,
@@ -3652,6 +3772,8 @@ impl Market {
             events,
             event_cap,
             next_event_id: parts.next_event_id.max(1),
+            players: parts.players,
+            next_service_id: parts.next_service_id.max(1),
             users: parts.users,
             next_user_id: parts.next_user_id.max(1),
             accounts: parts.accounts,
@@ -4093,6 +4215,8 @@ impl App {
                 directory: Directory::default(),
                 events: VecDeque::new(),
                 next_event_id: 1,
+                players: BTreeMap::new(),
+                next_service_id: 1,
                 users: BTreeMap::new(),
                 next_user_id: 1,
                 accounts: BTreeMap::new(),
@@ -4131,6 +4255,7 @@ impl App {
         let m = save.market;
         let directory = Directory {
             keys: Keyring::from_pairs(m.api_keys),
+            services: Services::from_saved(m.services),
             owners: m.traders.iter().map(|t| (t.id, t.user_id)).collect(),
         };
         let responses: BTreeMap<u64, OrderResponse> = m.order_responses.into_iter().collect();
@@ -4169,6 +4294,12 @@ impl App {
                 directory,
                 events: m.events.into_iter().collect(),
                 next_event_id: m.next_event_id,
+                players: m
+                    .players
+                    .into_iter()
+                    .map(|p| (p.external_id.clone(), p))
+                    .collect(),
+                next_service_id: m.next_service_id.max(1),
                 users: m.users.into_iter().map(|u| (u.id, u)).collect(),
                 next_user_id: m.next_user_id,
                 accounts: m.accounts.into_iter().map(|a| (a.id, a)).collect(),
@@ -4414,6 +4545,13 @@ impl App {
     /// The user `key` speaks for, if it is one of ours.
     pub fn user_of(&self, key: &str) -> Option<UserId> {
         self.directory.borrow().user_of(key)
+    }
+
+    /// The service `key` speaks for, if it is one of ours. Answered from the
+    /// published directory, so authorising a game-backend request sends no
+    /// job anywhere.
+    pub fn service_of(&self, key: &str) -> Option<ServiceAuth> {
+        self.directory.borrow().service_of(key)
     }
 
     /// The user `trader` belongs to, if the trader exists.
