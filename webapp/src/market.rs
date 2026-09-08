@@ -2606,6 +2606,7 @@ impl Market {
         } else {
             0
         };
+        let mut inputs_cost_cents = 0i64;
         for (handle, line) in inputs {
             let qty = line.qty;
             handle
@@ -2616,7 +2617,10 @@ impl Market {
                 })
                 .await?;
             if let Some(t) = self.traders.get_mut(&trader) {
-                t.destroy(line.symbol, qty);
+                // Withdrawn rather than destroyed: what the ore cost follows
+                // it into the crucible and comes back out as part of what the
+                // ingot cost.
+                inputs_cost_cents = inputs_cost_cents.saturating_add(t.withdraw(line.symbol, qty));
             }
         }
         let id = self.jobs.take_id();
@@ -2631,6 +2635,7 @@ impl Market {
             yield_bps,
             cost_cents: recipe.cost_cents,
             tx_id,
+            inputs_cost_cents,
             started_at_ms: at,
             due_at_ms: at.saturating_add(
                 i64::try_from(recipe.duration_secs)
@@ -2724,12 +2729,13 @@ impl Market {
                 .iter()
                 .map(|l| l.qty)
                 .fold(0u64, u64::saturating_add);
-            // What a unit is reckoned to have cost: the job's cost, spread
-            // over what it actually delivered.
+            // What a unit is reckoned to have cost: what went into the job —
+            // the ore and the furnace both — spread over what came out of it.
+            let spent = job.cost_cents.saturating_add(job.inputs_cost_cents);
             let unit_cost = if total == 0 {
                 0
             } else {
-                job.cost_cents / i64::try_from(total).unwrap_or(i64::MAX)
+                spent / i64::try_from(total).unwrap_or(i64::MAX)
             };
             let trader = TraderId(job.trader_id);
             let mut delivered = Vec::with_capacity(job.outputs.len());

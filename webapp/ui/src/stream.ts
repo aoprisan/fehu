@@ -174,6 +174,16 @@ export class MarketStream {
         this.#actions.recordEvent(record);
         break;
       }
+      case 'job_done': {
+        const trader = state.trader;
+        if (trader === null || message.trader_id !== trader.id) break;
+        const made = message.delivered.map((l) => `${l.qty} ${l.symbol}`).join(', ');
+        setOrderStatus(`job #${message.job_id} delivered ${made === '' ? 'nothing' : made}`);
+        // The units are the player's now, and so is what they cost.
+        void this.#actions.loadEconomy();
+        void this.#actions.refreshTrader();
+        break;
+      }
     }
     this.#store.emit('clock');
   }

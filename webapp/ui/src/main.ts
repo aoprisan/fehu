@@ -14,6 +14,7 @@ import { errorMessage } from './api.js';
 import { Chart } from './chart/chart.js';
 import { AccountPanel } from './panels/account.js';
 import { BookPanel } from './panels/book.js';
+import { EconomyPanel } from './panels/economy.js';
 import { EventsPanel } from './panels/events.js';
 import { HeaderPanel } from './panels/header.js';
 import { IntervalBar } from './panels/interval-bar.js';
@@ -38,6 +39,7 @@ new SymbolList(store, actions);
 new BookPanel(store, { onPriceClick: (cents) => ticket.setLimitPrice(cents) });
 new TapePanel(store);
 new AccountPanel(store, actions);
+new EconomyPanel(store, actions);
 new EventsPanel(store, actions);
 const intervals = new IntervalBar(store, actions);
 
@@ -56,6 +58,7 @@ async function boot(): Promise<void> {
     actions.loadTrader(),
     actions.loadBookAndTape(),
   ]);
+  await actions.loadEconomy();
   stream.connect();
 }
 

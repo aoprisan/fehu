@@ -426,6 +426,46 @@ impl Trader {
         left
     }
 
+    /// Take `qty` units of `symbol` out of the position and hand back what
+    /// they cost.
+    ///
+    /// This is neither a sale nor a consumption. The units are going into a
+    /// production job ([`crate::jobs`]) that will hand back something else,
+    /// so their basis goes *with* them instead of being written off: what
+    /// comes out of the furnace costs what went into it, and there is no
+    /// realised loss on the way in followed by a phantom gain on the way
+    /// out. Nothing here can fail — the caller has checked that the units
+    /// are held and unreserved.
+    pub fn withdraw(&mut self, symbol: &str, qty: u64) -> i64 {
+        let Some(pos) = self.positions.get_mut(symbol) else {
+            return 0;
+        };
+        let held = pos.qty.max(0);
+        let taken = i64::try_from(qty).unwrap_or(i64::MAX).min(held);
+        if taken == 0 {
+            return 0;
+        }
+        // Integer arithmetic, like every other number here: the basis that
+        // leaves is its share of what the position cost, rounded down, and
+        // the last unit out takes whatever rounding left behind.
+        let basis = if taken == held {
+            pos.cost_cents
+        } else {
+            (i128::from(pos.cost_cents) * i128::from(taken) / i128::from(held))
+                .try_into()
+                .unwrap_or(0)
+        };
+        pos.qty -= taken;
+        pos.cost_cents = (pos.cost_cents - basis).max(0);
+        if pos.qty == 0 {
+            pos.cost_cents = 0;
+            if pos.realised_pnl_cents == 0 && pos.cash_cents == 0 {
+                self.positions.remove(symbol);
+            }
+        }
+        basis
+    }
+
     /// Record a trade this trader took part in: the position, the reservation
     /// its resting order held, and the rows in the account's history.
     ///

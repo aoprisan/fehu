@@ -70,7 +70,7 @@ below follows from that:
   price series. `tests/trading.rs` holds that invariant.
 - Version constants that gate save compatibility: `fehu::STATE_VERSION`
   (simulator), `fehu::EXCHANGE_VERSION`, `fehu_webapp::save::STATE_VERSION`
-  (the whole market file, currently 8) and
+  (the whole market file, currently 9) and
   `fehu_webapp::journal::JOURNAL_VERSION` (the command journal beside it,
   currently 2). Loading a mismatched version is refused rather than guessed
   at.
@@ -167,7 +167,14 @@ snapshot, because a snapshot may fall between any two commands. No credential
 ever reaches either: a key exists once, in the response that issued it.
 
 Other modules: `catalog.rs` (what the world will make and what it charges;
-goods are issued by a purchase and destroyed by consuming them), `npc.rs`
+goods are issued by a purchase and destroyed by consuming them), `jobs.rs`
+(recipes, and the jobs run against them: the inputs and the cost go when a
+job starts, the outputs arrive on the engine step that reaches its due
+instant), `rewards.rs` (budget wallets, what a named reward is worth, and
+every game event id already paid — a reward is idempotent on the *game's*
+event id, not only on the `Idempotency-Key`), `world.rs` (what a game event
+does to production and demand, in integer basis points ramping down in a
+straight line), `npc.rs`
 (the funded traders the world runs itself, re-quoted inside the engine
 step), `account.rs` (users, accounts, cash ledger), `trading.rs`
 (traders, positions, share reservations, wire DTOs), `auth.rs` (API keys —

@@ -43,8 +43,15 @@ renders straight from a fetch response, so the stream and the REST endpoints
 cannot disagree about what is on screen.
 
 There is no framework. Views are already functions of state, so adding one
-later is a per-panel change rather than a rewrite; the 28 kB bundle
-(10 kB gzipped) is the reason not to add one yet.
+later is a per-panel change rather than a rewrite; the 36 kB bundle
+(12 kB gzipped) is the reason not to add one yet.
+
+The panels are the market's — symbols, chart, book, tape, ticket, account,
+events — plus one for the economy: `panels/economy.ts` draws the wallet the
+player's money is in, the units they hold of the world's goods, and what
+they have in the furnace. The three are one panel because a job spends all
+three at once — it takes units and cents now and gives back units later —
+so three separate panels would always be read as one.
 
 ## Keeping the types honest
 

@@ -432,8 +432,19 @@ async fn a_job_delivers_on_the_step_that_reaches_it() {
         .clone();
     assert_eq!(ingots["qty"], 1);
     assert_eq!(
-        ingots["cost_cents"], 500,
-        "what the job cost is what the ingot is reckoned to have cost"
+        ingots["cost_cents"], 700,
+        "the furnace's 5.00 and the two ore at 1.00: what went in is what it cost"
+    );
+    let ore = inventory["inventory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["symbol"] == "ORE")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        ore["realised_pnl_cents"], 0,
+        "and the ore was not written off on the way in"
     );
 
     // And it is delivered once, however many steps go past it.

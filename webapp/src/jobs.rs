@@ -415,6 +415,14 @@ pub struct Job {
     /// What it cost, and the balanced transaction that moved it.
     pub cost_cents: i64,
     pub tx_id: u64,
+    /// What the inputs cost their owner, taken out of their positions when
+    /// the job started.
+    ///
+    /// It is not money that moved — the ore was already paid for — but it is
+    /// what the ore was worth, and it goes into what the ingot is reckoned to
+    /// have cost. See [`Trader::withdraw`](crate::trading::Trader::withdraw).
+    #[serde(default)]
+    pub inputs_cost_cents: i64,
     /// Simulated instants: when it started and when it is due.
     pub started_at_ms: i64,
     pub due_at_ms: i64,
@@ -763,6 +771,7 @@ mod tests {
             yield_bps: BPS,
             cost_cents: 0,
             tx_id: 0,
+            inputs_cost_cents: 0,
             started_at_ms: 0,
             due_at_ms: 1_000,
             finished_at_ms: None,

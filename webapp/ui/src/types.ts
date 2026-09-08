@@ -1009,6 +1009,8 @@ export interface Job {
   cost_cents: number;
   /** The balanced transaction that paid the cost, or 0 for a free recipe. */
   tx_id: number;
+  /** What the inputs cost their owner: it goes into what the output cost. */
+  inputs_cost_cents: number;
   started_at_ms: number;
   due_at_ms: number;
   finished_at_ms: number | null;
