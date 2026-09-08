@@ -12,6 +12,7 @@ pub mod account;
 pub mod actor;
 pub mod api;
 pub mod auth;
+pub mod catalog;
 pub mod engine;
 pub mod events;
 pub mod journal;

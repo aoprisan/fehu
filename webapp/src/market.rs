@@ -72,6 +72,7 @@ use crate::account::{
 };
 use crate::actor::{Actor, Gone};
 use crate::auth::Keyring;
+use crate::catalog::{Catalog, CatalogItem, ConsumeReceipt, GoodsError, PurchaseReceipt};
 use crate::events::EventRecord;
 use crate::journal::JournalError;
 use crate::limit::{Decision, Limiter, Rate};
@@ -605,8 +606,11 @@ pub struct Market {
     /// The four wallets the world always has.
     pub wallets: Wallets,
     /// Per symbol, the wallet its dividends and its delisting buyout are
-    /// paid out of. A payout it cannot fund is refused, never clipped.
+    /// paid out of. A payout it cannot fund is refused, never clipped. For a
+    /// good it is where the money paid for its units lands.
     pub issuers: BTreeMap<&'static str, WalletId>,
+    /// What the world will make, and for how much. See [`crate::catalog`].
+    pub catalog: Catalog,
     /// Settlements the ledger refused after the book had already traded.
     /// Always zero in a healthy market; see [`Market::book`].
     pub settlement_failures: u64,
@@ -1859,7 +1863,15 @@ impl Market {
             });
         }
         let quote = state.quote();
-        let float = self.issuer_float_cents;
+        // A good's issuer pays no dividend and buys nobody out; its wallet
+        // is where the money paid for its units *arrives*. Floating it out
+        // of treasury would set currency aside against a payout that cannot
+        // happen.
+        let float = if state.info.is_good() {
+            0
+        } else {
+            self.issuer_float_cents
+        };
         self.symbols.push(Symbol::spawn(state));
         self.fund_issuer(ticker, float);
         self.publish_listings();
@@ -1867,6 +1879,203 @@ impl Market {
             quote: quote.clone(),
         });
         Ok(quote)
+    }
+
+    /// Write or replace a catalogue line.
+    ///
+    /// Operator authority. The symbol has to be a listed good: a line
+    /// against a company would be an offer to print its shares.
+    ///
+    /// # Errors
+    /// [`GoodsError`] naming what was wrong. Nothing is changed by a
+    /// refusal.
+    pub async fn set_catalog_item(
+        &mut self,
+        symbol: &Symbol,
+        price_cents: i64,
+        available: Option<u64>,
+        note: Option<String>,
+    ) -> Result<CatalogItem, GoodsError> {
+        let sym = symbol.ticker;
+        if !symbol.ask(|s| s.info.is_good()).await? {
+            return Err(GoodsError::NotAGood(sym.to_string()));
+        }
+        self.catalog
+            .set(sym, price_cents, available, note)
+            .cloned()
+            .map_err(GoodsError::from)
+    }
+
+    /// Take a line out of the catalogue. Units already issued off it stay in
+    /// the world; what stops is the making of more.
+    pub fn remove_catalog_item(&mut self, symbol: &str) -> Option<CatalogItem> {
+        self.catalog.remove(symbol)
+    }
+
+    /// Buy `qty` units of a good at the catalogue price.
+    ///
+    /// This is the only way a unit of a good comes into existence today, and
+    /// it does two separable things at once: currency moves from the buyer's
+    /// wallet to the good's issuer wallet — a balanced transaction, so the
+    /// supply is untouched — and units that did not exist are issued to the
+    /// buyer.
+    ///
+    /// The order is the one the milestone-1 settlements had to learn:
+    /// everything is checked, then the money is posted, and only then are
+    /// the units issued. The post is the fallible half, so it goes first;
+    /// by the time it has succeeded, issuing cannot fail, because the
+    /// arithmetic that could have overflowed was checked before either.
+    ///
+    /// # Errors
+    /// [`GoodsError`] naming what was wrong. A refusal moves nothing and
+    /// issues nothing.
+    pub async fn purchase(
+        &mut self,
+        symbol: &Symbol,
+        trader: TraderId,
+        qty: u64,
+        now_ms: i64,
+    ) -> Result<PurchaseReceipt, GoodsError> {
+        let sym = symbol.ticker;
+        if qty == 0 {
+            return Err(GoodsError::Quantity(
+                "a purchase is for at least one unit".into(),
+            ));
+        }
+        // What the symbol says about itself, before anything moves: that it
+        // is a good, and that it can hold the units this would issue.
+        let (is_good, issued) = symbol
+            .ask(|s| match &s.info.asset {
+                AssetKind::Good { issued, .. } => (true, *issued),
+                AssetKind::Stock { .. } => (false, 0),
+            })
+            .await?;
+        if !is_good {
+            return Err(GoodsError::NotAGood(sym.to_string()));
+        }
+        if issued.checked_add(qty).is_none() {
+            return Err(GoodsError::Quantity(format!(
+                "{sym} cannot issue that many more units"
+            )));
+        }
+        let unit_price_cents = self.catalog.quote(sym, qty)?;
+        let total_cents = fehu::ledger::checked_notional_cents(unit_price_cents, qty)
+            .map_err(|e| GoodsError::Money(MoneyError::Ledger(e)))?;
+        let account_id = self
+            .traders
+            .get(&trader)
+            .ok_or(GoodsError::UnknownTrader(trader.0))?
+            .account_id;
+        let wallet = self.wallet_of(account_id)?;
+        let issuer = self.issuer_wallet(sym);
+        let tx = self.ledger.post(
+            Draft::new(Reason::Purchase)
+                .debit(wallet, total_cents)
+                .credit(issuer, total_cents)
+                .memo(Some(format!("{qty} × {sym} from the catalogue"))),
+        )?;
+        // Past the point of refusal. Everything from here was checked above.
+        let units_outstanding = symbol
+            .change(move |s| {
+                s.info
+                    .issue(qty)
+                    .unwrap_or_else(|_| s.info.units_outstanding())
+            })
+            .await?;
+        self.catalog.issue(sym, qty);
+        let Self {
+            ledger,
+            accounts,
+            traders,
+            ..
+        } = self;
+        let position_qty = traders
+            .get_mut(&trader)
+            .zip(accounts.get_mut(&account_id))
+            .map_or(0, |(t, a)| {
+                t.acquire(
+                    ledger,
+                    a,
+                    sym,
+                    qty,
+                    unit_price_cents,
+                    tx.id,
+                    now_ms,
+                    Some(format!("{qty} × {sym} from the catalogue")),
+                )
+            });
+        Ok(PurchaseReceipt {
+            trader_id: trader.0,
+            symbol: sym,
+            qty,
+            unit_price_cents,
+            total_cents,
+            tx_id: tx.id,
+            position_qty,
+            units_outstanding,
+            available: self.catalog.get(sym).and_then(|item| item.available),
+        })
+    }
+
+    /// Destroy `qty` units of a good the trader holds.
+    ///
+    /// No currency moves: a thing that has been used up is not a thing that
+    /// has been sold. What changes is the world's count of what has been
+    /// consumed, and the holder's position, which realises what the units
+    /// cost as a loss.
+    ///
+    /// The units must be held *and* unreserved: a unit promised to a resting
+    /// sell is spoken for, and eating it would leave an order the trader
+    /// cannot fill.
+    ///
+    /// # Errors
+    /// [`GoodsError`] naming what was wrong. A refusal destroys nothing.
+    pub async fn consume(
+        &mut self,
+        symbol: &Symbol,
+        trader: TraderId,
+        qty: u64,
+    ) -> Result<ConsumeReceipt, GoodsError> {
+        let sym = symbol.ticker;
+        if qty == 0 {
+            return Err(GoodsError::Quantity(
+                "consuming is of at least one unit".into(),
+            ));
+        }
+        if !symbol.ask(|s| s.info.is_good()).await? {
+            return Err(GoodsError::NotAGood(sym.to_string()));
+        }
+        let free = self
+            .traders
+            .get(&trader)
+            .ok_or(GoodsError::UnknownTrader(trader.0))?
+            .free_shares(sym);
+        if free < qty {
+            return Err(GoodsError::InsufficientUnits {
+                needed: qty,
+                available: free,
+            });
+        }
+        // The holder has the units, so the world has them: the audit says
+        // those are the same sentence. Nothing below can fail.
+        let units_outstanding = symbol
+            .change(move |s| {
+                s.info
+                    .consume(qty)
+                    .unwrap_or_else(|_| s.info.units_outstanding())
+            })
+            .await?;
+        let position_qty = self
+            .traders
+            .get_mut(&trader)
+            .map_or(0, |t| t.destroy(sym, qty));
+        Ok(ConsumeReceipt {
+            trader_id: trader.0,
+            symbol: sym,
+            qty,
+            position_qty,
+            units_outstanding,
+        })
     }
 
     /// Delist a symbol: withdraw its book, drop its stops, buy every holder
@@ -2303,6 +2512,7 @@ impl Market {
                     .iter()
                     .map(|(sym, id)| ((*sym).to_string(), *id))
                     .collect(),
+                catalog: self.catalog.clone(),
                 users: self.users.values().cloned().collect(),
                 accounts: self.accounts.values().cloned().collect(),
                 traders: self.traders.values().cloned().collect(),
@@ -2341,6 +2551,7 @@ struct MarketParts {
     ledger: Ledger,
     wallets: Wallets,
     issuers: BTreeMap<&'static str, WalletId>,
+    catalog: Catalog,
     symbols: Vec<SymbolState>,
     directory: Directory,
     events: VecDeque<EventRecord>,
@@ -2387,6 +2598,7 @@ impl Market {
             ledger: parts.ledger,
             wallets: parts.wallets,
             issuers: parts.issuers,
+            catalog: parts.catalog,
             settlement_failures: 0,
             symbols,
             listings_tx,
@@ -2782,6 +2994,7 @@ impl App {
                 ledger,
                 wallets,
                 issuers: BTreeMap::new(),
+                catalog: Catalog::default(),
                 symbols,
                 directory: Directory::default(),
                 events: VecDeque::new(),
@@ -2845,6 +3058,7 @@ impl App {
                     .into_iter()
                     .filter_map(|(sym, id)| Some((crate::symbols::lookup(&sym)?, id)))
                     .collect(),
+                catalog: m.catalog,
                 symbols,
                 directory,
                 events: m.events.into_iter().collect(),

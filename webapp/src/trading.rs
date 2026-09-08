@@ -337,6 +337,60 @@ impl Trader {
         }
     }
 
+    /// Put `qty` units of `symbol` into the position at `price_cents` each:
+    /// a purchase from the catalogue, which is not a fill and never touches
+    /// a book.
+    ///
+    /// The money has already moved — `tx_id` names the balanced transaction
+    /// that moved it — and the units have already been issued against the
+    /// symbol. This is the holder's own view of both.
+    #[allow(clippy::too_many_arguments)]
+    pub fn acquire(
+        &mut self,
+        ledger: &Ledger,
+        account: &mut Account,
+        symbol: &'static str,
+        qty: u64,
+        price_cents: i64,
+        tx_id: u64,
+        now_ms: i64,
+        memo: Option<String>,
+    ) -> i64 {
+        let value = notional_cents(price_cents, qty);
+        account.record(
+            ledger,
+            LedgerKind::Purchase,
+            tx_id,
+            -value,
+            now_ms,
+            Some(symbol),
+            None,
+            memo,
+        );
+        let pos = self.positions.entry(symbol).or_default();
+        pos.apply(Side::Buy, qty, price_cents);
+        pos.qty
+    }
+
+    /// Take `qty` units of `symbol` out of the position for good.
+    ///
+    /// Consuming is a sale at nothing: the units leave and nothing comes
+    /// back, so what they cost becomes a realised loss and the account's
+    /// cash is untouched. Nothing here can fail — the caller has checked
+    /// that the units are held and unreserved — because the world's count of
+    /// what has been consumed has already gone up.
+    pub fn destroy(&mut self, symbol: &str, qty: u64) -> i64 {
+        let Some(pos) = self.positions.get_mut(symbol) else {
+            return 0;
+        };
+        pos.apply(Side::Sell, qty, 0);
+        let left = pos.qty;
+        if pos.qty == 0 && pos.realised_pnl_cents == 0 && pos.cash_cents == 0 {
+            self.positions.remove(symbol);
+        }
+        left
+    }
+
     /// Record a trade this trader took part in: the position, the reservation
     /// its resting order held, and the rows in the account's history.
     ///

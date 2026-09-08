@@ -226,6 +226,30 @@ pub enum Command {
     ListSymbol {
         listing: Listing,
     },
+    /// Operator: write or replace what a good costs from the catalogue.
+    SetCatalogItem {
+        symbol: String,
+        price_cents: i64,
+        available: Option<u64>,
+        note: Option<String>,
+    },
+    /// Operator: stop making a good. What was issued off the line stays.
+    RemoveCatalogItem {
+        symbol: String,
+    },
+    /// Buy units of a good at the catalogue price: the only thing that
+    /// brings a unit of one into existence.
+    Purchase {
+        trader_id: u64,
+        symbol: String,
+        qty: u64,
+    },
+    /// Use units up. They leave the world; no currency moves.
+    Consume {
+        trader_id: u64,
+        symbol: String,
+        qty: u64,
+    },
     Delist {
         symbol: String,
         cents_per_share: Option<i64>,
@@ -286,6 +310,10 @@ impl Command {
             Self::PlaceStop { .. } => "place_stop",
             Self::CancelStop { .. } => "cancel_stop",
             Self::ListSymbol { .. } => "list_symbol",
+            Self::SetCatalogItem { .. } => "set_catalog_item",
+            Self::RemoveCatalogItem { .. } => "remove_catalog_item",
+            Self::Purchase { .. } => "purchase",
+            Self::Consume { .. } => "consume",
             Self::Delist { .. } => "delist",
             Self::Dividend { .. } => "dividend",
             Self::Halt { .. } => "halt",
@@ -1257,6 +1285,63 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
         }
 
         Command::ListSymbol { listing } => apply_listing(m, wall_ms, listing).await,
+
+        Command::SetCatalogItem {
+            symbol,
+            price_cents,
+            available,
+            note,
+        } => {
+            let handle = m
+                .symbol(symbol)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(symbol))?;
+            let item = m
+                .set_catalog_item(&handle, *price_cents, *available, note.clone())
+                .await
+                .map_err(ApiError::goods)?;
+            Applied::new(200, &item)
+        }
+
+        Command::RemoveCatalogItem { symbol } => {
+            let sym = crate::symbol::intern(symbol).ok_or_else(|| ApiError::not_found(symbol))?;
+            let item = m
+                .remove_catalog_item(sym)
+                .ok_or_else(|| ApiError::not_found(symbol))?;
+            Applied::new(200, &item)
+        }
+
+        Command::Purchase {
+            trader_id,
+            symbol,
+            qty,
+        } => {
+            let handle = m
+                .symbol(symbol)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(symbol))?;
+            let receipt = m
+                .purchase(&handle, TraderId(*trader_id), *qty, wall_ms)
+                .await
+                .map_err(ApiError::goods)?;
+            Applied::new(201, &receipt)
+        }
+
+        Command::Consume {
+            trader_id,
+            symbol,
+            qty,
+        } => {
+            let handle = m
+                .symbol(symbol)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(symbol))?;
+            let receipt = m
+                .consume(&handle, TraderId(*trader_id), *qty)
+                .await
+                .map_err(ApiError::goods)?;
+            Applied::new(200, &receipt)
+        }
 
         Command::Delist {
             symbol,

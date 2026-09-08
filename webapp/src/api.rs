@@ -28,6 +28,7 @@ use crate::account::{
 use fehu::ledger::LedgerError;
 
 use crate::actor::Gone;
+use crate::catalog::{CatalogError, CatalogResponse, GoodsError, MAX_NOTE_LEN};
 use crate::events::{CatalogEntry, EventRecord, GameEventKind, GameEventRequest, PushEventRequest};
 use crate::journal::{Command, Listing, Outcome, Principal, seed_from_ticker};
 use crate::limit::Decision;
@@ -109,6 +110,10 @@ pub fn router(app: AppState) -> Router {
         .route("/api/accounts/{account_id}/status", post(set_status))
         .route("/api/accounts/{account_id}/validate", get(validate_account))
         .route("/api/accounts/{account_id}/ledger", get(get_ledger))
+        .route("/api/catalog", get(get_catalog).post(set_catalog_item))
+        .route("/api/catalog/{symbol}", delete(remove_catalog_item))
+        .route("/api/traders/{trader_id}/purchases", post(purchase))
+        .route("/api/traders/{trader_id}/consume", post(consume))
         .route("/api/supply", get(supply))
         .route("/api/commands/{key}", get(get_command))
         .route("/api/game/catalog", get(catalog))
@@ -412,6 +417,37 @@ impl ApiError {
     /// never something they can fix by changing the request.
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
+    }
+
+    /// A purchase or a consumption the world would not carry out.
+    pub(crate) fn goods(e: GoodsError) -> Self {
+        match e {
+            GoodsError::Money(m) => Self::money(m),
+            GoodsError::UnknownTrader(id) => Self::unknown_trader(id),
+            GoodsError::Unknown(sym) => Self::not_found(&sym),
+            GoodsError::NotAGood(_) => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not_a_good",
+                e.to_string(),
+            ),
+            GoodsError::Quantity(_) => Self::bad_request(e.to_string()),
+            GoodsError::Catalog(CatalogError::Unknown(sym)) => Self::new(
+                StatusCode::NOT_FOUND,
+                "not_in_catalog",
+                CatalogError::Unknown(sym).to_string(),
+            ),
+            GoodsError::Catalog(CatalogError::Exhausted { .. }) => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "catalog_exhausted",
+                e.to_string(),
+            ),
+            GoodsError::Catalog(_) => Self::bad_request(e.to_string()),
+            GoodsError::InsufficientUnits { .. } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "insufficient_inventory",
+                e.to_string(),
+            ),
+        }
     }
 
     /// A corporate payout the issuer could not fund.
@@ -1120,6 +1156,143 @@ async fn list_symbol(
                 source: req.source.unwrap_or_else(|| "api".into()),
                 note: req.note,
             },
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+// ---------------------------------------------------------------------------
+// The catalogue: goods, and the two things that are done to them besides
+// trading them.
+
+/// `GET /api/catalog`: what the world will make and what it charges.
+async fn get_catalog(State(app): State<AppState>) -> Result<Json<CatalogResponse>, ApiError> {
+    Ok(Json(CatalogResponse {
+        items: app
+            .market
+            .call(|m| m.catalog.items().cloned().collect())
+            .await?,
+    }))
+}
+
+/// Body of `POST /api/catalog`.
+#[derive(Deserialize)]
+struct CatalogRequest {
+    /// The good this line sells. It has to be listed, and it has to be a
+    /// good.
+    symbol: String,
+    /// What one unit costs, in cents. At least one: a free good would be a
+    /// way of making units out of nothing.
+    price_cents: i64,
+    /// Units this line may still issue. Omit it for a seam that never runs
+    /// out, which is what a demo wants and a scarce world does not.
+    available: Option<u64>,
+    note: Option<String>,
+}
+
+/// Write or replace one line of the catalogue.
+async fn set_catalog_item(
+    State(app): State<AppState>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<CatalogRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let symbol = crate::symbol::intern(&req.symbol)
+        .ok_or_else(|| ApiError::not_found(&req.symbol))?
+        .to_string();
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::SetCatalogItem {
+            symbol,
+            price_cents: req.price_cents,
+            available: req.available,
+            note: clean_text(req.note, MAX_NOTE_LEN),
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Stop making a good. Units already issued off the line stay in the world.
+async fn remove_catalog_item(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+) -> Result<Committed, ApiError> {
+    let symbol = crate::symbol::intern(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?
+        .to_string();
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::RemoveCatalogItem { symbol },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Body of `POST /api/traders/{id}/purchases` and `.../consume`.
+#[derive(Deserialize)]
+struct GoodsRequest {
+    symbol: String,
+    qty: u64,
+}
+
+/// Buy units of a good at the catalogue price: currency to the good's
+/// issuer, units to the buyer, in one command.
+async fn purchase(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    caller: Caller,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<GoodsRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    owned_trader(&app, caller, TraderId(trader_id))?;
+    let symbol = crate::symbol::intern(&req.symbol)
+        .ok_or_else(|| ApiError::not_found(&req.symbol))?
+        .to_string();
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::Purchase {
+            trader_id,
+            symbol,
+            qty: req.qty,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Use units up. They leave the world and nothing comes back.
+async fn consume(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    caller: Caller,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<GoodsRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    owned_trader(&app, caller, TraderId(trader_id))?;
+    let symbol = crate::symbol::intern(&req.symbol)
+        .ok_or_else(|| ApiError::not_found(&req.symbol))?
+        .to_string();
+    run(
+        &app,
+        caller.into(),
+        key,
+        Command::Consume {
+            trader_id,
+            symbol,
+            qty: req.qty,
         },
     )
     .await

@@ -144,6 +144,9 @@ pub struct MarketSave {
     /// Per symbol, the wallet its payouts come out of.
     #[serde(default)]
     pub issuers: Vec<(String, fehu::ledger::WalletId)>,
+    /// What the world will make and what it charges. Since version 8.
+    #[serde(default)]
+    pub catalog: crate::catalog::Catalog,
     pub users: Vec<User>,
     pub accounts: Vec<Account>,
     pub traders: Vec<Trader>,

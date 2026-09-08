@@ -831,3 +831,59 @@ export interface SupplyDto {
   synthetic_debt_cents: number;
   wallets: number;
 }
+
+// --- webapp/src/catalog.rs -------------------------------------------------
+
+/**
+ * `catalog::CatalogItem` — one line of the catalogue: a good, its price, and
+ * how much of it is left to make.
+ */
+export interface CatalogItem {
+  symbol: string;
+  /** What one unit costs. Always at least a cent. */
+  price_cents: number;
+  /** Units this line may still issue; `null` for a seam that never runs out. */
+  available: number | null;
+  /** Units it has issued since the line was written. */
+  issued: number;
+  note: string | null;
+}
+
+/** `GET /api/catalog` (`catalog::CatalogResponse`). */
+export interface CatalogResponse {
+  items: CatalogItem[];
+}
+
+/**
+ * `POST /api/traders/{id}/purchases` (`catalog::PurchaseReceipt`): currency
+ * to the good's issuer, units that did not exist to the buyer.
+ */
+export interface PurchaseReceipt {
+  trader_id: number;
+  symbol: string;
+  qty: number;
+  unit_price_cents: number;
+  /** `qty × unit_price_cents`, the amount that moved. */
+  total_cents: number;
+  /** The balanced transaction that moved it. */
+  tx_id: number;
+  /** What the trader holds of the good now. */
+  position_qty: number;
+  /** Units of the good in existence now. */
+  units_outstanding: number;
+  /** What the line has left to make, or `null` for a seam. */
+  available: number | null;
+}
+
+/**
+ * `POST /api/traders/{id}/consume` (`catalog::ConsumeReceipt`). No currency
+ * moves: a thing used up is not a thing sold, so there is no transaction to
+ * name.
+ */
+export interface ConsumeReceipt {
+  trader_id: number;
+  symbol: string;
+  qty: number;
+  position_qty: number;
+  units_outstanding: number;
+}

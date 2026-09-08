@@ -153,6 +153,11 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/symbols/{sym}/book?depth=10` | Aggregated bids and asks, reference price, pending trader flow |
 | `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first |
 | `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and — for `?api_key=`, since `EventSource` cannot set headers — that player's `fill`s |
+| `GET` | `/api/catalog` | What the world will make and what it charges: one line per good |
+| `POST` | `/api/catalog` | Game master: write or replace a line — `{"symbol":"ORE","price_cents":250,"available":500}`, `available` omitted for a seam that never runs out |
+| `DELETE` | `/api/catalog/{sym}` | Game master: stop making a good. What was made stays made |
+| `POST` | `/api/traders/{id}/purchases` | `{"symbol":"ORE","qty":100}` — pay the catalogue price and receive units that did not exist |
+| `POST` | `/api/traders/{id}/consume` | `{"symbol":"ORE","qty":25}` — use units up. They leave the world and no currency moves |
 | `GET` | `/api/supply` | How much currency exists and where it sits: minted, burned, outstanding, what the wallets actually hold, and whether the two agree |
 | `GET` | `/api/commands/{key}` | The answer a command was given, by the `Idempotency-Key` it was sent under, for a client that lost the response |
 | `GET` | `/api/reconcile` | Game master: check ownership, reservations, share supply, retained cash ledgers **and that the currency adds up**; returns `valid` and `issues` |
@@ -374,6 +379,24 @@ bids may not exceed the float — the bids count because the ladder would sell
 what nobody holds. For a good there is no ladder, so a bid speaks for
 nothing, and the question is stricter: every issued unit that has not been
 consumed is held by somebody.
+
+Units come from the **catalogue** and go when they are consumed. A game
+master writes a line — `POST /api/catalog` with a ticker and a price, and
+optionally how many units the line may still make — and a player who pays
+that price gets units that did not exist before
+(`POST /api/traders/{id}/purchases`). The currency is not created, only
+moved: it is debited from the buyer and credited to the good's issuer wallet
+as one balanced transaction, so `GET /api/supply` reads exactly as it did.
+`POST /api/traders/{id}/consume` is the other end. Units the trader holds
+free of reservations are destroyed, what they cost is realised as a loss, and
+no currency moves at all — a thing that has been used up is not a thing that
+has been sold. Both are journaled commands, so a retry under the same
+`Idempotency-Key` is answered, not re-made, and both survive a restart.
+
+The catalogue is the world selling to a player, which is a placeholder for a
+merchant selling to one. When NPC traders arrive they will hold inventory,
+quote it on the same book through the same orders, and run out; the
+catalogue stays as what stocks them.
 
 A **stop** is a line drawn on the price rather than an order: it rests
 nowhere, holds no queue position and reserves nothing, and the book has never
