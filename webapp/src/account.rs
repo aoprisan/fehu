@@ -29,6 +29,7 @@
 use std::collections::VecDeque;
 
 use fehu::Side;
+use fehu::TraderId;
 use fehu::ledger::{Draft, Ledger, LedgerError, Reason, WalletId, WalletStatus};
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +69,67 @@ pub struct User {
     pub created_at_ms: i64,
     /// Accounts opened for this user, oldest first.
     pub accounts: Vec<AccountId>,
+}
+
+/// The longest external player id this server will map.
+pub const MAX_EXTERNAL_ID: usize = 128;
+
+/// A player the game already has, mapped onto the ids this server knows
+/// them by.
+///
+/// The game backend owns player identity: it has its own id for everyone
+/// long before they touch the economy, and it should not have to remember a
+/// second one. So provisioning takes that id and hands back the user, the
+/// account and the trader created for it, and is idempotent on it — the
+/// backend can call it on every login without keeping a record of whether it
+/// already has.
+///
+/// The mapping is one-way on purpose. An external id resolves to one player;
+/// nothing resolves an external id *from* a trader, because the game already
+/// knows which of its players it asked about.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Player {
+    /// The game's own id for this player. Unique across the world.
+    pub external_id: String,
+    pub user_id: UserId,
+    pub account_id: AccountId,
+    pub trader_id: TraderId,
+    /// The wallet the account's money is in, so a backend has it without a
+    /// second call.
+    pub wallet: WalletId,
+    pub created_at_ms: i64,
+}
+
+/// Why an external player id is not one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BadExternalId(pub String);
+
+impl std::fmt::Display for BadExternalId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "`external_id` {}", self.0)
+    }
+}
+
+impl std::error::Error for BadExternalId {}
+
+/// Clean an external player id, or say why it is not one.
+///
+/// Trimmed, non-empty, bounded and free of control characters — it is a key
+/// in a map that outlives every process, and it comes back out in responses.
+pub fn clean_external_id(id: &str) -> Result<String, BadExternalId> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(BadExternalId("cannot be empty".into()));
+    }
+    if id.chars().count() > MAX_EXTERNAL_ID {
+        return Err(BadExternalId(format!(
+            "is longer than {MAX_EXTERNAL_ID} characters"
+        )));
+    }
+    if id.chars().any(char::is_control) {
+        return Err(BadExternalId("cannot hold control characters".into()));
+    }
+    Ok(id.to_owned())
 }
 
 /// Why a money movement was refused. Every amount is in cents.
@@ -656,6 +718,34 @@ pub struct UserDto {
     /// in the response that created them, and `null` everywhere after. Send
     /// it as `Authorization: Bearer <key>`.
     pub api_key: Option<String>,
+}
+
+/// `POST /api/v1/economy/players`.
+#[derive(Clone, Debug, Serialize)]
+pub struct PlayerDto {
+    /// The game's own id for this player, as it was sent.
+    pub external_id: String,
+    pub user_id: u64,
+    pub account_id: u64,
+    pub trader_id: u64,
+    /// The wallet the account's money is in.
+    pub wallet_id: u64,
+    pub created_at_ms: i64,
+    /// Whether this call is what created the mapping. `false` says the
+    /// player was already provisioned and nothing was made — which is what
+    /// provisioning on every login is supposed to look like.
+    pub created: bool,
+    /// The key that proves a request speaks for this player, shown **once**:
+    /// in the response that provisioned them, and `null` on every repeat.
+    /// A backend that loses it provisions a different player, because the
+    /// server kept only a digest.
+    pub api_key: Option<String>,
+}
+
+/// `GET /api/v1/economy/players`.
+#[derive(Clone, Debug, Serialize)]
+pub struct PlayersResponse {
+    pub players: Vec<PlayerDto>,
 }
 
 /// `GET /api/accounts/{id}`.

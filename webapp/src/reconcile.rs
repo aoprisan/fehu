@@ -49,6 +49,9 @@ pub struct Reconciliation {
     pub jobs_running: usize,
     /// Budget wallets rewards are paid from.
     pub budgets_checked: usize,
+    /// Players the game backend has provisioned, each checked against the
+    /// user, account, trader and wallet its mapping names.
+    pub players_checked: usize,
     pub issues: Vec<String>,
 }
 
@@ -273,6 +276,43 @@ pub fn reconcile(save: &Save) -> Reconciliation {
             ));
         }
     }
+    // Provisioned players: a mapping is what stops the backend building a
+    // second user for somebody who already has one, so a row pointing at ids
+    // that are not there is worse than no row — the next call for that
+    // player would find the mapping, hand back ids nothing answers to, and
+    // never create the player it was asked for.
+    let mut players_checked = 0;
+    for player in &save.market.players {
+        players_checked += 1;
+        let named = |what: &str, id: u64| {
+            format!(
+                "player {:?} maps to {what} {id}, which the market does not have",
+                player.external_id
+            )
+        };
+        if !users.contains_key(&player.user_id.0) {
+            issues.push(named("user", player.user_id.0));
+        }
+        match accounts.get(&player.account_id) {
+            None => issues.push(named("account", player.account_id.0)),
+            Some(account) if account.user_id != player.user_id => issues.push(format!(
+                "player {:?} maps to account {}, which belongs to user {}",
+                player.external_id, player.account_id.0, account.user_id.0
+            )),
+            Some(_) => {}
+        }
+        match traders.get(&player.trader_id) {
+            None => issues.push(named("trader", player.trader_id.0)),
+            Some(trader) if trader.user_id != player.user_id => issues.push(format!(
+                "player {:?} maps to trader {}, which belongs to user {}",
+                player.external_id, player.trader_id.0, trader.user_id.0
+            )),
+            Some(_) => {}
+        }
+        if ledger.wallet(player.wallet).is_none() {
+            issues.push(named("wallet", player.wallet.0));
+        }
+    }
     let supply = ledger.supply();
     Reconciliation {
         valid: issues.is_empty(),
@@ -288,6 +328,7 @@ pub fn reconcile(save: &Save) -> Reconciliation {
         synthetic_debt_cents: ledger.synthetic_debt_cents(),
         jobs_running,
         budgets_checked,
+        players_checked,
         issues,
     }
 }
@@ -357,6 +398,44 @@ mod tests {
             .await
             .unwrap();
         assert!(!app.reconcile().await.valid);
+    }
+
+    #[tokio::test]
+    async fn a_player_mapping_that_points_at_nobody_is_an_issue() {
+        // The mapping is what stops a second user being built for somebody
+        // who already has one, so a row nothing answers to is worse than no
+        // row at all: the next call would find it and create nothing.
+        let app = App::new(quiet());
+        app.market
+            .call(|m| {
+                m.provision_player("steam:1", None, None, 0, "sha256:test".into())
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        let report = app.reconcile().await;
+        assert!(report.valid, "{report:?}");
+        assert_eq!(report.players_checked, 1);
+
+        let trader = app
+            .market
+            .call(|m| m.player("steam:1").unwrap().trader_id)
+            .await
+            .unwrap();
+        app.market
+            .call(move |m| m.traders.remove(&trader))
+            .await
+            .unwrap();
+        let report = app.reconcile().await;
+        assert!(!report.valid);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|s| s.contains("steam:1") && s.contains("trader")),
+            "{:?}",
+            report.issues
+        );
     }
 
     #[tokio::test]

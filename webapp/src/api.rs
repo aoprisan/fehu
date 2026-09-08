@@ -1,6 +1,7 @@
 //! HTTP surface: JSON endpoints, the SSE stream and the embedded UI.
 
 use std::convert::Infallible;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +24,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::account::{
     Account, AccountCheck, AccountDto, AccountId, AccountStatus, CreateUserRequest, LedgerResponse,
-    MoneyError, OpenAccountRequest, StatusRequest, TransferRequest, UserDto, UserId,
+    MoneyError, OpenAccountRequest, Player, PlayerDto, PlayersResponse, StatusRequest,
+    TransferRequest, UserDto, UserId,
 };
 use fehu::ledger::LedgerError;
 
@@ -40,6 +42,9 @@ use crate::market::{
 };
 use crate::npc::{NpcsResponse, Policy};
 use crate::rewards::{BudgetsResponse, RewardError};
+use crate::service::{
+    Scope, ScopeSet, ServiceAuth, ServiceDto, ServiceError, ServiceId, ServicesResponse,
+};
 use crate::trading::{
     AmendRequest, BookDto, CreateTraderRequest, HolderDto, HoldingDto, MAX_CLIENT_ORDER_ID,
     OpenOrderDto, OrderRecord, OrderRequest, PortfolioDto, PositionDto, Refused, StopOrder,
@@ -148,7 +153,10 @@ pub fn router(app: AppState) -> Router {
         // implementation, two spellings, so the game backend can speak the
         // documented economy API and the demo UI can go on speaking the one
         // it was written against.
-        .route("/api/v1/economy/players", post(create_trader))
+        .route(
+            "/api/v1/economy/players",
+            get(list_players).post(provision_player),
+        )
         .route(
             "/api/v1/economy/players/{trader_id}/inventory",
             get(get_inventory),
@@ -186,6 +194,14 @@ pub fn router(app: AppState) -> Router {
         .route(
             "/api/v1/economy/admin/budgets/{wallet_id}/fund",
             post(fund_budget),
+        )
+        .route(
+            "/api/v1/economy/admin/services",
+            get(list_services).post(create_service),
+        )
+        .route(
+            "/api/v1/economy/admin/services/{service_id}",
+            delete(revoke_service),
         )
         .route("/api/v1/economy/admin/rewards", post(set_reward_rule))
         .route(
@@ -475,6 +491,43 @@ impl ApiError {
     /// A valid key, but for somebody else's property.
     pub(crate) fn forbidden(what: impl Into<String>) -> Self {
         Self::new(StatusCode::FORBIDDEN, "forbidden", what)
+    }
+
+    /// A service credential that does not carry the scope this route needs.
+    ///
+    /// Deliberately not `invalid_api_key`: the key is real and the server
+    /// knows it. What is missing is authority, which is something an
+    /// operator can grant and the caller cannot fix by retrying.
+    pub(crate) fn missing_scope(scope: Scope) -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "missing_scope",
+            format!(
+                "this endpoint needs the `{scope}` scope, which that service key does not carry"
+            ),
+        )
+    }
+
+    /// A service credential that has been taken away.
+    pub(crate) fn revoked_key() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "revoked_api_key",
+            "that service key has been revoked",
+        )
+    }
+
+    pub(crate) fn unknown_service(id: u64) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "unknown_service",
+            format!("no such service: {id}"),
+        )
+    }
+
+    /// A service the world would not issue.
+    pub(crate) fn service(e: ServiceError) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "invalid_service", e.to_string())
     }
 
     /// The market will not take an order for this symbol right now.
@@ -806,6 +859,125 @@ impl OptionalFromRequestParts<AppState> for Admin {
     }
 }
 
+/// A credential that may act for the game backend at one scope: a service
+/// key that carries it, or the operator.
+///
+/// This is the third principal the economy plan asks for, and the reason it
+/// exists is least privilege. Before it, every game-backend route was gated
+/// by [`Admin`] alone, so a backend that had to pay a quest reward held the
+/// key that can also mint currency, freeze an account and rewrite the
+/// catalogue. A service key carries [`Scope::Reward`] and cannot do any of
+/// the rest.
+///
+/// **A scope narrows a credential; it does not narrow the operator.** Every
+/// route reached through here is still open to the operator exactly as it
+/// was, on the same terms [`Admin`] has always applied — including a server
+/// with no `FEHU_ADMIN_KEY`, which stays open, because that is what a
+/// single-player game on localhost is documented to get. Issuing a service
+/// takes nothing away from a world that never issues one.
+///
+/// The order of resolution is what makes that safe: **a key the registry
+/// knows is judged as that service**, whatever else is configured. So a
+/// service key is never quietly promoted to operator authority by an
+/// unlocked server, and a scope it does not carry is refused even there.
+pub struct Trusted<S: ScopeOf> {
+    principal: Principal,
+    _scope: PhantomData<S>,
+}
+
+impl<S: ScopeOf> Trusted<S> {
+    /// Who to journal the command as.
+    fn principal(&self) -> Principal {
+        self.principal
+    }
+}
+
+/// A scope, as a type, so a handler names the authority it needs in its own
+/// signature and cannot be wired up to check the wrong one.
+pub trait ScopeOf {
+    /// The scope a `Trusted<Self>` demands.
+    const SCOPE: Scope;
+}
+
+/// Marker types for [`Trusted`], one per [`Scope`].
+pub mod scope {
+    use super::{Scope, ScopeOf};
+
+    /// Map a player the game already has onto this world's ids.
+    pub struct Provision;
+    /// Pay a configured reward out of a budget.
+    pub struct Reward;
+    /// Issue and destroy units of a good.
+    pub struct Inventory;
+    /// Push a game event from the catalogue.
+    pub struct Events;
+
+    impl ScopeOf for Provision {
+        const SCOPE: Scope = Scope::Provision;
+    }
+    impl ScopeOf for Reward {
+        const SCOPE: Scope = Scope::Reward;
+    }
+    impl ScopeOf for Inventory {
+        const SCOPE: Scope = Scope::Inventory;
+    }
+    impl ScopeOf for Events {
+        const SCOPE: Scope = Scope::Events;
+    }
+}
+
+impl<S: ScopeOf> FromRequestParts<AppState> for Trusted<S> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, ApiError> {
+        // A key the registry knows is judged as that service, and only as
+        // that service: presenting a service credential is a claim to act as
+        // one, so it is never also weighed as the operator's.
+        if let Some(key) = api_key_of(parts)
+            && let Some(auth) = app.service_of(&key)
+        {
+            if auth.revoked {
+                return Err(ApiError::revoked_key());
+            }
+            if !auth.scopes.contains(S::SCOPE) {
+                return Err(ApiError::missing_scope(S::SCOPE));
+            }
+            return Ok(Self {
+                principal: Principal::Service { id: auth.id.0 },
+                _scope: PhantomData,
+            });
+        }
+        <Admin as FromRequestParts<AppState>>::from_request_parts(parts, app).await?;
+        Ok(Self {
+            principal: Principal::Operator,
+            _scope: PhantomData,
+        })
+    }
+}
+
+/// The service a request speaks for, whatever scopes it carries.
+///
+/// For the routes where a service is one of several principals that may ask,
+/// rather than the only one: purchasing on a player's behalf, and recovering
+/// the response to a command this service itself sent. A revoked key still
+/// resolves, so the refusal can say the key was taken away rather than that
+/// it was never a key.
+pub struct ServiceCaller(pub ServiceAuth);
+
+impl OptionalFromRequestParts<AppState> for ServiceCaller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        app: &AppState,
+    ) -> Result<Option<Self>, ApiError> {
+        let Some(key) = api_key_of(parts) else {
+            return Ok(None);
+        };
+        Ok(app.service_of(&key).map(ServiceCaller))
+    }
+}
+
 /// The longest `Idempotency-Key` this server will remember.
 const MAX_IDEMPOTENCY_KEY: usize = 128;
 
@@ -885,7 +1057,12 @@ impl IntoResponse for Committed {
 /// only copy went out with the first response. A client that loses that
 /// response has to create another user.
 fn with_key(mut out: Outcome, api_key: String) -> Committed {
+    // Only a `201`: a command that answered `200` created nothing, so the
+    // key generated for it was never installed and handing it back would be
+    // handing out a credential that opens nothing. That is what a repeat of
+    // an already-provisioned player answers.
     if !out.replayed
+        && out.status == 201
         && let Some(map) = out.body.as_object_mut()
     {
         map.insert("api_key".into(), serde_json::Value::String(api_key));
@@ -1846,19 +2023,19 @@ struct RewardRequest {
 
 /// Pay a reward for something the game says happened.
 ///
-/// The game backend's call, so it carries operator authority: a player
-/// cannot decide they have finished a quest. A `source` already paid gets
-/// the receipt it produced the first time and moves nothing.
+/// The game backend's call, never a player's: a player cannot decide they
+/// have finished a quest. A `source` already paid gets the receipt it
+/// produced the first time and moves nothing.
 async fn pay_reward(
     State(app): State<AppState>,
-    _admin: Admin,
+    trusted: Trusted<scope::Reward>,
     Idempotency(key): Idempotency,
     payload: Result<Json<RewardRequest>, JsonRejection>,
 ) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
     run(
         &app,
-        Principal::Operator,
+        trusted.principal(),
         key,
         Command::PayReward {
             rule: req.rule,
@@ -1868,6 +2045,152 @@ async fn pay_reward(
     )
     .await
     .map(Committed)
+}
+
+// ---------------------------------------------------------------------------
+// The game backend: its own credentials, and the players it provisions.
+
+/// Body of `POST /api/v1/economy/admin/services`.
+#[derive(Deserialize)]
+struct ServiceRequest {
+    /// What the credential is for, so a list of them reads as something.
+    name: String,
+    /// What it may do. At least one; see [`Scope`].
+    scopes: ScopeSet,
+}
+
+/// Issue a credential for the game backend.
+///
+/// The operator's alone, and deliberately not reachable through any scope: a
+/// service that could issue a service could issue itself a wider one, which
+/// would make every scope advisory. Granting authority stays with the
+/// credential that already has all of it.
+async fn create_service(
+    State(app): State<AppState>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<ServiceRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    // Generated here rather than by the command, so the journal and the
+    // idempotency index hold the digest and never the key itself.
+    let api_key = crate::auth::new_api_key();
+    let out = run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::CreateService {
+            name: req.name,
+            scopes: req.scopes,
+            key_digest: crate::auth::key_digest(&api_key),
+        },
+    )
+    .await?;
+    Ok(with_key(out, api_key))
+}
+
+/// Every service credential the world has issued, revoked ones included.
+/// Digests are not in the answer; see [`ServiceDto`].
+async fn list_services(
+    State(app): State<AppState>,
+    _admin: Admin,
+) -> Result<Json<ServicesResponse>, ApiError> {
+    let services = app
+        .market
+        .call(|m| m.services().iter().map(ServiceDto::from).collect())
+        .await?;
+    Ok(Json(ServicesResponse { services }))
+}
+
+/// Take a service's key away. What it did with it stays done: the journal
+/// still names it, and the players it provisioned are still there.
+async fn revoke_service(
+    State(app): State<AppState>,
+    Path(id): Path<u64>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+) -> Result<Committed, ApiError> {
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::RevokeService { id },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Body of `POST /api/v1/economy/players`.
+#[derive(Deserialize)]
+struct ProvisionRequest {
+    /// The game's own id for this player.
+    external_id: String,
+    name: Option<String>,
+    email: Option<String>,
+}
+
+/// Map a player the game already has onto a user, an account and a trader.
+///
+/// Idempotent on `external_id`: the first call creates the three and answers
+/// `201` with the player's key; every later call for the same player answers
+/// `200` with the same ids, `created: false` and no key, because the only
+/// copy of it went out with the first response. So a backend may call this
+/// on every login without keeping a record of whether it has.
+///
+/// The account opens empty. Arriving in the world creates no currency —
+/// minting is the operator's and rewards come out of budgets — which is the
+/// invariant the whole ledger rests on.
+async fn provision_player(
+    State(app): State<AppState>,
+    trusted: Trusted<scope::Provision>,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<ProvisionRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let external_id = crate::account::clean_external_id(&req.external_id)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let api_key = crate::auth::new_api_key();
+    let out = run(
+        &app,
+        trusted.principal(),
+        key,
+        Command::ProvisionPlayer {
+            external_id,
+            name: req.name,
+            email: req.email,
+            key_digest: crate::auth::key_digest(&api_key),
+        },
+    )
+    .await?;
+    Ok(with_key(out, api_key))
+}
+
+/// What `GET /api/v1/economy/players` may be narrowed by.
+#[derive(Deserialize)]
+struct PlayerQuery {
+    /// One player, by the game's id for them. The answer is a list of one,
+    /// or an empty list — never a 404, because "have I provisioned this
+    /// player" is a question with a plain answer.
+    external_id: Option<String>,
+}
+
+/// The players this world has been asked to provision.
+async fn list_players(
+    State(app): State<AppState>,
+    _trusted: Trusted<scope::Provision>,
+    Query(query): Query<PlayerQuery>,
+) -> Result<Json<PlayersResponse>, ApiError> {
+    let players = app
+        .market
+        .call(move |m| match &query.external_id {
+            Some(id) => m
+                .player(id.trim())
+                .map(|p| vec![player_dto(p, false)])
+                .unwrap_or_default(),
+            None => m.players.values().map(|p| player_dto(p, false)).collect(),
+        })
+        .await?;
+    Ok(Json(PlayersResponse { players }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2086,6 +2409,35 @@ async fn world(
     }))
 }
 
+/// Who may issue or destroy units on `trader`'s behalf: the game backend
+/// with [`Scope::Inventory`], or the trader's own owner.
+///
+/// The service is weighed first, for the same reason [`Trusted`] does it: a
+/// key the registry knows is a claim to act as that service, and a service
+/// key is not a user key, so there is nothing for the owner branch to match
+/// anyway. The operator is deliberately *not* here — a purchase spends a
+/// player's money, and holding the mint has never meant holding their
+/// wallet.
+fn goods_principal(
+    app: &App,
+    trader_id: u64,
+    caller: Option<Caller>,
+    service: Option<ServiceCaller>,
+) -> Result<Principal, ApiError> {
+    if let Some(ServiceCaller(auth)) = service {
+        if auth.revoked {
+            return Err(ApiError::revoked_key());
+        }
+        if !auth.scopes.contains(Scope::Inventory) {
+            return Err(ApiError::missing_scope(Scope::Inventory));
+        }
+        return Ok(Principal::Service { id: auth.id.0 });
+    }
+    let caller = caller.ok_or_else(ApiError::unauthenticated)?;
+    owned_trader(app, caller, TraderId(trader_id))?;
+    Ok(caller.into())
+}
+
 /// Body of `POST /api/v1/economy/purchases` and `.../consume`: the same two
 /// commands as the trader-addressed routes, with the trader in the body
 /// because that is the shape the plan's economy surface names.
@@ -2098,18 +2450,19 @@ struct GoodsBody {
 
 async fn purchase_body(
     State(app): State<AppState>,
-    caller: Caller,
+    caller: Option<Caller>,
+    service: Option<ServiceCaller>,
     Idempotency(key): Idempotency,
     payload: Result<Json<GoodsBody>, JsonRejection>,
 ) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
-    owned_trader(&app, caller, TraderId(req.trader_id))?;
+    let principal = goods_principal(&app, req.trader_id, caller, service)?;
     let symbol = crate::symbol::intern(&req.symbol)
         .ok_or_else(|| ApiError::not_found(&req.symbol))?
         .to_string();
     run(
         &app,
-        caller.into(),
+        principal,
         key,
         Command::Purchase {
             trader_id: req.trader_id,
@@ -2123,18 +2476,19 @@ async fn purchase_body(
 
 async fn consume_body(
     State(app): State<AppState>,
-    caller: Caller,
+    caller: Option<Caller>,
+    service: Option<ServiceCaller>,
     Idempotency(key): Idempotency,
     payload: Result<Json<GoodsBody>, JsonRejection>,
 ) -> Result<Committed, ApiError> {
     let Json(req) = payload.map_err(ApiError::bad_json)?;
-    owned_trader(&app, caller, TraderId(req.trader_id))?;
+    let principal = goods_principal(&app, req.trader_id, caller, service)?;
     let symbol = crate::symbol::intern(&req.symbol)
         .ok_or_else(|| ApiError::not_found(&req.symbol))?
         .to_string();
     run(
         &app,
-        caller.into(),
+        principal,
         key,
         Command::Consume {
             trader_id: req.trader_id,
@@ -2428,9 +2782,16 @@ async fn push_sim_event(
     .map(Committed)
 }
 
+/// Push a game event from the catalogue at the world.
+///
+/// The game backend's, with [`Scope::Events`], or the operator's. Raw
+/// simulator events (`POST /api/symbols/{symbol}/events`) stay the
+/// operator's alone: they are a lever on the price process rather than a
+/// fact about the game, and a backend that wants to move a price has this
+/// route and the semantic catalogue to do it with.
 async fn push_game_event(
     State(app): State<AppState>,
-    _admin: Admin,
+    trusted: Trusted<scope::Events>,
     Idempotency(key): Idempotency,
     payload: Result<Json<GameEventRequest>, JsonRejection>,
 ) -> Result<Committed, ApiError> {
@@ -2441,7 +2802,7 @@ async fn push_game_event(
         .map_err(ApiError::bad_request)?;
     run_at(
         &app,
-        Principal::Operator,
+        trusted.principal(),
         key,
         at,
         Command::GameEvent {
@@ -3447,6 +3808,30 @@ async fn trader_deposit(
     .map(Committed)
 }
 
+/// One service, as a response. Never its digest.
+pub(crate) fn service_dto(market: &Market, id: ServiceId) -> Result<ServiceDto, ApiError> {
+    market
+        .services()
+        .get(id)
+        .map(ServiceDto::from)
+        .ok_or_else(|| ApiError::unknown_service(id.0))
+}
+
+/// One provisioned player, as a response. `created` says whether this call
+/// is what made the mapping.
+pub(crate) fn player_dto(player: &Player, created: bool) -> PlayerDto {
+    PlayerDto {
+        external_id: player.external_id.clone(),
+        user_id: player.user_id.0,
+        account_id: player.account_id.0,
+        trader_id: player.trader_id.0,
+        wallet_id: player.wallet.0,
+        created_at_ms: player.created_at_ms,
+        created,
+        api_key: None,
+    }
+}
+
 pub(crate) fn user_dto(
     market: &Market,
     views: &[SymbolView],
@@ -3629,6 +4014,7 @@ async fn get_command(
     Path(key): Path<String>,
     caller: Option<Caller>,
     admin: Option<Admin>,
+    service: Option<ServiceCaller>,
 ) -> Result<Json<CommandDto>, ApiError> {
     let unknown = || {
         ApiError::new(
@@ -3646,6 +4032,9 @@ async fn get_command(
     let mine = match record.principal {
         Principal::Anonymous => true,
         Principal::User { id } => caller.is_some_and(|c| c.0.0 == id),
+        Principal::Service { id } => {
+            service.is_some_and(|s| !s.0.revoked && s.0.id.0 == id) || admin.is_some()
+        }
         Principal::Operator | Principal::Engine => admin.is_some(),
     };
     if !mine {

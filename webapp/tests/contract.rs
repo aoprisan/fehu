@@ -1018,6 +1018,7 @@ async fn reconciliation_contract() {
             "synthetic_debt_cents",
             "jobs_running",
             "budgets_checked",
+            "players_checked",
             "issues",
         ],
     );
@@ -1220,4 +1221,83 @@ async fn npc_contract() {
     .await;
     assert_keys("NpcDto", &off, &npc_keys);
     assert_eq!(off["active"], false);
+}
+
+/// The game backend's own credentials, and the players it provisions.
+#[tokio::test]
+async fn service_and_player_shapes() {
+    let app = test_app();
+
+    let service_keys = [
+        "id",
+        "name",
+        "scopes",
+        "revoked",
+        "created_ms",
+        "revoked_ms",
+        "api_key",
+    ];
+    let service = post(
+        &app,
+        "/api/v1/economy/admin/services",
+        json!({ "name": "quests", "scopes": ["provision", "reward"] }),
+    )
+    .await;
+    assert_keys("ServiceDto", &service, &service_keys);
+    assert_eq!(
+        service["scopes"],
+        json!(["provision", "reward"]),
+        "a scope set is a list of names, in the order they are declared"
+    );
+    assert!(
+        service["api_key"].is_string(),
+        "the response that issues a service shows its key once"
+    );
+
+    let services = get(&app, "/api/v1/economy/admin/services").await;
+    assert_keys("ServicesResponse", &services, &["services"]);
+    let listed = first("ServicesResponse", &services, "services");
+    assert_keys("ServiceDto", listed, &service_keys);
+    assert_eq!(
+        listed["api_key"],
+        Value::Null,
+        "and never again after that one"
+    );
+
+    let player_keys = [
+        "external_id",
+        "user_id",
+        "account_id",
+        "trader_id",
+        "wallet_id",
+        "created_at_ms",
+        "created",
+        "api_key",
+    ];
+    let player = post(
+        &app,
+        "/api/v1/economy/players",
+        json!({ "external_id": "steam:1", "name": "Ada" }),
+    )
+    .await;
+    assert_keys("PlayerDto", &player, &player_keys);
+    assert_eq!(player["created"], true);
+
+    let again = post(
+        &app,
+        "/api/v1/economy/players",
+        json!({ "external_id": "steam:1", "name": "Ada" }),
+    )
+    .await;
+    assert_keys("PlayerDto", &again, &player_keys);
+    assert_eq!(again["created"], false);
+    assert_eq!(again["api_key"], Value::Null);
+
+    let players = get(&app, "/api/v1/economy/players").await;
+    assert_keys("PlayersResponse", &players, &["players"]);
+    assert_keys(
+        "PlayerDto",
+        first("PlayersResponse", &players, "players"),
+        &player_keys,
+    );
 }

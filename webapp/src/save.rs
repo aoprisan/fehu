@@ -58,6 +58,14 @@ pub type Symbol = &'static str;
 
 /// Current save format. Any other version, older or newer, is refused.
 ///
+/// Version 11 added the third principal ([`crate::service`]): the service
+/// credentials the game backend speaks with, and the players it has
+/// provisioned. A version 10 file carries neither. Starting from one would
+/// be a world whose backend's key had silently stopped working and whose
+/// provisioning had forgotten every player it had mapped — so the next call
+/// for a player who exists would build them a second user, a second account
+/// and a second trader. The file is refused like the rest.
+///
 /// Version 10 added the outbox ([`crate::outbox`]): the facts a game backend
 /// has not collected yet, and the cursor saying how far it has. A version 9
 /// file carries neither. Starting from one would be a world whose consumer
@@ -99,7 +107,7 @@ pub type Symbol = &'static str;
 /// transaction out of issuance, so the currency has a recorded origin and
 /// the books still add up. It is a day's work when there is such a world.
 /// There is not: the current file is a demo, regenerated from its seeds.
-pub const STATE_VERSION: u32 = 10;
+pub const STATE_VERSION: u32 = 11;
 
 /// Everything needed to carry on where the server left off.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -195,6 +203,18 @@ pub struct MarketSave {
     pub events: Vec<EventRecord>,
     /// `(SHA-256 digest, user id)`, so credentials work without being saved.
     pub api_keys: Vec<(String, u64)>,
+    /// The players the game backend has provisioned, by its own id for each.
+    /// Since version 11.
+    #[serde(default)]
+    pub players: Vec<crate::account::Player>,
+    /// The service credentials, as digests and scopes — the same discipline
+    /// as `api_keys`, so this is not a list of live keys either. Since
+    /// version 11.
+    #[serde(default)]
+    pub services: Vec<crate::service::Service>,
+    /// The id the next service will take.
+    #[serde(default)]
+    pub next_service_id: u64,
     pub next_user_id: u64,
     pub next_account_id: u64,
     pub next_trader_id: u64,
