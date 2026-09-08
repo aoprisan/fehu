@@ -12,11 +12,17 @@ import type {
   Candle,
   EventRecord,
   FillRecord,
+  HoldingDto,
   Interval,
+  Job,
+  Modifier,
   PortfolioDto,
   Quote,
+  Recipe,
   Side,
+  SymbolEffects,
   TradeDto,
+  WalletDto,
 } from './types.js';
 
 export type ConnectionState = 'connecting' | 'live' | 'reconnecting';
@@ -37,6 +43,18 @@ export interface AppState {
   /** Newest first. */
   tape: TradeDto[];
   trader: PortfolioDto | null;
+  /** The player's wallet, as the ledger holds it. */
+  wallet: WalletDto | null;
+  /** The player's units of the world's goods. */
+  inventory: HoldingDto[];
+  /** What the world knows how to make. */
+  recipes: Recipe[];
+  /** The player's jobs, newest first. */
+  jobs: Job[];
+  /** What events are doing to production and demand, per symbol. */
+  effects: SymbolEffects[];
+  /** The modifiers behind those numbers, newest last. */
+  modifiers: Modifier[];
   /** Fills seen on the stream since load, newest first. */
   liveFills: FillRecord[];
   /** Side the order ticket is set to. */
@@ -66,6 +84,8 @@ export type Topic =
   | 'book'
   | 'tape'
   | 'trader'
+  /** The wallet, the inventory, the recipes or the jobs changed. */
+  | 'economy'
   | 'events'
   | 'catalog'
   | 'clock'
@@ -85,6 +105,12 @@ export class Store {
     book: { bids: [], asks: [] },
     tape: [],
     trader: null,
+    wallet: null,
+    inventory: [],
+    recipes: [],
+    jobs: [],
+    effects: [],
+    modifiers: [],
     liveFills: [],
     side: 'buy',
     pitch: 9,

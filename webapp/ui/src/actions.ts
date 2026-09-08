@@ -162,6 +162,72 @@ export class Actions {
     }
   }
 
+  /**
+   * The economy half of a player: their wallet, their units of the world's
+   * goods, the recipes they can run and the jobs they have running.
+   *
+   * One call after anything that could have moved any of them — a job
+   * started, a job delivered on the stream, a fill — because they move
+   * together: smelting takes ore, cents and time and gives back an ingot.
+   */
+  async loadEconomy(): Promise<void> {
+    const trader = this.#state.trader;
+    if (trader === null) return;
+    try {
+      const [inventory, recipes, jobs, world] = await Promise.all([
+        api.inventory(trader.id),
+        api.recipes(),
+        api.jobs(),
+        api.world(),
+      ]);
+      this.#state.inventory = inventory.inventory;
+      this.#state.recipes = recipes.recipes;
+      this.#state.jobs = jobs.jobs.slice().reverse();
+      this.#state.effects = world.symbols;
+      this.#state.modifiers = world.modifiers;
+      // The account is what knows which wallet is this player's; the wallet
+      // is what the ledger actually holds the money in.
+      const account = await api.account(trader.account_id);
+      this.#state.wallet = await api.wallet(account.wallet_id);
+      this.#store.emit('economy');
+    } catch (e) {
+      setStatus(errorMessage(e), true);
+    }
+  }
+
+  /**
+   * Run a recipe. The inputs and the cost go now; the outputs arrive on the
+   * engine step that reaches the job's due instant, which is what the panel
+   * counts down to.
+   */
+  async startJob(recipe: string): Promise<void> {
+    const trader = this.#state.trader;
+    if (trader === null) return;
+    try {
+      const job = await api.startJob(trader.id, recipe);
+      const made = job.outputs.map((o) => `${o.qty} ${o.symbol}`).join(', ');
+      setOrderStatus(`job #${job.id}: ${job.recipe} → ${made}`);
+      await Promise.all([this.refreshTrader(), this.loadEconomy()]);
+    } catch (e) {
+      setOrderStatus(errorMessage(e), true);
+    }
+  }
+
+  /** Stop a job before it is due. The inputs stay in the crucible. */
+  async cancelJob(jobId: number): Promise<void> {
+    try {
+      const job = await api.cancelJob(jobId);
+      setOrderStatus(
+        job.refunded_cents > 0
+          ? `job #${job.id} cancelled, ${fmtPrice(job.refunded_cents)} back`
+          : `job #${job.id} cancelled`,
+      );
+      await Promise.all([this.refreshTrader(), this.loadEconomy()]);
+    } catch (e) {
+      setOrderStatus(errorMessage(e), true);
+    }
+  }
+
   async loadBookAndTape(): Promise<void> {
     const symbol = this.#state.symbol;
     if (symbol === null) return;

@@ -61,7 +61,7 @@ aside { background: var(--panel); overflow: auto; }
 .up { color: var(--up); } .down { color: var(--down); }
 #chart-area { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 #trading {
-  display: grid; grid-template-columns: 200px 1fr 220px; gap: 0; border-top: 1px solid var(--line);
+  display: grid; grid-template-columns: 200px 1fr 200px 230px; gap: 0; border-top: 1px solid var(--line);
   background: var(--panel); height: 250px; min-height: 0;
 }
 #trading > div { padding: 8px 10px; overflow: auto; min-width: 0; }
@@ -93,9 +93,13 @@ b.stopped { color: var(--down); text-transform: uppercase; font-size: 10px; lett
 .deposit { display: flex; gap: 6px; margin: 6px 0; }
 .deposit input { flex: 1; min-width: 0; }
 .deposit.closed { display: none; }
-#orders li { display: flex; gap: 6px; align-items: center; font-size: 12px; padding: 2px 0; }
-#orders li span { flex: 1; font-variant-numeric: tabular-nums; }
-#orders button { padding: 1px 6px; font-size: 11px; }
+#orders li, #jobs li { display: flex; gap: 6px; align-items: center; font-size: 12px; padding: 2px 0; }
+#orders li span, #jobs li span { flex: 1; font-variant-numeric: tabular-nums; }
+#orders button, #jobs button { padding: 1px 6px; font-size: 11px; }
+#jobs { list-style: none; margin: 0; padding: 0; }
+#jobs li span:nth-child(3) { flex: 2; color: var(--muted); }
+#start-job select { flex: 1; min-width: 0; }
+#start-job.closed { display: none; }
 .twocol { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 #acct-hdr { color: var(--muted); font-variant-numeric: tabular-nums; }
 #acct-hdr b { color: var(--text); }
@@ -140,7 +144,7 @@ code { background: var(--backdrop); padding: 1px 4px; border-radius: 3px; }
   .sym { min-width: 160px; border-right: 1px solid var(--line); }
   #events { max-height: 45vh; }
   #trading { grid-template-columns: 1fr 1fr; height: auto; }
-  #trading > div:last-child { display: none; }
+  #trading > div:nth-child(3) { display: none; }
 }
 
 #orders { list-style: none; margin: 0; padding: 0; }

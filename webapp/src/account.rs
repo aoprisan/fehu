@@ -80,6 +80,9 @@ pub enum MoneyError {
     /// The account has no wallet, or names one the ledger does not have.
     /// A bug rather than a request the caller got wrong.
     NoWallet { account: AccountId },
+    /// A transfer to the account it came from. It would balance, and it
+    /// would mean nothing.
+    SameAccount { account: AccountId },
     /// The ledger refused the movement. It says why, and nothing moved.
     Ledger(LedgerError),
 }
@@ -122,6 +125,9 @@ impl std::fmt::Display for MoneyError {
             Self::NoWallet { account } => {
                 write!(f, "account {} has no wallet in the ledger", account.0)
             }
+            Self::SameAccount { account } => {
+                write!(f, "account {} cannot transfer to itself", account.0)
+            }
             Self::Ledger(e) => write!(f, "{e}"),
         }
     }
@@ -162,6 +168,17 @@ pub enum LedgerKind {
     /// A delisting bought the holder out: the shares are gone and this is
     /// what they were worth.
     Delisting,
+    /// Currency sent to another account.
+    TransferOut,
+    /// Currency received from another account.
+    TransferIn,
+    /// A reward the game paid out of a budget for something that happened
+    /// outside the market.
+    Reward,
+    /// What starting a production job cost.
+    JobCost,
+    /// What cancelling one gave back.
+    JobRefund,
 }
 
 /// One movement of money, in the order it happened.

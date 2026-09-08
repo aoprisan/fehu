@@ -8,6 +8,7 @@ use fehu::{Event, EventError, EventKind, Simulator, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::save::Symbol;
+use crate::world::{Effect, EffectSpec};
 
 /// A raw simulator event as accepted by `POST /api/symbols/{symbol}/events`.
 /// Mirrors [`fehu::EventKind`] with durations in seconds.
@@ -415,6 +416,61 @@ impl GameEventKind {
             ],
         }
     }
+
+    /// What this game event does to the world beyond the price, at
+    /// `magnitude`.
+    ///
+    /// The price effects above are what the *market* makes of the news. These
+    /// are what the world does about it: a scandal at a mine slows the mine
+    /// down and thins out the merchants standing in front of it; hype does
+    /// the opposite and does not last. Both arrive as modifiers on
+    /// [`crate::world`], which production reads when a job starts and a
+    /// merchant reads when it re-quotes.
+    ///
+    /// The magnitudes are deliberately larger than the price ones and the
+    /// windows deliberately shorter: a fifth off a yield for six hours is
+    /// something a player notices, and a percent for a week is not.
+    pub fn world_effects(self, magnitude: f64) -> Vec<EffectSpec> {
+        const HOUR: u64 = 3_600;
+        // Basis points at magnitude 1, scaled and clamped: a magnitude of 5
+        // must not turn a 40 % pull into a 200 % one.
+        let scale = |bps: i32| -> i32 {
+            let scaled = f64::from(bps) * magnitude;
+            scaled.clamp(-9_000.0, 9_000.0) as i32
+        };
+        let mut out = Vec::new();
+        let mut push = |effect: Effect, bps: i32, secs: u64| {
+            out.push(EffectSpec {
+                effect,
+                delta_bps: scale(bps),
+                secs,
+            });
+        };
+        match self {
+            Self::ProductLaunch => {
+                push(Effect::Demand, 4_000, 6 * HOUR);
+                push(Effect::Production, 1_000, 6 * HOUR);
+            }
+            Self::EarningsBeat => push(Effect::Demand, 2_000, 3 * HOUR),
+            Self::EarningsMiss => push(Effect::Demand, -2_000, 3 * HOUR),
+            Self::Scandal => {
+                push(Effect::Demand, -4_000, 12 * HOUR);
+                push(Effect::Production, -1_500, 12 * HOUR);
+            }
+            Self::Lawsuit => push(Effect::Demand, -1_500, 12 * HOUR),
+            Self::Buyback => push(Effect::Demand, 1_000, 24 * HOUR),
+            Self::CeoResigns => push(Effect::Production, -1_500, 6 * HOUR),
+            Self::Hype => push(Effect::Demand, 5_000, 2 * HOUR),
+            Self::MarketCrash => {
+                push(Effect::Demand, -3_500, 12 * HOUR);
+                push(Effect::Production, -1_000, 12 * HOUR);
+            }
+            Self::MarketRally => push(Effect::Demand, 2_500, 12 * HOUR),
+            Self::RateHike => push(Effect::Demand, -1_500, 24 * HOUR),
+            Self::RateCut => push(Effect::Demand, 1_500, 24 * HOUR),
+        }
+        out
+    }
 }
 
 /// Body of `POST /api/game/events`.
@@ -440,6 +496,9 @@ pub struct CatalogEntry {
     pub description: &'static str,
     /// The bundle at magnitude 1.
     pub effects: Vec<SimEvent>,
+    /// What it does to production and demand at magnitude 1, alongside the
+    /// price. See [`crate::world`].
+    pub world: Vec<EffectSpec>,
 }
 
 /// An accepted event, as stored in the log and pushed to the stream.

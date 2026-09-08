@@ -161,9 +161,26 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `DELETE` | `/api/catalog/{sym}` | Game master: stop making a good. What was made stays made |
 | `POST` | `/api/traders/{id}/purchases` | `{"symbol":"ORE","qty":100}` — pay the catalogue price and receive units that did not exist |
 | `POST` | `/api/traders/{id}/consume` | `{"symbol":"ORE","qty":25}` — use units up. They leave the world and no currency moves |
+| `GET` | `/api/traders/{id}/inventory` | The trader's units of the world's goods, with what is reserved |
+| `GET` | `/api/recipes` | What the world knows how to make, and what making it takes |
+| `POST` | `/api/recipes` | Game master: write or replace a recipe — `{"id":"smelt","inputs":[{"symbol":"ORE","qty":2}],"outputs":[{"symbol":"INGOT","qty":1}],"cost_cents":500,"duration_secs":300}`, optional `refund_bps`, `note`. Every line has to be a listed good |
+| `DELETE` | `/api/recipes/{id}` | Game master: stop making a thing. Jobs already running still deliver |
+| `POST` | `/api/jobs` | Run one: `{"trader_id":1,"recipe":"smelt"}` — the inputs and the cost go now, the outputs arrive at `due_at_ms` |
+| `GET` | `/api/jobs`, `/api/jobs/{id}` | The caller's jobs, or one of them: what it took, what it will deliver and when |
+| `POST` | `/api/jobs/{id}/cancel` | Stop a job before it is due. What comes back is `refund_bps` of the cost, nothing by default |
+| `GET` | `/api/budgets` | Game master: the pools rewards are paid from, and the rules that price them |
+| `POST` | `/api/budgets` | Game master: open one, funded out of treasury — `{"name":"quests","cash_cents":5000000}` |
+| `POST` | `/api/budgets/{wallet_id}/fund` | Game master: top one up, `{"amount_cents":100000}` |
+| `POST` | `/api/rewards/rules` | Game master: what a named reward is worth — `{"id":"daily","budget":12,"amount_cents":5000}` |
+| `DELETE` | `/api/rewards/rules/{id}` | Game master: take a rule away. What it has paid stays paid |
+| `POST` | `/api/rewards` | Game master: pay for something that happened — `{"rule":"daily","trader_id":1,"source":"quest:42"}`. A `source` already paid gets its first receipt back and moves nothing |
+| `POST` | `/api/transfers` | `{"from_account_id":1,"to_account_id":2,"amount_cents":25000}` — players paying each other; the sender's owner, or the game master |
+| `GET` | `/api/wallets/{id}`, `/api/wallets/{id}/transactions` | One wallet: its kind, balance, reservation and history. The owner's, or the game master's |
+| `GET` | `/api/world?at_ms=` | What game events are doing to production and demand, per symbol, now or at an instant |
 | `GET` | `/api/supply` | How much currency exists and where it sits: minted, burned, outstanding, what the wallets actually hold, and whether the two agree |
 | `GET` | `/api/commands/{key}` | The answer a command was given, by the `Idempotency-Key` it was sent under, for a client that lost the response |
 | `GET` | `/api/reconcile` | Game master: check ownership, reservations, share supply, retained cash ledgers **and that the currency adds up**; returns `valid` and `issues` |
+| — | `/api/v1/economy/…` | The economy surface under the paths `docs/economy-engine-plan.md` names: `players`, `players/{id}/inventory`, `wallets/{id}`, `transfers`, `rewards`, `purchases`, `consume`, `jobs`, `recipes`, `catalog`, `budgets`, `supply`, `world`, `commands/{key}`, `reconcile`, and `admin/{recipes,catalog,budgets,rewards}`. The same handlers as above, under a second spelling |
 | `GET` | `/api/health` | Uptime, simulated time, tick/trade counters, orders placed and refused, fills booked and any that failed to settle, stream and rate-limit state, and how long requests and engine steps are taking |
 
 At start-up each symbol generates a year of daily bars in coarse mode and then
@@ -180,7 +197,14 @@ issuer wallet is given to pay dividends and buyouts from, and
 `FEHU_SYNTHETIC_FLOAT_CENTS` (5×10^13) is what the stand-in for the
 simulator's unfunded liquidity starts with — see **The currency** below —
 and `FEHU_SYNTHETIC=0` switches that liquidity off altogether, leaving the
-book to whoever funded what is in it. `FEHU_MARKET_HOURS=09:30-16:00`
+book to whoever funded what is in it. `FEHU_SEED_MERCHANTS_CENTS` is the
+other half of that switch: set it and a world that is being *warmed up* gets
+a funded merchant behind every seeded symbol, each with that much currency
+out of treasury and about as much stock as it would buy, so
+`FEHU_SEED_MERCHANTS_CENTS=10000000 FEHU_SYNTHETIC=0` is a demo in which
+every fill has somebody on the other side who paid for what they are
+selling. A restored world is left alone: it already has the merchants it
+had. `FEHU_MARKET_HOURS=09:30-16:00`
 gives the market a UTC weekday session (unset, it never closes);
 `FEHU_PRICE_LIMIT_PCT` (0.10) and `FEHU_HALT_SECS` (300) set the limit move
 that halts a symbol and how long the halt lasts. `FEHU_RATE_PER_SEC` (20) and
@@ -202,7 +226,12 @@ across restarts (`FEHU_SAVE_SECS`, 30 by default, sets how often the snapshot
 is written; the command journal beside it is written before every change is
 acknowledged, so the interval costs nothing that was promised).
 `FEHU_COMMAND_LOG` (10 000) is how many `Idempotency-Key`s are remembered,
-which is how late a retry may arrive and still be free. `FEHU_ADMIN_KEY` locks the
+which is how late a retry may arrive and still be free. `FEHU_JOB_LOG`
+(2 000) is how many *finished* jobs are kept with what each delivered — a
+running one is never dropped, being a promise the world has taken payment for
+— and `FEHU_REWARD_LOG` (10 000) how many game event ids are remembered with
+the reward each one paid, which is how late a duplicate quest result may
+arrive and still be caught. `FEHU_ADMIN_KEY` locks the
 game-master endpoints behind a key of your choosing: the ones that move
 prices (`POST /api/game/events`, `POST /api/symbols/{sym}/events`), the ones
 that list, halt and delist symbols, and — since currency became conserved —

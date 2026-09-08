@@ -2,6 +2,7 @@
 
 import type {
   AccountCheck,
+  BudgetsResponse,
   AmendRequest,
   AmendResponse,
   AccountDto,
@@ -13,7 +14,10 @@ import type {
   EventRecord,
   EventsResponse,
   GameEventRequest,
+  InventoryResponse,
   Interval,
+  Job,
+  JobsResponse,
   LedgerResponse,
   OpenOrderDto,
   OrderRecord,
@@ -21,12 +25,15 @@ import type {
   OrderResponse,
   PortfolioDto,
   PushEventRequest,
+  RecipesResponse,
   SharesResponse,
   SymbolStatus,
   SymbolsResponse,
   TradesResponse,
   TransferRequest,
   UserHoldingsResponse,
+  WalletDto,
+  WorldResponse,
 } from './types.js';
 
 /** A non-2xx response, carrying the server's `error.code` when it sent one. */
@@ -160,6 +167,32 @@ export const api = {
 
   cancelOrder: (symbol: string, orderId: number, traderId: number): Promise<OpenOrderDto> =>
     send('DELETE', `/api/symbols/${enc(symbol)}/orders/${orderId}?trader_id=${traderId}`),
+
+  /** One wallet by id: the owner's or the operator's to read. */
+  wallet: (walletId: number): Promise<WalletDto> => request(`/api/wallets/${walletId}`),
+
+  /** A trader's units of the world's goods, reservations included. */
+  inventory: (traderId: number): Promise<InventoryResponse> =>
+    request(`/api/traders/${traderId}/inventory`),
+
+  /** What the world knows how to make. */
+  recipes: (): Promise<RecipesResponse> => request('/api/recipes'),
+
+  /** The caller's jobs, running and finished, oldest first. */
+  jobs: (): Promise<JobsResponse> => request('/api/jobs'),
+
+  /** Start a job: the inputs and the cost now, the outputs when it is due. */
+  startJob: (traderId: number, recipe: string): Promise<Job> =>
+    send('POST', '/api/jobs', { trader_id: traderId, recipe }),
+
+  /** Stop one before it is due. What comes back is what the recipe says. */
+  cancelJob: (jobId: number): Promise<Job> => send('POST', `/api/jobs/${jobId}/cancel`, {}),
+
+  /** What game events are doing to production and demand. */
+  world: (): Promise<WorldResponse> => request('/api/world'),
+
+  /** The pools rewards are paid from. Operator authority. */
+  budgets: (): Promise<BudgetsResponse> => request('/api/budgets'),
 
   pushGameEvent: (body: GameEventRequest): Promise<EventRecord> =>
     send('POST', '/api/game/events', body),

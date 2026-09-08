@@ -375,13 +375,21 @@ impl Trader {
     /// Give the trader `qty` units of `symbol` at `price_cents` a unit,
     /// with no money moving and no fill.
     ///
-    /// This is a world-start endowment, and it exists for exactly one
-    /// caller: an NPC being handed the inventory it will make a market in.
-    /// The units are not created here — a stock's shares already exist and
-    /// this is an assignment of ones nobody held, a good's have just been
-    /// issued against its count — so the audit's sentence stays true either
-    /// way. `price_cents` is the reference price at the time, so the NPC has
-    /// a cost basis to quote a margin over rather than an infinite one.
+    /// This is units arriving with no transaction behind them, and it has
+    /// exactly two callers: an NPC being handed the inventory it will make a
+    /// market in, and a production job delivering what it made
+    /// ([`crate::jobs`]). The units are not created here — a stock's shares
+    /// already exist and this is an assignment of ones nobody held, a good's
+    /// have just been issued against its count — so the audit's sentence
+    /// stays true either way. `price_cents` is what a unit is reckoned to
+    /// have cost: the reference price for an endowment, the job's cost
+    /// spread over what it delivered, so there is a basis to quote a margin
+    /// over rather than an infinite one.
+    ///
+    /// It writes no ledger row, and that is the point: no currency moved, so
+    /// a row claiming a balance the account does not have would be exactly
+    /// the inconsistency [`Account::ledger_issues`](crate::account::Account::ledger_issues)
+    /// exists to catch. A job's money moved when it started.
     ///
     /// The position's `cash_cents` is deliberately left alone: it records
     /// what trades in this symbol paid in and out, and an endowment paid
@@ -416,6 +424,46 @@ impl Trader {
             self.positions.remove(symbol);
         }
         left
+    }
+
+    /// Take `qty` units of `symbol` out of the position and hand back what
+    /// they cost.
+    ///
+    /// This is neither a sale nor a consumption. The units are going into a
+    /// production job ([`crate::jobs`]) that will hand back something else,
+    /// so their basis goes *with* them instead of being written off: what
+    /// comes out of the furnace costs what went into it, and there is no
+    /// realised loss on the way in followed by a phantom gain on the way
+    /// out. Nothing here can fail — the caller has checked that the units
+    /// are held and unreserved.
+    pub fn withdraw(&mut self, symbol: &str, qty: u64) -> i64 {
+        let Some(pos) = self.positions.get_mut(symbol) else {
+            return 0;
+        };
+        let held = pos.qty.max(0);
+        let taken = i64::try_from(qty).unwrap_or(i64::MAX).min(held);
+        if taken == 0 {
+            return 0;
+        }
+        // Integer arithmetic, like every other number here: the basis that
+        // leaves is its share of what the position cost, rounded down, and
+        // the last unit out takes whatever rounding left behind.
+        let basis = if taken == held {
+            pos.cost_cents
+        } else {
+            (i128::from(pos.cost_cents) * i128::from(taken) / i128::from(held))
+                .try_into()
+                .unwrap_or(0)
+        };
+        pos.qty -= taken;
+        pos.cost_cents = (pos.cost_cents - basis).max(0);
+        if pos.qty == 0 {
+            pos.cost_cents = 0;
+            if pos.realised_pnl_cents == 0 && pos.cash_cents == 0 {
+                self.positions.remove(symbol);
+            }
+        }
+        basis
     }
 
     /// Record a trade this trader took part in: the position, the reservation

@@ -377,7 +377,7 @@ and to be replaced by measurement after the first two.
 | 1 | ✅ `src/ledger.rs` with property tests on the `no_std` path; `account.rs` rewired to it; funding routes made operator-only; fees to venue; payouts funded; freeze split from close; save version 6 | Contract tests show no player route changes supply; reconcile reports zero drift after the existing API tests | days |
 | 2 | ✅ `webapp/src/journal.rs`; every mutation journaled inside its market job; `Idempotency-Key`; replay on start; engine tick journaled with its wall input; `GET /commands/{key}`; save version 7 | Kill the process at random points under the concurrency test; restart reproduces the last acknowledged state and no duplicate reward | week |
 | 3 | ✅ `AssetKind`; goods in holdings; NPC wallets and policies; synthetic ladder and prints disabled on the server; catalogue, purchase and consume routes; save version 8 | Player-to-player and player-to-NPC fills, partial fills, IOC/FOK, amendments, stops, dividends and delistings conserve currency and units | weeks |
-| 4 | Recipes and jobs; rewards from budgets; game events with production and demand effects; `/api/v1/economy` routes and `types.ts`; UI panels for wallet, inventory and jobs; `just ui` | The acceptance scenario below passes, including retries and restarts at every step | weeks |
+| 4 | ✅ Recipes and jobs; rewards from budgets; game events with production and demand effects; `/api/v1/economy` routes and `types.ts`; UI panels for wallet, inventory and jobs; `just ui` | The acceptance scenario below passes, including retries and restarts at every step | weeks |
 | 5 | Tier two: SQLite journal and history, outbox with cursor replay for the game backend, bounded admission and quotas, load test with a declared target, backup and restore drill | p95 command latency and recovery time under the declared load; restore reconciles | weeks, only if tier one is outgrown |
 
 Milestone 1 alone is a correct custodial token: conserved supply, operator
@@ -603,6 +603,109 @@ Determinism is untouched a third time. Quoting reads the market and the
 symbol and nothing else — no clock, no randomness — and happens inside
 `Command::Step`, so a replayed step draws the same book.
 
+### Milestone 4 as built
+
+Done. `webapp/src/jobs.rs`, `webapp/src/rewards.rs` and `webapp/src/world.rs`
+are new; `webapp/tests/jobs.rs`, `webapp/tests/rewards.rs` and
+`webapp/tests/economy_jobs.rs` hold the acceptance; the UI gained one panel
+and the save format went to version 9. Nine things are worth recording.
+
+**A job is due at an instant, not after a number of ticks.** The plan
+measures a recipe in `duration_ticks`. A tick belongs to a *symbol* — each
+simulator has its own interval, and a world with four listings has four
+answers to "how long is a tick" — and a job belongs to no symbol. So a
+recipe takes `duration_secs` of simulated time and a job carries the instant
+it is due at, which the engine step compares against the instant it is
+advancing to. That instant is a field of the journal entry, so a replayed
+step delivers exactly the jobs the original one delivered.
+
+**A job holds nothing.** The plan pairs jobs with the hold *handles* that
+milestone 1 deliberately did not build, on the assumption that a job would
+reserve its inputs for its duration. It does not: starting one consumes the
+inputs and posts the cost in the same command. That keeps the acceptance's
+third question — is anything held for nothing — trivially answerable, needs
+no reservation kind that every audit would have to learn, and gives a job
+the same refusal shape as everything else: check, move the money, move the
+units, and a refusal leaves the world as it found it.
+
+**What a job will deliver is decided when it starts.** The outputs are
+resolved, scaled and written into the job at the start, so a recipe an
+operator rewrites afterwards changes the next job and not this one, and
+neither does an event that lands halfway through. The recipe's version is
+recorded beside them, which is the audit trail the plan's `(RecipeId, u32)`
+was for, without a job having to go looking for a text that may have been
+rewritten twice since.
+
+**What comes out of the furnace costs what went into it.** The first
+implementation destroyed the inputs — `Trader::destroy`, which consuming
+uses — and gave the output the job's cash cost as its basis. That is
+conserved but it reads wrong: smelting showed as a realised loss on the ore
+followed by a phantom gain on the ingot. Inputs are now *withdrawn*
+(`Trader::withdraw`): their basis leaves the position with them and lands in
+what the output is reckoned to have cost. Consuming still writes off, because
+a thing that has been used up really is a loss.
+
+**A reward is idempotent on the game's event id, not on the request.** An
+`Idempotency-Key` protects a request; it does not protect an *event*. A game
+backend that crashes after paying, restarts and re-derives the quest result
+will send a second request with a second key for the same kill. So a reward
+carries the game's own `source` id, that id is remembered with the receipt it
+produced, and the second request gets the first receipt back with
+`duplicate: true` and moves nothing. The index is bounded (`FEHU_REWARD_LOG`)
+and saved with the market, for the same reasons the idempotency index is.
+
+**The operator key is the service credential.** The plan's API section has
+three principal kinds — player, service with scopes, operator — and this
+milestone implements two. Rewards, budgets, recipes and the catalogue are the
+operator's, which in tier one *is* the trusted game backend: one host, one
+process, the game backend on the same network. Splitting `provision`,
+`reward`, `inventory` and `events` into separate scoped credentials is a
+change to `auth.rs` and the journaled `Principal`, worth doing when there is
+more than one service and not before. `POST /api/transfers` is the one new
+route a player can reach, and it moves currency without making any.
+
+**The world's mood is integer and linear.** A game event now pushes
+modifiers on production and demand alongside its price effects. The price
+effects decay exponentially in `f64` inside the deterministic core; these do
+not — a modifier is at full strength when it lands and ramps down to nothing
+in integer basis points. A yield is a count of units and a quote size is a
+count of units, so measuring them in floats would only add a rounding
+question, and replay reaches the same batch without touching `libm` at all.
+Production is read once, when a job starts; demand is read every time a
+merchant re-quotes, which is how the world's appetite reaches the book.
+
+**`/api/v1/economy` is a second spelling, not a second implementation.**
+Every route under it is the same handler as the one it mirrors, so the game
+backend can speak the documented economy API and the demo UI can go on
+speaking the surface it was written against. Two of the plan's rows are not
+aliased: mint, burn and freeze stay at their account-addressed paths, because
+`/admin/mint` would need an account in its body and there is nothing to gain
+from a third way of naming one.
+
+**The demo can now be an economy without being one by default.** Milestone 3
+left the ladder switched on because a world with no merchants and no players
+would otherwise have an empty book, and said seeding the four demo symbols
+belonged here. It does, as `FEHU_SEED_MERCHANTS_CENTS`: a world that is being
+*warmed up* gets a funded merchant behind every listing, each given that much
+currency out of treasury and about as much stock as it would buy, through the
+same journaled command a request would send. With `FEHU_SYNTHETIC=0` beside
+it the demo is a market in which everything on the book was paid for. It is
+off by default, because turning it on by default would change what every
+existing test's world is; and a *restored* world is left alone, since it
+already has the merchants it had.
+
+**And the acceptance found one thing.** `POST /api/symbols` answered a retry
+of the listing that succeeded with `409 already listed`: its cheap
+"is this ticker taken" check ran *before* `run_command` reached the
+idempotency index. The one command that genuinely cannot be sent twice was
+also the one whose lost response could not be recovered. It now asks the
+index first, and answers a retry with what it answered the first time.
+
+Determinism is untouched a fourth time. Jobs and rewards draw no randomness,
+the price process never sees them, and the world's modifiers are integers, so
+neither `STATE_VERSION` nor `EXCHANGE_VERSION` moves and the golden hashes in
+`tests/determinism.rs` are unchanged.
+
 ## Acceptance scenario
 
 Initialise a world with a genesis supply in treasury. Onboard two players.
@@ -641,6 +744,51 @@ cargo test -p fehu-webapp      # webapp: all suites pass, 0 failed
 
 `just lint`, the `no_std` path and the wasm build were not run for this
 documentation-only change; milestone 0 runs `just ci` in full.
+
+### After milestone 4
+
+Run the same way, command by command. All of it passes:
+
+```
+cargo fmt --all -- --check                                  # clean
+cargo clippy --all-targets --all-features -- -D warnings    # clean
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo clippy -p fehu-webapp --all-targets -- -D warnings    # clean
+cargo build --all-features / --no-default-features / +serde # clean
+cargo test --all-features                                   # 103 passed, 0 failed
+cargo test --no-default-features --tests                    #  96 passed, 0 failed
+cargo test -p fehu-webapp                                   # 228 passed, 0 failed
+cargo build --release --target wasm32-unknown-unknown …     # clean, both feature sets
+cd webapp/ui && npm ci && npm run build                     # bundle rebuilt and committed
+```
+
+Three new suites. `webapp/tests/jobs.rs`: a recipe that names only listed
+goods, a job refused for want of ore, for want of cents and for units already
+promised to a resting sell, one delivered on the step that reaches it and
+only once, one cancelled for what the recipe says it gives back, one retried
+under a single key and started once, an event moving the yield of the *next*
+job and the size a merchant quotes, a modifier ramping down and being swept,
+and a world stopped with a job in the furnace that comes back running it.
+`webapp/tests/rewards.rs`: a budget filled out of treasury and never minted,
+a reward that moves currency rather than making it, one refused when the
+budget runs dry, the same game event paid once however many keys ask for it,
+transfers between players, a frozen account that is paid but pays nobody, and
+a restart that still remembers what it has paid for. One test joins
+`webapp/tests/npc.rs`: a world with no synthetic liquidity, seeded, quoting
+both sides of every book and owing nobody anything.
+
+`webapp/tests/economy_jobs.rs` is the milestone's own acceptance: the
+scenario above, asked after every step whether the currency adds up, whether
+every unit is somewhere and whether anything is held for nothing; then every
+request sent again under its original key, with nothing moving for any of
+it; then the world rebuilt from the journal at each of the sixteen
+boundaries it passed through. The plan's negative cases are the tests beside
+it — an empty budget, a merchant out of stock, a recipient at the balance
+cap, a freeze while an order is resting, and a job that must be delivered
+once however many steps pass over it and once more after a replay.
+
+The 195 webapp tests that predate the milestone are unchanged and pass, apart
+from three key sets in `contract.rs` that gained a field.
 
 ### After milestone 3
 

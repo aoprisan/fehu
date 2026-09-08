@@ -203,6 +203,8 @@ export interface CatalogEntry {
   scope: Scope;
   description: string;
   effects: SimEvent[];
+  /** What it does to production and demand, alongside the price. */
+  world: EffectSpec[];
 }
 
 /** `events::EventRecord` — the audit-log row, also pushed to the stream. */
@@ -489,8 +491,14 @@ export type LedgerKind =
   | 'buy'
   | 'sell'
   | 'fee'
+  | 'purchase'
   | 'dividend'
-  | 'delisting';
+  | 'delisting'
+  | 'transfer_out'
+  | 'transfer_in'
+  | 'reward'
+  | 'job_cost'
+  | 'job_refund';
 
 /** `account::UserDto`. */
 export interface UserDto {
@@ -777,6 +785,13 @@ export type DelistedMessage = { type: 'delisted' } & Delisting;
  */
 export type Sequenced<M> = M & { seq: number };
 
+/**
+ * A production job came due and delivered what it made. There is no message
+ * for a job starting: that is a command with a response, and its owner
+ * already has it.
+ */
+export type JobDoneMessage = { type: 'job_done' } & JobDelivery;
+
 export type StreamMessage = Sequenced<
   | HelloMessage
   | TickMessage
@@ -787,6 +802,7 @@ export type StreamMessage = Sequenced<
   | OrderExpiredMessage
   | ListedMessage
   | DelistedMessage
+  | JobDoneMessage
 >;
 
 /** The server's error body: `{"error": {"code", "message"}}`. */
@@ -811,6 +827,10 @@ export interface Reconciliation {
   circulating_cents: number;
   /** What unfunded liquidity has put into players' hands beyond its float. */
   synthetic_debt_cents: number;
+  /** Jobs still in the furnace: promises the world has taken payment for. */
+  jobs_running: number;
+  /** Budget wallets rewards are paid from. */
+  budgets_checked: number;
   issues: string[];
 }
 
@@ -830,6 +850,8 @@ export interface SupplyDto {
   player_cents: number;
   /** Sitting in the tills of the traders the world runs itself. */
   npc_cents: number;
+  /** Set aside in budgets, waiting to be paid out as rewards. */
+  budget_cents: number;
   synthetic_debt_cents: number;
   wallets: number;
 }
@@ -921,6 +943,8 @@ export interface NpcDto {
   policy: NpcPolicy;
   /** Quoting is on. Off, it keeps its money and stock and stops offering them. */
   active: boolean;
+  /** What it quotes at each level now: its policy size, scaled by demand. */
+  quoted_size: number;
   /** Currency it can still bid with. */
   cash_cents: number;
   /** Units it holds. */
@@ -932,4 +956,207 @@ export interface NpcDto {
 /** `GET /api/npcs` (`npc::NpcsResponse`). */
 export interface NpcsResponse {
   npcs: NpcDto[];
+}
+
+
+// --- webapp/src/jobs.rs ----------------------------------------------------
+
+/** `jobs::Line` — how many units of what, on one side of a recipe. */
+export interface RecipeLine {
+  symbol: string;
+  qty: number;
+}
+
+/** `jobs::Recipe` — what the world knows how to make, and what it takes. */
+export interface Recipe {
+  id: string;
+  /** Bumped every time an operator rewrites it. */
+  version: number;
+  /** Units consumed when a job starts. */
+  inputs: RecipeLine[];
+  /** Units issued when it completes, before the world's effect on the yield. */
+  outputs: RecipeLine[];
+  /** What the furnace charges, paid to the venue when the job starts. */
+  cost_cents: number;
+  /** How long it takes, in simulated seconds. */
+  duration_secs: number;
+  /** What a cancellation gives back, in basis points of the cost. */
+  refund_bps: number;
+  note: string | null;
+}
+
+/** `GET /api/recipes` (`jobs::RecipesResponse`). */
+export interface RecipesResponse {
+  recipes: Recipe[];
+}
+
+/** `jobs::JobStatus`. */
+export type JobStatus = 'running' | 'done' | 'cancelled';
+
+/** `jobs::Job` — one run of a recipe. */
+export interface Job {
+  id: number;
+  recipe: string;
+  /** The version of the recipe this job was started under. */
+  recipe_version: number;
+  trader_id: number;
+  account_id: number;
+  /** What it took, and what it will deliver. Both fixed when it started. */
+  inputs: RecipeLine[];
+  outputs: RecipeLine[];
+  /** The yield the world was running at when it started; 10000 is as written. */
+  yield_bps: number;
+  cost_cents: number;
+  /** The balanced transaction that paid the cost, or 0 for a free recipe. */
+  tx_id: number;
+  /** What the inputs cost their owner: it goes into what the output cost. */
+  inputs_cost_cents: number;
+  started_at_ms: number;
+  due_at_ms: number;
+  finished_at_ms: number | null;
+  status: JobStatus;
+  /** What a cancellation actually paid back. */
+  refunded_cents: number;
+}
+
+/** `GET /api/jobs` (`jobs::JobsResponse`). */
+export interface JobsResponse {
+  jobs: Job[];
+}
+
+/** What a completed job delivered (`jobs::JobDelivery`). */
+export interface JobDelivery {
+  job_id: number;
+  trader_id: number;
+  recipe: string;
+  /** What actually arrived: a line whose good was delisted delivers nothing. */
+  delivered: RecipeLine[];
+  at_ms: number;
+}
+
+// --- webapp/src/rewards.rs -------------------------------------------------
+
+/** `rewards::BudgetDto` — a pool rewards are paid out of. */
+export interface BudgetDto {
+  wallet: number;
+  name: string;
+  created_at_ms: number;
+  /** What the wallet holds now: whether the next reward can be paid. */
+  balance_cents: number;
+  paid_cents: number;
+  paid_count: number;
+}
+
+/** `rewards::RewardRule` — what a named reward is worth. */
+export interface RewardRule {
+  id: string;
+  version: number;
+  /** The budget's wallet id. */
+  budget: number;
+  amount_cents: number;
+  note: string | null;
+  paid_cents: number;
+  paid_count: number;
+}
+
+/** `GET /api/budgets` (`rewards::BudgetsResponse`). */
+export interface BudgetsResponse {
+  budgets: BudgetDto[];
+  rules: RewardRule[];
+}
+
+/** `POST /api/rewards` (`rewards::RewardReceipt`). */
+export interface RewardReceipt {
+  rule: string;
+  /** The game's own id for what happened. Paid at most once. */
+  source: string;
+  trader_id: number;
+  account_id: number;
+  budget: number;
+  amount_cents: number;
+  tx_id: number;
+  balance_cents: number;
+  at_ms: number;
+  /** The receipt of an earlier payment: nothing moved for this request. */
+  duplicate: boolean;
+}
+
+// --- webapp/src/world.rs ---------------------------------------------------
+
+/** What a modifier changes (`world::Effect`). */
+export type Effect = 'production' | 'demand';
+
+/** `world::EffectSpec` — one event's pull, and how long it lasts. */
+export interface EffectSpec {
+  effect: Effect;
+  /** At full strength, in basis points: 2000 is a fifth more. */
+  delta_bps: number;
+  /** How long it takes to ramp down to nothing, in simulated seconds. */
+  secs: number;
+}
+
+/** `world::Modifier` — a pull in force, ramping down in a straight line. */
+export interface Modifier {
+  id: number;
+  effect: Effect;
+  /** The symbol it hits, or `null` for every symbol. */
+  symbol: string | null;
+  delta_bps: number;
+  from_ms: number;
+  until_ms: number;
+  /** `"game:scandal"`, as the event log spells it. */
+  kind: string;
+  source: string;
+}
+
+/** One symbol's standing with the world (`world::SymbolEffects`). */
+export interface SymbolEffects {
+  symbol: string;
+  /** What a recipe making this yields, in basis points of the recipe. */
+  production_bps: number;
+  /** What a merchant in this quotes, in basis points of its policy size. */
+  demand_bps: number;
+}
+
+/** `GET /api/world` (`world::WorldResponse`). */
+export interface WorldResponse {
+  at_ms: number;
+  modifiers: Modifier[];
+  symbols: SymbolEffects[];
+}
+
+// --- wallets and transfers -------------------------------------------------
+
+/** `api::WalletDto` — one wallet: what it is, and what it holds. */
+export interface WalletDto {
+  wallet: number;
+  kind:
+    | 'player'
+    | 'treasury'
+    | 'budget'
+    | 'npc'
+    | 'issuer'
+    | 'venue'
+    | 'issuance'
+    | 'synthetic';
+  status: AccountStatus;
+  balance_cents: number;
+  reserved_cents: number;
+  available_cents: number;
+  /** The account this wallet is the money of, if it is somebody's. */
+  account_id: number | null;
+}
+
+/** `api::InventoryResponse` — a trader's units of the world's goods. */
+export interface InventoryResponse {
+  trader_id: number;
+  inventory: HoldingDto[];
+}
+
+/** Body of `POST /api/transfers`. */
+export interface TransferBody {
+  from_account_id: number;
+  to_account_id: number;
+  amount_cents: number;
+  memo?: string | null;
 }

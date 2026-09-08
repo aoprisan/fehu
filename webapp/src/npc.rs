@@ -179,6 +179,16 @@ pub struct Npc {
     /// rather than trying every tick forever.
     #[serde(default)]
     pub quoted_orders: u32,
+    /// The size it quoted at each level last time.
+    ///
+    /// The third half of the re-quote decision, and the one the world's
+    /// appetite moves: a game event that changes demand
+    /// ([`Effect::Demand`](crate::world::Effect::Demand)) changes what the
+    /// policy size comes out as, and a merchant whose quotes are the wrong
+    /// size for the world is redrawn even if the price has not moved and
+    /// nothing has been eaten.
+    #[serde(default)]
+    pub quoted_size: u64,
 }
 
 /// `GET /api/npcs`: who the world is trading as.
@@ -198,6 +208,9 @@ pub struct NpcDto {
     pub name: String,
     pub policy: Policy,
     pub active: bool,
+    /// What it is quoting at each level now: its policy size, scaled by what
+    /// the world wants of this good.
+    pub quoted_size: u64,
     /// Currency it can still bid with.
     pub cash_cents: i64,
     /// Units it holds.
