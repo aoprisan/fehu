@@ -31,8 +31,18 @@ crates/fehu-economy/    the economy server binary
   tests/                contract, economy, journal, load, …
   ui/                   TypeScript front-end (Vite)
   static/               committed UI build output, embedded in the binary
-docs/                   architecture animation, economy engine plan
+docs/                   architecture animation, live demo, economy engine plan
 ```
+
+## Watching it work
+
+Two pages in [`docs/`](docs), both self-contained — open either in a browser,
+no server needed.
+
+| Page | What it does |
+|---|---|
+| [`docs/demo.html`](docs/demo.html) | **A server you can watch.** A miniature of the economy server runs in the page: actors, the command journal, the ledger, the books and the world. Push it around, then crash it and watch a snapshot plus the journal put it back — with the state hash taken before and after. |
+| [`docs/architecture.html`](docs/architecture.html) | **Where an order goes.** One request at a time, hop by hop, through the router, the market actor and a symbol's book. |
 
 ## Tooling
 

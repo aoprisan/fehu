@@ -30,6 +30,13 @@ in a browser and watch an order travel the actors — the middleware, the market
 mailbox, the book, the fills and the stream — one step at a time, alongside an
 engine step, a cancel, a refusal and a read that never touches the market.
 
+[`docs/demo.html`](../../docs/demo.html) goes the other way: instead of one
+request through the map, a working miniature of this server runs in the page —
+the same command journal, ledger, books, jobs and world modifiers, driven by
+its own engine loop. Push it around with the buttons, then crash it and watch
+a snapshot plus the entries after it replay through the same `apply` and come
+back to an identical state hash.
+
 The UI is TypeScript ([`ui/`](ui/README.md)) built with Vite. Its output is
 committed to `static/` and embedded into the binary, so
 the command above needs no Node toolchain; `just ui` rebuilds it after a
