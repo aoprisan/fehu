@@ -1,41 +1,17 @@
-[package]
-name = "fehu"
+# Virtual workspace root: the utilities library and the economy server that
+# runs it. The root builds nothing itself on purpose — a bare
+# `cargo build --no-default-features` here would also build the server, whose
+# dependency on `fehu` re-enables `std` and unifies the no_std check away, so
+# every library command names `-p fehu`. See the `justfile`.
+[workspace]
+members = ["crates/fehu", "crates/fehu-economy"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "Deterministic synthetic stock price simulator for games (no_std + alloc)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/aoprisan/fehu"
-keywords = ["simulation", "finance", "game", "no_std", "deterministic"]
-categories = ["simulation", "game-development", "no-std"]
-
-[features]
-default = ["std"]
-std = []
-serde = ["dep:serde", "rand_xoshiro/serde"]
-
-[dependencies]
-libm = "0.2"
-rand_core = "0.10"
-rand_xoshiro = "0.8"
-serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
-
-[dev-dependencies]
-proptest = "1"
-criterion = "0.8"
-serde_json = { version = "1", features = ["float_roundtrip"] }
-postcard = { version = "1", features = ["alloc"] }
-
-[[bench]]
-name = "ticks"
-harness = false
-
-[[example]]
-name = "dump"
-required-features = ["std"]
 
 [profile.bench]
 debug = false
-
-[workspace]
-members = ["webapp"]
-resolver = "3"

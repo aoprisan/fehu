@@ -1,0 +1,35 @@
+[package]
+name = "fehu"
+description = "Deterministic synthetic stock price simulator for games (no_std + alloc)"
+keywords = ["simulation", "finance", "game", "no_std", "deterministic"]
+categories = ["simulation", "game-development", "no-std"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["std"]
+std = []
+serde = ["dep:serde", "rand_xoshiro/serde"]
+
+[dependencies]
+libm = "0.2"
+rand_core = "0.10"
+rand_xoshiro = "0.8"
+serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
+
+[dev-dependencies]
+proptest = "1"
+criterion = "0.8"
+serde_json = { version = "1", features = ["float_roundtrip"] }
+postcard = { version = "1", features = ["alloc"] }
+
+[[bench]]
+name = "ticks"
+harness = false
+
+[[example]]
+name = "dump"
+required-features = ["std"]
