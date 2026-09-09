@@ -1,0 +1,768 @@
+<title>Two Games, One Ledger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --ground:  #f0f2ee;
+    --surface: #f9faf7;
+    --sunk:    #e3e6e0;
+    --ink:     #191b19;
+    --ink-2:   #4b514c;
+    --ink-3:   #767d77;
+    --rule:    #ccd0c9;
+    --rule-2:  #dde0d9;
+    --credit:  #1e5b3e;
+    --debit:   #8d3325;
+    --gold:    #866a1d;
+
+    --f-display: "Instrument Serif", Georgia, "Times New Roman", serif;
+    --f-body:    "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+    --f-mono:    "IBM Plex Mono", ui-monospace, Menlo, monospace;
+
+    --measure: 64ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:  #111310;
+      --surface: #191c17;
+      --sunk:    #0b0d0a;
+      --ink:     #e2e5df;
+      --ink-2:   #a8afa6;
+      --ink-3:   #7e857d;
+      --rule:    #2b2f29;
+      --rule-2:  #21251f;
+      --credit:  #5ea87b;
+      --debit:   #d4715f;
+      --gold:    #c6a24d;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:  #111310;
+    --surface: #191c17;
+    --sunk:    #0b0d0a;
+    --ink:     #e2e5df;
+    --ink-2:   #a8afa6;
+    --ink-3:   #7e857d;
+    --rule:    #2b2f29;
+    --rule-2:  #21251f;
+    --credit:  #5ea87b;
+    --debit:   #d4715f;
+    --gold:    #c6a24d;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--f-body);
+    font-size: 16.5px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 1.5rem; }
+
+  /* ---------- masthead ---------- */
+
+  header.top { padding: 3.6rem 0 1.4rem; border-bottom: 3px double var(--ink); }
+  .eyebrow {
+    font-family: var(--f-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.17em;
+    text-transform: uppercase;
+    color: var(--credit);
+  }
+  h1 {
+    font-family: var(--f-display);
+    font-weight: 400;
+    font-size: clamp(2.9rem, 8vw, 5.4rem);
+    line-height: 0.95;
+    letter-spacing: -0.01em;
+    margin: 0.6rem 0 0.7rem;
+    text-wrap: balance;
+  }
+  .standfirst {
+    font-size: 1.2rem;
+    line-height: 1.5;
+    color: var(--ink-2);
+    max-width: 62ch;
+    margin: 0 0 1.6rem;
+    font-weight: 300;
+  }
+  .byline {
+    font-family: var(--f-mono);
+    font-size: 0.73rem;
+    color: var(--ink-3);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem 2.2rem;
+  }
+  .byline b { font-weight: 500; text-transform: uppercase; letter-spacing: 0.08em; }
+  .byline span { color: var(--ink); }
+
+  /* ---------- structure ---------- */
+
+  main { padding: 2.8rem 0 4rem; }
+  section { margin-bottom: 3.4rem; }
+
+  .mark {
+    font-family: var(--f-mono);
+    font-size: 0.71rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--credit);
+    display: block;
+    margin-bottom: 0.5rem;
+  }
+  h2 {
+    font-family: var(--f-display);
+    font-weight: 400;
+    font-size: clamp(1.85rem, 4.2vw, 2.7rem);
+    line-height: 1.06;
+    letter-spacing: -0.005em;
+    margin: 0 0 1rem;
+    max-width: 26ch;
+    text-wrap: balance;
+  }
+  h3 {
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    margin: 0 0 0.5rem;
+  }
+  p { max-width: var(--measure); margin: 0 0 1rem; }
+  ul { max-width: var(--measure); padding-left: 1.15rem; margin: 0 0 1rem; }
+  li { margin-bottom: 0.45rem; }
+  li::marker { color: var(--ink-3); }
+  strong { font-weight: 600; }
+  a { color: var(--credit); text-underline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--credit); outline-offset: 2px; }
+  code {
+    font-family: var(--f-mono);
+    font-size: 0.84em;
+    background: var(--sunk);
+    padding: 0.08em 0.32em;
+    border-radius: 2px;
+    word-break: break-word;
+  }
+
+  /* ---------- the running two-column ledger ---------- */
+
+  .ledger {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0;
+    border-top: 1px solid var(--ink);
+    margin: 1.5rem 0 0;
+  }
+  @media (min-width: 820px) {
+    .ledger { grid-template-columns: 1fr 1fr; column-gap: 3rem; }
+  }
+  .ledger > div { padding: 1.1rem 0 1.3rem; }
+  .ledger > div + div { border-top: 1px solid var(--rule); }
+  @media (min-width: 820px) {
+    .ledger > div + div { border-top: 0; }
+  }
+  .ledger .who {
+    font-family: var(--f-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    display: block;
+    margin-bottom: 0.5rem;
+  }
+  .ledger .dc .who { color: var(--debit); }
+  .ledger .gc .who { color: var(--gold); }
+  .ledger h4 {
+    font-family: var(--f-display);
+    font-weight: 400;
+    font-size: 1.5rem;
+    line-height: 1.15;
+    margin: 0 0 0.6rem;
+  }
+  .ledger p { font-size: 0.96rem; max-width: 46ch; margin-bottom: 0.8rem; }
+  .ledger p:last-child { margin-bottom: 0; }
+  .ledger dl { margin: 0.8rem 0 0; font-size: 0.9rem; }
+  .ledger dl div {
+    display: grid;
+    grid-template-columns: 9.5rem 1fr;
+    gap: 0 1rem;
+    padding: 0.32rem 0;
+    border-bottom: 1px solid var(--rule-2);
+  }
+  .ledger dt {
+    font-family: var(--f-mono);
+    font-size: 0.73rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    padding-top: 0.12rem;
+  }
+  .ledger dd { margin: 0; color: var(--ink-2); }
+  .ledger dd b { color: var(--ink); font-weight: 500; }
+
+  .ledger pre {
+    font-family: var(--f-mono);
+    font-size: 0.78rem;
+    line-height: 1.55;
+    background: var(--surface);
+    border: 1px solid var(--rule-2);
+    padding: 0.75rem 0.9rem;
+    overflow-x: auto;
+    margin: 0 0 0.8rem;
+  }
+  .verdict {
+    font-family: var(--f-mono);
+    font-size: 0.78rem;
+    color: var(--debit);
+    display: block;
+    margin-top: 0.5rem;
+  }
+
+  /* ---------- comparison table ---------- */
+
+  .scroller { overflow-x: auto; margin: 1.6rem 0; border-top: 1px solid var(--ink); }
+  table { border-collapse: collapse; width: 100%; min-width: 660px; font-size: 0.92rem; }
+  thead th {
+    font-family: var(--f-mono);
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    text-align: left;
+    color: var(--ink-3);
+    padding: 0.65rem 1.2rem 0.65rem 0;
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  thead th.dc { color: var(--debit); }
+  thead th.gc { color: var(--gold); }
+  tbody td {
+    padding: 0.62rem 1.2rem 0.62rem 0;
+    border-bottom: 1px solid var(--rule-2);
+    vertical-align: top;
+    line-height: 1.48;
+    color: var(--ink-2);
+  }
+  tbody td:first-child {
+    color: var(--ink);
+    font-weight: 500;
+    font-size: 0.88rem;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  td:last-child, th:last-child { padding-right: 0; }
+  td .num { font-variant-numeric: tabular-nums; font-family: var(--f-mono); font-size: 0.85rem; color: var(--ink); }
+
+  /* ---------- figure ---------- */
+
+  figure { margin: 2rem 0; }
+  figure svg { display: block; width: 100%; height: auto; color: var(--ink); }
+  figcaption {
+    font-size: 0.88rem;
+    color: var(--ink-3);
+    margin-top: 0.7rem;
+    max-width: 66ch;
+    line-height: 1.55;
+  }
+  figcaption b {
+    font-family: var(--f-mono);
+    font-size: 0.71rem;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--credit);
+    margin-right: 0.5rem;
+  }
+
+  /* ---------- lessons ---------- */
+
+  .lessons { border-top: 1px solid var(--ink); margin-top: 1.5rem; }
+  .lessons > div {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.2rem 2.5rem;
+    padding: 1.1rem 0;
+    border-bottom: 1px solid var(--rule-2);
+  }
+  @media (min-width: 860px) { .lessons > div { grid-template-columns: 21rem 1fr; } }
+  .lessons h4 {
+    font-family: var(--f-display);
+    font-weight: 400;
+    font-size: 1.35rem;
+    line-height: 1.15;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .lessons p { margin: 0; max-width: 58ch; color: var(--ink-2); font-size: 0.97rem; }
+
+  /* ---------- documents ---------- */
+
+  .docs { border-top: 1px solid var(--ink); margin-top: 1.4rem; }
+  .docs a.row {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.15rem 2rem;
+    padding: 0.85rem 0;
+    border-bottom: 1px solid var(--rule-2);
+    text-decoration: none;
+    color: inherit;
+  }
+  @media (min-width: 760px) { .docs a.row { grid-template-columns: 13rem 1fr auto; align-items: baseline; } }
+  .docs a.row:hover .title { color: var(--credit); text-decoration: underline; }
+  .docs .game {
+    font-family: var(--f-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  .docs .title { font-weight: 500; }
+  .docs .kind {
+    font-family: var(--f-mono);
+    font-size: 0.72rem;
+    color: var(--ink-3);
+    letter-spacing: 0.06em;
+  }
+
+  .pull {
+    font-family: var(--f-display);
+    font-size: clamp(1.5rem, 3.6vw, 2.1rem);
+    line-height: 1.22;
+    color: var(--ink);
+    max-width: 30ch;
+    margin: 2.2rem 0;
+    padding-left: 1.4rem;
+    border-left: 3px solid var(--credit);
+    text-wrap: balance;
+  }
+
+  footer {
+    border-top: 3px double var(--ink);
+    padding: 1rem 0 3rem;
+    font-family: var(--f-mono);
+    font-size: 0.73rem;
+    color: var(--ink-3);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 2rem;
+  }
+
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<div class="wrap">
+
+  <header class="top">
+    <div class="eyebrow">Case study &middot; fehu</div>
+    <h1>Two Games, One Ledger</h1>
+    <p class="standfirst">
+      A Rust multiplayer shooter and a client-only browser city-builder share nothing —
+      not a language, not a runtime, not a genre, not a player. They arrived at the same
+      hole in the same place, and the fix has the same shape in both.
+    </p>
+    <div class="byline">
+      <div><b>Subject</b> <span>fehu &middot; the economy library and its server</span></div>
+      <div><b>Cases</b> <span>DeadCity, Global Conflict v2</span></div>
+      <div><b>Level</b> <span>High-level; the design notes are linked at the end</span></div>
+    </div>
+  </header>
+
+  <main>
+
+    <section>
+      <span class="mark">The premise</span>
+      <h2>Every game with a currency eventually needs a ledger. Almost none of them start with one.</h2>
+      <p>
+        A currency starts as a number that goes up. It stays that way through the prototype, through
+        the vertical slice, and usually through launch, because a number that goes up is correct
+        right up to the moment somebody else can affect it. Then, in a fairly narrow window, three
+        things become true at once: players notice inflation before you do, retries pay twice, and
+        the feature you actually want to build turns out to be a feature about ownership.
+      </p>
+      <p>
+        These two projects are at that window, from opposite directions. Looking at them side by
+        side is useful precisely because they have nothing in common — which makes the parts that
+        <em>are</em> in common the interesting ones.
+      </p>
+    </section>
+
+    <section>
+      <span class="mark">The subjects</span>
+      <h2>Nothing in common except the problem.</h2>
+
+      <div class="ledger">
+        <div class="dc">
+          <span class="who">Case 01</span>
+          <h4>DeadCity</h4>
+          <p>
+            A multiplayer top-down zombie shooter. Rust server on Actix actors with Rapier3D
+            physics, a TypeScript/PixiJS client, protobuf over WebSocket and ENet. Real players,
+            real concurrency, a season pass and a live roadmap.
+          </p>
+          <dl>
+            <div><dt>Economy lives</dt><dd>Server, in <b>actor attributes</b></dd></div>
+            <div><dt>Persisted by</dt><dd><b>File write on a timer</b></dd></div>
+            <div><dt>Currencies</dt><dd>SC, HC, skulls &times;3, mats &times;6, chips, energy</dd></div>
+            <div><dt>Hot path</dt><dd><b>60 fps</b> physics, 150 ms AI</dd></div>
+            <div><dt>Pressure</dt><dd>Roadmap features it cannot reach</dd></div>
+          </dl>
+        </div>
+        <div class="gc">
+          <span class="who">Case 02</span>
+          <h4>Global Conflict v2</h4>
+          <p>
+            A client-only city-building PWA on a 3D globe. React and Vite, no backend at all: the
+            player&rsquo;s city and roughly 190 bot rivals run in one browser tab and persist to a
+            single <code>localStorage</code> key.
+          </p>
+          <dl>
+            <div><dt>Economy lives</dt><dd>Browser, in <b>one JSON blob</b></dd></div>
+            <div><dt>Persisted by</dt><dd><b>localStorage</b>, owned by the player</dd></div>
+            <div><dt>Currencies</dt><dd>Cash, Bucks, 129 tradable goods</dd></div>
+            <div><dt>Hot path</dt><dd><b>16.7 clicks/s</b> sustained cap</dd></div>
+            <div><dt>Pressure</dt><dd>Cannot admit a second player</dd></div>
+          </dl>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <span class="mark">The finding</span>
+      <h2>The same hole, wearing two different costumes.</h2>
+      <p>
+        Both were found the same way: by asking what statement about money the code could be wrong
+        about. In both, the answer was none.
+      </p>
+
+      <div class="ledger">
+        <div class="dc">
+          <span class="who">DeadCity</span>
+<pre>// grant, in effect
+agent.attrs[SC] += amount;
+// persistence
+File::create(path).unwrap();
+write_all(&amp;whole_state);   // on a timer</pre>
+          <p>
+            Nothing conserves, so a payout bug and a popular weekend look identical on every graph
+            that exists. A crash between grant and save loses the grant; a client that reconnects
+            and re-sends a claim is paid twice, held off only by an in-memory flag.
+          </p>
+          <span class="verdict">No supply statement · no durability · no transfer</span>
+        </div>
+        <div class="gc">
+          <span class="who">Global Conflict v2</span>
+<pre>// game/market.ts
+city.cash += n * resourceInfo(r).sell   // sell
+city.cash -= n * resourceInfo(r).buy    // buy</pre>
+          <p>
+            Money is created by selling and destroyed by buying. There is no supply at all — not an
+            unenforced one, an absent one. With one player that is invisible. With two it is the
+            whole game: the equilibrium price of all 129 goods is set by how much money exists.
+          </p>
+          <span class="verdict">Money from nowhere · save file owned by the player</span>
+        </div>
+      </div>
+
+      <p class="pull">
+        One had a ledger with no audit. The other had arithmetic where the ledger should be.
+      </p>
+    </section>
+
+    <section>
+      <span class="mark">The instrument</span>
+      <h2>What fehu contributes, in four sentences.</h2>
+      <p>
+        Money is an integer count of cents in one world-wide ledger, and every movement is a set of
+        signed postings that sums to zero — so <code>&Sigma; balances = minted &minus; burned</code>
+        is an audit anyone can run, and no route a player can reach changes the supply. Goods are
+        issued and consumed rather than floated, and the audit asks the strict question: every
+        issued unit that has not been consumed is held by somebody. Nothing changes the world except
+        a journaled command, appended and <code>fsync</code>ed before the response goes out, replayed
+        on start-up through the same code the live path uses. And a game backend holds a scoped
+        service credential — <code>provision</code>, <code>reward</code>, <code>inventory</code>,
+        <code>events</code> — rather than the key that can mint.
+      </p>
+      <p>
+        The library underneath (<code>crates/fehu</code>) is <code>no_std + alloc</code> and
+        bit-reproducible on native and wasm32, which turns out to matter for exactly one of these two
+        cases — and matter a lot.
+      </p>
+    </section>
+
+    <section>
+      <span class="mark">The divergence</span>
+      <h2>Same instrument, two quite different instruments panels.</h2>
+      <p>
+        This is the part worth reading if you are evaluating fehu for something else. The economics
+        are identical; almost every engineering decision around them differs, and the differences
+        are all downstream of two questions — <em>who is allowed to be authoritative</em>, and
+        <em>how fast is the hot path</em>.
+      </p>
+
+      <div class="scroller">
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th class="dc">DeadCity</th>
+              <th class="gc">Global Conflict v2</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Who talks to fehu</td>
+              <td>The game server, holding three scoped service credentials. Players never see it.</td>
+              <td>The browser, holding a per-player API key. There is no server to hold anything else.</td>
+            </tr>
+            <tr>
+              <td>Trust posture</td>
+              <td>Server-authoritative already; fehu inherits that. The open risk is the client-supplied player id.</td>
+              <td>Client-asserted production in phase 1. Money is safe, goods are claimable — and the leaderboard has to say so.</td>
+            </tr>
+            <tr>
+              <td>Hot-path rate</td>
+              <td><span class="num">60 fps</span> physics, <span class="num">~400</span> kills per run</td>
+              <td><span class="num">16.7</span> clicks/s sustained, burst <span class="num">100</span></td>
+            </tr>
+            <tr>
+              <td>Crossing rate</td>
+              <td><span class="num">1</span> settlement per run, at <code>stopped()</code></td>
+              <td><span class="num">1</span> flush every few seconds, plus deliberate trades</td>
+            </tr>
+            <tr>
+              <td>Symbols needed</td>
+              <td>About a dozen goods. Comfortably under the default cap.</td>
+              <td><span class="num">129</span> goods against a default cap of <span class="num">32</span> — raise it, and measure the tick.</td>
+            </tr>
+            <tr>
+              <td>Migration cost</td>
+              <td>Real. Existing balances have no provenance, so the cutover is a deliberate, journaled mint per player with the total written down.</td>
+              <td>Nil. The Config panel already resets the world whenever a CSV changes, so the first live world is just a new world.</td>
+            </tr>
+            <tr>
+              <td>Offline requirement</td>
+              <td>None. A run needs the server anyway.</td>
+              <td>Hard. It is an installable PWA that banks steps while closed — solved by running the same <code>no_std</code> simulator in wasm and queueing writes under idempotency keys.</td>
+            </tr>
+            <tr>
+              <td>What it unlocks</td>
+              <td>High-Stakes Extraction, prize-pool events, and player trading — three roadmap items blocked on the same missing thing.</td>
+              <td>A second player. Which is to say: the game it is trying to become.</td>
+            </tr>
+            <tr>
+              <td>Known gap</td>
+              <td colspan="2">Both need a directed transfer of goods that fehu does not have — it moves money between accounts and goods only through the book. One small upstream command, wanted by both.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <span class="mark">The convergence</span>
+      <h2>Both obey one rule, at rates two orders of magnitude apart.</h2>
+      <p>
+        A journaled ledger that <code>fsync</code>s before it answers is the right instrument for
+        money and the wrong instrument for a game loop. Every workable integration therefore has the
+        same shape: the fast thing accumulates in memory, and a <em>natural boundary in the game</em>
+        — not a timer someone picked — decides when it crosses.
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 900 340" role="img" aria-label="DeadCity accumulates run earnings in memory across a 60 fps run and crosses once at run end; Global Conflict accumulates production locally at 16.7 clicks per second and flushes every few seconds. Both cross into the same single-writer ledger.">
+          <defs>
+            <marker id="cs-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,0 10,5 0,10" fill="currentColor"></polygon>
+            </marker>
+            <marker id="cs-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,0 10,5 0,10" fill="#2b7a54"></polygon>
+            </marker>
+          </defs>
+
+          <g font-family="'IBM Plex Mono',monospace" font-size="11" fill="currentColor">
+
+            <text x="30" y="16" font-size="11.5" letter-spacing="1.5" fill="#a03c2b">DEADCITY — RUN LANE</text>
+            <text x="470" y="16" font-size="11.5" letter-spacing="1.5" fill="#8a6a1c">GLOBAL CONFLICT — CLICK LANE</text>
+
+            <!-- left column -->
+            <rect x="30" y="34" width="380" height="44" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+            <text x="220" y="61" text-anchor="middle" font-size="12">physics 60 fps · broadcast 30 fps · AI 150 ms</text>
+
+            <line x1="220" y1="78" x2="220" y2="90" stroke="currentColor" stroke-width="1.2" marker-end="url(#cs-a)"></line>
+
+            <rect x="30" y="92" width="380" height="44" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+            <text x="220" y="119" text-anchor="middle" font-size="12">kills · pickups · streaks &mdash; ~400 per run</text>
+
+            <line x1="220" y1="136" x2="220" y2="148" stroke="currentColor" stroke-width="1.2" marker-end="url(#cs-a)"></line>
+
+            <rect x="30" y="150" width="380" height="52" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+            <text x="220" y="171" text-anchor="middle" font-size="12">MetaPlayerAgent &mdash; in memory</text>
+            <text x="220" y="190" text-anchor="middle" font-size="10.5" opacity="0.65">RunSc 36 · RunXp 37 · carried skulls</text>
+
+            <!-- right column -->
+            <rect x="470" y="34" width="400" height="44" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+            <text x="670" y="61" text-anchor="middle" font-size="12">GROW / Walk Mode &mdash; 16.7 clicks/s sustained</text>
+
+            <line x1="670" y1="78" x2="670" y2="90" stroke="currentColor" stroke-width="1.2" marker-end="url(#cs-a)"></line>
+
+            <rect x="470" y="92" width="400" height="44" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+            <text x="670" y="119" text-anchor="middle" font-size="12">production batches · food · stalls</text>
+
+            <line x1="670" y1="136" x2="670" y2="148" stroke="currentColor" stroke-width="1.2" marker-end="url(#cs-a)"></line>
+
+            <rect x="470" y="150" width="400" height="52" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+            <text x="670" y="171" text-anchor="middle" font-size="12">pending deltas &mdash; in memory</text>
+            <text x="670" y="190" text-anchor="middle" font-size="10.5" opacity="0.65">flush: timer · trade · page hide</text>
+
+            <!-- boundary -->
+            <line x1="20" y1="234" x2="880" y2="234" stroke="#2b7a54" stroke-width="1.5" stroke-dasharray="7 5"></line>
+            <text x="20" y="228" font-size="11" letter-spacing="1.4" fill="#2b7a54">THE BOUNDARY — chosen by the game, not by a timer</text>
+
+            <line x1="220" y1="202" x2="220" y2="252" stroke="#2b7a54" stroke-width="1.8" marker-end="url(#cs-g)"></line>
+            <text x="232" y="222" font-size="10.5" fill="#2b7a54">1 call per run</text>
+
+            <line x1="670" y1="202" x2="670" y2="252" stroke="#2b7a54" stroke-width="1.8" marker-end="url(#cs-g)"></line>
+            <text x="682" y="222" font-size="10.5" fill="#2b7a54">1 call per few seconds</text>
+
+            <!-- ledger -->
+            <rect x="30" y="254" width="840" height="58" fill="none" stroke="#2b7a54" stroke-width="1.8"></rect>
+            <text x="450" y="278" text-anchor="middle" font-size="12.5" fill="#2b7a54">fehu-economy &mdash; one writer, every command journaled and fsynced before it answers</text>
+            <text x="450" y="298" text-anchor="middle" font-size="10.5" fill="#2b7a54" opacity="0.85">20 mutations/s per credential · idempotent on retry · replayed from the journal on restart</text>
+
+            <text x="30" y="332" font-size="10.5" opacity="0.65">Above the line, losing the state is correct: an unbanked run and an unflushed batch are both worth nothing by design.</text>
+          </g>
+        </svg>
+        <figcaption>
+          <b>Figure</b>
+          Two hot paths at very different rates, the same boundary, the same ledger. The rule is not
+          &ldquo;batch your writes&rdquo; — it is that the crossing point should be a moment the game
+          already treats as meaningful, so that what is lost above the line is exactly what a player
+          would agree they had not earned yet.
+        </figcaption>
+      </figure>
+    </section>
+
+    <section>
+      <span class="mark">What generalises</span>
+      <h2>Five things that came out of both, not one.</h2>
+
+      <div class="lessons">
+        <div>
+          <h4>Settle at a boundary the game already has</h4>
+          <p>
+            Run end and page hide are not arbitrary flush points — they are moments where the player
+            already understands that something has concluded. Pick those and the failure semantics
+            explain themselves; pick a timer and you have to invent a story about the last four
+            seconds.
+          </p>
+        </div>
+        <div>
+          <h4>Move property. Leave progress alone.</h4>
+          <p>
+            XP, levels, energy and season points have no scarcity, no owner-to-owner transfer and no
+            inflation risk. Putting them in a ledger costs a round trip and buys nothing. Both
+            integrations moved less than half of what looked at first like &ldquo;the economy&rdquo;.
+          </p>
+        </div>
+        <div>
+          <h4>Idempotency belongs on the game&rsquo;s own event id</h4>
+          <p>
+            A transport-level key protects against a lost response. A key on <code>run:8f2c1a</code>
+            or <code>season:7:tier:12</code> protects against the same event being reported twice by
+            two different paths a year apart — which is the failure that actually happens.
+          </p>
+        </div>
+        <div>
+          <h4>Randomness stays upstream</h4>
+          <p>
+            A ledger that replays its journal cannot roll dice. Crate contents, loot tables and drop
+            rates stay in the game, and only the outcome is recorded. This is a constraint that reads
+            as a limitation and behaves as a clarification.
+          </p>
+        </div>
+        <div>
+          <h4>Migration cost is set by one question</h4>
+          <p>
+            Can you reset the world? Global Conflict can, and already does on every config change, so
+            its migration is free. DeadCity cannot, so its cutover is a deliberate mint with a number
+            written down. Nothing else about the two integrations differs by as much.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <span class="mark">Where each lands</span>
+      <h2>Different asks, for the same reason.</h2>
+      <div class="ledger">
+        <div class="dc">
+          <span class="who">DeadCity</span>
+          <h4>A two-week shadow spike</h4>
+          <p>
+            Provision on login, settle one district&rsquo;s runs into fehu at run end, and let the
+            attributes keep deciding what the player sees. Diff the two nightly for a week.
+          </p>
+          <p>
+            If they agree, the rest is a phase plan with one one-way door. If they disagree, that is
+            a payout bug which has been invisible until now — which is itself the result, and the
+            cheapest way this project will ever find it.
+          </p>
+        </div>
+        <div class="gc">
+          <span class="who">Global Conflict v2</span>
+          <h4>One sprint, six methods</h4>
+          <p>
+            The seam already exists: <code>GameClient.ts</code> was written with a second
+            implementation in mind and says so. Implement six market methods against fehu, delegate
+            the rest to the existing mock, gate it on a build-time host.
+          </p>
+          <p>
+            With no host configured the Pages deploy is unchanged. The demo is two browsers trading
+            with each other — the first thing this game has ever done that needed two.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <span class="mark">The documents</span>
+      <h2>Where the detail lives.</h2>
+      <div class="docs">
+        <a class="row" href="https://claude.ai/code/artifact/733f88f6-5037-4773-9e8e-fd21a14f817f">
+          <span class="game">DeadCity</span>
+          <span class="title">DeadCity Economy on fehu</span>
+          <span class="kind">architecture</span>
+        </a>
+        <a class="row" href="https://claude.ai/code/artifact/1bd26dc9-8161-40c8-b8ae-ed678c723a0b">
+          <span class="game">DeadCity</span>
+          <span class="title">The Ledger DeadCity Doesn&rsquo;t Have</span>
+          <span class="kind">the case</span>
+        </a>
+        <a class="row" href="https://claude.ai/code/artifact/cd8ca7ed-a056-4148-9e7d-3f4353fec38a">
+          <span class="game">Global Conflict v2</span>
+          <span class="title">Global Conflict on fehu</span>
+          <span class="kind">architecture</span>
+        </a>
+        <a class="row" href="https://claude.ai/code/artifact/2800d406-6a8b-4619-8b95-265c213a8093">
+          <span class="game">Global Conflict v2</span>
+          <span class="title">One Save File, 190 Puppets</span>
+          <span class="kind">the case</span>
+        </a>
+      </div>
+      <p style="margin-top:1.4rem">
+        Neither integration has been built. Both designs were written against the current code in
+        the three repositories, and every figure quoted here — click rates, symbol counts, attribute
+        keys, tick budgets — was read out of it rather than estimated.
+      </p>
+    </section>
+
+    <footer>
+      <span>Case study &middot; fehu &times; DeadCity &times; Global Conflict v2</span>
+      <span>fehu/docs/case-study/two-games-one-ledger.html</span>
+    </footer>
+
+  </main>
+</div>
