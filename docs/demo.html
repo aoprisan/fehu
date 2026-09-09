@@ -1,0 +1,1883 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fehu — a server you can watch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500;600&display=swap">
+<style>
+:root {
+  --ground:      #edf1f2;
+  --surface:     #ffffff;
+  --surface-2:   #f5f8f9;
+  --surface-3:   #e6ecee;
+  --ink:         #0f181e;
+  --ink-2:       #38474f;
+  --muted:       #6a7c86;
+  --line:        #c7d3d8;
+  --line-soft:   #dee7ea;
+  --accent:      #a2560f;
+  --accent-2:    #c9761f;
+  --accent-wash: #f4e6d4;
+  --buy:         #0e6a58;
+  --sell:        #a63a2f;
+  --engine:      #3a4bab;
+  --stream:      #7a4599;
+  --disk:        #2f7d8c;
+  --shadow:      0 1px 2px rgba(15, 24, 30, .06), 0 8px 24px -12px rgba(15, 24, 30, .18);
+
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+  --serif: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:      #0c1216;
+    --surface:     #131c22;
+    --surface-2:   #18242b;
+    --surface-3:   #1f2d35;
+    --ink:         #e3ecf0;
+    --ink-2:       #b0c1ca;
+    --muted:       #7d919c;
+    --line:        #2b3a43;
+    --line-soft:   #1e2a31;
+    --accent:      #e0994a;
+    --accent-2:    #f0b268;
+    --accent-wash: #35250f;
+    --buy:         #3cbb9c;
+    --sell:        #e97e6f;
+    --engine:      #8e9cf0;
+    --stream:      #c294e2;
+    --disk:        #63c2d2;
+    --shadow:      0 1px 2px rgba(0, 0, 0, .4), 0 10px 30px -14px rgba(0, 0, 0, .7);
+  }
+}
+:root[data-theme="dark"] {
+  --ground:      #0c1216;
+  --surface:     #131c22;
+  --surface-2:   #18242b;
+  --surface-3:   #1f2d35;
+  --ink:         #e3ecf0;
+  --ink-2:       #b0c1ca;
+  --muted:       #7d919c;
+  --line:        #2b3a43;
+  --line-soft:   #1e2a31;
+  --accent:      #e0994a;
+  --accent-2:    #f0b268;
+  --accent-wash: #35250f;
+  --buy:         #3cbb9c;
+  --sell:        #e97e6f;
+  --engine:      #8e9cf0;
+  --stream:      #c294e2;
+  --disk:        #63c2d2;
+  --shadow:      0 1px 2px rgba(0, 0, 0, .4), 0 10px 30px -14px rgba(0, 0, 0, .7);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 34px 22px 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+/* ---------- header ---------- */
+
+.masthead { display: flex; flex-direction: column; gap: 10px; }
+
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0;
+}
+
+h1 {
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: clamp(30px, 4.4vw, 46px);
+  line-height: 1.06;
+  letter-spacing: -.015em;
+  margin: 0;
+  text-wrap: balance;
+}
+
+.deck { margin: 0; max-width: 68ch; color: var(--ink-2); font-size: 16.5px; }
+
+.deck code, .rule code, .note code, .tape code, .cap code { font-family: var(--mono); font-size: .88em; }
+
+.rule {
+  border-left: 3px solid var(--accent);
+  padding: 4px 0 4px 14px;
+  margin: 2px 0 0;
+  max-width: 74ch;
+  color: var(--ink-2);
+}
+.rule b { color: var(--ink); font-weight: 600; margin-right: 4px; }
+
+/* ---------- controls ---------- */
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 8px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
+.acts { display: flex; flex-wrap: wrap; gap: 6px; flex: 1 1 460px; }
+
+.chip {
+  appearance: none;
+  font: 500 12.5px/1 var(--sans);
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 8px 11px;
+  cursor: pointer;
+  transition: background .12s, color .12s, border-color .12s;
+}
+.chip:hover:not(:disabled) { border-color: var(--muted); color: var(--ink); }
+.chip:disabled { opacity: .45; cursor: not-allowed; }
+.chip.danger { border-color: color-mix(in srgb, var(--sell) 55%, var(--line)); color: var(--sell); }
+.chip.disk { border-color: color-mix(in srgb, var(--disk) 55%, var(--line)); color: var(--disk); }
+
+.transport { display: flex; align-items: center; gap: 6px; }
+
+.tbtn {
+  appearance: none;
+  font: 500 12.5px/1 var(--mono);
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 8px 12px;
+  min-width: 38px;
+  cursor: pointer;
+}
+.tbtn:hover { border-color: var(--muted); }
+.tbtn.primary { background: var(--ink); color: var(--surface); border-color: var(--ink); min-width: 74px; }
+.speed {
+  font: 500 12.5px/1 var(--mono);
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 8px 8px;
+}
+button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ---------- board ---------- */
+
+.board {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  padding: 6px 6px 0;
+  margin: 0;
+  overflow-x: auto;
+}
+.board svg { display: block; width: 100%; height: auto; min-width: 880px; }
+.board figcaption {
+  border-top: 1px solid var(--line-soft);
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--muted);
+  min-width: 880px;
+}
+.board figcaption b { color: var(--ink-2); font-weight: 600; }
+
+.n-box { fill: var(--surface-2); stroke: var(--line); stroke-width: 1.25; }
+.n-box.big { fill: var(--surface-3); }
+.n-title { font: 600 12.5px var(--sans); fill: var(--ink); }
+.n-sub   { font: 400 10px var(--mono); fill: var(--muted); }
+.n-num   { font: 500 12px var(--mono); fill: var(--ink); }
+.n-num.up { fill: var(--buy); }
+.n-num.down { fill: var(--sell); }
+.e-line  { fill: none; stroke: var(--line); stroke-width: 1.5; }
+.e-line.dashed { stroke-dasharray: 5 4; }
+.e-label { font: 500 10px var(--mono); fill: var(--muted); }
+.strip   { fill: var(--surface); stroke: var(--line-soft); stroke-width: 1; }
+.slot    { fill: none; stroke: var(--line); stroke-width: 1; }
+.slot.on { fill: var(--accent); stroke: var(--accent); }
+
+.n-box.lit       { stroke: var(--accent); stroke-width: 2.25; fill: var(--accent-wash); }
+.n-box.lit-engine{ stroke: var(--engine); stroke-width: 2.25; }
+.n-box.lit-stream{ stroke: var(--stream); stroke-width: 2.25; }
+.n-box.lit-disk  { stroke: var(--disk);   stroke-width: 2.25; }
+.n-box.dead      { opacity: .28; }
+.e-line.lit { stroke: var(--accent); stroke-width: 2.4; }
+.tok { fill: var(--accent); stroke: var(--surface); stroke-width: 1.4; }
+.tok.engine { fill: var(--engine); }
+.tok.stream { fill: var(--stream); }
+.tok.disk   { fill: var(--disk); }
+.tok.bad    { fill: var(--sell); }
+.spark { fill: none; stroke: var(--accent); stroke-width: 1.4; }
+.depth-bid { fill: color-mix(in srgb, var(--buy) 42%, transparent); }
+.depth-ask { fill: color-mix(in srgb, var(--sell) 42%, transparent); }
+
+/* ---------- panels ---------- */
+
+.grid-2 { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+.grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(288px, 1fr)); gap: 18px; align-items: start; }
+@media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.panel-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--surface-2);
+}
+.panel-head h2 {
+  margin: 0;
+  font: 600 11.5px/1 var(--mono);
+  letter-spacing: .13em; text-transform: uppercase; color: var(--ink-2);
+}
+.panel-head .meta { font: 400 11.5px/1 var(--mono); color: var(--muted); }
+.panel-body { padding: 14px; display: flex; flex-direction: column; gap: 14px; }
+.panel-foot { border-top: 1px solid var(--line-soft); padding: 9px 14px; font: 400 11.5px/1.5 var(--mono); color: var(--muted); }
+
+/* tapes */
+.tape { max-height: 330px; overflow-y: auto; }
+.tape ol { list-style: none; margin: 0; padding: 0; }
+.tape li {
+  display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 10px;
+  padding: 7px 14px; border-bottom: 1px solid var(--line-soft);
+  animation: slidein .25s ease-out;
+}
+.tape li:last-child { border-bottom: 0; }
+.tape .seq { font: 500 11px/1.6 var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.tape .who { font: 500 10px/1.6 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+.tape .t { font: 600 12.5px/1.4 var(--mono); color: var(--ink); }
+.tape .b { display: block; font: 400 12px/1.45 var(--sans); color: var(--ink-2); }
+.tape .r { display: block; font: 400 10.5px/1.5 var(--mono); color: var(--muted); margin-top: 2px; }
+.tape .who { margin-right: 5px; }
+.tape li.mark { background: color-mix(in srgb, var(--disk) 12%, transparent); }
+.tape li.mark .t { color: var(--disk); }
+.tape li.replayed { background: var(--accent-wash); }
+.tape li.refused .t { color: var(--sell); }
+.tape li.tick { opacity: .55; }
+.chip.mini { padding: 4px 8px; font-size: 11px; font-family: var(--mono); }
+.who.user { color: var(--accent); }
+.who.engine { color: var(--engine); }
+.who.operator { color: var(--ink-2); }
+.who.service { color: var(--stream); }
+@keyframes slidein { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+
+.kv { display: grid; grid-template-columns: 1fr auto; gap: 5px 10px; margin: 0; }
+.kv dt { font: 400 12px var(--sans); color: var(--muted); margin: 0; }
+.kv dd { margin: 0; font: 500 12.5px var(--mono); font-variant-numeric: tabular-nums; text-align: right; color: var(--ink); }
+.kv dd.hold { color: var(--accent); }
+.kv dd.pos  { color: var(--buy); }
+.kv dd.neg  { color: var(--sell); }
+.kv dt.deep { padding-left: 12px; font-family: var(--mono); font-size: 11px; }
+
+.sub { font: 600 10.5px/1 var(--mono); letter-spacing: .13em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
+
+.ladder { display: flex; flex-direction: column; gap: 1px; }
+.lrow {
+  display: grid; grid-template-columns: 56px 44px minmax(0, 1fr); gap: 8px; align-items: center;
+  font: 500 12px var(--mono); font-variant-numeric: tabular-nums; padding: 1px 0;
+}
+.lrow .p { text-align: right; }
+.lrow .q { text-align: right; color: var(--muted); }
+.lrow.ask .p { color: var(--sell); }
+.lrow.bid .p { color: var(--buy); }
+.bar { height: 9px; border-radius: 1px; background: var(--line-soft); }
+.lrow.ask .bar { background: color-mix(in srgb, var(--sell) 34%, transparent); }
+.lrow.bid .bar { background: color-mix(in srgb, var(--buy) 34%, transparent); }
+.lrow.mine { background: var(--accent-wash); }
+.lrow.mine .p { color: var(--accent); }
+.lrow.mine .bar { background: color-mix(in srgb, var(--accent) 55%, transparent); }
+.spread {
+  display: flex; justify-content: space-between;
+  font: 400 10.5px var(--mono); color: var(--muted);
+  border-top: 1px dashed var(--line); border-bottom: 1px dashed var(--line);
+  padding: 4px 0; margin: 3px 0;
+}
+
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font: 500 11px var(--mono); letter-spacing: .04em;
+  padding: 4px 8px; border-radius: 3px;
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-2);
+}
+.pill.ok   { border-color: var(--buy);  color: var(--buy); }
+.pill.bad  { border-color: var(--sell); color: var(--sell); }
+.pill.live { border-color: var(--accent); color: var(--accent); }
+.pill.disk { border-color: var(--disk); color: var(--disk); }
+
+.rows { display: flex; flex-direction: column; gap: 7px; }
+.row {
+  display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 8px; align-items: center;
+  font: 500 12px var(--mono); font-variant-numeric: tabular-nums;
+}
+.row .lab { font-family: var(--sans); font-weight: 400; color: var(--ink-2); }
+.meter { height: 6px; background: var(--line-soft); border-radius: 3px; overflow: hidden; grid-column: 1 / -1; }
+.meter i { display: block; height: 100%; background: var(--accent); transition: width .3s; }
+.meter.job i { background: var(--engine); }
+.meter.good i { background: var(--buy); }
+.empty { font: 400 12px var(--sans); color: var(--muted); font-style: italic; }
+
+/* ---------- crash / replay ---------- */
+
+.verify { border-color: var(--disk); }
+.verify .panel-head { background: color-mix(in srgb, var(--disk) 10%, var(--surface-2)); }
+.replay-steps { display: flex; flex-direction: column; gap: 0; }
+.rstep {
+  display: grid; grid-template-columns: 24px minmax(0,1fr) auto; gap: 10px; align-items: baseline;
+  padding: 9px 14px; border-bottom: 1px solid var(--line-soft);
+  opacity: .38; transition: opacity .2s, background .2s;
+}
+.rstep:last-child { border-bottom: 0; }
+.rstep.done { opacity: 1; }
+.rstep.now { opacity: 1; background: color-mix(in srgb, var(--disk) 12%, transparent); }
+.rstep .n { font: 500 11px var(--mono); color: var(--muted); }
+.rstep .t { font: 500 13px var(--sans); color: var(--ink); }
+.rstep .t small { display: block; font: 400 11.5px var(--mono); color: var(--muted); }
+.rstep .v { font: 500 11.5px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.hashes { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+.hash {
+  border: 1px solid var(--line); border-radius: 3px; padding: 10px 12px; background: var(--surface-2);
+}
+.hash .k { display: block; font: 600 10px var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+.hash .v { display: block; margin-top: 3px; font: 600 16px var(--mono); color: var(--ink); letter-spacing: .02em; }
+.hash.match { border-color: var(--buy); }
+.hash.match .v { color: var(--buy); }
+.verdict {
+  font: 600 13px var(--sans); padding: 10px 12px; border-radius: 3px;
+  background: color-mix(in srgb, var(--buy) 12%, transparent);
+  color: var(--buy); border: 1px solid color-mix(in srgb, var(--buy) 45%, transparent);
+}
+.verdict.pending { background: var(--surface-2); color: var(--muted); border-color: var(--line); }
+
+/* ---------- notes ---------- */
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font: 400 12px var(--sans); color: var(--muted); padding: 0 2px; }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.swatch { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+
+.notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); gap: 16px; }
+.note { border-top: 2px solid var(--line); padding-top: 12px; }
+.note h3 { margin: 0 0 5px; font: 600 13.5px var(--sans); color: var(--ink); }
+.note p { margin: 0; font-size: 13px; color: var(--ink-2); }
+.note.a { border-top-color: var(--accent); }
+.note.e { border-top-color: var(--engine); }
+.note.s { border-top-color: var(--stream); }
+.note.d { border-top-color: var(--disk); }
+
+h2.section {
+  font-family: var(--serif); font-weight: 600; font-size: 25px; letter-spacing: -.01em;
+  margin: 12px 0 -8px;
+}
+.cap { margin: 0; max-width: 74ch; color: var(--ink-2); font-size: 14px; }
+
+footer {
+  border-top: 1px solid var(--line); padding-top: 14px;
+  font: 400 12px var(--mono); color: var(--muted);
+  display: flex; flex-wrap: wrap; gap: 4px 16px;
+}
+footer a { color: var(--accent); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="masthead">
+    <p class="eyebrow">fehu · economy server · a working model</p>
+    <h1>A server you can watch</h1>
+    <p class="deck">
+      Everything below is running. A miniature of <code>fehu-economy</code> — its actors, its
+      command journal, its ledger, its books and its world — is executing in this page, one
+      command at a time, and every number you see was produced by it rather than written down.
+      Push it around with the buttons, then crash it and watch the journal put it back.
+    </p>
+    <p class="rule">
+      <b>The one invariant:</b>
+      nothing changes the market except a <code>Command</code>. The engine tick is one. Your order
+      is one. Replay is the same <code>apply</code> over the same commands — which is why a
+      snapshot plus the entries after it reproduces the world exactly, and why the hash at the
+      bottom of this page comes back identical.
+    </p>
+  </header>
+
+  <div class="controls">
+    <div class="acts" id="acts" role="group" aria-label="Send a command"></div>
+    <div class="transport">
+      <button class="tbtn primary" id="play">Pause</button>
+      <select class="speed" id="speed" aria-label="Engine speed">
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+        <option value="4">4×</option>
+      </select>
+    </div>
+  </div>
+
+  <figure class="board">
+    <svg id="map" viewBox="0 0 1100 508" role="img"
+         aria-label="Live map of the fehu economy server: players, the game backend and the operator call an axum router whose middleware counts requests, rate-limits writes and admits them; every mutation becomes one job on the single market actor, which appends it to the journal on disk, calls the per-symbol actors that own the simulators and books, and publishes the result to the stream actor that feeds server-sent events back to browsers. A background engine loop sends the market a Step command on a timer."></svg>
+    <figcaption id="caption"><b>Warming up.</b> Genesis commands are going through the journal.</figcaption>
+  </figure>
+
+  <div class="legend">
+    <span><i class="swatch" style="background: var(--accent)"></i> a command from a client</span>
+    <span><i class="swatch" style="background: var(--engine)"></i> the engine step</span>
+    <span><i class="swatch" style="background: var(--stream)"></i> a published fact</span>
+    <span><i class="swatch" style="background: var(--disk)"></i> a write to disk</span>
+    <span>dashed edge — a read, which never queues behind the market</span>
+  </div>
+
+  <h2 class="section">What just happened</h2>
+  <p class="cap">
+    The left column is the journal file: one line per accepted command, in the order the market
+    actor ran them. The right column is what the world looks like now — assembled from the same
+    state those commands built. Refusals never reach the journal, so a refused command leaves
+    nothing behind and a retry is simply tried again.
+  </p>
+
+  <div class="grid-2">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Command journal</h2>
+        <span class="meta"><button class="chip mini" id="jfilter" aria-pressed="false">hide Step</button>
+        <span id="journal-meta">seq 0</span></span>
+      </div>
+      <div class="tape" id="journal"><ol id="journal-list"></ol></div>
+      <div class="panel-foot" id="journal-foot">journal.rs · append, fsync, then answer</div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Market actor</h2>
+        <span class="meta" id="market-meta">idle</span>
+      </div>
+      <div class="panel-body">
+        <div>
+          <p class="sub">Simulated clock</p>
+          <dl class="kv">
+            <dt>Market::now (pinned while applying)</dt><dd id="v-now">—</dd>
+            <dt>Engine steps applied</dt><dd id="v-steps">0</dd>
+            <dt>Commands refused (not journaled)</dt><dd id="v-refused" class="neg">0</dd>
+          </dl>
+        </div>
+        <div>
+          <p class="sub">Currency is conserved</p>
+          <dl class="kv" id="wallets"></dl>
+        </div>
+        <div>
+          <p class="sub">Flow meter · by reason</p>
+          <div class="rows" id="flow"></div>
+        </div>
+      </div>
+      <div class="panel-foot" id="supply-foot">—</div>
+    </section>
+  </div>
+
+  <div class="grid-3">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Book · <span id="book-sym">ACME</span></h2>
+        <span class="meta" id="book-meta">—</span>
+      </div>
+      <div class="panel-body">
+        <div class="ladder" id="ladder"></div>
+        <dl class="kv" id="position"></dl>
+      </div>
+      <div class="panel-foot">book.rs · price–time priority, whole cents, integer shares</div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>The world</h2>
+        <span class="meta" id="world-meta">—</span>
+      </div>
+      <div class="panel-body">
+        <div>
+          <p class="sub">Player inventory</p>
+          <div class="rows" id="goods"></div>
+        </div>
+        <div>
+          <p class="sub">Jobs in flight</p>
+          <div class="rows" id="jobs"></div>
+        </div>
+        <div>
+          <p class="sub">Event modifiers · ramping down</p>
+          <div class="rows" id="mods"></div>
+        </div>
+      </div>
+      <div class="panel-foot">jobs.rs · world.rs — integer basis points, no clock, no RNG</div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Published</h2>
+        <span class="meta" id="stream-meta">seq 0</span>
+      </div>
+      <div class="tape" id="stream" style="max-height:290px"><ol id="stream-list"></ol></div>
+      <div class="panel-foot" id="outbox-foot">outbox.rs · durable, cursor-replayable</div>
+    </section>
+  </div>
+
+  <h2 class="section">Now kill it</h2>
+  <p class="cap">
+    The snapshot on disk is minutes out of date and that is fine: it records the journal sequence
+    it includes, and everything after it is still in the file beside it. Press the button and the
+    live state is thrown away — then rebuilt by replaying those entries through the very same
+    <code>apply</code> that accepted them, with the instant read from each entry instead of from a
+    clock. The FNV-1a hash of the whole world is taken before and after.
+  </p>
+
+  <section class="panel verify">
+    <div class="panel-head">
+      <h2>Crash · resume · verify</h2>
+      <span class="meta" id="verify-meta">idle</span>
+    </div>
+    <div class="replay-steps" id="replay-steps"></div>
+    <div class="panel-body">
+      <div class="hashes">
+        <div class="hash" id="hash-before"><span class="k">state before the crash</span><span class="v">—</span></div>
+        <div class="hash" id="hash-after"><span class="k">state after replay</span><span class="v">—</span></div>
+      </div>
+      <div class="verdict pending" id="verdict">Run it and see.</div>
+    </div>
+    <div class="panel-foot">save.rs + journal.rs · <code>App::resume</code> — the live path and the replay path are one function</div>
+  </section>
+
+  <h2 class="section">Why it is built this way</h2>
+  <div class="notes">
+    <div class="note a">
+      <h3>No locks anywhere</h3>
+      <p>
+        Every piece of state belongs to one task and is reached by sending it a closure. Calls go
+        one way — the market calls the symbols; the symbols call nobody — so there is no cycle to
+        deadlock and nothing to design around. Money queues single file on one mailbox; reads go
+        straight to a symbol and wait on nothing.
+      </p>
+    </div>
+    <div class="note e">
+      <h3>The tick is a command</h3>
+      <p>
+        A step carries the simulated instant it advances to, so an order that filled against the
+        price at 12:04:31 fills against it again on replay. That is the only reading of the clock
+        in the whole apply path: a command may not read anything a replay cannot.
+      </p>
+    </div>
+    <div class="note d">
+      <h3>Refusals leave nothing</h3>
+      <p>
+        Every path validates fully before it mutates. A command that is refused is not journaled,
+        so a retry of a refusal is just tried again — and the idempotency index means a retry of a
+        <em>success</em> gets the first answer back rather than a second effect.
+      </p>
+    </div>
+    <div class="note s">
+      <h3>The stream is not the record</h3>
+      <p>
+        Server-sent events are best effort, for charts. The same facts are appended to the outbox
+        inside the command that caused them, numbered and retained, so a game backend that was
+        restarting can ask again from its cursor and get them.
+      </p>
+    </div>
+  </div>
+
+  <footer>
+    <span>fehu · a deterministic synthetic market</span>
+    <span>this page runs a model, not the server: the rules are the same, the scale is not</span>
+    <span><a href="architecture.html">where an order goes →</a></span>
+  </footer>
+</div>
+<script>
+"use strict";
+/* =====================================================================
+ * A model of crates/fehu-economy, small enough to watch.
+ *
+ * The shapes are the server's shapes: one `apply` that is the only thing
+ * that ever changes the world, a journal of the commands that went through
+ * it, a snapshot that records the sequence it includes, and a resume that
+ * replays the rest through the same function. Everything the page draws is
+ * read out of the state those commands built.
+ * ===================================================================== */
+
+/* ------------------------------ numbers ---------------------------- */
+
+const fmtCents = c => (c < 0 ? "-" : "") + Math.abs(c).toLocaleString("en-US") + "¢";
+const fmtUsd = c => {
+  const neg = c < 0; c = Math.abs(c);
+  return (neg ? "-$" : "$") + Math.floor(c / 100).toLocaleString("en-US") + "." + String(c % 100).padStart(2, "0");
+};
+const fmtInt = n => n.toLocaleString("en-US");
+const clockOf = ms => {
+  const t = Math.floor(ms / 1000);
+  return String(Math.floor(t / 3600) % 24).padStart(2, "0") + ":" +
+         String(Math.floor(t / 60) % 60).padStart(2, "0") + ":" +
+         String(t % 60).padStart(2, "0");
+};
+
+/* Canonical JSON — keys sorted, so two worlds that hold the same thing
+ * hash the same however they were built up. */
+function canon(v) {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
+  return "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}";
+}
+/* FNV-1a, as crates/fehu/tests/determinism.rs uses to pin its golden ticks. */
+function fnv1a(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i) & 0xff;
+    h = Math.imul(h, 0x01000193) >>> 0;
+    h ^= s.charCodeAt(i) >>> 8;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+const hashWorld = w => "0x" + fnv1a(canon(w)).toString(16).padStart(8, "0");
+const clone = o => JSON.parse(JSON.stringify(o));
+
+/* --------------------------- the RNG stream ------------------------ */
+/* xorshift128. The state is part of the world, so a restored snapshot
+ * draws exactly the numbers the crashed process would have drawn next. */
+
+function nextU32(s) {
+  let t = s[3] >>> 0; const w = s[0] >>> 0;
+  s[3] = s[2]; s[2] = s[1]; s[1] = w;
+  t ^= (t << 11) >>> 0; t >>>= 0;
+  t ^= t >>> 8;
+  t ^= w ^ (w >>> 19);
+  s[0] = t >>> 0;
+  return s[0];
+}
+const unit = s => nextU32(s) / 4294967296;
+function normal(s) {
+  let u = unit(s); if (u < 1e-12) u = 1e-12;
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * unit(s));
+}
+const seedFrom = n => [(n ^ 0x9e3779b9) >>> 0, (n * 2654435761 ^ 0x85ebca6b) >>> 0,
+                       (n * 1103515245 + 12345) >>> 0, (n ^ 0xc2b2ae35) >>> 0];
+
+/* ------------------------------ statics ---------------------------- */
+
+const SYMS = ["ACME", "BRIG", "CRUX"];
+const START = { ACME: 5000, BRIG: 1840, CRUX: 12600 };
+const TICKS_PER_STEP = 5;      // simulated seconds an engine step advances
+const FEE_BPS = 10;            // the venue's cut of a fill
+const PLAYER = "player:1";
+
+const WALLET_KIND = {
+  "treasury": "Treasury", "issuance": "Issuance", "venue": "Venue",
+  "synthetic": "Synthetic", "budget:quests": "Budget", [PLAYER]: "Player",
+};
+for (const s of SYMS) WALLET_KIND["npc:" + s] = "Npc";
+WALLET_KIND["issuer:goods"] = "Issuer";
+
+const CATALOG = { ORE: 120, FUEL: 90 };
+const RECIPE = {
+  INGOT: { inputs: { ORE: 2, FUEL: 1 }, cost: 40, yield: 1, seconds: 30 },
+};
+const GAME_EVENTS = {
+  collapse: { label: "Mine collapse at the ACME seam", sym: "ACME", sim: { jump: -0.035, vol: 2.2 },
+              effect: "production", bps: -3000, seconds: 180 },
+  festival: { label: "Harvest festival", sym: "BRIG", sim: { jump: 0.022, drift: 0.02 },
+              effect: "demand", bps: 2500, seconds: 180 },
+};
+
+/* ------------------------------- state ----------------------------- */
+
+let world = null;      // the live market: everything a command may touch
+let journal = null;    // { entries: [...since the snapshot], nextSeq }
+let snapshot = null;   // { world, seq } — the file on disk
+let stream = null;     // { seq, buf } — published, not state: rebuilt on resume
+let stats = { refused: 0 };
+
+function emptyWorld() {
+  const w = {
+    nowMs: 9 * 3600 * 1000,          // the simulated clock: 09:00:00
+    steps: 0,
+    wallets: {}, resv: {}, positions: {}, goods: {},
+    books: {}, sims: {}, bars: {}, prints: {},
+    flow: {}, jobs: [], mods: [], simEvents: {},
+    outbox: { seq: 0, entries: [] },
+    idem: {}, rewardsPaid: {},
+    nextOrderId: 1, nextJobId: 1,
+  };
+  for (const k of Object.keys(WALLET_KIND)) { w.wallets[k] = 0; }
+  for (const t of [PLAYER, ...SYMS.map(s => "npc:" + s)]) {
+    w.resv[t] = { cash: 0, shares: {} };
+    w.positions[t] = {};
+  }
+  w.goods[PLAYER] = {};
+  for (const s of SYMS) {
+    w.books[s] = { bids: [], asks: [] };
+    w.sims[s] = { logp: Math.log(START[s]), fund: START[s], vari: 1e-5, shock: 0, rng: seedFrom(START[s] * 7 + 11) };
+    w.bars[s] = [START[s]];
+    w.prints[s] = [];
+    w.simEvents[s] = [];
+  }
+  return w;
+}
+
+/* ------------------------------ ledger ----------------------------- */
+/* One balanced transaction or none. Integer cents throughout; the sum over
+ * every wallet is zero at every instant, which is what "conserved" means. */
+
+function post(w, moves, reason) {
+  let sum = 0, moved = 0;
+  for (const [id, d] of moves) { sum += d; if (d > 0) moved += d; }
+  if (sum !== 0) throw new Error("unbalanced transaction");
+  for (const [id, d] of moves) w.wallets[id] = (w.wallets[id] || 0) + d;
+  w.flow[reason] = (w.flow[reason] || 0) + moved;
+}
+const supply = w => -w.wallets["issuance"];
+/* A wallet that no trader stands behind reserves nothing. */
+const avail = (w, t) => w.wallets[t] - (w.resv[t] ? w.resv[t].cash : 0);
+const held = (w, t, s) => ((w.positions[t] || {})[s] || 0) - ((w.resv[t] ? w.resv[t].shares[s] : 0) || 0);
+
+/* refusal: thrown before anything is touched, so nothing is left behind */
+function refuse(why) { const e = new Error(why); e.refusal = true; throw e; }
+
+/* ---------------------------- order book --------------------------- */
+/* Price–time priority. Bids high first, asks low first, ties by id: the
+ * order that arrived first is the order that fills first. */
+
+function bookInsert(book, o) {
+  const side = o.side === "buy" ? book.bids : book.asks;
+  side.push(o);
+  side.sort((a, b) => (o.side === "buy" ? b.price - a.price : a.price - b.price) || (a.id - b.id));
+}
+function best(book, side) { const l = side === "buy" ? book.bids : book.asks; return l.length ? l[0] : null; }
+
+/* Match `o` against the resting other side, returning the prints. */
+function match(w, sym, o) {
+  const book = w.books[sym], fills = [];
+  const opp = o.side === "buy" ? book.asks : book.bids;
+  while (o.qty > 0 && opp.length) {
+    const r = opp[0];
+    const crosses = o.price === null || (o.side === "buy" ? o.price >= r.price : o.price <= r.price);
+    if (!crosses) break;
+    const q = Math.min(o.qty, r.qty);
+    settle(w, sym, o, r, r.price, q);
+    fills.push({ price: r.price, qty: q, taker: o.owner, maker: r.owner });
+    o.qty -= q; r.qty -= q;
+    if (r.qty === 0) opp.shift();
+  }
+  return fills;
+}
+
+/* A fill: the money and the shares move in the same command, before the
+ * next job on the market actor can see either. `o` is the order that
+ * arrived, `r` the resting one it crossed. */
+function settle(w, sym, o, r, price, qty) {
+  const buyer = o.side === "buy" ? o.owner : r.owner;
+  const seller = o.side === "buy" ? r.owner : o.owner;
+  const gross = price * qty;
+  const fee = Math.ceil(gross * FEE_BPS / 10000);
+  // release the maker's standing reservation for exactly this quantity —
+  // by which side it is on, never by who owns it
+  if (r.side === "buy") w.resv[r.owner].cash -= gross;
+  else w.resv[r.owner].shares[sym] = (w.resv[r.owner].shares[sym] || 0) - qty;
+  post(w, [[buyer, -gross], [seller, gross]], "trade");
+  post(w, [[seller, -fee], ["venue", fee]], "fee");
+  w.positions[buyer][sym] = (w.positions[buyer][sym] || 0) + qty;
+  w.positions[seller][sym] = (w.positions[seller][sym] || 0) - qty;
+  w.prints[sym].unshift({ price, qty, at: w.nowMs });
+  if (w.prints[sym].length > 8) w.prints[sym].pop();
+}
+
+function cancelOrder(w, sym, id) {
+  const book = w.books[sym];
+  for (const side of ["bids", "asks"]) {
+    const i = book[side].findIndex(o => o.id === id);
+    if (i < 0) continue;
+    const o = book[side][i];
+    book[side].splice(i, 1);
+    if (o.side === "buy") w.resv[o.owner].cash -= o.price * o.qty;
+    else w.resv[o.owner].shares[sym] = (w.resv[o.owner].shares[sym] || 0) - o.qty;
+    return o;
+  }
+  return null;
+}
+
+/* ------------------------- the price process ----------------------- */
+/* The shape of crates/fehu/src/sim.rs: a slow fundamental that only game
+ * inputs move, a price that mean-reverts toward it, GARCH(1,1) volatility
+ * and Poisson jumps. Every draw comes off the symbol's own stream, so the
+ * order of the draws is part of the format. */
+
+const KAPPA = 0.02, OMEGA = 2e-7, ALPHA = 0.08, BETA = 0.9;
+const LAMBDA = 0.0025, JUMP = 0.010, DRIFT = 0.00001;
+
+function simTick(w, sym) {
+  const s = w.sims[sym];
+  let drift = DRIFT, volMul = 1, kick = 0;
+  for (const e of w.simEvents[sym]) {                 // effects decay exponentially
+    const age = (w.nowMs - e.at) / 1000;
+    const decay = Math.exp(-age / e.halfLife);
+    if (decay < 0.02) continue;
+    if (e.kind === "drift") drift += e.mag * decay * 0.001;
+    if (e.kind === "vol") volMul += (e.mag - 1) * decay;
+    if (e.kind === "jump" && !e.spent) { kick += e.mag; e.spent = true; }
+  }
+  s.fund = s.fund * Math.exp(drift);
+  s.vari = OMEGA + ALPHA * s.shock * s.shock + BETA * s.vari;
+  const sig = Math.sqrt(s.vari) * volMul;
+  s.shock = sig * normal(s.rng);
+  let jump = 0;
+  if (unit(s.rng) < LAMBDA) jump = normal(s.rng) * JUMP;
+  s.logp += KAPPA * (Math.log(s.fund) - s.logp) + s.shock + jump + kick;
+  return Math.max(1, Math.round(Math.exp(s.logp)));
+}
+const refPrice = (w, sym) => Math.max(1, Math.round(Math.exp(w.sims[sym].logp)));
+
+/* --------------------------- world modifiers ----------------------- */
+/* Integer basis points, ramping down in a straight line. Read at instants
+ * that are themselves journaled, so replay reads the same numbers. */
+
+function modifier(w, effect, at) {
+  let bps = 0;
+  for (const m of w.mods) {
+    if (m.effect !== effect) continue;
+    if (at >= m.endMs || at < m.startMs) continue;
+    const left = (m.endMs - at) / (m.endMs - m.startMs);
+    bps += Math.trunc(m.bps * left);
+  }
+  return bps;
+}
+
+/* ------------------------- the NPC merchants ----------------------- */
+/* A funded trader, re-quoted inside the engine step. It quotes what its
+ * wallet and its inventory can stand and no more, so running out shows up
+ * in the book instead of in a rule written down somewhere. */
+
+function requote(w, sym) {
+  const npc = "npc:" + sym;
+  for (const side of ["bids", "asks"]) {
+    for (const o of [...w.books[sym][side]]) if (o.owner === npc) cancelOrder(w, sym, o.id);
+  }
+  const ref = refPrice(w, sym);
+  const demand = modifier(w, "demand", w.nowMs);
+  const base = Math.max(1, Math.round(40 * (10000 + demand) / 10000));
+  for (let lvl = 1; lvl <= 4; lvl++) {
+    const qty = base * lvl;
+    const bid = Math.max(1, ref - lvl * Math.max(1, Math.round(ref * 0.0009)));
+    const ask = ref + lvl * Math.max(1, Math.round(ref * 0.0009));
+    if (avail(w, npc) >= bid * qty) place(w, sym, { side: "buy", price: bid, qty, owner: npc });
+    if (held(w, npc, sym) >= qty) place(w, sym, { side: "sell", price: ask, qty, owner: npc });
+    // a quote it cannot fund is simply not there: scarcity, visible in the book
+  }
+}
+
+
+/* One submission. Everything is checked, then the reservation is taken,
+ * then the book is touched — so a refusal leaves the world exactly as it
+ * found it, and the cash behind every resting bid is exactly what the book
+ * says it should be. */
+function place(w, sym, req) {
+  const { side, qty, owner, ioc } = req;
+  const price = req.price;
+  if (qty <= 0) refuse("quantity must be positive");
+  if (side === "buy") {
+    if (avail(w, owner) < price * qty) refuse("insufficient funds — " + fmtCents(price * qty) + " needed, " + fmtCents(avail(w, owner)) + " free");
+  } else if (held(w, owner, sym) < qty) {
+    refuse("insufficient shares — " + fmtInt(qty) + " " + sym + " needed, " + fmtInt(held(w, owner, sym)) + " free");
+  }
+  if (side === "buy") w.resv[owner].cash += price * qty;
+  else w.resv[owner].shares[sym] = (w.resv[owner].shares[sym] || 0) + qty;
+
+  const o = { id: w.nextOrderId++, side, price, qty, owner };
+  const fills = match(w, sym, o);
+  const filled = qty - o.qty;
+  if (side === "buy") w.resv[owner].cash -= price * filled;   // the filled part is spent, not reserved
+  else w.resv[owner].shares[sym] -= filled;
+
+  if (o.qty > 0) {
+    if (ioc) {                                                 // marketable-or-cancel: nothing rests
+      if (side === "buy") w.resv[owner].cash -= price * o.qty;
+      else w.resv[owner].shares[sym] -= o.qty;
+      o.qty = 0;
+    } else {
+      bookInsert(w.books[sym], o);
+    }
+  }
+  return { order: o, fills, filled, resting: o.qty };
+}
+
+/* ------------------------------- apply ----------------------------- */
+/* The only implementation of what a mutation does. The live path calls it
+ * with a command a handler built; resume calls it with a command read back
+ * out of the journal. Nothing in here reads a clock or draws a number the
+ * entry did not carry: `at` is the entry's instant, which is what
+ * Market::now answers with while a command is being applied. */
+
+function apply(w, cmd, at) {
+  const facts = [];                    // what nobody asked for: outbox + stream
+  const note = (kind, text, detail) => facts.push({ kind, text, detail });
+
+  switch (cmd.t) {
+
+  case "Genesis": {
+    post(w, [["issuance", -cmd.supply], ["treasury", cmd.supply]], "mint");
+    post(w, [["treasury", -cmd.player], [PLAYER, cmd.player]], "faucet");
+    let out = 0;
+    for (const s of SYMS) { post(w, [["treasury", -cmd.npc], ["npc:" + s, cmd.npc]], "transfer"); out += cmd.npc; }
+    post(w, [["treasury", -cmd.budget], ["budget:quests", cmd.budget]], "transfer");
+    for (const s of SYMS) w.positions["npc:" + s][s] = cmd.shares;   // the listing endowment
+    for (const s of SYMS) requote(w, s);
+    note("listed", "3 symbols listed", SYMS.join(" · "));
+    return { body: { supply: supply(w) }, facts };
+  }
+
+  case "Step": {
+    if (cmd.toMs <= w.nowMs) return { body: { ticks: 0 }, facts };
+    // the market fans the advance out to every symbol at once and joins them
+    for (let i = 0; i < TICKS_PER_STEP; i++) {
+      w.nowMs += 1000;
+      for (const s of SYMS) {
+        const p = simTick(w, s);
+        w.bars[s].push(p);
+        if (w.bars[s].length > 90) w.bars[s].shift();
+      }
+    }
+    w.nowMs = cmd.toMs;
+    w.steps++;
+    for (const s of SYMS) requote(w, s);           // then it settles what each did
+    // jobs come due at the instant the step is advancing to
+    const done = [];
+    for (const j of [...w.jobs]) {
+      if (j.dueMs > w.nowMs) continue;
+      w.jobs.splice(w.jobs.indexOf(j), 1);
+      for (const [g, n] of Object.entries(j.outputs)) w.goods[j.owner][g] = (w.goods[j.owner][g] || 0) + n;
+      done.push(j);
+      note("job.done", "job #" + j.id + " delivered",
+           Object.entries(j.outputs).map(([g, n]) => n + "× " + g).join(", "));
+    }
+    for (const j of done) noteOutbox(w, "job.done", { job: j.id, outputs: j.outputs });
+    // ticks go on the stream and deliberately not into the outbox: they are
+    // market data, reconstructible from the bars at any time
+    note("tick", SYMS.map(s => s + " " + fmtCents(refPrice(w, s))).join("   "), "at " + clockOf(w.nowMs));
+    return { body: { ticks: TICKS_PER_STEP * SYMS.length, jobs: done.length }, facts };
+  }
+
+  case "PlaceOrder": {
+    const r = place(w, cmd.sym, { side: cmd.side, price: cmd.price, qty: cmd.qty, owner: cmd.trader, ioc: cmd.ioc });
+    for (const f of r.fills) {
+      note("fill", cmd.sym + " " + cmd.side + " " + fmtInt(f.qty) + " @ " + fmtCents(f.price),
+           "taker " + short(f.taker) + " · maker " + short(f.maker));
+      noteOutbox(w, "fill", { sym: cmd.sym, price: f.price, qty: f.qty });
+    }
+    return { body: { order_id: r.order.id, filled: r.filled, resting: r.resting }, facts };
+  }
+
+  case "CancelOrder": {
+    const book = w.books[cmd.sym];
+    const mine = [...book.bids, ...book.asks].find(x => x.id === cmd.id && x.owner === cmd.trader);
+    if (!mine) refuse("no such order");
+    const o = cancelOrder(w, cmd.sym, cmd.id);
+    return { body: { cancelled: o.id }, facts };
+  }
+
+  case "Purchase": {
+    const price = CATALOG[cmd.good];
+    if (price === undefined) refuse("no such catalogue line");
+    const total = price * cmd.units;
+    if (avail(w, cmd.buyer) < total) refuse("insufficient funds — " + fmtCents(total) + " needed");
+    // currency moves, it is not created; the units are what a purchase creates
+    post(w, [[cmd.buyer, -total], ["issuer:goods", total]], "purchase");
+    w.goods[cmd.buyer][cmd.good] = (w.goods[cmd.buyer][cmd.good] || 0) + cmd.units;
+    return { body: { good: cmd.good, units: cmd.units, paid: total }, facts };
+  }
+
+  case "Consume": {
+    const have = w.goods[cmd.owner][cmd.good] || 0;
+    if (have < cmd.units) refuse("not enough " + cmd.good);
+    w.goods[cmd.owner][cmd.good] = have - cmd.units;   // units leave the world, no currency moves
+    return { body: { consumed: cmd.units }, facts };
+  }
+
+  case "StartJob": {
+    const r = RECIPE[cmd.recipe];
+    if (!r) refuse("no such recipe");
+    for (const [g, n] of Object.entries(r.inputs)) {
+      if ((w.goods[cmd.owner][g] || 0) < n) refuse("recipe needs " + n + "× " + g);
+    }
+    if (avail(w, cmd.owner) < r.cost) refuse("insufficient funds for the furnace time");
+    // the yield is resolved now, and written into the job: an event that
+    // lands halfway through does not change what the player was told
+    const bps = modifier(w, "production", at);
+    const units = Math.max(0, Math.trunc(r.yield * 100 * (10000 + bps) / 10000) / 100);
+    for (const [g, n] of Object.entries(r.inputs)) w.goods[cmd.owner][g] -= n;
+    post(w, [[cmd.owner, -r.cost], ["issuer:goods", r.cost]], "jobcost");
+    const job = { id: w.nextJobId++, owner: cmd.owner, recipe: cmd.recipe,
+                  startMs: at, dueMs: at + r.seconds * 1000,
+                  outputs: { [cmd.recipe]: Math.max(1, Math.round(units)) }, bps };
+    w.jobs.push(job);
+    return { body: { job: job.id, due_ms: job.dueMs, outputs: job.outputs }, facts };
+  }
+
+  case "PayReward": {
+    if (w.rewardsPaid[cmd.gameEventId] !== undefined) {
+      return { body: { receipt: w.rewardsPaid[cmd.gameEventId], duplicate: true }, facts };
+    }
+    if (avail(w, "budget:quests") < cmd.cents) refuse("the budget has run out");
+    post(w, [["budget:quests", -cmd.cents], [cmd.player, cmd.cents]], "reward");
+    w.rewardsPaid[cmd.gameEventId] = cmd.cents;
+    return { body: { paid: cmd.cents, source_id: cmd.gameEventId }, facts };
+  }
+
+  case "FundBudget": {
+    if (avail(w, "treasury") < cmd.cents) refuse("treasury cannot fund that");
+    post(w, [["treasury", -cmd.cents], ["budget:quests", cmd.cents]], "transfer");
+    return { body: { budget: w.wallets["budget:quests"] }, facts };
+  }
+
+  case "GameEvent": {
+    const g = GAME_EVENTS[cmd.kind];
+    if (!g) refuse("unknown game event");
+    for (const [k, mag] of Object.entries(g.sim)) {
+      w.simEvents[g.sym].push({ kind: k, mag, at, halfLife: 60, spent: false });
+    }
+    w.mods.push({ effect: g.effect, bps: g.bps, startMs: at, endMs: at + g.seconds * 1000, label: g.label });
+    note("event", g.label, g.effect + " " + (g.bps > 0 ? "+" : "") + g.bps + " bps on " + g.sym);
+    noteOutbox(w, "event", { kind: cmd.kind, sym: g.sym, bps: g.bps });
+    return { body: { accepted: cmd.kind, scope: g.sym }, facts };
+  }
+
+  }
+  refuse("unknown command");
+}
+
+/* The outbox is part of the state: appended inside the command that caused
+ * the fact, numbered, and saved with the snapshot. That is what makes a
+ * restart invisible to a consumer reading it against a cursor. */
+function noteOutbox(w, kind, payload) {
+  w.outbox.seq++;
+  w.outbox.entries.push({ seq: w.outbox.seq, kind, payload });
+  if (w.outbox.entries.length > 60) w.outbox.entries.shift();
+}
+const short = id => id.replace("player:", "player ").replace("npc:", "npc ");
+
+/* ------------------------- journal + snapshot ---------------------- */
+
+function commitIdem(w, key, seq, body) {
+  if (!key) return;
+  w.idem[key] = { seq, body };
+  const keys = Object.keys(w.idem);
+  if (keys.length > 40) delete w.idem[keys[0]];       // bounded, oldest first
+}
+
+/* Market::run_command — the funnel every mutation goes through. */
+function runCommand(principal, key, cmd) {
+  if (key && world.idem[key]) {                        // 1. the same key, the same answer
+    onIdempotent(key, world.idem[key]);
+    return world.idem[key];
+  }
+  const at = cmd.t === "Step" ? cmd.toMs : world.nowMs;
+  let out;
+  try {
+    out = apply(world, cmd, at);                       // 2. apply, or refuse having changed nothing
+  } catch (e) {
+    if (!e.refusal) throw e;
+    stats.refused++;
+    onRefused(cmd, e.message);
+    return null;
+  }
+  const entry = { seq: journal.nextSeq++, at, wall: Date.now(), principal, cmd, key: key || null };
+  journal.entries.push(entry);                         // 3. append, fsync, then answer
+  commitIdem(world, key, entry.seq, out.body);
+  onCommitted(entry, out);
+  return { seq: entry.seq, body: out.body };
+}
+
+function takeSnapshot() {
+  snapshot = { world: clone(world), seq: journal.nextSeq - 1, wall: Date.now() };
+  journal.entries = [];                                // rewritten once the rename lands
+  onSnapshot();
+}
+
+/* App::resume — the snapshot, then every entry after it through `apply`.
+ * No clock is read: each entry carries the instant it ran at. */
+function resumeFrom(snap, entries, onEach) {
+  const w = clone(snap.world);
+  for (const e of entries) {
+    const out = apply(w, e.cmd, e.at);
+    commitIdem(w, e.key, e.seq, out.body);
+    if (onEach) onEach(e);
+  }
+  return w;
+}
+
+/* ============================== the page ============================ */
+
+const $ = id => document.getElementById(id);
+const SVGNS = "http://www.w3.org/2000/svg";
+const el = (n, a, txt) => {
+  const e = document.createElementNS(SVGNS, n);
+  for (const k in a) e.setAttribute(k, a[k]);
+  if (txt !== undefined) e.textContent = txt;
+  return e;
+};
+
+const NODES = {
+  players:  { x: 36,  y: 52,  w: 168, h: 52,  title: "Players",       sub: "api key" },
+  backend:  { x: 36,  y: 122, w: 168, h: 52,  title: "Game backend",  sub: "service key · scopes" },
+  operator: { x: 36,  y: 192, w: 168, h: 52,  title: "Operator",      sub: "FEHU_ADMIN_KEY" },
+  browsers: { x: 36,  y: 420, w: 168, h: 52,  title: "Browsers",      sub: "server-sent events" },
+  router:   { x: 246, y: 52,  w: 172, h: 196, title: "axum router",   sub: "api.rs", big: true },
+  engine:   { x: 246, y: 300, w: 172, h: 64,  title: "engine loop",   sub: "engine.rs" },
+  market:   { x: 474, y: 78,  w: 240, h: 222, title: "market actor",  sub: "market.rs · one job at a time", big: true },
+  journal:  { x: 474, y: 344, w: 240, h: 76,  title: "journal",       sub: "append · fsync · then answer" },
+  snapshot: { x: 790, y: 424, w: 262, h: 64,  title: "snapshot",      sub: "save.rs · records its seq" },
+  ACME:     { x: 790, y: 52,  w: 262, h: 70,  symbol: true },
+  BRIG:     { x: 790, y: 132, w: 262, h: 70,  symbol: true },
+  CRUX:     { x: 790, y: 212, w: 262, h: 70,  symbol: true },
+  stream:   { x: 790, y: 322, w: 262, h: 72,  title: "stream actor",  sub: "seq · replay buffer" },
+};
+
+const EDGES = {
+  "players>router":  "M204,78 C224,78 226,104 246,116",
+  "backend>router":  "M204,148 C224,148 228,148 246,150",
+  "operator>router": "M204,218 C224,218 228,192 246,184",
+  "router>market":   "M418,150 C444,150 448,150 474,150",
+  "engine>market":   "M418,332 C446,332 452,290 474,270",
+  "market>journal":  "M594,300 L594,344",
+  "journal>snap":    "M714,396 C748,400 762,414 790,444",
+  "market>ACME":     "M714,120 C752,120 754,87 790,87",
+  "market>BRIG":     "M714,162 C752,162 754,167 790,167",
+  "market>CRUX":     "M714,206 C752,206 754,247 790,247",
+  "market>stream":   "M714,266 C750,266 758,330 790,346",
+  "stream>browsers": "M790,390 C600,440 380,470 204,458",
+  "read":            "M418,64 C520,18 660,16 790,60",
+};
+const EDGE_LABELS = [
+  { at: "router>market", t: "one job", dx: 0, dy: -8 },
+  { at: "market>journal", t: "append", dx: 6, dy: 4, anchor: "start" },
+  { at: "journal>snap", t: "truncate", dx: 0, dy: -6 },
+  { at: "market>stream", t: "publish", dx: 4, dy: -4, anchor: "start" },
+  { at: "stream>browsers", t: "SSE", dx: 0, dy: -9 },
+  { at: "read", t: "reads — straight to the symbol", dx: 0, dy: -8 },
+  { at: "engine>market", t: "Step", dx: -8, dy: -7, anchor: "end" },
+];
+
+const svg = $("map");
+const paths = {}, boxes = {}, texts = {};
+
+function buildMap() {
+  const gEdges = el("g", {}), gNodes = el("g", {}), gLabels = el("g", {}), gToks = el("g", { id: "toks" });
+
+  for (const [k, d] of Object.entries(EDGES)) {
+    const p = el("path", { d, class: "e-line" + (k === "read" || k === "journal>snap" ? " dashed" : ""), id: "e-" + k });
+    gEdges.appendChild(p);
+    paths[k] = p;
+  }
+  svg.appendChild(gEdges);          // in the document before anything measures it
+  for (const l of EDGE_LABELS) {
+    const p = paths[l.at], m = p.getPointAtLength(p.getTotalLength() * 0.5);
+    gLabels.appendChild(el("text", {
+      x: m.x + (l.dx || 0), y: m.y + (l.dy || 0), class: "e-label",
+      "text-anchor": l.anchor || "middle",
+    }, l.t));
+  }
+
+  for (const [k, n] of Object.entries(NODES)) {
+    const g = el("g", {});
+    const r = el("rect", { x: n.x, y: n.y, width: n.w, height: n.h, rx: 3,
+                           class: "n-box" + (n.big ? " big" : ""), id: "b-" + k });
+    boxes[k] = r; g.appendChild(r);
+    if (n.symbol) {
+      g.appendChild(el("text", { x: n.x + 14, y: n.y + 21, class: "n-title" }, k));
+      const price = el("text", { x: n.x + n.w - 14, y: n.y + 21, class: "n-num", "text-anchor": "end" }, "—");
+      const spread = el("text", { x: n.x + 14, y: n.y + n.h - 10, class: "n-sub" }, "");
+      const spark = el("polyline", { class: "spark", points: "" });
+      texts["price-" + k] = price; texts["spread-" + k] = spread; texts["spark-" + k] = spark;
+      g.appendChild(spark); g.appendChild(price); g.appendChild(spread);
+    } else {
+      g.appendChild(el("text", { x: n.x + 14, y: n.y + 22, class: "n-title" }, n.title));
+      g.appendChild(el("text", { x: n.x + 14, y: n.y + 37, class: "n-sub" }, n.sub));
+    }
+    gNodes.appendChild(g);
+  }
+
+  // the router's middleware, in the order a request meets it
+  const strips = ["count · metrics.rs", "allow(user) · limit.rs", "admit · Admission", "handler → Command"];
+  strips.forEach((s, i) => {
+    const y = 82 + i * 30;
+    gNodes.appendChild(el("rect", { x: 258, y, width: 148, height: 24, rx: 2, class: "strip" }));
+    gNodes.appendChild(el("text", { x: 264, y: y + 16, class: "n-sub" }, s));
+  });
+
+  // the market's mailbox and its readouts
+  const m = NODES.market;
+  gNodes.appendChild(el("text", { x: m.x + 16, y: m.y + 62, class: "n-sub" }, "mailbox"));
+  for (let i = 0; i < 10; i++) {
+    const c = el("rect", { x: m.x + 16 + i * 18, y: m.y + 70, width: 14, height: 14, rx: 2, class: "slot", id: "slot-" + i });
+    boxes["slot" + i] = c; gNodes.appendChild(c);
+  }
+  texts.job = el("text", { x: m.x + 16, y: m.y + 108, class: "n-num" }, "idle");
+  gNodes.appendChild(texts.job);
+  gNodes.appendChild(el("line", { x1: m.x + 16, y1: m.y + 120, x2: m.x + m.w - 16, y2: m.y + 120,
+                                  stroke: "var(--line)", "stroke-width": 1 }));
+  const readouts = [["Market::now", "now"], ["journal seq", "seq"], ["supply", "supply"], ["steps applied", "steps"]];
+  readouts.forEach(([lab, key], i) => {
+    const y = m.y + 140 + i * 18;
+    gNodes.appendChild(el("text", { x: m.x + 16, y, class: "n-sub" }, lab));
+    texts[key] = el("text", { x: m.x + m.w - 16, y, class: "n-sub", "text-anchor": "end", style: "fill: var(--ink)" }, "—");
+    gNodes.appendChild(texts[key]);
+  });
+
+  // the journal's and the snapshot's own readouts
+  texts.jseq = el("text", { x: NODES.journal.x + NODES.journal.w - 14, y: NODES.journal.y + 22,
+                            class: "n-num", "text-anchor": "end" }, "0");
+  gNodes.appendChild(texts.jseq);
+  texts.jsize = el("text", { x: NODES.journal.x + 14, y: NODES.journal.y + 58, class: "n-sub" }, "0 entries since the snapshot");
+  gNodes.appendChild(texts.jsize);
+  texts.snap = el("text", { x: NODES.snapshot.x + NODES.snapshot.w - 14, y: NODES.snapshot.y + 24,
+                            class: "n-num", "text-anchor": "end" }, "—");
+  gNodes.appendChild(texts.snap);
+  texts.sseq = el("text", { x: NODES.stream.x + NODES.stream.w - 14, y: NODES.stream.y + 22,
+                            class: "n-num", "text-anchor": "end" }, "0");
+  gNodes.appendChild(texts.sseq);
+  texts.engine = el("text", { x: NODES.engine.x + 14, y: NODES.engine.y + 54, class: "n-sub" }, "every 700 ms");
+  gNodes.appendChild(texts.engine);
+
+  svg.appendChild(gLabels); svg.appendChild(gNodes); svg.appendChild(gToks);
+}
+
+/* ------------------------- token animation ------------------------- */
+
+const toks = [];
+function fire(edge, cls, ms, done) {
+  const p = paths[edge];
+  if (!p) { if (done) done(); return; }
+  const c = el("circle", { r: 5, class: "tok" + (cls ? " " + cls : ""), cx: -20, cy: -20 });
+  $("toks").appendChild(c);
+  toks.push({ c, p, len: p.getTotalLength(), t0: performance.now(), ms, done, edge });
+  p.classList.add("lit");
+  setTimeout(() => p.classList.remove("lit"), ms);
+}
+function animate(now) {
+  for (let i = toks.length - 1; i >= 0; i--) {
+    const t = toks[i];
+    const k = Math.min(1, (now - t.t0) / t.ms);
+    const pt = t.p.getPointAtLength(t.len * k);
+    t.c.setAttribute("cx", pt.x); t.c.setAttribute("cy", pt.y);
+    if (k >= 1) { t.c.remove(); toks.splice(i, 1); if (t.done) t.done(); }
+  }
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+function flash(node, cls, ms) {
+  const b = boxes[node];
+  if (!b) return;
+  b.classList.add(cls || "lit");
+  setTimeout(() => b.classList.remove(cls || "lit"), ms || 380);
+}
+
+/* ---------------------------- the mailbox -------------------------- */
+/* Unbounded, single file, in arrival order. Every mutation is one job on
+ * it — which is exactly why the money never needs a lock. */
+
+const mailbox = [];
+let busy = false, running = true, dead = false;
+const SOURCE_EDGE = { players: "players>router", backend: "backend>router", operator: "operator>router" };
+
+function enqueue(source, principal, cmd, label, key) {
+  if (dead) return;
+  mailbox.push({ source, principal, cmd, label, key: key || null });
+  renderMailbox();
+}
+
+function drain() {
+  if (dead || busy || !running || !mailbox.length) return;
+  const j = mailbox.shift();
+  busy = true;
+  renderMailbox();
+  const cls = j.source === "engine" ? "engine" : "";
+  if (j.source === "engine") {
+    fire("engine>market", "engine", 320, () => execute(j));
+  } else {
+    flash(j.source, "lit", 300);
+    fire(SOURCE_EDGE[j.source], cls, 260, () => {
+      flash("router", "lit", 260);
+      fire("router>market", cls, 240, () => execute(j));
+    });
+  }
+}
+
+function execute(j) {
+  texts.job.textContent = j.label;
+  flash("market", "lit", 420);
+  try { runCommand(j.principal, j.key, j.cmd); }
+  finally { busy = false; }
+  // snapshots happen on their own, as they do in the server: the file is
+  // allowed to be out of date because the journal beside it is not
+  if (journal.entries.length >= 30) { takeSnapshot(); }
+  render();
+  setTimeout(() => { texts.job.textContent = mailbox.length ? "…" : "idle"; }, 90);
+}
+
+/* ------------------------- what a commit looks like ---------------- */
+
+let journalLines = [];      // what the page has seen, which outlives the file
+let streamLines = [];
+
+function onCommitted(entry, out) {
+  // the entry is on disk before the caller is answered
+  fire("market>journal", "disk", 300, () => flash("journal", "lit-disk", 300));
+  if (entry.cmd.t === "Step") {
+    for (const s of SYMS) fire("market>" + s, "engine", 300, () => flash(s, "lit-engine", 300));
+  } else if (entry.cmd.sym) {
+    fire("market>" + entry.cmd.sym, "", 300, () => flash(entry.cmd.sym, "lit", 300));
+  }
+  if (out.facts.length || entry.cmd.t === "Step") {
+    fire("market>stream", "stream", 340, () => {
+      flash("stream", "lit-stream", 300);
+      stream.seq++;
+      fire("stream>browsers", "stream", 520, () => flash("browsers", "lit-stream", 260));
+    });
+  }
+  journalLines.push({ entry, out });
+  if (journalLines.length > 90) journalLines.shift();
+  for (const f of out.facts) {
+    streamLines.push({ seq: stream.seq + 1, ...f });
+    if (streamLines.length > 40) streamLines.shift();
+  }
+  if (entry.cmd.t !== "Step") caption(describe(entry.cmd), "committed at seq " + entry.seq);
+  renderJournal(); renderStream();
+}
+
+function onRefused(cmd, why) {
+  flash("market", "lit-bad", 500);
+  caption(describe(cmd) + " — refused", why + ". Nothing was written: a refusal leaves the world as it found it.");
+  render();
+}
+function onIdempotent(key, rec) {
+  flash("market", "lit", 400);
+  caption("Idempotency-Key seen before", "the recorded answer from seq " + rec.seq + " is returned and nothing is applied.");
+}
+function onSnapshot() {
+  fire("journal>snap", "disk", 420, () => flash("snapshot", "lit-disk", 420));
+  journalLines.push({ mark: "snapshot @ seq " + snapshot.seq, detail: "the file is rewritten from here; the idempotency index went into the snapshot" });
+  renderJournal(); render();
+}
+
+function caption(head, tail) {
+  $("caption").innerHTML = "<b>" + esc(head) + ".</b> " + esc(tail || "");
+}
+const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+/* how a command reads on the tape */
+function describe(c) {
+  switch (c.t) {
+    case "Genesis":     return "Genesis";
+    case "Step":        return "Step → " + clockOf(c.toMs);
+    case "PlaceOrder":  return (c.ioc ? "market " : "limit ") + c.side + " " + fmtInt(c.qty) + " " + c.sym +
+                               (c.ioc ? "" : " @ " + fmtCents(c.price));
+    case "CancelOrder": return "cancel order #" + c.id;
+    case "Purchase":    return "buy " + c.units + "× " + c.good + " from the catalogue";
+    case "Consume":     return "consume " + c.units + "× " + c.good;
+    case "StartJob":    return "start a " + c.recipe + " job";
+    case "PayReward":   return "pay " + fmtCents(c.cents) + " for " + c.gameEventId;
+    case "FundBudget":  return "fund the quest budget with " + fmtCents(c.cents);
+    case "GameEvent":   return GAME_EVENTS[c.kind] ? GAME_EVENTS[c.kind].label : c.kind;
+  }
+  return c.t;
+}
+const PRINCIPAL_CLASS = { User: "user", Engine: "engine", Operator: "operator", Service: "service" };
+
+/* ------------------------------ rendering -------------------------- */
+
+function renderMailbox() {
+  for (let i = 0; i < 10; i++) {
+    boxes["slot" + i].classList.toggle("on", i < Math.min(10, mailbox.length + (busy ? 1 : 0)));
+  }
+}
+
+let hideSteps = false;
+function renderJournal() {
+  const list = $("journal-list");
+  list.innerHTML = "";
+  const shown = journalLines.filter(l => !(hideSteps && l.entry && l.entry.cmd.t === "Step"));
+  for (const l of shown.slice(-40)) {
+    const li = document.createElement("li");
+    if (l.mark) {
+      li.className = "mark";
+      li.innerHTML = '<span class="seq">disk</span><span><span class="t">' + esc(l.mark) +
+                     '</span><span class="r">' + esc(l.detail) + "</span></span>";
+    } else {
+      const e = l.entry;
+      li.innerHTML =
+        '<span class="seq">' + e.seq + "</span>" +
+        '<span><span class="who ' + (PRINCIPAL_CLASS[e.principal] || "") + '">' + esc(e.principal) + "</span> " +
+        '<span class="t">' + esc(e.cmd.t) + "</span>" +
+        '<span class="b">' + esc(describe(e.cmd)) + "</span>" +
+        '<span class="r">at ' + clockOf(e.at) + (e.key ? " · key " + esc(e.key) : "") +
+        (l.out && l.out.body ? " · " + esc(bodyBrief(l.out.body)) : "") + "</span></span>";
+    }
+    list.appendChild(li);
+  }
+  list.parentElement.scrollTop = list.parentElement.scrollHeight;
+  $("journal-meta").textContent = "seq " + (journal.nextSeq - 1);
+  $("journal-foot").textContent =
+    "file holds " + journal.entries.length + " " + (journal.entries.length === 1 ? "entry" : "entries") +
+    " since the snapshot at seq " + (snapshot ? snapshot.seq : "—");
+}
+function bodyBrief(b) {
+  const parts = [];
+  for (const [k, v] of Object.entries(b)) {
+    if (v === 0 || v === false || v === null) continue;
+    parts.push(k + " " + (typeof v === "object" ? JSON.stringify(v) : v));
+  }
+  return parts.slice(0, 3).join(" · ");
+}
+
+function renderStream() {
+  const list = $("stream-list");
+  list.innerHTML = "";
+  for (const l of streamLines.slice(-24)) {
+    const li = document.createElement("li");
+    if (l.kind === "tick") li.className = "tick";
+    li.innerHTML = '<span class="seq">' + l.seq + "</span>" +
+      '<span><span class="t">' + esc(l.kind) + '</span><span class="b">' + esc(l.text) + "</span>" +
+      (l.detail ? '<span class="r">' + esc(l.detail) + "</span>" : "") + "</span>";
+    list.appendChild(li);
+  }
+  list.parentElement.scrollTop = list.parentElement.scrollHeight;
+  $("stream-meta").textContent = "seq " + stream.seq;
+  $("outbox-foot").textContent = "outbox · " + world.outbox.seq + " facts numbered, " +
+    world.outbox.entries.length + " retained for a cursor";
+}
+
+function render() {
+  if (!world) return;
+  // the map
+  for (const s of SYMS) {
+    const p = refPrice(world, s), bars = world.bars[s].slice(-56);
+    const lo = Math.min(...bars), hi = Math.max(...bars), n = NODES[s];
+    const x0 = n.x + 14, x1 = n.x + n.w - 14, y0 = n.y + 30, y1 = n.y + 52;
+    const pts = bars.map((v, i) => {
+      const x = x0 + (x1 - x0) * (bars.length < 2 ? 1 : i / (bars.length - 1));
+      const y = hi === lo ? (y0 + y1) / 2 : y1 - (y1 - y0) * (v - lo) / (hi - lo);
+      return x.toFixed(1) + "," + y.toFixed(1);
+    }).join(" ");
+    texts["spark-" + s].setAttribute("points", pts);
+    const prev = bars.length > 1 ? bars[bars.length - 2] : p;
+    texts["price-" + s].textContent = fmtCents(p);
+    texts["price-" + s].setAttribute("class", "n-num " + (p > prev ? "up" : p < prev ? "down" : ""));
+    const b = best(world.books[s], "buy"), a = best(world.books[s], "sell");
+    texts["spread-" + s].textContent =
+      (b ? fmtCents(b.price) : "—") + " / " + (a ? fmtCents(a.price) : "—") +
+      "   " + world.books[s].bids.length + " bids · " + world.books[s].asks.length + " asks";
+  }
+  texts.now.textContent = clockOf(world.nowMs);
+  texts.seq.textContent = String(journal.nextSeq - 1);
+  texts.supply.textContent = fmtUsd(supply(world));
+  texts.steps.textContent = fmtInt(world.steps);
+  texts.jseq.textContent = String(journal.nextSeq - 1);
+  texts.jsize.textContent = journal.entries.length + " entries since the snapshot";
+  texts.snap.textContent = snapshot ? "seq " + snapshot.seq : "—";
+  texts.sseq.textContent = String(stream.seq);
+
+  // market panel
+  $("v-now").textContent = clockOf(world.nowMs);
+  $("v-steps").textContent = fmtInt(world.steps);
+  $("v-refused").textContent = fmtInt(stats.refused);
+  $("market-meta").textContent = busy ? "running one job" : mailbox.length ? mailbox.length + " queued" : "idle";
+
+  let sum = 0;
+  const wl = $("wallets"); wl.innerHTML = "";
+  for (const [id, c] of Object.entries(world.wallets)) {
+    sum += c;
+    if (id === "issuance") continue;
+    const dt = document.createElement("dt");
+    dt.textContent = label(id) + " · " + WALLET_KIND[id];
+    const dd = document.createElement("dd");
+    dd.textContent = fmtUsd(c);
+    if (id === PLAYER) dd.className = "pos";
+    if (c < 0) dd.className = "neg";
+    wl.appendChild(dt); wl.appendChild(dd);
+  }
+  const dt = document.createElement("dt"); dt.textContent = "issuance (the mirror, always negative)";
+  const dd = document.createElement("dd"); dd.className = "neg"; dd.textContent = fmtUsd(world.wallets.issuance);
+  wl.appendChild(dt); wl.appendChild(dd);
+  $("supply-foot").innerHTML = "supply " + fmtUsd(supply(world)) +
+    " · Σ over every wallet = " + fmtCents(sum) +
+    (sum === 0 ? ' <span class="pill ok">conserved</span>' : ' <span class="pill bad">LEAK</span>');
+
+  const fl = $("flow"); fl.innerHTML = "";
+  const flows = Object.entries(world.flow).sort((a, b) => b[1] - a[1]);
+  const top = flows.length ? flows[0][1] : 1;
+  for (const [reason, moved] of flows) {
+    const row = document.createElement("div"); row.className = "row";
+    row.innerHTML = '<span class="lab">' + esc(reason) + "</span><span>" + fmtUsd(moved) + "</span>" +
+      '<span class="meter"><i style="width:' + (100 * moved / top).toFixed(1) + '%"></i></span>';
+    fl.appendChild(row);
+  }
+
+  renderBook();
+  renderWorld();
+}
+const label = id => id === PLAYER ? "you" : id.replace("npc:", "merchant ").replace("budget:", "budget ").replace("issuer:", "issuer ");
+
+function renderBook() {
+  const s = "ACME", book = world.books[s];
+  const agg = side => {
+    const m = new Map();
+    for (const o of book[side]) {
+      const e = m.get(o.price) || { qty: 0, mine: false };
+      e.qty += o.qty; e.mine = e.mine || o.owner === PLAYER;
+      m.set(o.price, e);
+    }
+    return [...m.entries()].map(([price, e]) => ({ price, ...e }));
+  };
+  const asks = agg("asks").slice(0, 5).reverse(), bids = agg("bids").slice(0, 5);
+  const max = Math.max(1, ...asks.map(l => l.qty), ...bids.map(l => l.qty));
+  const lad = $("ladder"); lad.innerHTML = "";
+  const row = (l, side) => {
+    const d = document.createElement("div");
+    d.className = "lrow " + side + (l.mine ? " mine" : "");
+    d.innerHTML = '<span class="p">' + fmtCents(l.price) + '</span><span class="q">' + fmtInt(l.qty) +
+      '</span><span class="bar" style="width:' + (100 * l.qty / max).toFixed(1) + '%"></span>';
+    return d;
+  };
+  for (const l of asks) lad.appendChild(row(l, "ask"));
+  const sp = document.createElement("div"); sp.className = "spread";
+  const b = bids[0], a = asks[asks.length - 1];
+  sp.innerHTML = "<span>spread</span><span>" + (b && a ? fmtCents(a.price - b.price) : "—") + "</span>";
+  lad.appendChild(sp);
+  for (const l of bids) lad.appendChild(row(l, "bid"));
+
+  const pos = world.positions[PLAYER][s] || 0;
+  const p = $("position"); p.innerHTML = "";
+  const kv = [
+    ["Cash", fmtUsd(world.wallets[PLAYER]), ""],
+    ["Reserved by resting bids", fmtUsd(world.resv[PLAYER].cash), "hold"],
+    ["ACME held", fmtInt(pos), "pos"],
+    ["Reserved by resting asks", fmtInt(world.resv[PLAYER].shares[s] || 0), ""],
+  ];
+  for (const [k, v, c] of kv) {
+    const dt = document.createElement("dt"); dt.textContent = k;
+    const dd = document.createElement("dd"); dd.textContent = v; if (c) dd.className = c;
+    p.appendChild(dt); p.appendChild(dd);
+  }
+  const last = world.prints[s][0];
+  $("book-meta").textContent = last ? "last " + fmtCents(last.price) + " × " + fmtInt(last.qty) : "no prints yet";
+}
+
+function renderWorld() {
+  const g = $("goods"); g.innerHTML = "";
+  const inv = Object.entries(world.goods[PLAYER]).filter(([, n]) => n > 0);
+  if (!inv.length) g.innerHTML = '<p class="empty">nothing yet — buy from the catalogue</p>';
+  for (const [good, n] of inv) {
+    const row = document.createElement("div"); row.className = "row";
+    row.innerHTML = '<span class="lab">' + esc(good) + "</span><span>" + fmtInt(n) + " ×</span>";
+    g.appendChild(row);
+  }
+  const j = $("jobs"); j.innerHTML = "";
+  if (!world.jobs.length) j.innerHTML = '<p class="empty">no jobs running</p>';
+  for (const job of world.jobs) {
+    const k = Math.min(1, Math.max(0, (world.nowMs - job.startMs) / (job.dueMs - job.startMs)));
+    const row = document.createElement("div"); row.className = "row";
+    row.innerHTML = '<span class="lab">#' + job.id + " " + esc(job.recipe) +
+      (job.bps ? " <em>" + (job.bps > 0 ? "+" : "") + job.bps + " bps</em>" : "") +
+      '</span><span>due ' + clockOf(job.dueMs) + "</span>" +
+      '<span class="meter job"><i style="width:' + (k * 100).toFixed(1) + '%"></i></span>';
+    j.appendChild(row);
+  }
+  const m = $("mods"); m.innerHTML = "";
+  const live = world.mods.filter(x => world.nowMs < x.endMs);
+  if (!live.length) m.innerHTML = '<p class="empty">the world is quiet</p>';
+  for (const x of live) {
+    const now = modifier(world, x.effect, world.nowMs);
+    const row = document.createElement("div"); row.className = "row";
+    row.innerHTML = '<span class="lab">' + esc(x.effect) + " · " + esc(x.label) + "</span><span>" +
+      (now > 0 ? "+" : "") + now + " bps</span>" +
+      '<span class="meter good"><i style="width:' + (100 * Math.abs(now) / Math.max(1, Math.abs(x.bps))).toFixed(1) + '%"></i></span>';
+    m.appendChild(row);
+  }
+  $("world-meta").textContent = world.jobs.length + " running · " + live.length + " modifiers";
+}
+
+/* ------------------------------ actions ---------------------------- */
+
+const keygen = () => Math.random().toString(16).slice(2, 8);
+let lastReward = null;
+
+const ACTS = [
+  { label: "Rest a bid under the market", run: () => {
+      const p = Math.round(refPrice(world, "ACME") * 0.996);
+      enqueue("players", "User", { t: "PlaceOrder", trader: PLAYER, sym: "ACME", side: "buy", price: p, qty: 300 },
+              "place(ACME, buy 300)", keygen());
+    } },
+  { label: "Buy 150 ACME at market", run: () => {
+      const p = Math.ceil(refPrice(world, "ACME") * 1.02);
+      enqueue("players", "User", { t: "PlaceOrder", trader: PLAYER, sym: "ACME", side: "buy", price: p, qty: 150, ioc: true },
+              "place(ACME, buy 150 IOC)", keygen());
+    } },
+  { label: "Sell 100 ACME at market", run: () => {
+      const p = Math.floor(refPrice(world, "ACME") * 0.98);
+      enqueue("players", "User", { t: "PlaceOrder", trader: PLAYER, sym: "ACME", side: "sell", price: p, qty: 100, ioc: true },
+              "place(ACME, sell 100 IOC)", keygen());
+    } },
+  { label: "Cancel my resting orders", run: () => {
+      let n = 0;
+      for (const s of SYMS) for (const side of ["bids", "asks"]) {
+        for (const o of world.books[s][side]) if (o.owner === PLAYER) {
+          enqueue("players", "User", { t: "CancelOrder", trader: PLAYER, sym: s, id: o.id }, "cancel(#" + o.id + ")", keygen());
+          n++;
+        }
+      }
+      if (!n) caption("Nothing to cancel", "you have no resting orders.");
+    } },
+  { label: "Buy 6 ORE + 3 FUEL", run: () => {
+      enqueue("players", "User", { t: "Purchase", buyer: PLAYER, good: "ORE", units: 6 }, "purchase(ORE ×6)", keygen());
+      enqueue("players", "User", { t: "Purchase", buyer: PLAYER, good: "FUEL", units: 3 }, "purchase(FUEL ×3)", keygen());
+    } },
+  { label: "Smelt an INGOT", run: () => {
+      enqueue("players", "User", { t: "StartJob", owner: PLAYER, recipe: "INGOT" }, "start_job(INGOT)", keygen());
+    } },
+  { label: "Pay a quest reward", run: () => {
+      lastReward = { key: keygen(), gameEventId: "quest:" + Math.random().toString(16).slice(2, 7), cents: 25000 };
+      enqueue("backend", "Service", { t: "PayReward", player: PLAYER, ...lastReward }, "pay_reward()", lastReward.key);
+    } },
+  { label: "…and send that reward again", run: () => {
+      if (!lastReward) { caption("Pay one first", "there is nothing to retry."); return; }
+      enqueue("backend", "Service", { t: "PayReward", player: PLAYER, ...lastReward },
+              "pay_reward() retry", lastReward.key);
+    } },
+  { label: "Mine collapse", run: () => {
+      enqueue("operator", "Operator", { t: "GameEvent", kind: "collapse" }, "game_event(collapse)", keygen());
+    } },
+  { label: "Harvest festival", run: () => {
+      enqueue("operator", "Operator", { t: "GameEvent", kind: "festival" }, "game_event(festival)", keygen());
+    } },
+  { label: "Order I cannot afford", run: () => {
+      enqueue("players", "User", { t: "PlaceOrder", trader: PLAYER, sym: "CRUX", side: "buy", price: refPrice(world, "CRUX"), qty: 100000 },
+              "place(CRUX, buy 100 000)", keygen());
+    } },
+  { label: "Take a snapshot", cls: "disk", run: () => { takeSnapshot(); render(); } },
+  { label: "Crash the server", cls: "danger", run: () => crash() },
+];
+
+function buildActs() {
+  const box = $("acts");
+  ACTS.forEach((a, i) => {
+    const b = document.createElement("button");
+    b.className = "chip" + (a.cls ? " " + a.cls : "");
+    b.textContent = a.label;
+    b.onclick = () => { if (!dead) a.run(); };
+    box.appendChild(b);
+  });
+}
+
+/* --------------------------- the engine loop ----------------------- */
+
+let simClock = 0, engineTimer = null, speed = 1;
+
+function engineTick() {
+  if (dead || !running) return;
+  simClock += TICKS_PER_STEP * 1000;
+  enqueue("engine", "Engine", { t: "Step", toMs: simClock }, "step → " + clockOf(simClock));
+  // a client that keeps trading, so there is always something to watch
+  if (Math.random() < 0.28) {
+    const pos = world.positions[PLAYER].ACME || 0;
+    if (pos > 250 && Math.random() < 0.5) {
+      enqueue("players", "User",
+        { t: "PlaceOrder", trader: PLAYER, sym: "ACME", side: "sell", price: Math.floor(refPrice(world, "ACME") * 0.98), qty: 60, ioc: true },
+        "place(ACME, sell 60)", keygen());
+    } else if (avail(world, PLAYER) > refPrice(world, "ACME") * 80) {
+      enqueue("players", "User",
+        { t: "PlaceOrder", trader: PLAYER, sym: "ACME", side: "buy", price: Math.ceil(refPrice(world, "ACME") * 1.02), qty: 40, ioc: true },
+        "place(ACME, buy 40)", keygen());
+    }
+  }
+}
+function restartEngine() {
+  clearInterval(engineTimer);
+  engineTimer = setInterval(engineTick, 700 / speed);
+  texts.engine.textContent = "every " + Math.round(700 / speed) + " ms";
+}
+
+/* ------------------------- crash · resume · verify ----------------- */
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const STEP_ROWS = [
+  ["kill -9", "the process is gone, and every account, book and simulator with it"],
+  ["read the snapshot", "it records the journal sequence it includes"],
+  ["replay what came after", "through the same apply, with the instant read from each entry"],
+  ["hash the world", "FNV-1a over the whole state, before and after"],
+];
+
+function renderSteps(state) {
+  const box = $("replay-steps"); box.innerHTML = "";
+  STEP_ROWS.forEach(([t, s], i) => {
+    const d = document.createElement("div");
+    d.className = "rstep" + (state.done > i ? " done" : state.now === i ? " now" : "");
+    d.innerHTML = '<span class="n">' + (i + 1) + '</span><span class="t">' + esc(t) +
+                  "<small>" + esc(s) + "</small></span><span class=\"v\">" + esc(state.v[i] || "") + "</span>";
+    box.appendChild(d);
+  });
+}
+
+async function crash() {
+  if (dead) return;
+  dead = true; running = false; mailbox.length = 0; busy = false;
+  clearInterval(engineTimer);
+  renderMailbox();
+  $("play").textContent = "Play";
+  const st = { done: 0, now: 0, v: [] };
+  const set = (i, v) => { st.v[i] = v; st.done = i + 1; st.now = i + 1; renderSteps(st); };
+  renderSteps(st);
+
+  const before = hashWorld(world);
+  const entries = journal.entries.slice();
+  const snapSeq = snapshot.seq;
+  $("hash-before").querySelector(".v").textContent = before;
+  $("hash-after").querySelector(".v").textContent = "—";
+  $("hash-after").classList.remove("match");
+  $("hash-before").classList.remove("match");
+  $("verdict").className = "verdict pending";
+  $("verdict").textContent = "Replaying…";
+  $("verify-meta").textContent = "crashed";
+
+  // 1. the process dies
+  for (const k of ["market", "ACME", "BRIG", "CRUX", "stream", "router", "engine"]) boxes[k].classList.add("dead");
+  texts.job.textContent = "— gone —";
+  caption("kill -9", "memory is gone. The snapshot and the journal beside it are not.");
+  set(0, "state hash " + before);
+  await sleep(900);
+
+  // 2. the snapshot comes back
+  flash("snapshot", "lit-disk", 900);
+  set(1, "seq " + snapSeq);
+  caption("Reading the snapshot", "it is minutes old, and it says which sequence it includes.");
+  await sleep(700);
+
+  // 3. replay
+  $("verify-meta").textContent = "replaying " + entries.length + " entries";
+  const replayed = clone(snapshot.world);
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    const out = apply(replayed, e.cmd, e.at);      // no clock is read: e.at is the instant
+    commitIdem(replayed, e.key, e.seq, out.body);
+    flash("journal", "lit-disk", 90);
+    flash("market", "lit", 90);
+    markReplayed(e.seq);
+    set(2, (i + 1) + " / " + entries.length + " entries");
+    await sleep(Math.max(24, 320 / Math.max(1, entries.length / 6)));
+  }
+  if (!entries.length) set(2, "0 entries — the snapshot was current");
+
+  // 4. compare
+  world = replayed;
+  const after = hashWorld(world);
+  set(3, after === before ? "identical" : "DIFFERENT");
+  $("hash-after").querySelector(".v").textContent = after;
+  const ok = after === before;
+  $("hash-before").classList.toggle("match", ok);
+  $("hash-after").classList.toggle("match", ok);
+  $("verdict").className = "verdict" + (ok ? "" : " pending");
+  $("verdict").textContent = ok
+    ? "Identical. " + entries.length + " commands replayed from seq " + (snapSeq + 1) +
+      " and the world came back exactly as it was — same prices, same books, same reservations, same cents. " +
+      "The live path and the replay path are the same function over the same input, which is the only way the two can be trusted to agree."
+    : "Diverged — which is the bug this design exists to make impossible.";
+  $("verify-meta").textContent = ok ? "verified" : "diverged";
+
+  for (const k of ["market", "ACME", "BRIG", "CRUX", "stream", "router", "engine"]) boxes[k].classList.remove("dead");
+  stream = { seq: 0 };                    // connections reconnect; the stream is not the record
+  streamLines = [];
+  simClock = world.nowMs;
+  dead = false; running = true;
+  $("play").textContent = "Pause";
+  texts.job.textContent = "idle";
+  caption("Resumed", "the stream restarts at seq 0 — it was never the record. The outbox kept its numbers.");
+  restartEngine();
+  render(); renderStream(); renderJournal();
+}
+
+function markReplayed(seq) {
+  for (const li of $("journal-list").children) {
+    const n = li.querySelector(".seq");
+    if (n && Number(n.textContent) === seq) li.classList.add("replayed");
+  }
+}
+
+/* ------------------------------- boot ------------------------------ */
+
+function boot() {
+  buildMap();
+  buildActs();
+  world = emptyWorld();
+  journal = { entries: [], nextSeq: 1 };
+  stream = { seq: 0 };
+  snapshot = { world: clone(world), seq: 0, wall: Date.now() };
+  simClock = world.nowMs;
+
+  runCommand("Operator", "genesis", {
+    t: "Genesis", supply: 30000000, player: 5000000, npc: 6000000, budget: 500000, shares: 4000,
+  });
+  takeSnapshot();
+  render(); renderJournal(); renderStream(); renderSteps({ done: 0, now: -1, v: [] });
+  caption("Running", "the engine is stepping. Everything on this page came out of the state those commands built.");
+
+  setInterval(drain, 90);
+  setInterval(() => { render(); renderMailbox(); }, 260);
+  restartEngine();
+
+  $("play").onclick = () => {
+    running = !running;
+    $("play").textContent = running ? "Pause" : "Play";
+    caption(running ? "Running" : "Paused", running ? "the engine loop is sending Step commands again."
+            : "the engine loop is stopped. The buttons still work — the market just is not advancing.");
+  };
+  $("speed").onchange = e => { speed = Number(e.target.value); restartEngine(); };
+  $("jfilter").onclick = e => {
+    hideSteps = !hideSteps;
+    e.target.setAttribute("aria-pressed", String(hideSteps));
+    e.target.textContent = hideSteps ? "show Step" : "hide Step";
+    renderJournal();
+  };
+}
+
+boot();
+</script>
+</body>
+</html>
