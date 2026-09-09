@@ -386,7 +386,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fehu-webapp"
+name = "fehu-economy"
 version = "0.1.0"
 dependencies = [
  "axum",

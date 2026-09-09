@@ -1,0 +1,27 @@
+[package]
+name = "fehu-economy"
+publish = false
+description = "Economy server: seeded fehu symbols, a conserved currency, goods and jobs, behind an HTTP/SSE API"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fehu = { path = "../fehu", features = ["serde"] }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+serde = { version = "1", features = ["derive"] }
+getrandom = "0.3"
+sha2 = "0.10"
+# `float_roundtrip` so a saved simulator restores bit-exactly.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

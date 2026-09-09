@@ -4,47 +4,57 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A cargo workspace with two crates and a TypeScript UI:
+A virtual cargo workspace: the utilities library, the economy server that
+runs it, and that server's TypeScript UI.
 
-- **`fehu`** (repo root, `src/`) — a `no_std + alloc` deterministic synthetic
-  stock price simulator, plus an optional limit order book and exchange on
-  top of it. This is the published library; it is the thing that must stay
-  portable and bit-reproducible.
-- **`fehu-webapp`** (`webapp/`) — a sample axum server that runs several
-  `fehu` symbols in wall-clock time behind an HTTP/SSE API. `std`, tokio,
-  `publish = false`.
-- **`webapp/ui/`** — Vite + TypeScript, no framework. Its build output is
-  **committed** to `webapp/static/` and embedded into the Rust binary.
+- **`fehu`** (`crates/fehu/`) — the utilities library: a `no_std + alloc`
+  deterministic synthetic stock price simulator, plus an optional limit
+  order book, currency ledger and exchange on top of it. This is the
+  published crate; it is the thing that must stay portable and
+  bit-reproducible.
+- **`fehu-economy`** (`crates/fehu-economy/`) — the economy server binary: an
+  axum server that runs several `fehu` symbols in wall-clock time behind an
+  HTTP/SSE API, with accounts, goods, jobs, rewards and a command journal.
+  `std`, tokio, `publish = false`.
+- **`crates/fehu-economy/ui/`** — Vite + TypeScript, no framework. Its build
+  output is **committed** to `crates/fehu-economy/static/` and embedded into
+  the Rust binary.
 
-`README.md` is included as the crate-level rustdoc (`#![doc = include_str!]`),
-so its Rust snippets are compiled as doctests — a broken example fails
-`cargo test`. It is also the reference for the whole HTTP surface and every
-`FEHU_*` environment variable; read it before touching an endpoint.
+The workspace root is virtual, so a bare `cargo build --no-default-features`
+also builds the server, whose dependency on `fehu` re-enables `std` and
+defeats the check. Every library command names `-p fehu`; the `justfile` does.
+
+`crates/fehu/README.md` is included as that crate's rustdoc
+(`#![doc = include_str!]`), so its Rust snippets are compiled as doctests — a
+broken example fails `cargo test`. `crates/fehu-economy/README.md` is the
+reference for the whole HTTP surface and every `FEHU_*` environment variable;
+read it before touching an endpoint. The root `README.md` is the map of the
+two.
 
 ## Commands
 
 `just` (see `justfile`) is the entry point; `just ci` is everything CI runs.
 
 ```sh
-just test            # cargo test --all-features, then --no-default-features, then -p fehu-webapp
-just lint            # fmt --check + clippy -D warnings over every feature set and the webapp
-just build           # std, no_std, and no_std+serde
+just test            # -p fehu --all-features, then --no-default-features, then -p fehu-economy
+just lint            # fmt --check + clippy -D warnings over every feature set and the server
+just build           # std, no_std, and no_std+serde, then the server
 just wasm            # wasm32-unknown-unknown build (no_std, with and without serde)
-just bench           # criterion, benches/ticks.rs
-just serve           # run the webapp on :3000
-just ui              # npm ci && vite build -> webapp/static (commit the result)
+just bench           # criterion, crates/fehu/benches/ticks.rs
+just serve           # run the economy server on :3000
+just ui              # npm ci && vite build -> crates/fehu-economy/static (commit it)
 just ui-dev          # Vite on :5173 with HMR, proxying /api to a running `just serve`
-just ui-check        # rebuild the bundle and fail if webapp/static is stale
-just dump out 42     # a year of ticks + daily candles to CSV via examples/dump.rs
+just ui-check        # rebuild the bundle and fail if the committed one is stale
+just dump out 42     # a year of ticks + daily candles to CSV via crates/fehu/examples/dump.rs
 ```
 
 Single test / single file:
 
 ```sh
-cargo test --all-features --test determinism            # one integration test file
-cargo test --all-features golden_hash_default_config    # one test by name
-cargo test -p fehu-webapp --test contract
-cargo test --no-default-features --tests                # the no_std path (skips doctests)
+cargo test -p fehu --all-features --test determinism         # one integration test file
+cargo test -p fehu --all-features golden_hash_default_config # one test by name
+cargo test -p fehu-economy --test contract
+cargo test -p fehu --no-default-features --tests             # no_std (skips doctests)
 ```
 
 Feature combinations matter: `std` (default), `serde`, and bare `no_std +
@@ -57,27 +67,27 @@ Same seed + same events ⇒ byte-identical ticks on native and wasm. Everything
 below follows from that:
 
 - **All transcendental math and every RNG-to-float conversion goes through
-  `src/math.rs`.** Only `libm` for `exp`/`ln`/`sqrt`/`pow`/`cos`/`tanh`/
+  `crates/fehu/src/math.rs`.** Only `libm` for `exp`/`ln`/`sqrt`/`pow`/`cos`/`tanh`/
   `round`; only `next_u64` from the RNG; never `mul_add` or `powi` (they lower
   to LLVM intrinsics that differ per target). Do not call `f64::exp()` etc.
-  directly anywhere in `src/`.
-- **RNG draw order is part of the format.** `tests/determinism.rs` pins golden
+  directly anywhere in `crates/fehu/src/`.
+- **RNG draw order is part of the format.** `crates/fehu/tests/determinism.rs` pins golden
   FNV-1a hashes of 10 000 ticks for three configs. If you deliberately change
-  the model or the draw order, bump `STATE_VERSION` (`src/sim.rs`) and update
+  the model or the draw order, bump `STATE_VERSION` (`crates/fehu/src/sim.rs`) and update
   the constants in that test — never update the constants alone.
 - Separate concerns get separate RNG streams (the exchange's synthetic flow
   uses a `long_jump`ed stream), so adding trading does not perturb the bare
-  price series. `tests/trading.rs` holds that invariant.
+  price series. `crates/fehu/tests/trading.rs` holds that invariant.
 - Version constants that gate save compatibility: `fehu::STATE_VERSION`
-  (simulator), `fehu::EXCHANGE_VERSION`, `fehu_webapp::save::STATE_VERSION`
+  (simulator), `fehu::EXCHANGE_VERSION`, `fehu_economy::save::STATE_VERSION`
   (the whole market file, currently 12) and
-  `fehu_webapp::journal::JOURNAL_VERSION` (the command journal beside it,
+  `fehu_economy::journal::JOURNAL_VERSION` (the command journal beside it,
   currently 2). Loading a mismatched version is refused rather than guessed
   at.
 - JSON round-trips need `serde_json`'s `float_roundtrip` feature; without it a
   parsed `f64` can be one ulp off. Binary formats (postcard) are always exact.
 
-## Library architecture (`src/`)
+## Library architecture (`crates/fehu/src/`)
 
 `lib.rs` is only re-exports; the module docs are the real reference.
 
@@ -87,7 +97,7 @@ below follows from that:
   algorithm, and `evolve()` is steps 2–9 shared by the fine and coarse paths.
   Coarse mode (`coarse_candles`) takes one latent step per candle and draws
   high/low from the Brownian-bridge extremum distribution — that is how the
-  webapp generates a year of daily history at start-up.
+  server generates a year of daily history at start-up.
 - `event.rs` / `config.rs` — external events with decaying effects, and config
   validation plus the per-tick derived quantities cached from it.
 - `book.rs` — a standalone price–time-priority limit order book. Whole cents,
@@ -103,7 +113,7 @@ below follows from that:
 - `time.rs`, `candles.rs` — timestamps and the optional market-hours calendar;
   OHLCV aggregation.
 
-## Webapp architecture (`webapp/src/`)
+## Server architecture (`crates/fehu-economy/src/`)
 
 **There are no locks in the server.** Every piece of state belongs to exactly
 one tokio task and is reached by sending it a closure (`actor.rs`). Read
@@ -206,16 +216,17 @@ reserve shares; a cancel gives them back. No margin, no shorting.
 
 ## Conventions
 
-- `src/` is `#![no_std]`, `#![forbid(unsafe_code)]`, `#![warn(missing_docs)]`.
+- `crates/fehu/src/` is `#![no_std]`, `#![forbid(unsafe_code)]`, `#![warn(missing_docs)]`.
   Nothing in the library may reach for `std`, a clock, or a global — a
   `#[cfg(feature = "std")]` island is the only exception.
 - Module-level `//!` docs carry the design rationale and are expected to stay
   accurate; when you change behaviour, change the module doc in the same edit.
-- `webapp/tests/contract.rs` pins the exact JSON key set of every response
-  against `webapp/ui/src/types.ts`. Renaming or adding a serialised field
+- `crates/fehu-economy/tests/contract.rs` pins the exact JSON key set of
+  every response against `crates/fehu-economy/ui/src/types.ts`. Renaming or adding a serialised field
   fails that test — **change the Rust type and `types.ts` together**.
-- `webapp/static/` is committed build output. After any change under
-  `webapp/ui/src/`, run `just ui` and commit the regenerated bundle;
+- `crates/fehu-economy/static/` is committed build output. After any change
+  under `crates/fehu-economy/ui/src/`, run `just ui` and commit the
+  regenerated bundle;
   `just ui-check` (part of `just ci`) fails otherwise. Asset names are fixed
   (`assets/app.js`, `assets/app.css`) because `include_str!` cannot name a
   content-hashed file.
