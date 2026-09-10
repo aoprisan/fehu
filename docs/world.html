@@ -1,0 +1,1804 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fehu — a world you can play</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500;600&display=swap">
+<style>
+:root {
+  --ground:      #edf1f2;
+  --surface:     #ffffff;
+  --surface-2:   #f5f8f9;
+  --surface-3:   #e6ecee;
+  --ink:         #0f181e;
+  --ink-2:       #38474f;
+  --muted:       #6a7c86;
+  --line:        #c7d3d8;
+  --line-soft:   #dee7ea;
+  --accent:      #a2560f;
+  --accent-2:    #c9761f;
+  --accent-wash: #f4e6d4;
+  --buy:         #0e6a58;
+  --sell:        #a63a2f;
+  --engine:      #3a4bab;
+  --stream:      #7a4599;
+  --disk:        #2f7d8c;
+  --ore:         #8a6f48;
+  --ingot:       #2f7d8c;
+  --tool:        #7a4599;
+  --shadow:      0 1px 2px rgba(15, 24, 30, .06), 0 8px 24px -12px rgba(15, 24, 30, .18);
+
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+  --serif: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:      #0c1216;
+    --surface:     #131c22;
+    --surface-2:   #18242b;
+    --surface-3:   #1f2d35;
+    --ink:         #e3ecf0;
+    --ink-2:       #b0c1ca;
+    --muted:       #7d919c;
+    --line:        #2b3a43;
+    --line-soft:   #1e2a31;
+    --accent:      #e0994a;
+    --accent-2:    #f0b268;
+    --accent-wash: #35250f;
+    --buy:         #3cbb9c;
+    --sell:        #e97e6f;
+    --engine:      #8e9cf0;
+    --stream:      #c294e2;
+    --disk:        #63c2d2;
+    --ore:         #c9a86e;
+    --ingot:       #63c2d2;
+    --tool:        #c294e2;
+    --shadow:      0 1px 2px rgba(0, 0, 0, .4), 0 10px 30px -14px rgba(0, 0, 0, .7);
+  }
+}
+:root[data-theme="dark"] {
+  --ground:      #0c1216;
+  --surface:     #131c22;
+  --surface-2:   #18242b;
+  --surface-3:   #1f2d35;
+  --ink:         #e3ecf0;
+  --ink-2:       #b0c1ca;
+  --muted:       #7d919c;
+  --line:        #2b3a43;
+  --line-soft:   #1e2a31;
+  --accent:      #e0994a;
+  --accent-2:    #f0b268;
+  --accent-wash: #35250f;
+  --buy:         #3cbb9c;
+  --sell:        #e97e6f;
+  --engine:      #8e9cf0;
+  --stream:      #c294e2;
+  --disk:        #63c2d2;
+  --ore:         #c9a86e;
+  --ingot:       #63c2d2;
+  --tool:        #c294e2;
+  --shadow:      0 1px 2px rgba(0, 0, 0, .4), 0 10px 30px -14px rgba(0, 0, 0, .7);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 34px 22px 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+/* ---------- header ---------- */
+
+.masthead { display: flex; flex-direction: column; gap: 10px; }
+
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0;
+}
+
+h1 {
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: clamp(30px, 4.4vw, 46px);
+  line-height: 1.06;
+  letter-spacing: -.015em;
+  margin: 0;
+  text-wrap: balance;
+}
+
+.deck { margin: 0; max-width: 68ch; color: var(--ink-2); font-size: 16.5px; }
+.deck code, .rule code, .note code, .cap code, .foot code { font-family: var(--mono); font-size: .88em; }
+
+.rule {
+  border-left: 3px solid var(--accent);
+  padding: 4px 0 4px 14px;
+  margin: 2px 0 0;
+  max-width: 74ch;
+  color: var(--ink-2);
+}
+.rule b { color: var(--ink); font-weight: 600; margin-right: 4px; }
+
+h2.section {
+  font-family: var(--serif);
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -.01em;
+  margin: 12px 0 -8px;
+}
+.cap { margin: 0; max-width: 76ch; color: var(--muted); font-size: 14px; }
+
+/* ---------- controls ---------- */
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 8px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+.acts { display: flex; flex-wrap: wrap; gap: 6px; flex: 1 1 520px; }
+
+.chip {
+  appearance: none;
+  font: 500 12.5px/1 var(--sans);
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 8px 11px;
+  cursor: pointer;
+  transition: background .12s, color .12s, border-color .12s;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.chip:hover:not(:disabled) { border-color: var(--muted); color: var(--ink); }
+.chip:disabled { opacity: .4; cursor: not-allowed; }
+.chip kbd {
+  font: 500 10px/1 var(--mono);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  padding: 2px 3px;
+}
+.chip.ore   { border-color: color-mix(in srgb, var(--ore) 55%, var(--line)); }
+.chip.ingot { border-color: color-mix(in srgb, var(--ingot) 55%, var(--line)); }
+.chip.tool  { border-color: color-mix(in srgb, var(--tool) 55%, var(--line)); }
+
+.transport { display: flex; align-items: center; gap: 6px; }
+.tbtn {
+  appearance: none;
+  font: 500 12.5px/1 var(--mono);
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 8px 12px;
+  min-width: 38px;
+  cursor: pointer;
+}
+.tbtn:hover { border-color: var(--muted); }
+.tbtn.primary { background: var(--ink); color: var(--surface); border-color: var(--ink); min-width: 74px; }
+.speed, .seedbox {
+  font: 500 12.5px/1 var(--mono);
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 8px 8px;
+}
+.seedbox { width: 78px; }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ---------- board ---------- */
+
+.board {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  padding: 6px 6px 0;
+  margin: 0;
+  overflow-x: auto;
+}
+.board svg { display: block; width: 100%; height: auto; min-width: 900px; }
+.board figcaption {
+  border-top: 1px solid var(--line-soft);
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--muted);
+  min-width: 900px;
+}
+.board figcaption b { color: var(--ink-2); font-weight: 600; }
+
+.n-box { fill: var(--surface-2); stroke: var(--line); stroke-width: 1.25; }
+.n-box.big { fill: var(--surface-3); }
+.n-box.you { stroke: color-mix(in srgb, var(--accent) 60%, var(--line)); }
+.n-box.rival { stroke: color-mix(in srgb, var(--engine) 55%, var(--line)); }
+.n-title { font: 600 12.5px var(--sans); fill: var(--ink); }
+.n-sub { font: 400 10.5px var(--mono); fill: var(--muted); }
+.n-num { font: 500 12px var(--mono); fill: var(--ink-2); }
+.n-num.big { font-size: 15px; fill: var(--ink); }
+.n-tag { font: 500 9.5px var(--mono); fill: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
+
+.edge { fill: none; stroke: var(--line); stroke-width: 1.5; }
+.edge.read { stroke-dasharray: 3 4; stroke: var(--muted); opacity: .75; }
+.e-label { font: 500 10px var(--mono); fill: var(--muted); }
+
+.pip { stroke: none; }
+.arc-bg { fill: none; stroke: var(--line); stroke-width: 3.5; }
+.arc-fg { fill: none; stroke-width: 3.5; stroke-linecap: round; }
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  font-size: 12.5px;
+  color: var(--muted);
+  margin: -8px 2px 0;
+}
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.swatch.sq { border-radius: 1px; }
+
+/* ---------- conservation bar ---------- */
+
+.conserve {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.conserve-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.conserve-head h3 { margin: 0; font: 600 13px var(--sans); }
+.conserve-head .meta { font: 500 11.5px var(--mono); color: var(--muted); }
+.stack { display: flex; height: 16px; border-radius: 2px; overflow: hidden; background: var(--surface-3); }
+.stack i { display: block; height: 100%; transition: width .4s ease; }
+.stack-key { display: flex; flex-wrap: wrap; gap: 4px 14px; font: 500 11px var(--mono); color: var(--muted); }
+.stack-key span { display: inline-flex; align-items: center; gap: 5px; }
+
+/* ---------- panels ---------- */
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
+  gap: 14px;
+  align-items: start;
+}
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--surface-2);
+}
+.panel-head h2, .panel-head h3 { margin: 0; font: 600 13px var(--sans); }
+.panel-head .meta { font: 500 11px var(--mono); color: var(--muted); }
+.panel-body { padding: 11px 12px; display: flex; flex-direction: column; gap: 10px; }
+.panel-foot {
+  border-top: 1px solid var(--line-soft);
+  padding: 8px 12px;
+  font: 400 11.5px var(--sans);
+  color: var(--muted);
+}
+.panel-foot code { font-family: var(--mono); font-size: .9em; }
+
+.rows { display: flex; flex-direction: column; gap: 5px; }
+.row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 12.5px; }
+.row .k { color: var(--muted); }
+.row .v { font: 500 12.5px var(--mono); color: var(--ink); }
+.row .v.big { font-size: 16px; }
+
+.holds { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.hold {
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  padding: 7px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--surface-2);
+}
+.hold .g { font: 500 10px var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+.hold .q { font: 600 17px var(--mono); color: var(--ink); line-height: 1.1; }
+.hold .m { font: 400 10.5px var(--mono); color: var(--muted); }
+.hold.ore   { border-left: 2px solid var(--ore); }
+.hold.ore .g   { color: var(--ore); }
+.hold.ingot { border-left: 2px solid var(--ingot); }
+.hold.ingot .g { color: var(--ingot); }
+.hold.tool  { border-left: 2px solid var(--tool); }
+.hold.tool .g  { color: var(--tool); }
+
+.jobs { display: flex; flex-direction: column; gap: 5px; min-height: 22px; }
+.job { display: flex; align-items: center; gap: 8px; font: 500 11.5px var(--mono); color: var(--ink-2); }
+.job .bar { flex: 1; height: 5px; background: var(--surface-3); border-radius: 3px; overflow: hidden; }
+.job .bar i { display: block; height: 100%; background: var(--accent); }
+.job.rival .bar i { background: var(--engine); }
+.empty { font: 400 11.5px var(--sans); color: var(--muted); font-style: italic; }
+
+/* ---------- ladders ---------- */
+
+.ladder { display: flex; flex-direction: column; gap: 3px; }
+.lad-head { display: flex; justify-content: space-between; font: 500 10px var(--mono); color: var(--muted); letter-spacing: .06em; text-transform: uppercase; }
+.lvl { display: grid; grid-template-columns: 62px 1fr 42px; gap: 7px; align-items: center; font: 500 11.5px var(--mono); }
+.lvl .p { color: var(--ink-2); text-align: right; }
+.lvl .b { height: 9px; background: var(--surface-3); border-radius: 2px; overflow: hidden; }
+.lvl .b i { display: block; height: 100%; background: var(--buy); opacity: .8; transition: width .3s; }
+.lvl .q { color: var(--muted); }
+.lvl.gone .p, .lvl.gone .q { opacity: .35; }
+
+/* ---------- world ---------- */
+
+.mods { display: flex; flex-direction: column; gap: 7px; }
+.mod { display: flex; flex-direction: column; gap: 3px; }
+.mod .t { display: flex; justify-content: space-between; font: 500 11.5px var(--mono); }
+.mod .t .n { color: var(--ink-2); }
+.mod .t .d { color: var(--muted); }
+.mod .t .d.up { color: var(--buy); }
+.mod .t .d.down { color: var(--sell); }
+.mod .bar { height: 5px; background: var(--surface-3); border-radius: 3px; overflow: hidden; }
+.mod .bar i { display: block; height: 100%; transition: width .3s linear; }
+
+.log { display: flex; flex-direction: column; gap: 0; max-height: 208px; overflow: auto; }
+.line {
+  display: grid;
+  grid-template-columns: 52px 1fr;
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 12px;
+  animation: slidein .18s ease;
+}
+.line:last-child { border-bottom: 0; }
+.line .t { font: 500 11px var(--mono); color: var(--muted); }
+.line .m { color: var(--ink-2); }
+.line .m b { font-weight: 600; color: var(--ink); }
+.line.you .t { color: var(--accent); }
+.line.rival .t { color: var(--engine); }
+.line.world .t { color: var(--stream); }
+.line.bad .m b { color: var(--sell); }
+@keyframes slidein { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+
+/* ---------- score ---------- */
+
+.score { display: flex; flex-direction: column; gap: 12px; }
+.score-svg { width: 100%; height: auto; display: block; }
+.tally { display: grid; grid-template-columns: 1fr auto 1fr; gap: 10px; align-items: center; }
+.side { display: flex; flex-direction: column; gap: 1px; padding: 9px 11px; border: 1px solid var(--line-soft); border-radius: 3px; background: var(--surface-2); }
+.side.you { border-left: 3px solid var(--accent); }
+.side.rival { border-left: 3px solid var(--engine); text-align: right; }
+.side .who { font: 500 10.5px var(--mono); letter-spacing: .07em; text-transform: uppercase; color: var(--muted); }
+.side .net { font: 600 21px var(--mono); color: var(--ink); line-height: 1.15; }
+.side .delta { font: 500 11.5px var(--mono); color: var(--muted); }
+.side .delta.up { color: var(--buy); }
+.side .delta.down { color: var(--sell); }
+.vs { font: 500 11px var(--mono); color: var(--muted); }
+
+.verdict {
+  border-radius: 3px;
+  padding: 10px 12px;
+  font-size: 13.5px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink-2);
+}
+.verdict.win { border-color: color-mix(in srgb, var(--buy) 55%, var(--line)); color: var(--buy); }
+.verdict.lose { border-color: color-mix(in srgb, var(--sell) 55%, var(--line)); color: var(--sell); }
+.verdict b { color: inherit; font-weight: 600; }
+
+/* ---------- notes ---------- */
+
+.notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
+.note {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line);
+  border-radius: 4px;
+  padding: 13px 15px;
+  box-shadow: var(--shadow);
+}
+.note h3 { margin: 0 0 6px; font: 600 13.5px var(--sans); }
+.note p { margin: 0; font-size: 13px; color: var(--ink-2); }
+.note.a { border-left-color: var(--accent); }
+.note.b { border-left-color: var(--ingot); }
+.note.c { border-left-color: var(--tool); }
+.note.d { border-left-color: var(--engine); }
+
+footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  justify-content: space-between;
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+  margin-top: 8px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+footer a { color: var(--accent); text-decoration: none; }
+footer a:hover { text-decoration: underline; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="masthead">
+    <p class="eyebrow">fehu · economy server · the world</p>
+    <h1>A world you can play</h1>
+    <p class="deck">
+      An economy is a loop: currency goes round and round, and goods are made, moved up a grade
+      and used up. Below, that loop is running — a miniature of <code>fehu-economy</code>'s
+      catalogue, recipes, jobs, merchants and world effects — and every coin and every unit you
+      see move is a real posting in a real ledger. There is also a game on top of it. You hold one
+      hand; the world holds the other, plays by the same rules against the same clock, and is
+      trying to finish richer than you.
+    </p>
+    <p class="rule">
+      <b>The two rules of the loop:</b>
+      currency is never created, only <em>moved</em> — the bar under the board is the whole supply
+      and it never changes width. Units are the opposite: a purchase or a job makes them out of
+      nothing and consuming them takes them away for good. They are counted separately because
+      they are counted by a different rule.
+    </p>
+  </header>
+
+  <div class="controls">
+    <div class="acts" id="acts" role="group" aria-label="Your moves"></div>
+    <div class="transport">
+      <input class="seedbox" id="seed" value="42" inputmode="numeric" aria-label="Seed" title="Seed: the same seed is the same world">
+      <button class="tbtn" id="again" title="Start over with the seed in the box">Restart</button>
+      <button class="tbtn primary" id="play">Pause</button>
+      <select class="speed" id="speed" aria-label="Clock speed">
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+        <option value="4">4×</option>
+      </select>
+    </div>
+  </div>
+
+  <figure class="board">
+    <svg id="map" viewBox="0 0 1160 560" role="img"
+         aria-label="Live map of the economy: the treasury funds the merchants, the merchants pay the two hands for finished units, the hands pay the seam for ore and the furnace for work, and the seam and the furnace sweep their takings back to the treasury. Ore rises through the furnace into ingots and tools; the merchants consume what they buy, so those units leave the world. The price process and the world's modifiers are read, never paid."></svg>
+    <figcaption id="caption"><b>Warming up.</b> The world is being funded out of the treasury.</figcaption>
+  </figure>
+
+  <div class="legend">
+    <span>round — cents:</span>
+    <span><i class="swatch" style="background: var(--accent)"></i> yours</span>
+    <span><i class="swatch" style="background: var(--engine)"></i> the world's hand</span>
+    <span><i class="swatch" style="background: var(--muted)"></i> the world's own plumbing</span>
+    <span>square — units:</span>
+    <span><i class="swatch sq" style="background: var(--ore)"></i> ore</span>
+    <span><i class="swatch sq" style="background: var(--ingot)"></i> ingot</span>
+    <span><i class="swatch sq" style="background: var(--tool)"></i> tool</span>
+    <span>dashed edge — a read: a price or a modifier, which nobody pays for</span>
+  </div>
+
+  <section class="conserve">
+    <div class="conserve-head">
+      <h3>Every cent in the world, and whose wallet it is in</h3>
+      <span class="meta" id="supply-meta">—</span>
+    </div>
+    <div class="stack" id="stack" role="img" aria-label="The whole currency supply, split by wallet"></div>
+    <div class="stack-key" id="stack-key"></div>
+  </section>
+
+  <h2 class="section">The hands</h2>
+  <p class="cap">
+    Both play the same four moves. Buying ore takes cents out of your wallet and makes units that
+    did not exist. A job takes its inputs and its cost <em>up front</em> and delivers at an instant
+    fixed when it started — which is why a scandal that lands halfway through does not change what
+    you were promised. Selling is an ordinary order against a merchant that is holding real
+    inventory and real money, and can run out of either.
+  </p>
+
+  <div class="grid">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Your hand</h2>
+        <span class="meta" id="you-meta">—</span>
+      </div>
+      <div class="panel-body">
+        <div class="row"><span class="k">wallet</span><span class="v big" id="you-cash">—</span></div>
+        <div class="holds" id="you-holds"></div>
+        <div class="jobs" id="you-jobs"></div>
+      </div>
+      <div class="panel-foot" id="you-foot">jobs.rs · the inputs and the cost go now, the units arrive on the step that reaches the due instant</div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>The world's hand</h2>
+        <span class="meta" id="rival-meta">—</span>
+      </div>
+      <div class="panel-body">
+        <div class="row"><span class="k">wallet</span><span class="v big" id="rival-cash">—</span></div>
+        <div class="holds" id="rival-holds"></div>
+        <div class="jobs" id="rival-jobs"></div>
+      </div>
+      <div class="panel-foot">npc.rs · a policy read once per step, from the reference price and nothing else</div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>What the merchants will pay</h2>
+        <span class="meta" id="mkt-meta">—</span>
+      </div>
+      <div class="panel-body" id="ladders"></div>
+      <div class="panel-foot">book.rs · price–time priority. Selling more than the top level walks you down the ladder.</div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>The world</h2>
+        <span class="meta" id="world-meta">—</span>
+      </div>
+      <div class="panel-body">
+        <div class="mods" id="mods"></div>
+        <div class="log" id="log" aria-live="polite" aria-label="What just happened"></div>
+      </div>
+      <div class="panel-foot">world.rs · a modifier is at full strength when it lands and ramps down to nothing in a straight line</div>
+    </section>
+  </div>
+
+  <h2 class="section">The score</h2>
+  <p class="cap">
+    Net worth is your wallet plus what you are holding, marked at what a merchant would actually
+    pay for it right now — including the units still in the furnace, since those are promised. The
+    run ends when the clock does.
+  </p>
+
+  <section class="panel score-panel">
+    <div class="panel-head">
+      <h2>You against the world</h2>
+      <span class="meta" id="clock-meta">—</span>
+    </div>
+    <div class="panel-body score">
+      <svg class="score-svg" id="equity" viewBox="0 0 900 190" role="img" aria-label="Net worth of both hands over the run"></svg>
+      <div class="tally">
+        <div class="side you">
+          <span class="who">you</span>
+          <span class="net" id="you-net">—</span>
+          <span class="delta" id="you-delta">—</span>
+        </div>
+        <span class="vs">vs</span>
+        <div class="side rival">
+          <span class="who">the world</span>
+          <span class="net" id="rival-net">—</span>
+          <span class="delta" id="rival-delta">—</span>
+        </div>
+      </div>
+      <div class="verdict" id="verdict">The world is playing your hand for you. Take a move and it is yours.</div>
+    </div>
+    <div class="panel-foot">the same seed is the same world — put it back in the box and try a different line</div>
+  </section>
+
+  <h2 class="section">Why it behaves like this</h2>
+  <div class="notes">
+    <div class="note a">
+      <h3>The money only moves</h3>
+      <p>
+        Every posting is balanced: what leaves one wallet arrives in another, in the same
+        transaction, in integer cents. Buying ore does not burn your money — it puts it in the
+        seam's wallet, which the world sweeps back to the treasury, which funds the merchants,
+        which is where your sale proceeds come from. That is the loop, and it is why the supply
+        bar never moves.
+      </p>
+    </div>
+    <div class="note b">
+      <h3>Units are made and used up</h3>
+      <p>
+        Nothing but a command brings a unit into existence: a purchase from the catalogue, or a
+        job delivering. Consuming one takes it out of the world for good and moves no currency at
+        all — a thing that has been used up is not a thing that has been sold. So the unit counts
+        rise and fall while the money goes round.
+      </p>
+    </div>
+    <div class="note c">
+      <h3>A promise, and a price</h3>
+      <p>
+        An event pushes two different numbers. A <em>production</em> modifier is read once, when a
+        job starts, and written into the job — so what you were told you would get is what arrives.
+        A <em>demand</em> modifier is read every time a merchant re-quotes, so the world's appetite
+        shows up in the depth of the book, live, while you are deciding whether to sell.
+      </p>
+    </div>
+    <div class="note d">
+      <h3>The same seed is the same world</h3>
+      <p>
+        The price path and the events are drawn from one seeded stream, in a fixed order. Restart
+        with the seed still in the box and the world does exactly what it did before — so the only
+        thing that changed the outcome was you. That is the invariant the whole library is built
+        to hold.
+      </p>
+    </div>
+  </div>
+
+  <footer>
+    <span>fehu · a deterministic synthetic market</span>
+    <span>this page runs a model, not the server: the rules are the same, the scale is not</span>
+    <span><a href="demo.html">a server you can watch →</a> &nbsp; <a href="architecture.html">where an order goes →</a></span>
+  </footer>
+</div>
+<script>
+/* =====================================================================
+ * A miniature of the fehu economy, and a game played on it.
+ *
+ * Everything on this page is produced by the model below. It is the
+ * server's rules at a scale that fits in a page:
+ *
+ *   ledger.rs   every movement is a balanced posting in integer cents
+ *   catalog.rs  the seam: cents for units that did not exist before
+ *   jobs.rs     a recipe takes its inputs and its cost up front and
+ *               delivers at an instant fixed when the job started
+ *   npc.rs      merchants quote what they can fund and what they hold
+ *   world.rs    an event pushes a modifier that ramps down in a line
+ *   sim.rs      the reference price: mean reversion, clustered vol, jumps
+ *
+ * Nothing here reads a clock except the transport at the bottom, which
+ * decides when to send the next Step. Everything a step does is a pure
+ * function of the world and the seeded stream.
+ * ===================================================================== */
+
+/* ------------------------------ numbers ---------------------------- */
+
+const fmtCents = c => (c < 0 ? "-" : "") + Math.abs(Math.round(c)).toLocaleString("en-US") + "¢";
+const fmtUsd = c => {
+  const n = Math.abs(c) / 100;
+  return (c < 0 ? "-$" : "$") + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+};
+const fmtInt = n => Math.round(n).toLocaleString("en-US");
+const fmtBps = b => (b > 0 ? "+" : "") + (b / 100).toFixed(1) + "%";
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+
+/* --------------------------- the RNG stream ------------------------ */
+/* xorshift128. One stream, drawn in a fixed order: the same seed is the
+ * same world, which is the whole point of the library underneath. */
+
+function nextU32(s) {
+  let t = s[0] ^ (s[0] << 11);
+  t ^= t >>> 8;
+  s[0] = s[1]; s[1] = s[2]; s[2] = s[3];
+  s[3] = (s[3] ^ (s[3] >>> 19) ^ t) >>> 0;
+  return s[3];
+}
+const unit = s => nextU32(s) / 4294967296;
+function normal(s) {
+  const u = Math.max(unit(s), 1e-12), v = unit(s);
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+const seedFrom = n => [
+  (n ^ 0x9e3779b9) >>> 0,
+  ((n * 2654435761) ^ 0x85ebca6b) >>> 0,
+  ((n + 0x6d2b79f5) * 1597334677) >>> 0,
+  ((n ^ 0xc2b2ae35) * 2246822507) >>> 0,
+];
+
+/* ------------------------------ statics ---------------------------- */
+
+const SUPPLY = 4_000_000;          // cents, minted once at genesis
+const STEP_SECS = 5;               // simulated seconds an engine step advances
+const RUN_STEPS = 200;             // the length of a run
+const MAX_JOBS = 5;                // jobs one hand may have in the furnace
+const FEE_BPS = 10;                // the venue's cut of a fill
+const OPENING = 60_000;            // what each hand is paid out of treasury
+
+const GOODS = {
+  ORE:   { glyph: "○", label: "ore",   css: "ore",   color: "var(--ore)" },
+  INGOT: { glyph: "◇", label: "ingot", css: "ingot", color: "var(--ingot)" },
+  TOOL:  { glyph: "▲", label: "tool",  css: "tool",  color: "var(--tool)" },
+};
+const GRADES = ["ORE", "INGOT", "TOOL"];
+const TRADED = ["INGOT", "TOOL"];
+
+const SEAM_PRICE = 120;            // one unit of ORE, from the catalogue
+const SEAM_STOCK = 4_000;          // a finite line: both hands draw on it
+
+const RECIPES = {
+  refine: { id: "refine", inputs: { ORE: 8 },   cost: 240, out: "INGOT", qty: 6, steps: 8,  label: "refine" },
+  fit:    { id: "fit",    inputs: { INGOT: 6 }, cost: 900, out: "TOOL",  qty: 5, steps: 14, label: "fit" },
+};
+
+const REF0 = { INGOT: 240, TOOL: 700 };
+const POLICY = {
+  INGOT: { halfSpreadBps: 40, levels: 5, stepBps: 90, size: 14, float: 460_000 },
+  TOOL:  { halfSpreadBps: 40, levels: 5, stepBps: 80, size: 6,  float: 680_000 },
+};
+const FUND_PER_STEP = 7_000;       // what the treasury tops a merchant up by
+const CONSUME_BPS = 1_800;         // of a merchant's stock, used up each step
+
+/* The price process, per step. Stationary variance omega/(1-alpha-beta). */
+const KAPPA = 0.03, OMEGA = 2e-6, ALPHA = 0.08, BETA = 0.90;
+const LAMBDA = 0.012, JUMP = 0.02, DRIFT = 0.00002;
+
+/* The game-event catalogue: a semantic happening, expanded into simulator
+ * events and world modifiers exactly as `events.rs` expands one. */
+const EVENTS = [
+  { kind: "game:surge",      text: "a buying spree",     sym: "INGOT", effect: "demand",     delta:  3000, steps: 45, jump:  0.04 },
+  { kind: "game:commission", text: "a big order",        sym: "TOOL",  effect: "demand",     delta:  4000, steps: 35, jump:  0.05 },
+  { kind: "game:glut",       text: "a glut",             sym: "INGOT", effect: "demand",     delta: -2500, steps: 55, jump: -0.045 },
+  { kind: "game:tariff",     text: "a tariff",           sym: null,    effect: "demand",     delta: -2000, steps: 50, jump: -0.02 },
+  { kind: "game:rich_seam",  text: "a rich seam",        sym: "INGOT", effect: "production", delta:  3000, steps: 60, jump: -0.02 },
+  { kind: "game:cave_in",    text: "a cave-in",          sym: "INGOT", effect: "production", delta: -3500, steps: 60, jump:  0.035 },
+  { kind: "game:festival",   text: "a festival",         sym: "TOOL",  effect: "demand",     delta:  2500, steps: 30, jump:  0.03 },
+  { kind: "game:strike",     text: "a strike",           sym: "TOOL",  effect: "production", delta: -3000, steps: 45, jump:  0.02 },
+];
+
+/* ------------------------------- state ----------------------------- */
+
+let W = null;              // the world: everything a command may touch
+let handedOver = false;    // has the visitor taken their hand yet
+
+const emptyHand = () => ({
+  held: { ORE: 0, INGOT: 0, TOOL: 0 },   // units in hand
+  basis: { ORE: 0, INGOT: 0, TOOL: 0 },  // what those units cost, in cents
+  jobs: [],
+  nextJob: 1,
+  earned: 0,
+  spent: 0,
+});
+
+function newWorld(seed) {
+  const w = {
+    seed,
+    step: 0,
+    nowMs: 0,
+    rng: seedFrom(seed),
+    over: false,
+    // The ledger. `issuance` is the mirror of everything in circulation and
+    // is the one wallet allowed to be negative; it is excluded from the sum.
+    wallets: {
+      issuance: -SUPPLY, treasury: SUPPLY,
+      you: 0, rival: 0, seam: 0, venue: 0,
+      "npc:INGOT": 0, "npc:TOOL": 0,
+    },
+    flow: {},
+    hands: { you: emptyHand(), rival: emptyHand() },
+    seam: { price: SEAM_PRICE, available: SEAM_STOCK, issued: 0 },
+    units: { made: 0, consumed: 0, live: { ORE: 0, INGOT: 0, TOOL: 0 } },
+    sims: {}, books: {}, npcs: {},
+    mods: [], nextMod: 1, nextEvent: 12,
+    log: [], equity: [], marks: { you: 0, rival: 0 },
+  };
+  for (const sym of TRADED) {
+    w.sims[sym] = { logp: Math.log(REF0[sym]), mu: Math.log(REF0[sym]), h: OMEGA / (1 - ALPHA - BETA), e: 0, hist: [REF0[sym]] };
+    w.books[sym] = { bids: [] };
+    w.npcs[sym] = { stock: 0, consumed: 0, bought: 0 };
+  }
+  return w;
+}
+
+/* ------------------------------ ledger ----------------------------- */
+
+function refuse(why) { const e = new Error(why); e.refusal = true; throw e; }
+
+/* One balanced transaction. Nothing else in this page moves currency. */
+function post(w, moves, reason) {
+  let sum = 0;
+  for (const m of moves) sum += m[1];
+  if (sum !== 0) throw new Error("unbalanced posting: " + reason);
+  for (const [k, d] of moves) {
+    if (d < 0 && k !== "issuance" && w.wallets[k] + d < 0) refuse(k + " cannot fund that");
+  }
+  for (const [k, d] of moves) w.wallets[k] += d;
+  let moved = 0;
+  for (const m of moves) if (m[1] > 0) moved += m[1];
+  w.flow[reason] = (w.flow[reason] || 0) + moved;
+}
+
+/* The conservation sum: every wallet but the issuance mirror. */
+const circulating = w => Object.keys(w.wallets)
+  .filter(k => k !== "issuance")
+  .reduce((a, k) => a + w.wallets[k], 0);
+
+/* Units are counted by the other rule: made out of nothing, and gone for
+ * good when they are used up. */
+function issueUnits(w, sym, qty) { w.units.made += qty; w.units.live[sym] += qty; }
+function consumeUnits(w, sym, qty) { w.units.consumed += qty; w.units.live[sym] -= qty; }
+
+/* ------------------------- the price process ----------------------- */
+
+function simStep(w, sym) {
+  const s = w.sims[sym];
+  s.h = OMEGA + ALPHA * s.e * s.e + BETA * s.h;
+  const e = Math.sqrt(s.h) * normal(w.rng);
+  s.e = e;
+  let d = KAPPA * (s.mu - s.logp) + e + DRIFT;
+  if (unit(w.rng) < LAMBDA) d += (unit(w.rng) < 0.5 ? -1 : 1) * JUMP * (1 + unit(w.rng));
+  s.logp += d;
+  const p = refPrice(w, sym);
+  s.hist.push(p);
+  if (s.hist.length > 220) s.hist.shift();
+}
+const refPrice = (w, sym) => Math.max(1, Math.round(Math.exp(w.sims[sym].logp)));
+
+/* --------------------------- world modifiers ----------------------- */
+
+/* world.rs: full strength when it lands, nothing at its end, a straight
+ * line in between, in integer basis points. */
+function pullBps(m, nowMs) {
+  if (nowMs < m.from || nowMs >= m.until) return 0;
+  const span = m.until - m.from;
+  if (span <= 0) return 0;
+  return Math.trunc(m.delta * (m.until - nowMs) / span);
+}
+function multiplierBps(w, effect, sym) {
+  let pull = 0;
+  for (const m of w.mods) {
+    if (m.effect !== effect) continue;
+    if (m.sym !== null && m.sym !== sym) continue;
+    pull += pullBps(m, w.nowMs);
+  }
+  return clamp(10_000 + pull, 2_500, 40_000);   // MIN_YIELD_BPS..MAX_YIELD_BPS
+}
+function forgetSpent(w) { w.mods = w.mods.filter(m => w.nowMs < m.until); }
+
+/* ------------------------- the NPC merchants ----------------------- */
+
+/* npc.rs: a ladder in basis points of the reference, sized by what the
+ * world's appetite says and truncated by what the wallet can fund. A bid
+ * that cannot be paid for is not a bid. */
+function requote(w, sym) {
+  const p = POLICY[sym];
+  const ref = refPrice(w, sym);
+  const mult = multiplierBps(w, "demand", sym);
+  let cash = w.wallets["npc:" + sym];
+  const bids = [];
+  for (let i = 0; i < p.levels; i++) {
+    const px = Math.max(1, Math.round(ref * (10_000 - p.halfSpreadBps - i * p.stepBps) / 10_000));
+    const want = Math.floor(p.size * mult / 10_000);
+    const qty = Math.min(want, Math.floor(cash / px));
+    if (qty <= 0) break;
+    cash -= qty * px;
+    bids.push({ px, qty });
+  }
+  w.books[sym].bids = bids;
+}
+const bestBid = (w, sym) => (w.books[sym].bids[0] ? w.books[sym].bids[0].px : 0);
+const depth = (w, sym) => w.books[sym].bids.reduce((a, b) => a + b.qty, 0);
+const depthAbove = (w, sym, px) => w.books[sym].bids.filter(b => b.px >= px).reduce((a, b) => a + b.qty, 0);
+
+/* What a hand is holding, marked at what a merchant would really pay. */
+function markUnit(w, sym) {
+  if (sym === "ORE") return w.seam.price;
+  return bestBid(w, sym) || Math.round(refPrice(w, sym) * 0.99);
+}
+function netWorth(w, who) {
+  const h = w.hands[who];
+  let n = w.wallets[who];
+  for (const g of GRADES) n += h.held[g] * markUnit(w, g);
+  for (const j of h.jobs) n += j.qty * markUnit(w, j.out);   // promised, so counted
+  return n;
+}
+
+/* ---------------------------- the moves ---------------------------- */
+/* Every one of these is a command. There is no other way to change the
+ * world, and each validates completely before it moves anything — so a
+ * refusal leaves the world exactly as it found it. */
+
+const pending = [];                 // particles the board has not drawn yet
+const emit = (edge, dir, kind, tint, n) => {
+  for (let i = 0; i < (n || 1); i++) pending.push({ edge, dir, kind, tint, i });
+};
+const tintOf = who => (who === "you" ? "var(--accent)" : "var(--engine)");
+
+function logLine(w, cls, msg) {
+  w.log.push({ step: w.step, cls, msg });
+  if (w.log.length > 80) w.log.shift();
+}
+
+/* Take `qty` units out of a hand, and the share of their cost with them. */
+function takeUnits(h, sym, qty) {
+  const share = h.held[sym] > 0 ? Math.round(h.basis[sym] * qty / h.held[sym]) : 0;
+  h.held[sym] -= qty;
+  h.basis[sym] = Math.max(0, h.basis[sym] - share);
+  return share;
+}
+
+/* catalog.rs — the world selling a unit that did not exist before. */
+function buy(w, who, qty) {
+  const total = w.seam.price * qty;
+  if (qty <= 0) refuse("nothing to buy");
+  if (w.seam.available < qty) refuse("the seam has only " + w.seam.available + " left");
+  if (w.wallets[who] < total) refuse("that costs " + fmtUsd(total) + " and you have " + fmtUsd(w.wallets[who]));
+  post(w, [[who, -total], ["seam", total]], "purchase");
+  w.seam.available -= qty;
+  w.seam.issued += qty;
+  issueUnits(w, "ORE", qty);
+  const h = w.hands[who];
+  h.held.ORE += qty;
+  h.basis.ORE += total;
+  h.spent += total;
+  emit("seam-hands", -1, "coin", tintOf(who), 3);
+  emit("seam-hands", 1, "unit", GOODS.ORE.color, Math.min(6, qty));
+  logLine(w, who, (who === "you" ? "You" : "The world") + " bought <b>" + qty + " ore</b> for " + fmtUsd(total));
+  return { qty, total };
+}
+
+/* jobs.rs — the inputs and the cost go now; what it will deliver is
+ * resolved now too, and a later event cannot change it. */
+function startJob(w, who, key) {
+  const r = RECIPES[key];
+  const h = w.hands[who];
+  if (!r) refuse("no such recipe");
+  if (h.jobs.length >= MAX_JOBS) refuse("the furnace is full");
+  for (const sym in r.inputs) if (h.held[sym] < r.inputs[sym]) refuse("that needs " + r.inputs[sym] + " " + GOODS[sym].label);
+  if (w.wallets[who] < r.cost) refuse("that job costs " + fmtUsd(r.cost));
+  // The yield is read once, here, and written into the job.
+  const mult = multiplierBps(w, "production", r.out);
+  const qty = Math.max(1, Math.floor(r.qty * mult / 10_000));
+  post(w, [[who, -r.cost], ["venue", r.cost]], "job_cost");
+  let basis = r.cost;
+  for (const sym in r.inputs) {
+    basis += takeUnits(h, sym, r.inputs[sym]);
+    consumeUnits(w, sym, r.inputs[sym]);
+    emit("hands-furnace", 1, "unit", GOODS[sym].color, Math.min(5, r.inputs[sym]));
+  }
+  emit("hands-furnace", 1, "coin", tintOf(who), 2);
+  const job = {
+    id: who + "#" + h.nextJob++, who, recipe: r.id, label: r.label,
+    out: r.out, qty, basis, mult,
+    fromMs: w.nowMs, dueMs: w.nowMs + r.steps * STEP_SECS * 1000, steps: r.steps,
+  };
+  h.jobs.push(job);
+  const note = mult === 10_000 ? "" : " (" + fmtBps(mult - 10_000) + " on the yield)";
+  logLine(w, who, (who === "you" ? "You" : "The world") + " started <b>" + r.label + "</b> for " + qty + " " + GOODS[r.out].label + note);
+  return job;
+}
+
+/* The step that reaches the due instant delivers it — not a wall clock. */
+function deliver(w) {
+  for (const who of ["you", "rival"]) {
+    const h = w.hands[who];
+    const done = h.jobs.filter(j => j.dueMs <= w.nowMs);
+    if (!done.length) continue;
+    h.jobs = h.jobs.filter(j => j.dueMs > w.nowMs);
+    for (const j of done) {
+      issueUnits(w, j.out, j.qty);
+      h.held[j.out] += j.qty;
+      h.basis[j.out] += j.basis;
+      emit("hands-furnace", -1, "unit", GOODS[j.out].color, Math.min(6, j.qty));
+      logLine(w, who, (who === "you" ? "Your" : "The world's") + " " + j.label + " delivered <b>" + j.qty + " " + GOODS[j.out].label + "</b>");
+    }
+  }
+}
+
+/* An ordinary order against a funded book: it fills what is there. */
+function sell(w, who, sym, qty) {
+  const h = w.hands[who];
+  if (qty <= 0) refuse("nothing to sell");
+  if (h.held[sym] < qty) refuse("you hold " + h.held[sym] + " " + GOODS[sym].label);
+  const book = w.books[sym];
+  if (!book.bids.length) refuse("nobody is bidding for " + GOODS[sym].label);
+  let left = qty, proceeds = 0, filled = 0, worst = 0;
+  for (const lvl of book.bids) {
+    if (left <= 0) break;
+    const n = Math.min(left, lvl.qty);
+    if (n <= 0) continue;
+    const notional = n * lvl.px;
+    post(w, [["npc:" + sym, -notional], [who, notional]], "sell");
+    const fee = Math.floor(notional * FEE_BPS / 10_000);
+    if (fee > 0) post(w, [[who, -fee], ["venue", fee]], "fee");
+    lvl.qty -= n;
+    left -= n;
+    filled += n;
+    proceeds += notional - fee;
+    worst = lvl.px;
+  }
+  book.bids = book.bids.filter(l => l.qty > 0);
+  if (filled === 0) refuse("nobody is bidding for " + GOODS[sym].label);
+  const cost = takeUnits(h, sym, filled);
+  w.npcs[sym].stock += filled;
+  w.npcs[sym].bought += filled;
+  h.earned += proceeds;
+  emit("hands-merch", 1, "unit", GOODS[sym].color, Math.min(6, filled));
+  emit("hands-merch", -1, "coin", tintOf(who), 4);
+  const pnl = proceeds - cost;
+  logLine(w, who + (pnl < 0 ? " bad" : ""),
+    (who === "you" ? "You" : "The world") + " sold <b>" + filled + " " + GOODS[sym].label + "</b> at " +
+    fmtCents(worst) + " for " + fmtUsd(proceeds) + " (" + (pnl >= 0 ? "+" : "") + fmtUsd(pnl) + ")");
+  return { filled, proceeds, worst };
+}
+
+/* ------------------------------ the step --------------------------- */
+
+/* events.rs — one game happening, expanded into a simulator event that
+ * moves the price and a world modifier that moves production or demand. */
+function fireEvent(w) {
+  const e = EVENTS[Math.floor(unit(w.rng) * EVENTS.length)];
+  const syms = e.sym && e.sym !== "ORE" ? [e.sym] : TRADED;
+  for (const s of syms) w.sims[s].logp += Math.log(1 + e.jump);
+  w.mods.push({
+    id: w.nextMod++, kind: e.kind, text: e.text, effect: e.effect, sym: e.sym,
+    delta: e.delta, from: w.nowMs, until: w.nowMs + e.steps * STEP_SECS * 1000,
+  });
+  if (w.mods.length > 6) w.mods.shift();
+  w.nextEvent = w.step + 14 + Math.floor(unit(w.rng) * 20);
+  emit(e.effect === "production" ? "world-furnace" : "world-merch", 1, "spark", "var(--stream)", 4);
+  emit("world-market", 1, "spark", "var(--stream)", 3);
+  logLine(w, "world", "<b>" + e.text + "</b> — " + e.effect + " " + fmtBps(e.delta) +
+    (e.sym ? " on " + GOODS[e.sym].label : " everywhere") + ", ramping down over " + e.steps + " steps");
+}
+
+/* The world's own plumbing: it funds the merchants, they use up what they
+ * buy, and the takings come home. All of it in balanced postings. */
+function plumbing(w) {
+  for (const sym of TRADED) {
+    const wallet = "npc:" + sym;
+    const want = Math.min(FUND_PER_STEP, POLICY[sym].float - w.wallets[wallet], w.wallets.treasury);
+    if (want > 0) {
+      post(w, [["treasury", -want], [wallet, want]], "transfer");
+      emit("treasury-merch", 1, "coin", "var(--muted)", 2);
+    }
+    const npc = w.npcs[sym];
+    if (npc.stock > 0) {
+      const used = Math.max(1, Math.floor(npc.stock * CONSUME_BPS / 10_000));
+      npc.stock -= used;
+      npc.consumed += used;
+      consumeUnits(w, sym, used);          // gone for good, and no currency moves
+      emit("merch-sink", 1, "unit", GOODS[sym].color, Math.min(4, used));
+    }
+  }
+  for (const k of ["seam", "venue"]) {
+    const take = w.wallets[k];
+    if (take > 0) {
+      post(w, [[k, -take], ["treasury", take]], "transfer");
+      emit(k === "seam" ? "seam-treasury" : "furnace-treasury", 1, "coin", "var(--muted)", 2);
+    }
+  }
+}
+
+function step(w) {
+  if (w.over) return;
+  w.step += 1;
+  w.nowMs += STEP_SECS * 1000;
+  forgetSpent(w);
+  if (w.step >= w.nextEvent) fireEvent(w);
+  for (const sym of TRADED) simStep(w, sym);
+  deliver(w);
+  plumbing(w);
+  for (const sym of TRADED) requote(w, sym);
+  playHand(w, "rival", 1.18);
+  if (!handedOver) playHand(w, "you", 1.13);
+  w.marks = { you: netWorth(w, "you"), rival: netWorth(w, "rival") };
+  w.equity.push([w.marks.you, w.marks.rival]);
+  if (w.step >= RUN_STEPS) {
+    w.over = true;
+    logLine(w, "world", "<b>The clock is out.</b> " +
+      (w.marks.you > w.marks.rival ? "You finished ahead." : w.marks.you < w.marks.rival ? "The world finished ahead." : "A dead heat."));
+  }
+}
+
+/* --------------------------- a hand's policy ----------------------- */
+/* npc.rs: a policy, read once per step, from the book and its own
+ * position. It is beatable — it never waits for a better bid than its
+ * threshold, and it never counts what an event is about to do. */
+
+function playHand(w, who, edge) {
+  const h = w.hands[who];
+  const closing = w.step > RUN_STEPS - 16;
+  for (const sym of TRADED) {
+    const q = h.held[sym];
+    if (!q) continue;
+    const avg = h.basis[sym] / q;
+    if (closing) {
+      const n = Math.min(q, depth(w, sym));
+      if (n > 0) try_(w, { t: "Sell", who, sym, qty: n });
+      continue;
+    }
+    const n = Math.min(q, depthAbove(w, sym, Math.round(avg * edge)));
+    if (n > 0) try_(w, { t: "Sell", who, sym, qty: n });
+  }
+  if (closing) return;
+  if (h.jobs.length < MAX_JOBS) {
+    const fit = RECIPES.fit, refine = RECIPES.refine;
+    if (h.held.INGOT >= fit.inputs.INGOT && w.wallets[who] >= fit.cost + refine.cost) {
+      try_(w, { t: "Job", who, key: "fit" });
+    } else if (h.held.ORE >= refine.inputs.ORE && w.wallets[who] >= refine.cost) {
+      try_(w, { t: "Job", who, key: "refine" });
+    }
+  }
+  const lot = RECIPES.refine.inputs.ORE;
+  if (h.held.ORE < lot * 2 && w.seam.available >= lot &&
+      w.wallets[who] >= lot * w.seam.price + RECIPES.refine.cost + RECIPES.fit.cost) {
+    try_(w, { t: "Buy", who, qty: lot });
+  }
+}
+
+/* ------------------------------- apply ----------------------------- */
+
+function apply(w, cmd) {
+  switch (cmd.t) {
+    case "Buy": return buy(w, cmd.who, cmd.qty);
+    case "Job": return startJob(w, cmd.who, cmd.key);
+    case "Sell": return sell(w, cmd.who, cmd.sym, cmd.qty);
+    case "Step": return step(w);
+    default: refuse("unknown command");
+  }
+}
+
+/* The funnel. A refusal is not recorded and changes nothing; a success is
+ * the only thing that ever moves a number on this page. */
+function run(cmd) {
+  try {
+    return apply(W, cmd);
+  } catch (e) {
+    if (!e.refusal) throw e;
+    if (cmd.who === "you" && handedOver) {
+      logLine(W, "bad", "Refused: " + e.message);
+      render();
+    }
+    return null;
+  }
+}
+const try_ = (w, cmd) => run(cmd);
+
+/* ============================== the board =========================== */
+
+const $ = id => document.getElementById(id);
+const SVGNS = "http://www.w3.org/2000/svg";
+const el = (n, a, txt) => {
+  const e = document.createElementNS(SVGNS, n);
+  for (const k in a) e.setAttribute(k, a[k]);
+  if (txt !== undefined) e.textContent = txt;
+  return e;
+};
+const reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+const NODES = {
+  seam:     { x: 60,  y: 200, w: 200, h: 120, title: "the seam",         sub: "catalog.rs · issues units" },
+  treasury: { x: 60,  y: 396, w: 200, h: 110, title: "the treasury",     sub: "ledger.rs · the world's float" },
+  you:      { x: 336, y: 44,  w: 200, h: 112, title: "your hand",        sub: "", cls: "you" },
+  rival:    { x: 560, y: 44,  w: 200, h: 112, title: "the world's hand", sub: "", cls: "rival" },
+  furnace:  { x: 336, y: 232, w: 200, h: 128, title: "the furnace",      sub: "jobs.rs · recipes", big: true },
+  world:    { x: 560, y: 232, w: 200, h: 128, title: "the world",        sub: "world.rs · modifiers", big: true },
+  market:   { x: 830, y: 32,  w: 270, h: 84,  title: "the price process", sub: "sim.rs" },
+  merch:    { x: 830, y: 140, w: 270, h: 250, title: "the merchants",    sub: "npc.rs · funded, and finite", big: true },
+};
+
+const EDGES = {
+  "seam-hands":       { d: "M260,244 C300,232 310,158 336,116", t: "purchases · ore", lx: 292, ly: 176 },
+  "hands-furnace":    { d: "M436,156 L436,232",                 t: "inputs · yield",  lx: 444, ly: 196, anchor: "start" },
+  "hands-merch":      { d: "M760,100 C794,100 806,158 830,192", t: "sales",           lx: 806, ly: 122, anchor: "start" },
+  "treasury-merch":   { d: "M260,452 C520,532 780,494 940,392", t: "the float the merchants quote against", lx: 580, ly: 528 },
+  "seam-treasury":    { d: "M160,320 L160,396",                 t: "takings",         lx: 168, ly: 362, anchor: "start" },
+  "furnace-treasury": { d: "M336,306 C300,310 256,346 234,396", t: "takings",         lx: 268, ly: 372, anchor: "end" },
+  "merch-sink":       { d: "M1000,390 L1000,442",               t: "",                lx: 0, ly: 0 },
+  "world-furnace":    { d: "M600,360 C596,394 524,394 484,360", read: true, t: "production ×", lx: 542, ly: 406 },
+  "world-merch":      { d: "M760,300 L830,300",  read: true,    t: "demand ×",        lx: 795, ly: 292 },
+  "world-market":     { d: "M760,246 C800,238 802,126 830,86",  read: true, t: "sim events", lx: 782, ly: 182, anchor: "end" },
+  "market-merch":     { d: "M965,116 L965,140",  read: true,    t: "reference",       lx: 972, ly: 132, anchor: "start" },
+};
+
+const ref = {};          // live SVG text/rect nodes, by name
+const paths = {};        // edge id -> <path>
+let gParts = null;
+
+function txt(g, x, y, cls, t, extra) {
+  const e = el("text", Object.assign({ x, y, class: cls }, extra || {}), t);
+  g.appendChild(e);
+  return e;
+}
+function bar(g, x, y, w, h, fill, bg) {
+  const track = el("rect", { x, y, width: w, height: h, rx: 2, fill: bg || "var(--surface-3)" });
+  g.appendChild(track);
+  const i = el("rect", { x, y, width: 0, height: h, rx: 2, fill });
+  g.appendChild(i);
+  i.track = track;
+  return i;
+}
+const setTrack = (b, w) => b.track.setAttribute("width", w);
+
+function buildBoard() {
+  const svg = $("map");
+  svg.textContent = "";
+  const gE = el("g"), gL = el("g"), gN = el("g");
+  gParts = el("g");
+  svg.append(gE, gL, gN, gParts);
+
+  for (const id in EDGES) {
+    const e = EDGES[id];
+    const p = el("path", { d: e.d, class: e.read ? "edge read" : "edge" });
+    gE.appendChild(p);
+    paths[id] = p;
+    if (e.t) gL.appendChild(el("text", { x: e.lx, y: e.ly, class: "e-label", "text-anchor": e.anchor || "middle" }, e.t));
+  }
+
+  for (const id in NODES) {
+    const n = NODES[id];
+    const g = el("g");
+    gN.appendChild(g);
+    g.appendChild(el("rect", {
+      x: n.x, y: n.y, width: n.w, height: n.h, rx: 4,
+      class: "n-box" + (n.big ? " big" : "") + (n.cls ? " " + n.cls : ""),
+    }));
+    txt(g, n.x + 12, n.y + 21, "n-title", n.title);
+    if (n.sub) txt(g, n.x + 12, n.y + 35, "n-sub", n.sub);
+    build[id](g, n);
+  }
+
+  // Where units leave the world.
+  const s = el("g");
+  gN.appendChild(s);
+  s.appendChild(el("circle", { cx: 1000, cy: 462, r: 17, fill: "none", stroke: "var(--line)", "stroke-width": 1.25, "stroke-dasharray": "3 3" }));
+  ref.sink = txt(s, 1000, 466, "n-num", "0", { "text-anchor": "middle" });
+  txt(s, 1000, 496, "n-tag", "used up", { "text-anchor": "middle" });
+  txt(s, 1000, 510, "n-sub", "units leave the world", { "text-anchor": "middle" });
+}
+
+/* Each node draws its own live numbers. */
+const build = {
+  seam(g, n) {
+    ref.seamPrice = txt(g, n.x + 12, n.y + 62, "n-num big", "—");
+    txt(g, n.x + 12, n.y + 78, "n-tag", "one unit of ore");
+    ref.seamBar = bar(g, n.x + 12, n.y + 88, n.w - 24, 7, "var(--ore)");
+    ref.seamLeft = txt(g, n.x + 12, n.y + 110, "n-sub", "—");
+  },
+  treasury(g, n) {
+    ref.treasury = txt(g, n.x + 12, n.y + 62, "n-num big", "—");
+    txt(g, n.x + 12, n.y + 78, "n-tag", "left to fund the world with");
+    ref.treasuryBar = bar(g, n.x + 12, n.y + 88, n.w - 24, 7, "var(--muted)");
+  },
+  you(g, n) { hand(g, n, "you"); },
+  rival(g, n) { hand(g, n, "rival"); },
+  furnace(g, n) {
+    ref.jobRows = [];
+    for (let c = 0; c < 2; c++) {
+      for (let i = 0; i < 4; i++) {
+        const x = n.x + 12 + c * 96, y = n.y + 48 + i * 18;
+        const row = {
+          glyph: txt(g, x, y + 7, "n-sub", ""),
+          bar: bar(g, x + 12, y + 1, 70, 6, c === 0 ? "var(--accent)" : "var(--engine)", "var(--surface)"),
+          w: 70,
+        };
+        ref.jobRows.push(row);
+      }
+    }
+    ref.furnaceNote = txt(g, n.x + 12, n.y + 124, "n-sub", "idle");
+  },
+  world(g, n) {
+    ref.modRows = [];
+    for (let i = 0; i < 3; i++) {
+      const y = n.y + 48 + i * 22;
+      ref.modRows.push({
+        name: txt(g, n.x + 12, y + 7, "n-sub", ""),
+        val: txt(g, n.x + n.w - 12, y + 7, "n-num", "", { "text-anchor": "end" }),
+        bar: bar(g, n.x + 12, y + 12, n.w - 24, 5, "var(--stream)", "var(--surface)"),
+        w: n.w - 24,
+      });
+    }
+    ref.worldNote = txt(g, n.x + 12, n.y + 124, "n-sub", "quiet");
+  },
+  market(g, n) {
+    ref.spark = {};
+    TRADED.forEach((sym, i) => {
+      const x = n.x + 12 + i * 130;
+      ref.spark[sym] = {
+        line: (() => {
+          const p = el("path", { fill: "none", "stroke-width": 1.4, "stroke-linejoin": "round" });
+          p.style.stroke = GOODS[sym].color;
+          g.appendChild(p);
+          return p;
+        })(),
+        px: txt(g, x, n.y + 76, "n-num", "—"),
+        x, y: n.y + 40, w: 112, h: 26,
+      };
+      txt(g, x + 112, n.y + 76, "n-tag", GOODS[sym].label, { "text-anchor": "end" });
+    });
+  },
+  merch(g, n) {
+    ref.merch = {};
+    TRADED.forEach((sym, i) => {
+      const y = n.y + 52 + i * 100;
+      const m = {};
+      txt(g, n.x + 12, y + 10, "n-tag", "best bid · " + GOODS[sym].label);
+      m.bid = txt(g, n.x + 12, y + 34, "n-num big", "—");
+      m.depth = txt(g, n.x + n.w - 12, y + 34, "n-sub", "", { "text-anchor": "end" });
+      txt(g, n.x + 12, y + 52, "n-tag", "float");
+      m.floatBar = bar(g, n.x + 12, y + 58, n.w - 24, 6, GOODS[sym].color);
+      m.note = txt(g, n.x + 12, y + 80, "n-sub", "");
+      m.w = n.w - 24;
+      ref.merch[sym] = m;
+    });
+  },
+};
+
+function hand(g, n, who) {
+  const r = {};
+  r.cash = txt(g, n.x + 12, n.y + 42, "n-num big", "—");
+  r.net = txt(g, n.x + n.w - 12, n.y + 42, "n-num", "—", { "text-anchor": "end" });
+  txt(g, n.x + n.w - 12, n.y + 56, "n-tag", "net worth", { "text-anchor": "end" });
+  r.units = {};
+  GRADES.forEach((sym, i) => {
+    const x = n.x + 12 + i * 62;
+    const gl = el("text", { x, y: n.y + 84, class: "n-sub" }, GOODS[sym].glyph);
+    gl.style.fill = GOODS[sym].color;
+    g.appendChild(gl);
+    r.units[sym] = txt(g, x + 14, n.y + 84, "n-num", "0");
+    txt(g, x, n.y + 99, "n-tag", GOODS[sym].label);
+  });
+  ref[who + "Node"] = r;
+}
+
+/* ---------------------------- the particles ------------------------ */
+
+const parts = [];
+const PX_PER_SEC = 165;
+
+function drainPending() {
+  if (reduced) { pending.length = 0; return; }
+  while (pending.length && parts.length < 320) {
+    const p = pending.shift();
+    const path = paths[p.edge];
+    if (!path) continue;
+    const node = p.kind === "coin"
+      ? el("circle", { r: 3.1, fill: p.tint, class: "pip" })
+      : p.kind === "spark"
+        ? el("rect", { width: 3, height: 3, rx: 1.5, fill: p.tint, class: "pip" })
+        : el("rect", { width: 5.4, height: 5.4, rx: 1, fill: p.tint, class: "pip" });
+    gParts.appendChild(node);
+    parts.push({ node, path, len: path.getTotalLength(), t: 0, dir: p.dir, kind: p.kind, delay: (p.i || 0) * 0.09 });
+  }
+}
+
+let last = 0;
+function animate(now) {
+  const dt = last ? Math.min((now - last) / 1000, 0.1) : 0;
+  last = now;
+  drainPending();
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    if (p.delay > 0) { p.delay -= dt; continue; }
+    p.t += dt * PX_PER_SEC / p.len;
+    if (p.t >= 1) { p.node.remove(); parts.splice(i, 1); continue; }
+    const at = p.path.getPointAtLength((p.dir > 0 ? p.t : 1 - p.t) * p.len);
+    if (p.kind === "coin") { p.node.setAttribute("cx", at.x); p.node.setAttribute("cy", at.y); }
+    else {
+      const s = p.kind === "spark" ? 1.5 : 2.7;
+      p.node.setAttribute("x", at.x - s);
+      p.node.setAttribute("y", at.y - s);
+    }
+    p.node.setAttribute("opacity", p.t < .12 ? (p.t / .12).toFixed(2) : p.t > .88 ? ((1 - p.t) / .12).toFixed(2) : "1");
+  }
+  requestAnimationFrame(animate);
+}
+
+/* ============================== rendering ========================== */
+
+function sparkPath(hist, x, y, w, h) {
+  const pts = hist.slice(-72);
+  if (pts.length < 2) return "";
+  let lo = Infinity, hi = -Infinity;
+  for (const p of pts) { if (p < lo) lo = p; if (p > hi) hi = p; }
+  const span = Math.max(1, hi - lo);
+  return pts.map((p, i) =>
+    (i ? "L" : "M") + (x + i * w / (pts.length - 1)).toFixed(1) + "," + (y + h - (p - lo) / span * h).toFixed(1)
+  ).join(" ");
+}
+
+function renderBoard() {
+  const w = W;
+  ref.seamPrice.textContent = fmtCents(w.seam.price);
+  ref.seamBar.setAttribute("width", (176 * w.seam.available / SEAM_STOCK).toFixed(1));
+  ref.seamLeft.textContent = fmtInt(w.seam.available) + " units left · " + fmtInt(w.seam.issued) + " issued";
+
+  ref.treasury.textContent = fmtUsd(w.wallets.treasury);
+  ref.treasuryBar.setAttribute("width", (176 * clamp(w.wallets.treasury / SUPPLY, 0, 1)).toFixed(1));
+
+  for (const who of ["you", "rival"]) {
+    const r = ref[who + "Node"], h = w.hands[who];
+    r.cash.textContent = fmtUsd(w.wallets[who]);
+    r.net.textContent = fmtUsd(netWorth(w, who));
+    for (const sym of GRADES) r.units[sym].textContent = fmtInt(h.held[sym]);
+  }
+
+  const jobs = [];
+  for (const j of w.hands.you.jobs) jobs.push([0, j]);
+  for (const j of w.hands.rival.jobs) jobs.push([1, j]);
+  ref.jobRows.forEach((row, i) => {
+    const col = i < 4 ? 0 : 1, slot = i % 4;
+    const mine = jobs.filter(x => x[0] === col)[slot];
+    if (!mine) { row.glyph.textContent = ""; row.bar.setAttribute("width", 0); setTrack(row.bar, 0); return; }
+    setTrack(row.bar, row.w);
+    const j = mine[1];
+    const done = clamp((w.nowMs - j.fromMs) / (j.dueMs - j.fromMs), 0, 1);
+    row.glyph.textContent = GOODS[j.out].glyph + j.qty;
+    row.glyph.style.fill = GOODS[j.out].color;
+    row.bar.setAttribute("width", (row.w * done).toFixed(1));
+  });
+  const nj = w.hands.you.jobs.length + w.hands.rival.jobs.length;
+  ref.furnaceNote.textContent = nj ? nj + " running · yours left" : "nothing in the furnace";
+
+  const live = w.mods.filter(m => pullBps(m, w.nowMs) !== 0).slice(-3);
+  ref.modRows.forEach((row, i) => {
+    const m = live[i];
+    if (!m) { row.name.textContent = ""; row.val.textContent = ""; row.bar.setAttribute("width", 0); setTrack(row.bar, 0); return; }
+    setTrack(row.bar, row.w);
+    const pull = pullBps(m, w.nowMs);
+    row.name.textContent = m.text.length > 15 ? m.text.slice(0, 14) + "…" : m.text;
+    row.val.textContent = (m.effect === "production" ? "prod " : "dem ") + fmtBps(pull);
+    row.val.style.fill = pull > 0 ? "var(--buy)" : "var(--sell)";
+    row.bar.setAttribute("width", (row.w * Math.abs(pull) / Math.max(1, Math.abs(m.delta))).toFixed(1));
+    row.bar.setAttribute("fill", pull > 0 ? "var(--buy)" : "var(--sell)");
+  });
+  ref.worldNote.textContent = live.length
+    ? "ramping down in a line"
+    : "quiet · next in " + Math.max(0, w.nextEvent - w.step) + " steps";
+
+  for (const sym of TRADED) {
+    const s = ref.spark[sym];
+    s.line.setAttribute("d", sparkPath(w.sims[sym].hist, s.x, s.y, s.w, s.h));
+    s.px.textContent = fmtCents(refPrice(w, sym));
+    const m = ref.merch[sym], bb = bestBid(w, sym);
+    m.bid.textContent = bb ? fmtCents(bb) : "no bid";
+    m.bid.style.fill = bb ? "var(--ink)" : "var(--sell)";
+    m.depth.textContent = fmtInt(depth(w, sym)) + " wanted";
+    m.floatBar.setAttribute("width", (m.w * clamp(w.wallets["npc:" + sym] / POLICY[sym].float, 0, 1)).toFixed(1));
+    m.note.textContent = fmtUsd(w.wallets["npc:" + sym]) + " to spend · " + fmtInt(w.npcs[sym].stock) + " in stock";
+  }
+  ref.sink.textContent = fmtInt(w.units.consumed);
+}
+
+const STACK = [
+  ["you", "your wallet", "var(--accent)"],
+  ["rival", "the world's hand", "var(--engine)"],
+  ["npc:INGOT", "merchant · ingot", "var(--ingot)"],
+  ["npc:TOOL", "merchant · tool", "var(--tool)"],
+  ["seam", "the seam", "var(--ore)"],
+  ["venue", "the venue", "var(--sell)"],
+  ["treasury", "the treasury", "var(--muted)"],
+];
+
+function renderStack() {
+  const total = circulating(W);
+  $("supply-meta").textContent = "Σ " + fmtUsd(total) + " · minted once at genesis, never since";
+  $("stack").innerHTML = STACK.map(([k, , c]) =>
+    '<i style="width:' + (100 * W.wallets[k] / total).toFixed(3) + '%;background:' + c + '"></i>').join("");
+  $("stack-key").innerHTML = STACK.map(([k, label, c]) =>
+    '<span><i class="swatch" style="background:' + c + '"></i>' + label + " " + fmtUsd(W.wallets[k]) + "</span>").join("");
+}
+
+function renderHand(who) {
+  const h = W.hands[who], p = who === "you" ? "you" : "rival";
+  $(p + "-cash").textContent = fmtUsd(W.wallets[who]);
+  $(p + "-meta").textContent = who === "you"
+    ? (handedOver ? "yours" : "played for you until you take it")
+    : "policy · threshold 1.18× cost";
+  $(p + "-holds").innerHTML = GRADES.map(sym => {
+    const q = h.held[sym];
+    const avg = q ? Math.round(h.basis[sym] / q) : 0;
+    return '<div class="hold ' + GOODS[sym].css + '"><span class="g">' + GOODS[sym].glyph + " " + GOODS[sym].label +
+      '</span><span class="q">' + fmtInt(q) + '</span><span class="m">' +
+      (q ? "at " + fmtCents(avg) : "—") + "</span></div>";
+  }).join("");
+  const jobs = h.jobs;
+  $(p + "-jobs").innerHTML = jobs.length
+    ? jobs.map(j => {
+        const done = clamp((W.nowMs - j.fromMs) / (j.dueMs - j.fromMs), 0, 1);
+        const left = Math.ceil((j.dueMs - W.nowMs) / (STEP_SECS * 1000));
+        return '<div class="job' + (who === "rival" ? " rival" : "") + '"><span>' + j.label + " → " + j.qty + " " +
+          GOODS[j.out].glyph + '</span><span class="bar"><i style="width:' + (done * 100).toFixed(1) + '%"></i></span><span>' +
+          left + "</span></div>";
+      }).join("")
+    : '<div class="empty">nothing in the furnace</div>';
+}
+
+function renderLadders() {
+  $("mkt-meta").textContent = TRADED.map(s => GOODS[s].glyph + " " + fmtCents(refPrice(W, s))).join("  ");
+  $("ladders").innerHTML = TRADED.map(sym => {
+    const p = POLICY[sym], bids = W.books[sym].bids;
+    const top = Math.max(p.size, 1);
+    const rows = [];
+    for (let i = 0; i < p.levels; i++) {
+      const b = bids[i];
+      rows.push('<div class="lvl' + (b ? "" : " gone") + '"><span class="p">' +
+        (b ? fmtCents(b.px) : "—") + '</span><span class="b"><i style="width:' +
+        (b ? clamp(100 * b.qty / top, 0, 100).toFixed(1) : 0) + '%"></i></span><span class="q">' +
+        (b ? b.qty : "0") + "</span></div>");
+    }
+    const mult = multiplierBps(W, "demand", sym);
+    return '<div class="ladder"><div class="lad-head"><span>' + GOODS[sym].glyph + " " + GOODS[sym].label +
+      ' · bids</span><span>demand ×' + (mult / 10_000).toFixed(2) + "</span></div>" + rows.join("") + "</div>";
+  }).join("");
+}
+
+function renderWorld() {
+  const live = W.mods.filter(m => pullBps(m, W.nowMs) !== 0);
+  $("world-meta").textContent = live.length ? live.length + " in force" : "next event in " + Math.max(0, W.nextEvent - W.step);
+  $("mods").innerHTML = live.length ? live.map(m => {
+    const pull = pullBps(m, W.nowMs);
+    const frac = Math.abs(pull) / Math.max(1, Math.abs(m.delta));
+    const left = Math.ceil((m.until - W.nowMs) / (STEP_SECS * 1000));
+    return '<div class="mod"><div class="t"><span class="n">' + m.text + " · " + m.effect +
+      (m.sym ? " · " + GOODS[m.sym].label : " · everywhere") + '</span><span class="d ' + (pull > 0 ? "up" : "down") + '">' +
+      fmtBps(pull) + " · " + left + '</span></div><div class="bar"><i style="width:' + (frac * 100).toFixed(1) +
+      "%;background:" + (pull > 0 ? "var(--buy)" : "var(--sell)") + '"></i></div></div>';
+  }).join("") : '<div class="empty">nothing in force — the world is quiet</div>';
+
+  const lines = W.log.slice(-26).reverse();
+  $("log").innerHTML = lines.map(l =>
+    '<div class="line ' + l.cls + '"><span class="t">' + String(l.step).padStart(3, "0") + '</span><span class="m">' + l.msg + "</span></div>"
+  ).join("");
+}
+
+function renderEquity() {
+  const svg = $("equity");
+  svg.textContent = "";
+  const L = 54, R = 12, T = 12, B = 22, Wd = 900, Ht = 190;
+  const w = Wd - L - R, h = Ht - T - B;
+  let lo = OPENING, hi = OPENING;
+  for (const [a, b] of W.equity) { lo = Math.min(lo, a, b); hi = Math.max(hi, a, b); }
+  const pad = Math.max(2_000, (hi - lo) * 0.12);
+  lo -= pad; hi += pad;
+  const X = i => L + (RUN_STEPS <= 1 ? 0 : i * w / (RUN_STEPS - 1));
+  const Y = v => T + h - (v - lo) / Math.max(1, hi - lo) * h;
+
+  svg.appendChild(el("line", { x1: L, y1: Y(OPENING), x2: L + w, y2: Y(OPENING), stroke: "var(--line)", "stroke-dasharray": "3 4" }));
+  svg.appendChild(el("text", { x: L - 8, y: Y(OPENING) + 4, class: "n-sub", "text-anchor": "end" }, fmtUsd(OPENING)));
+  if (Math.abs(Y(hi) - Y(OPENING)) > 24) svg.appendChild(el("text", { x: L - 8, y: Y(hi) + 10, class: "n-sub", "text-anchor": "end" }, fmtUsd(hi)));
+  if (Math.abs(Y(lo) - Y(OPENING)) > 24) svg.appendChild(el("text", { x: L - 8, y: Y(lo) - 2, class: "n-sub", "text-anchor": "end" }, fmtUsd(lo)));
+  svg.appendChild(el("line", { x1: L, y1: T + h, x2: L + w, y2: T + h, stroke: "var(--line-soft)" }));
+  svg.appendChild(el("text", { x: L, y: Ht - 6, class: "n-sub" }, "step 0"));
+  svg.appendChild(el("text", { x: L + w, y: Ht - 6, class: "n-sub", "text-anchor": "end" }, "step " + RUN_STEPS));
+
+  [0, 1].forEach(k => {
+    if (W.equity.length < 2) return;
+    const d = W.equity.map((e, i) => (i ? "L" : "M") + X(i).toFixed(1) + "," + Y(e[k]).toFixed(1)).join(" ");
+    svg.appendChild(el("path", { d, fill: "none", "stroke-width": 1.8, "stroke-linejoin": "round", stroke: k === 0 ? "var(--accent)" : "var(--engine)" }));
+  });
+  if (W.equity.length) {
+    const i = W.equity.length - 1, e = W.equity[i];
+    [0, 1].forEach(k => svg.appendChild(el("circle", { cx: X(i), cy: Y(e[k]), r: 3, fill: k === 0 ? "var(--accent)" : "var(--engine)" })));
+  }
+}
+
+function renderScore() {
+  const you = netWorth(W, "you"), riv = netWorth(W, "rival");
+  $("you-net").textContent = fmtUsd(you);
+  $("rival-net").textContent = fmtUsd(riv);
+  const dy = you - OPENING, dr = riv - OPENING;
+  $("you-delta").textContent = (dy >= 0 ? "+" : "") + fmtUsd(dy) + " on the opening";
+  $("you-delta").className = "delta " + (dy >= 0 ? "up" : "down");
+  $("rival-delta").textContent = (dr >= 0 ? "+" : "") + fmtUsd(dr) + " on the opening";
+  $("rival-delta").className = "delta " + (dr >= 0 ? "up" : "down");
+  $("clock-meta").textContent = "step " + W.step + " of " + RUN_STEPS + " · " +
+    Math.floor(W.nowMs / 60000) + "m " + Math.floor(W.nowMs / 1000) % 60 + "s simulated";
+
+  const v = $("verdict");
+  const lead = you - riv;
+  if (W.over) {
+    v.className = "verdict " + (lead > 0 ? "win" : lead < 0 ? "lose" : "");
+    v.innerHTML = lead > 0
+      ? "<b>You finished " + fmtUsd(lead) + " ahead of the world.</b> Same seed, same events, same merchants — put the seed back in the box and see if the line was luck."
+      : lead < 0
+        ? "<b>The world finished " + fmtUsd(-lead) + " ahead.</b> It never waits for a better bid than 1.18× its cost. Restart on the same seed and beat it with timing."
+        : "<b>A dead heat.</b>";
+  } else if (!handedOver) {
+    v.className = "verdict";
+    v.innerHTML = "The world is playing your hand for you — press a move, or a number key, and it is yours.";
+  } else {
+    v.className = "verdict";
+    v.innerHTML = lead >= 0
+      ? "You are <b>" + fmtUsd(lead) + " ahead</b> with " + (RUN_STEPS - W.step) + " steps left."
+      : "You are <b>" + fmtUsd(-lead) + " behind</b> with " + (RUN_STEPS - W.step) + " steps left.";
+  }
+}
+
+function renderCaption() {
+  const live = W.mods.filter(m => pullBps(m, W.nowMs) !== 0);
+  const c = $("caption");
+  if (W.over) {
+    c.innerHTML = "<b>The run is over.</b> " + fmtInt(W.units.made) + " units were made and " +
+      fmtInt(W.units.consumed) + " were used up; the supply is still " + fmtUsd(circulating(W)) + ", to the cent.";
+    return;
+  }
+  if (live.length) {
+    const m = live[live.length - 1];
+    c.innerHTML = "<b>" + m.text + ".</b> " + (m.effect === "production"
+      ? "Every job started while this is in force writes " + fmtBps(pullBps(m, W.nowMs)) + " into its own yield and keeps it."
+      : "The merchants are quoting " + fmtBps(pullBps(m, W.nowMs)) + " of the size they otherwise would.");
+    return;
+  }
+  c.innerHTML = "<b>Step " + W.step + ".</b> The float goes out to the merchants, the takings come home, and the units " +
+    "the merchants bought are used up — " + fmtInt(W.units.live.ORE + W.units.live.INGOT + W.units.live.TOOL) +
+    " are alive in the world right now.";
+}
+
+function render() {
+  renderBoard();
+  renderStack();
+  renderHand("you");
+  renderHand("rival");
+  renderLadders();
+  renderWorld();
+  renderEquity();
+  renderScore();
+  renderCaption();
+  renderActs();
+}
+
+/* ============================== the moves =========================== */
+
+const G = s => GOODS[s].glyph;
+const MOVES = [
+  { k: "1", label: "Buy 8 " + G("ORE"), cls: "ore",
+    can: w => w.seam.available >= 8 && w.wallets.you >= 8 * w.seam.price,
+    cmd: () => ({ t: "Buy", who: "you", qty: 8 }) },
+  { k: "2", label: "Buy 24 " + G("ORE"), cls: "ore",
+    can: w => w.seam.available >= 24 && w.wallets.you >= 24 * w.seam.price,
+    cmd: () => ({ t: "Buy", who: "you", qty: 24 }) },
+  { k: "3", label: "Refine 8" + G("ORE") + " → 6" + G("INGOT"), cls: "ingot",
+    can: w => w.hands.you.held.ORE >= 8 && w.wallets.you >= RECIPES.refine.cost && w.hands.you.jobs.length < MAX_JOBS,
+    cmd: () => ({ t: "Job", who: "you", key: "refine" }) },
+  { k: "4", label: "Fit 6" + G("INGOT") + " → 5" + G("TOOL"), cls: "tool",
+    can: w => w.hands.you.held.INGOT >= 6 && w.wallets.you >= RECIPES.fit.cost && w.hands.you.jobs.length < MAX_JOBS,
+    cmd: () => ({ t: "Job", who: "you", key: "fit" }) },
+  { k: "5", label: "Sell 6 " + G("INGOT"), cls: "ingot",
+    can: w => w.hands.you.held.INGOT > 0 && depth(w, "INGOT") > 0,
+    cmd: w => ({ t: "Sell", who: "you", sym: "INGOT", qty: Math.min(6, w.hands.you.held.INGOT) }) },
+  { k: "6", label: "Sell all " + G("INGOT"), cls: "ingot",
+    can: w => w.hands.you.held.INGOT > 0 && depth(w, "INGOT") > 0,
+    cmd: w => ({ t: "Sell", who: "you", sym: "INGOT", qty: w.hands.you.held.INGOT }) },
+  { k: "7", label: "Sell 5 " + G("TOOL"), cls: "tool",
+    can: w => w.hands.you.held.TOOL > 0 && depth(w, "TOOL") > 0,
+    cmd: w => ({ t: "Sell", who: "you", sym: "TOOL", qty: Math.min(5, w.hands.you.held.TOOL) }) },
+  { k: "8", label: "Sell all " + G("TOOL"), cls: "tool",
+    can: w => w.hands.you.held.TOOL > 0 && depth(w, "TOOL") > 0,
+    cmd: w => ({ t: "Sell", who: "you", sym: "TOOL", qty: w.hands.you.held.TOOL }) },
+];
+
+function takeHand() {
+  if (handedOver) return;
+  handedOver = true;
+  logLine(W, "you", "<b>The hand is yours.</b> The world stops playing it for you.");
+}
+
+function playMove(i) {
+  const m = MOVES[i];
+  if (!m || W.over) return;
+  takeHand();
+  run(m.cmd(W));
+  render();
+}
+
+function renderActs() {
+  const box = $("acts");
+  if (!box.children.length) {
+    MOVES.forEach((m, i) => {
+      const b = document.createElement("button");
+      b.className = "chip " + m.cls;
+      b.innerHTML = '<kbd>' + m.k + "</kbd>" + m.label;
+      b.addEventListener("click", () => playMove(i));
+      box.appendChild(b);
+    });
+  }
+  MOVES.forEach((m, i) => { box.children[i].disabled = W.over || !m.can(W); });
+}
+
+/* ---------------------------- the transport ------------------------ */
+
+let timer = null, speed = 1, running = false;
+
+function tick() {
+  run({ t: "Step" });
+  render();
+  if (W.over) stop();
+}
+function start() {
+  stop();
+  running = true;
+  timer = setInterval(tick, 560 / speed);
+  $("play").textContent = "Pause";
+}
+function stop() {
+  if (timer) clearInterval(timer);
+  timer = null;
+  running = false;
+  $("play").textContent = W && W.over ? "Run again" : "Run";
+}
+
+function genesis(w) {
+  for (const who of ["you", "rival"]) post(w, [["treasury", -OPENING], [who, OPENING]], "faucet");
+  for (const sym of TRADED) {
+    const amt = Math.floor(POLICY[sym].float / 2);
+    post(w, [["treasury", -amt], ["npc:" + sym, amt]], "transfer");
+    requote(w, sym);
+  }
+  w.equity.push([OPENING, OPENING]);
+  w.marks = { you: OPENING, rival: OPENING };
+  logLine(w, "world", "<b>Genesis.</b> " + fmtUsd(SUPPLY) + " minted once; both hands paid " + fmtUsd(OPENING) + " out of treasury");
+}
+
+function boot(seed) {
+  stop();
+  W = newWorld(seed);
+  handedOver = false;
+  pending.length = 0;
+  parts.length = 0;
+  if (gParts) gParts.textContent = "";
+  genesis(W);
+  render();
+  start();
+}
+
+const seedIn = () => {
+  const n = parseInt($("seed").value, 10);
+  return Number.isFinite(n) ? (n >>> 0) : 42;
+};
+
+$("play").addEventListener("click", () => {
+  if (W.over) { boot(seedIn()); return; }
+  running ? stop() : start();
+});
+$("again").addEventListener("click", () => boot(seedIn()));
+$("speed").addEventListener("change", e => {
+  speed = parseFloat(e.target.value);
+  if (running) start();
+});
+$("seed").addEventListener("keydown", e => { if (e.key === "Enter") boot(seedIn()); });
+
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.metaKey || e.ctrlKey || e.altKey) return;
+  const i = MOVES.findIndex(m => m.k === e.key);
+  if (i >= 0) { e.preventDefault(); playMove(i); return; }
+  if (e.key === " ") {
+    e.preventDefault();
+    if (W.over) boot(seedIn()); else running ? stop() : start();
+  }
+});
+
+buildBoard();
+boot(42);
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>
