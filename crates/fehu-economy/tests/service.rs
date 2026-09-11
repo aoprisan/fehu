@@ -304,6 +304,84 @@ async fn a_scope_opens_its_own_route_and_nothing_else() {
 }
 
 #[tokio::test]
+async fn a_scope_reads_the_side_of_the_world_it_writes() {
+    // A backend that just changed something must be able to see what it
+    // did without holding a second key. Each read is open to the scopes
+    // whose writes it is the read side of, and shut to the rest.
+    let app = test_app();
+    let provisioner = issue(&app, "accounts", &["provision"]).await;
+    let rewarder = issue(&app, "quests", &["reward"]).await;
+    let stock = issue(&app, "goods", &["inventory"]).await;
+    let events = issue(&app, "world", &["events"]).await;
+
+    let (status, player) = provision(&app, &provisioner, "player-1").await;
+    assert_eq!(status, StatusCode::CREATED, "{player}");
+    let trader = player["trader_id"].as_u64().unwrap();
+    let wallet = player["wallet_id"].as_u64().unwrap();
+
+    // Inventory: the inventory scope's, for any player.
+    let uri = format!("/api/v1/economy/players/{trader}/inventory");
+    let (status, body) = get(&app, Some(&stock), &uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["trader_id"], json!(trader));
+    for (key, who) in [(&rewarder, "reward"), (&events, "events")] {
+        let (status, body) = get(&app, Some(key), &uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{who} cannot read stock");
+        assert_eq!(body["error"]["code"], "missing_scope");
+    }
+
+    // Budgets: the reward scope's.
+    let (status, body) = get(&app, Some(&rewarder), "/api/budgets").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = get(&app, Some(&events), "/api/budgets").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "missing_scope");
+
+    // Wallets: whatever moves money, and not the events scope, which does
+    // not. The refusal names every scope that would have done.
+    let wallet_uri = format!("/api/wallets/{wallet}");
+    for key in [&provisioner, &rewarder, &stock] {
+        let (status, body) = get(&app, Some(key), &wallet_uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["wallet"], json!(wallet));
+        let (status, body) = get(&app, Some(key), &format!("{wallet_uri}/transactions")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = get(&app, Some(&events), &wallet_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "missing_scope");
+    let message = body["error"]["message"].as_str().unwrap();
+    for scope in ["provision", "reward", "inventory"] {
+        assert!(message.contains(scope), "names `{scope}`: {message}");
+    }
+
+    // The outbox: any service's, and journaled as that service when it
+    // acknowledges. Still no player's.
+    let (status, body) = get(&app, Some(&events), "/api/outbox").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &app,
+        Some(&events),
+        "/api/outbox/ack",
+        json!({ "through": 0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = get(&app, player["api_key"].as_str(), "/api/outbox").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a player is not the backend"
+    );
+
+    // And the owner still reads their own, as before.
+    let (status, body) = get(&app, player["api_key"].as_str(), &wallet_uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = get(&app, player["api_key"].as_str(), &uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn a_service_key_is_never_promoted_to_the_operators() {
     // The order of resolution is the whole safety property: a key the
     // registry knows is judged as that service, whatever else is configured.

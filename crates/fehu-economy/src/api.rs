@@ -500,13 +500,18 @@ impl ApiError {
     /// Deliberately not `invalid_api_key`: the key is real and the server
     /// knows it. What is missing is authority, which is something an
     /// operator can grant and the caller cannot fix by retrying.
-    pub(crate) fn missing_scope(scope: Scope) -> Self {
+    pub(crate) fn missing_scope(scopes: &[Scope]) -> Self {
+        let needed = match scopes {
+            [one] => format!("the `{one}` scope"),
+            many => {
+                let names: Vec<String> = many.iter().map(|s| format!("`{s}`")).collect();
+                format!("one of the {} scopes", names.join(", "))
+            }
+        };
         Self::new(
             StatusCode::FORBIDDEN,
             "missing_scope",
-            format!(
-                "this endpoint needs the `{scope}` scope, which that service key does not carry"
-            ),
+            format!("this endpoint needs {needed}, which that service key does not carry"),
         )
     }
 
@@ -897,11 +902,14 @@ impl<S: ScopeOf> Trusted<S> {
 /// A scope, as a type, so a handler names the authority it needs in its own
 /// signature and cannot be wired up to check the wrong one.
 pub trait ScopeOf {
-    /// The scope a `Trusted<Self>` demands.
-    const SCOPE: Scope;
+    /// The scopes a `Trusted<Self>` accepts: a service key carrying any one
+    /// of them is let through. A write names exactly one; a read names the
+    /// scopes whose writes it is the read side of.
+    const SCOPES: &'static [Scope];
 }
 
-/// Marker types for [`Trusted`], one per [`Scope`].
+/// Marker types for [`Trusted`]: one per [`Scope`] for the writes, and the
+/// sets the reads accept.
 pub mod scope {
     use super::{Scope, ScopeOf};
 
@@ -913,18 +921,33 @@ pub mod scope {
     pub struct Inventory;
     /// Push a game event from the catalogue.
     pub struct Events;
+    /// Read a wallet: every scope that moves money in or out of one.
+    /// Provisioning opens a player's, a reward pays into one and a purchase
+    /// spends from one; the backend that did any of those may look at what
+    /// it did. Pushing an event moves no money and does not.
+    pub struct Wallets;
+    /// Read the outbox: any scope at all. The outbox is what the game
+    /// backend reads instead of the stream, and a service is the game
+    /// backend whatever it has been narrowed to.
+    pub struct Any;
 
     impl ScopeOf for Provision {
-        const SCOPE: Scope = Scope::Provision;
+        const SCOPES: &'static [Scope] = &[Scope::Provision];
     }
     impl ScopeOf for Reward {
-        const SCOPE: Scope = Scope::Reward;
+        const SCOPES: &'static [Scope] = &[Scope::Reward];
     }
     impl ScopeOf for Inventory {
-        const SCOPE: Scope = Scope::Inventory;
+        const SCOPES: &'static [Scope] = &[Scope::Inventory];
     }
     impl ScopeOf for Events {
-        const SCOPE: Scope = Scope::Events;
+        const SCOPES: &'static [Scope] = &[Scope::Events];
+    }
+    impl ScopeOf for Wallets {
+        const SCOPES: &'static [Scope] = &[Scope::Provision, Scope::Reward, Scope::Inventory];
+    }
+    impl ScopeOf for Any {
+        const SCOPES: &'static [Scope] = &Scope::ALL;
     }
 }
 
@@ -941,8 +964,8 @@ impl<S: ScopeOf> FromRequestParts<AppState> for Trusted<S> {
             if auth.revoked {
                 return Err(ApiError::revoked_key());
             }
-            if !auth.scopes.contains(S::SCOPE) {
-                return Err(ApiError::missing_scope(S::SCOPE));
+            if !S::SCOPES.iter().any(|&scope| auth.scopes.contains(scope)) {
+                return Err(ApiError::missing_scope(S::SCOPES));
             }
             return Ok(Self {
                 principal: Principal::Service { id: auth.id.0 },
@@ -954,6 +977,40 @@ impl<S: ScopeOf> FromRequestParts<AppState> for Trusted<S> {
             principal: Principal::Operator,
             _scope: PhantomData,
         })
+    }
+}
+
+impl<S: ScopeOf> OptionalFromRequestParts<AppState> for Trusted<S> {
+    type Rejection = ApiError;
+
+    /// Whether the request carries the backend's authority at this scope,
+    /// for a read that is also somebody's own — a wallet is its owner's to
+    /// read as well as the backend's.
+    ///
+    /// A service key is still judged: one that is revoked, or that carries
+    /// none of the scopes, is refused here rather than falling through to
+    /// the owner's check, because a service key is not a user key and the
+    /// owner branch could never match it anyway. Only the *absence* of
+    /// backend authority is answered with `None`.
+    async fn from_request_parts(
+        parts: &mut Parts,
+        app: &AppState,
+    ) -> Result<Option<Self>, ApiError> {
+        if let Some(key) = api_key_of(parts)
+            && app.service_of(&key).is_some()
+        {
+            return <Self as FromRequestParts<AppState>>::from_request_parts(parts, app)
+                .await
+                .map(Some);
+        }
+        Ok(
+            <Admin as OptionalFromRequestParts<AppState>>::from_request_parts(parts, app)
+                .await?
+                .map(|_| Self {
+                    principal: Principal::Operator,
+                    _scope: PhantomData,
+                }),
+        )
     }
 }
 
@@ -1905,9 +1962,11 @@ struct FundRequest {
 
 /// What the world has set aside, and what it will pay for. Operator
 /// authority: this is the game's own budgeting, not a player's business.
+/// The operator's, or the backend's with [`Scope::Reward`]: a service that
+/// pays from a budget may see what is left in it and what the rules say.
 async fn get_budgets(
     State(app): State<AppState>,
-    _admin: Admin,
+    _trusted: Trusted<scope::Reward>,
 ) -> Result<Json<BudgetsResponse>, ApiError> {
     let (budgets, rules) = app
         .market
@@ -2259,19 +2318,19 @@ pub struct WalletDto {
 }
 
 /// Whether the caller may look into `wallet`: it is their account's, or they
-/// are the operator.
+/// are the operator or the game backend (see [`scope::Wallets`]).
 fn may_read_wallet(
     m: &Market,
     wallet: fehu::ledger::WalletId,
     caller: Option<Caller>,
-    admin: Option<Admin>,
+    trusted: bool,
 ) -> Result<Option<AccountId>, ApiError> {
     let account = m
         .accounts
         .values()
         .find(|a| a.wallet == wallet)
         .map(|a| (a.id, a.user_id));
-    if admin.is_some() {
+    if trusted {
         return Ok(account.map(|(id, _)| id));
     }
     match (account, caller) {
@@ -2284,17 +2343,19 @@ fn may_read_wallet(
     }
 }
 
-/// One wallet's balance, by wallet id.
+/// One wallet's balance, by wallet id. Its owner's, the operator's, or the
+/// game backend's under any scope that moves money.
 async fn get_wallet(
     State(app): State<AppState>,
     Path(wallet_id): Path<u64>,
     caller: Option<Caller>,
-    admin: Option<Admin>,
+    trusted: Option<Trusted<scope::Wallets>>,
 ) -> Result<Json<WalletDto>, ApiError> {
     let wallet = fehu::ledger::WalletId(wallet_id);
+    let trusted = trusted.is_some();
     app.market
         .call(move |m| {
-            let account_id = may_read_wallet(m, wallet, caller, admin)?;
+            let account_id = may_read_wallet(m, wallet, caller, trusted)?;
             let held = m.ledger.wallet(wallet).ok_or_else(|| {
                 ApiError::new(
                     StatusCode::NOT_FOUND,
@@ -2324,12 +2385,13 @@ async fn get_wallet_transactions(
     State(app): State<AppState>,
     Path(wallet_id): Path<u64>,
     caller: Option<Caller>,
-    admin: Option<Admin>,
+    trusted: Option<Trusted<scope::Wallets>>,
 ) -> Result<Json<LedgerResponse>, ApiError> {
     let wallet = fehu::ledger::WalletId(wallet_id);
+    let trusted = trusted.is_some();
     app.market
         .call(move |m| {
-            let account_id = may_read_wallet(m, wallet, caller, admin)?.ok_or_else(|| {
+            let account_id = may_read_wallet(m, wallet, caller, trusted)?.ok_or_else(|| {
                 ApiError::new(
                     StatusCode::NOT_FOUND,
                     "no_account",
@@ -2360,13 +2422,17 @@ pub struct InventoryResponse {
     pub inventory: Vec<HoldingDto>,
 }
 
+/// Its owner's, or the game backend's with [`Scope::Inventory`]: exactly
+/// who may issue and destroy units on it, because a backend that just
+/// changed an inventory must be able to read what it did.
 async fn get_inventory(
     State(app): State<AppState>,
     Path(trader_id): Path<u64>,
-    caller: Caller,
+    caller: Option<Caller>,
+    service: Option<ServiceCaller>,
 ) -> Result<Json<InventoryResponse>, ApiError> {
     let trader = TraderId(trader_id);
-    owned_trader(&app, caller, trader)?;
+    goods_principal(&app, trader_id, caller, service)?;
     let views = app.views().await;
     let inventory = app
         .market
@@ -2431,7 +2497,7 @@ fn goods_principal(
             return Err(ApiError::revoked_key());
         }
         if !auth.scopes.contains(Scope::Inventory) {
-            return Err(ApiError::missing_scope(Scope::Inventory));
+            return Err(ApiError::missing_scope(&[Scope::Inventory]));
         }
         return Ok(Principal::Service { id: auth.id.0 });
     }
@@ -3948,10 +4014,11 @@ struct OutboxQuery {
 
 /// The facts the game backend has not collected yet.
 ///
-/// The operator's, because the log is the whole world's: one player's fills
-/// are in it beside another's. In tier one the operator key *is* the trusted
-/// game backend — one host, one process, the backend on the same network —
-/// which is the same reasoning that put rewards and budgets behind it.
+/// The operator's or any service's, and no player's, because the log is the
+/// whole world's: one player's fills are in it beside another's. A service
+/// key is the game backend whatever it has been narrowed to, and the outbox
+/// is what that backend reads instead of the stream, so every scope opens
+/// it; what a scope narrows is what the backend may *do*.
 ///
 /// Reading does not consume. A consumer that has acted on what it read says
 /// so with `POST /api/outbox/ack`, and until it does, the same facts come
@@ -3959,7 +4026,7 @@ struct OutboxQuery {
 /// sees them again rather than never.
 async fn read_outbox(
     State(app): State<AppState>,
-    _admin: Admin,
+    _trusted: Trusted<scope::Any>,
     Query(query): Query<OutboxQuery>,
 ) -> Result<Json<crate::outbox::Page>, ApiError> {
     let limit = query.limit.unwrap_or(crate::outbox::DEFAULT_PAGE);
@@ -3987,14 +4054,14 @@ struct AckRequest {
 /// restart and hand the backend facts it had already acted on.
 async fn ack_outbox(
     State(app): State<AppState>,
-    _admin: Admin,
+    trusted: Trusted<scope::Any>,
     Idempotency(key): Idempotency,
     body: Result<Json<AckRequest>, JsonRejection>,
 ) -> Result<Committed, ApiError> {
     let Json(req) = body.map_err(ApiError::bad_json)?;
     run(
         &app,
-        Principal::Operator,
+        trusted.principal(),
         key,
         Command::AckOutbox {
             through: req.through,

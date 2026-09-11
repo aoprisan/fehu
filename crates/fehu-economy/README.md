@@ -72,11 +72,18 @@ carries a fixed set of *scopes* and nothing else —
 | Scope | Opens |
 |---|---|
 | `provision` | `POST /api/v1/economy/players`, and the roster that reads it back |
-| `reward` | `POST /api/v1/economy/rewards` |
-| `inventory` | `POST /api/v1/economy/purchases` and `.../consume`, for any player |
+| `reward` | `POST /api/v1/economy/rewards`, and `GET /api/budgets` to see what is left |
+| `inventory` | `POST /api/v1/economy/purchases` and `.../consume`, and `GET .../players/{id}/inventory`, for any player |
 | `events` | `POST /api/game/events` |
+| any of `provision`, `reward`, `inventory` | `GET /api/wallets/{id}` and its `/transactions`: whatever moves money may read the wallet it moved it in |
+| any scope at all | `GET /api/outbox` and `POST /api/outbox/ack`: a service is the game backend whatever it has been narrowed to, and the outbox is what that backend reads instead of the stream |
 
-so a backend that pays quest rewards need not hold the key that can also mint
+A scope opens the read side of its own writes — a backend that just changed
+an inventory can see what it did without holding a second key — and nothing
+else: `/api/overview` names every wallet in the world and stays the
+operator's.
+
+So a backend that pays quest rewards need not hold the key that can also mint
 currency, freeze accounts and rewrite the catalogue. A scope **narrows a
 credential; it does not narrow the operator** — every route above stays open
 to the operator on exactly the terms it always was, so issuing a service
@@ -431,7 +438,8 @@ cursor; reading does not consume them, so a backend that dies between reading
 and acting reads them again rather than never. `POST /api/outbox/ack`
 `{"through":128}` says how far it got, and is a journaled command like
 everything else — a cursor that moved only in memory would fall back to the
-snapshot's value on a restart.
+snapshot's value on a restart. Both are the operator's or any service's, and
+no player's: the log is the whole world's.
 
 What is *not* in it is anything with a requester. A purchase, a transfer, a
 reward and a job *starting* are commands: whoever sent one has its response,
