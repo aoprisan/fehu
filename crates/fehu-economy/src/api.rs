@@ -71,7 +71,10 @@ pub fn router(app: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/reconcile", get(reconcile))
         .route("/api/symbols", get(list_symbols).post(list_symbol))
-        .route("/api/symbols/{symbol}", get(get_symbol))
+        .route(
+            "/api/symbols/{symbol}",
+            get(get_symbol).patch(reconfigure_symbol),
+        )
         .route("/api/symbols/{symbol}/bars", get(get_bars))
         .route(
             "/api/symbols/{symbol}/events",
@@ -1607,6 +1610,66 @@ async fn list_symbol(
                 source: req.source.unwrap_or_else(|| "api".into()),
                 note: req.note,
             },
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Body of `PATCH /api/symbols/{symbol}`. Every field optional; an absent
+/// one is left as it is.
+#[derive(Deserialize)]
+struct ReconfigureRequest {
+    name: Option<String>,
+    sector: Option<String>,
+    description: Option<String>,
+    /// Annual log drift and annualised volatility.
+    drift: Option<f64>,
+    volatility: Option<f64>,
+    /// Expected shares traded per day, which is what impact and the ladder's
+    /// depth scale by.
+    base_volume_per_day: Option<f64>,
+    /// The synthetic ladder's half spread, as a fraction of the price.
+    half_spread: Option<f64>,
+    /// Whether the symbol is quoted synthetically at all. Ignored for a good.
+    synthetic: Option<bool>,
+    source: Option<String>,
+    note: Option<String>,
+}
+
+/// Change a listed symbol without delisting it: what it is called, how its
+/// price behaves, how it is quoted. Game master's, and recorded in the event
+/// log like a listing, because a price series that changes character is a
+/// fact anyone reading the chart is owed.
+async fn reconfigure_symbol(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<ReconfigureRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let handle = app
+        .symbol(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::Reconfigure {
+            symbol: handle.ticker.to_string(),
+            name: clean_text(req.name, 64),
+            sector: clean_text(req.sector, 64),
+            description: req
+                .description
+                .map(|d| clean_text(Some(d), 280).unwrap_or_default()),
+            drift: req.drift,
+            volatility: req.volatility,
+            base_volume_per_day: req.base_volume_per_day,
+            half_spread: req.half_spread,
+            synthetic: req.synthetic,
+            source: req.source.unwrap_or_else(|| "api".into()),
+            note: req.note,
         },
     )
     .await

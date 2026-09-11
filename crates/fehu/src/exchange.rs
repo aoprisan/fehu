@@ -427,25 +427,24 @@ impl Exchange {
     ///
     /// The book's tick and lot follow the new rules for every order from
     /// here on; orders already resting are left where they are. The
-    /// synthetic ladder is withdrawn and, if the parameters still ask for
-    /// one, quoted again under the new ones around the current reference —
-    /// which draws from the flow stream, exactly as a step's requote does,
-    /// so the bare price series is untouched and the *synthetic* series
-    /// diverges from what it would have been, as any change to the ladder
-    /// must. The trades the new quotes executed against traders' resting
-    /// orders are returned, as [`resync`](Self::resync) returns them.
+    /// synthetic ladder quoted under the old parameters is withdrawn at
+    /// once and, if the new ones still ask for one, quoted again by the next
+    /// [`step`](Self::step) — or by [`resync`](Self::resync), for a caller
+    /// that wants it back before then. Nothing here draws randomness or
+    /// executes a trade, so a change books nothing and the bare price series
+    /// is untouched; the *synthetic* series diverges from what it would have
+    /// been from the next requote on, as any change to the ladder must.
     ///
     /// # Errors
     /// The first [`ConfigError`] found; nothing is changed on a refusal.
-    pub fn set_params(&mut self, params: TradingParams) -> Result<Vec<Trade>, ConfigError> {
+    pub fn set_params(&mut self, params: TradingParams) -> Result<(), ConfigError> {
         params.validate()?;
         self.params = params;
         self.book.set_rules(params.rules);
-        // A ladder quoted under the old parameters, or one the new ones no
-        // longer want: `requote` leaves the book alone when the ladder is
-        // off, so the withdrawal is explicit.
+        // `requote` leaves the book alone when the ladder is off, so the
+        // withdrawal is explicit here.
         self.book.cancel_all(Owner::Synthetic);
-        Ok(self.resync())
+        Ok(())
     }
 
     /// Replace the simulator's configuration, as

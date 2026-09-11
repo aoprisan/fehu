@@ -87,17 +87,28 @@ fn parameters_change_mid_world_without_touching_the_reference() {
         sim.step();
     }
 
-    // A wider ladder, applied at once: the touch moves out, the reference
-    // does not, and nothing the simulator does changes.
+    // A wider ladder: the old one goes at once, the next step quotes the
+    // new one, the reference never moves, and nothing the simulator does
+    // changes.
     let mut wider = TradingParams::default();
     wider.liquidity.half_spread *= 4.0;
-    let trades = changed.set_params(wider).unwrap();
-    assert!(trades.is_empty(), "nobody was resting: {trades:?}");
+    changed.set_params(wider).unwrap();
     assert_eq!(
         changed.params().liquidity.half_spread,
         wider.liquidity.half_spread
     );
+    assert!(
+        changed.book().best_bid().is_none(),
+        "the old ladder is withdrawn"
+    );
     let spread = |ex: &Exchange| ex.book().best_ask().unwrap() - ex.book().best_bid().unwrap();
+    {
+        let a = changed.step();
+        let b = untouched.step();
+        let t = sim.step();
+        assert_eq!(a.tick, t);
+        assert_eq!(b.tick, t);
+    }
     assert!(
         spread(&changed) >= 3 * spread(&untouched),
         "changed {} untouched {}",

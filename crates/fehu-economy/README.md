@@ -108,6 +108,7 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/symbols` | Quotes for every listed symbol |
 | `POST` | `/api/symbols` | Game master: list a new symbol — `{"symbol":"WDGT","name":"Widget Corp","shares_outstanding":1000000,"start_price_cents":5000}`, optional `sector`, `description`, `drift`, `volatility`, `seed`, `history_days`. `{"kind":"good","unit":"kg"}` lists a good instead: no float, no ladder, no dividend |
 | `GET` | `/api/symbols/{sym}` | Quote, latent snapshot, config and share count |
+| `PATCH` | `/api/symbols/{sym}` | Game master: change a listed symbol in place — any of `name`, `sector`, `description`, `drift`, `volatility`, `base_volume_per_day`, `half_spread`, `synthetic`; what is not given stays. Takes effect from the next tick, draws nothing, and is recorded in the event log as `corporate:reconfigure` |
 | `GET` | `/api/symbols/{sym}/shares` | The symbol's shares: outstanding, held by traders, bid for, still available, and who holds them |
 | `GET` | `/api/symbols/{sym}/status` | Whether the symbol can be traded: session open, halted, the limit band and the next open/close |
 | `POST` | `/api/symbols/{sym}/halt`, `/resume` | Game master: stop and start trading in one symbol |

@@ -234,6 +234,22 @@ pub enum Command {
     ListSymbol {
         listing: Listing,
     },
+    /// Operator: change what a listed symbol is called and how its price
+    /// behaves, without delisting it. Every field is optional and an absent
+    /// one is left as it is; see [`crate::symbol::SymbolState::reconfigure`].
+    Reconfigure {
+        symbol: String,
+        name: Option<String>,
+        sector: Option<String>,
+        description: Option<String>,
+        drift: Option<f64>,
+        volatility: Option<f64>,
+        base_volume_per_day: Option<f64>,
+        half_spread: Option<f64>,
+        synthetic: Option<bool>,
+        source: String,
+        note: Option<String>,
+    },
     /// Operator: write or replace what a good costs from the catalogue.
     SetCatalogItem {
         symbol: String,
@@ -432,6 +448,7 @@ impl Command {
             Self::PlaceStop { .. } => "place_stop",
             Self::CancelStop { .. } => "cancel_stop",
             Self::ListSymbol { .. } => "list_symbol",
+            Self::Reconfigure { .. } => "reconfigure",
             Self::SetCatalogItem { .. } => "set_catalog_item",
             Self::RemoveCatalogItem { .. } => "remove_catalog_item",
             Self::CreateNpc { .. } => "create_npc",
@@ -1462,6 +1479,54 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
         }
 
         Command::ListSymbol { listing } => apply_listing(m, wall_ms, listing).await,
+
+        Command::Reconfigure {
+            symbol,
+            name,
+            sector,
+            description,
+            drift,
+            volatility,
+            base_volume_per_day,
+            half_spread,
+            synthetic,
+            source,
+            note,
+        } => {
+            let handle = m
+                .symbol(symbol)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(symbol))?;
+            let patch = crate::symbol::Patch {
+                name: name.clone(),
+                sector: sector.clone(),
+                description: description.clone(),
+                drift: *drift,
+                volatility: *volatility,
+                base_volume_per_day: *base_volume_per_day,
+                half_spread: *half_spread,
+                synthetic: *synthetic,
+            };
+            let changed = patch.describe();
+            let quote = handle
+                .change(move |s| s.reconfigure(&patch).map(|()| s.quote()))
+                .await?
+                .map_err(|e| ApiError::invalid_event(e.to_string()))?;
+            let at = m.now();
+            let event = m.record(EventRecord {
+                id: 0,
+                received_at_ms: wall_ms,
+                at_ms: at.0,
+                symbols: vec![handle.ticker],
+                kind: "corporate:reconfigure".into(),
+                source: source.clone(),
+                note: note.clone(),
+                magnitude: None,
+                effects: Vec::new(),
+                summary: vec![format!("{} reconfigured: {changed}", handle.ticker)],
+            });
+            Applied::new(200, &ListingResponse { quote, event })
+        }
 
         Command::SetCatalogItem {
             symbol,

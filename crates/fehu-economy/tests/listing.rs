@@ -140,6 +140,89 @@ async fn a_listed_symbol_is_a_symbol_like_any_other() {
 }
 
 #[tokio::test]
+async fn a_listed_symbol_can_be_reconfigured_in_place() {
+    let app = test_app();
+    let (status, body) = post(&app, None, "/api/symbols", listing("WDGT")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (_, before) = get(&app, None, "/api/symbols/WDGT").await;
+    let vol_before = before["config"]["volatility"].as_f64().unwrap();
+    let price_before = before["quote"]["price_cents"].as_i64().unwrap();
+
+    let patch = |body: Value| {
+        call(
+            &app,
+            None,
+            Request::patch("/api/symbols/WDGT")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+    };
+    let (status, body) = patch(json!({
+        "name": "Widget Holdings",
+        "volatility": vol_before * 0.5,
+        "half_spread": 0.01,
+        "note": "calmer, wider",
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["quote"]["name"], "Widget Holdings");
+    assert_eq!(body["event"]["kind"], "corporate:reconfigure");
+    assert!(
+        body["event"]["summary"][0]
+            .as_str()
+            .unwrap()
+            .contains("volatility"),
+        "the audit line names what changed: {body}"
+    );
+
+    // The config took, the price did not move for it, and the sector it
+    // did not name is as it was.
+    let (_, after) = get(&app, None, "/api/symbols/WDGT").await;
+    assert_eq!(
+        after["config"]["volatility"].as_f64().unwrap(),
+        vol_before * 0.5
+    );
+    assert_eq!(after["quote"]["price_cents"], price_before);
+    assert_eq!(after["info"]["name"], "Widget Holdings");
+    assert_eq!(after["info"]["sector"], before["info"]["sector"]);
+
+    // The next tick quotes the wider ladder: one percent of the price on
+    // each side rather than five basis points.
+    engine::advance_to(&app, Timestamp(NOW_MS + 1_000)).await;
+    let (_, book) = get(&app, None, "/api/symbols/WDGT/book?depth=1").await;
+    let r = book["reference_cents"].as_i64().unwrap();
+    let ask = book["asks"][0]["price_cents"].as_i64().unwrap();
+    assert!(ask - r >= r / 100, "reference {r}, ask {ask}: {book}");
+
+    // Switched off, the ladder is gone at once and stays gone.
+    let (status, body) = patch(json!({ "synthetic": false })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    engine::advance_to(&app, Timestamp(NOW_MS + 2_000)).await;
+    let (_, book) = get(&app, None, "/api/symbols/WDGT/book?depth=1").await;
+    assert!(book["asks"].as_array().unwrap().is_empty(), "{book}");
+
+    // A bad value is refused whole: the name beside it is not taken either.
+    let (status, body) = patch(json!({ "name": "Nope", "volatility": -1.0 })).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_event");
+    let (_, unchanged) = get(&app, None, "/api/symbols/WDGT").await;
+    assert_eq!(unchanged["info"]["name"], "Widget Holdings");
+
+    // And an unknown symbol is not found.
+    let (status, _) = call(
+        &app,
+        None,
+        Request::patch("/api/symbols/NOPE")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "name": "x" }).to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn a_listing_is_refused_when_it_is_not_one() {
     let app = test_app();
 

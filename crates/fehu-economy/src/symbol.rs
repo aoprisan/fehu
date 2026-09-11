@@ -567,6 +567,57 @@ impl From<Snapshot> for SnapshotDto {
     }
 }
 
+/// What [`SymbolState::reconfigure`] may change. Every field is optional
+/// and an absent one is left as it is.
+#[derive(Clone, Debug, Default)]
+pub struct Patch {
+    pub name: Option<String>,
+    pub sector: Option<String>,
+    pub description: Option<String>,
+    pub drift: Option<f64>,
+    pub volatility: Option<f64>,
+    pub base_volume_per_day: Option<f64>,
+    pub half_spread: Option<f64>,
+    pub synthetic: Option<bool>,
+}
+
+impl Patch {
+    /// The fields the patch sets, named, for an audit line.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.name.is_some() {
+            parts.push("name".to_string());
+        }
+        if self.sector.is_some() {
+            parts.push("sector".to_string());
+        }
+        if self.description.is_some() {
+            parts.push("description".to_string());
+        }
+        if let Some(v) = self.drift {
+            parts.push(format!("drift {v}"));
+        }
+        if let Some(v) = self.volatility {
+            parts.push(format!("volatility {v}"));
+        }
+        if let Some(v) = self.base_volume_per_day {
+            parts.push(format!("volume {v}/day"));
+        }
+        if let Some(v) = self.half_spread {
+            parts.push(format!("half spread {v}"));
+        }
+        if let Some(v) = self.synthetic {
+            parts.push(format!("synthetic {v}"));
+        }
+        if parts.is_empty() {
+            "nothing".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
 /// One symbol: its exchange (simulator plus order book), the bars
 /// aggregated from its ticks, the coarse daily bars generated as
 /// pre-history at start-up, and the tape.
@@ -640,6 +691,54 @@ impl SymbolState {
     /// The reference price process.
     pub fn sim(&self) -> &fehu::Simulator {
         self.exchange.simulator()
+    }
+
+    /// Change what this symbol is called and how its price behaves, in
+    /// place. The name, sector and description are the listing's; drift,
+    /// volatility and daily volume go to the simulator through
+    /// [`Exchange::set_config`], the half spread and the synthetic switch to
+    /// the exchange through [`Exchange::set_params`], each of which takes
+    /// effect from the next step and draws nothing. A good is never quoted
+    /// synthetically, whatever the patch says — its units are counted, and
+    /// a print would be one nobody issued.
+    ///
+    /// # Errors
+    /// The first [`fehu::ConfigError`] a new value trips; nothing is
+    /// changed on a refusal, the listing's text included.
+    pub fn reconfigure(&mut self, patch: &Patch) -> Result<(), fehu::ConfigError> {
+        let mut config = self.sim().config().clone();
+        if let Some(drift) = patch.drift {
+            config.drift = drift;
+        }
+        if let Some(volatility) = patch.volatility {
+            config.volatility = volatility;
+        }
+        if let Some(base) = patch.base_volume_per_day {
+            config.volume.base_per_day = base;
+        }
+        let mut params = *self.exchange.params();
+        if let Some(half_spread) = patch.half_spread {
+            params.liquidity.half_spread = half_spread;
+        }
+        if let Some(synthetic) = patch.synthetic {
+            params.synthetic = synthetic && !self.info.is_good();
+        }
+        // Both validated before either is applied, so a bad spread does not
+        // leave a new volatility behind it.
+        config.validate()?;
+        params.validate()?;
+        self.exchange.set_config(config)?;
+        self.exchange.set_params(params)?;
+        if let Some(name) = &patch.name {
+            self.info.name = name.clone();
+        }
+        if let Some(sector) = &patch.sector {
+            self.info.sector = sector.clone();
+        }
+        if let Some(description) = &patch.description {
+            self.info.description = description.clone();
+        }
+        Ok(())
     }
 
     /// Generate `coarse_days` daily bars in coarse mode, then tick finely up

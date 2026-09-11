@@ -52,9 +52,9 @@ would like to have and does not.
   has no cooldown, per-player cap or expiry. The plan lists reward cadence
   and sizes as open choices to "implement with configuration"; only the size
   is configurable.
-- **No way to remove an NPC, close or drain a budget, or change a listed
-  symbol's configuration.** `journal::Command` has no variant for any of
-  them; an NPC can only be deactivated, a budget only funded.
+- **No way to remove an NPC, or close or drain a budget.** `journal::Command`
+  has no variant for either; an NPC can only be deactivated, a budget only
+  funded.
 - **No market-wide halt.** `Halt` and `Resume` are per symbol.
 - **Day orders are refused without a calendar** (`trading.rs`,
   `OrderRequest::day`). Documented, but a client has no way to ask whether
@@ -99,9 +99,6 @@ would like to have and does not.
 - **A version mismatch is a dead end.** `Simulator` and `Exchange` refuse any
   saved version other than the current one; there is no upgrade path from
   an older format.
-- **Configuration is immutable after construction.** `Exchange::params` and
-  `Simulator::config` have no setters, so a spread, an ADV or the
-  `synthetic` switch cannot change mid-world without a serde round trip.
 
 ## Browser UI (`crates/fehu-economy/ui`)
 
