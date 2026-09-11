@@ -181,7 +181,13 @@ three days of 1 s ticks, so every interval has history before the first
 request. `FEHU_TIME_SCALE=60` runs the market at 60 simulated seconds per
 wall second; `FEHU_BIND`, `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`,
 `FEHU_STARTING_CASH_CENTS`, `FEHU_TAPE`, `FEHU_FILL_LOG`, `FEHU_ORDER_LOG`
-and `FEHU_LEDGER_LOG` are the other knobs. `FEHU_GENESIS_CENTS` (10^14, i.e.
+and `FEHU_LEDGER_LOG` are the other knobs. `FEHU_NOW_MS` pins the simulated
+instant the world starts at, in Unix milliseconds, instead of reading the
+wall clock — which is how a test, or a demo that should look the same every
+time, gets the same history from the same seeds. `FEHU_MAX_BARS` (5 000) is
+how many completed bars each interval keeps per symbol and `FEHU_EVENT_LOG`
+(500) how many accepted events the audit log at `/api/events` retains.
+`FEHU_GENESIS_CENTS` (10^14, i.e.
 $1 trillion) is the world's whole opening supply, minted into treasury at
 start-up; `FEHU_STARTING_CASH_CENTS` is paid to each new account *out of*
 that, so a treasury that runs dry refuses to open more rather than printing
