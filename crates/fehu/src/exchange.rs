@@ -179,6 +179,19 @@ impl Default for TradingParams {
     }
 }
 
+/// What price impact scales by: `σ √(1/trading days)` and the expected
+/// daily volume, both from the config.
+fn impact_scale(cfg: &Config) -> (f64, f64) {
+    let days = cfg
+        .market_hours
+        .as_ref()
+        .map_or(365.25, crate::time::MarketHours::trading_days_per_year);
+    let sigma_day = cfg.volatility * sqrt(1.0 / days);
+    let adv = cfg.volume.base_per_day
+        * (1.0 + cfg.volume.return_sensitivity * sqrt(2.0 / core::f64::consts::PI));
+    (sigma_day, adv)
+}
+
 impl TradingParams {
     /// Check every field against its documented range.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -362,14 +375,7 @@ impl Exchange {
         // order without asking. Setting it here covers both a fresh exchange
         // and one read back from a save.
         book.set_rules(params.rules);
-        let cfg = sim.config();
-        let days = cfg
-            .market_hours
-            .as_ref()
-            .map_or(365.25, crate::time::MarketHours::trading_days_per_year);
-        let sigma_day = cfg.volatility * sqrt(1.0 / days);
-        let adv = cfg.volume.base_per_day
-            * (1.0 + cfg.volume.return_sensitivity * sqrt(2.0 / core::f64::consts::PI));
+        let (sigma_day, adv) = impact_scale(sim.config());
         let reference_cents = sim.snapshot().price_cents;
         Self {
             sim,
@@ -415,6 +421,46 @@ impl Exchange {
             self.interim_volume = self.interim_volume.saturating_add(t.qty);
         }
         trades
+    }
+
+    /// Replace the trading parameters of a running exchange.
+    ///
+    /// The book's tick and lot follow the new rules for every order from
+    /// here on; orders already resting are left where they are. The
+    /// synthetic ladder is withdrawn and, if the parameters still ask for
+    /// one, quoted again under the new ones around the current reference —
+    /// which draws from the flow stream, exactly as a step's requote does,
+    /// so the bare price series is untouched and the *synthetic* series
+    /// diverges from what it would have been, as any change to the ladder
+    /// must. The trades the new quotes executed against traders' resting
+    /// orders are returned, as [`resync`](Self::resync) returns them.
+    ///
+    /// # Errors
+    /// The first [`ConfigError`] found; nothing is changed on a refusal.
+    pub fn set_params(&mut self, params: TradingParams) -> Result<Vec<Trade>, ConfigError> {
+        params.validate()?;
+        self.params = params;
+        self.book.set_rules(params.rules);
+        // A ladder quoted under the old parameters, or one the new ones no
+        // longer want: `requote` leaves the book alone when the ladder is
+        // off, so the withdrawal is explicit.
+        self.book.cancel_all(Owner::Synthetic);
+        Ok(self.resync())
+    }
+
+    /// Replace the simulator's configuration, as
+    /// [`Simulator::set_config`] does, and recompute what price impact
+    /// derives from it. Use this rather than reaching through
+    /// [`simulator_mut`](Self::simulator_mut): the exchange caches the daily
+    /// volatility and the expected daily volume, and a config set behind
+    /// its back leaves impact scaled to the old ones.
+    ///
+    /// # Errors
+    /// The first [`ConfigError`] found; nothing is changed on a refusal.
+    pub fn set_config(&mut self, config: Config) -> Result<(), ConfigError> {
+        self.sim.set_config(config)?;
+        (self.sigma_day, self.adv) = impact_scale(self.sim.config());
+        Ok(())
     }
 
     /// The trading parameters.

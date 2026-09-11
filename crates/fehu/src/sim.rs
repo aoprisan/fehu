@@ -141,6 +141,30 @@ impl Simulator {
         &self.config
     }
 
+    /// Replace the configuration of a running simulator.
+    ///
+    /// Takes effect from the next step: the drift, volatility, GARCH,
+    /// jump, volume and calendar parameters are read afresh, and the
+    /// per-tick quantities derived from them are recomputed. The latent
+    /// state — price, fundamental, variance, active effects, the queued
+    /// events and the RNG — is left exactly as it is, so a change draws no
+    /// randomness and a series whose config is set to what it already was
+    /// continues bit for bit. The variance converges to the new
+    /// unconditional level at the GARCH's own pace rather than jumping to
+    /// it.
+    ///
+    /// `start_price_cents` and `start_ts` describe how a simulator begins
+    /// and have no effect on one that has already started.
+    ///
+    /// # Errors
+    /// The first [`ConfigError`] found; nothing is changed on a refusal.
+    pub fn set_config(&mut self, config: Config) -> Result<(), ConfigError> {
+        let derived = Derived::new(&config)?;
+        self.config = config;
+        self.derived = derived;
+        Ok(())
+    }
+
     /// Wall time the simulator has been advanced to.
     #[must_use]
     pub fn clock(&self) -> Timestamp {

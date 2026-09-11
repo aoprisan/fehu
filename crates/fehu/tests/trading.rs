@@ -77,6 +77,101 @@ fn ladder_is_quoted_around_the_reference_and_widens_with_vol() {
 }
 
 #[test]
+fn parameters_change_mid_world_without_touching_the_reference() {
+    let mut changed = exchange(3);
+    let mut untouched = exchange(3);
+    let mut sim = Simulator::new(Config::default(), 3).unwrap();
+    for _ in 0..50 {
+        changed.step();
+        untouched.step();
+        sim.step();
+    }
+
+    // A wider ladder, applied at once: the touch moves out, the reference
+    // does not, and nothing the simulator does changes.
+    let mut wider = TradingParams::default();
+    wider.liquidity.half_spread *= 4.0;
+    let trades = changed.set_params(wider).unwrap();
+    assert!(trades.is_empty(), "nobody was resting: {trades:?}");
+    assert_eq!(
+        changed.params().liquidity.half_spread,
+        wider.liquidity.half_spread
+    );
+    let spread = |ex: &Exchange| ex.book().best_ask().unwrap() - ex.book().best_bid().unwrap();
+    assert!(
+        spread(&changed) >= 3 * spread(&untouched),
+        "changed {} untouched {}",
+        spread(&changed),
+        spread(&untouched)
+    );
+    for _ in 0..200 {
+        let a = changed.step();
+        let b = untouched.step();
+        let t = sim.step();
+        assert_eq!(a.tick, t, "the reference series is the bare simulator's");
+        assert_eq!(b.tick, t);
+    }
+
+    // Switching the ladder off withdraws it; there is nothing synthetic
+    // left in the book.
+    let mut bare = wider;
+    bare.synthetic = false;
+    changed.set_params(bare).unwrap();
+    assert!(changed.book().best_bid().is_none() && changed.book().best_ask().is_none());
+    changed.step();
+    assert!(changed.book().best_bid().is_none(), "and it stays off");
+
+    // A bad parameter set is refused whole and changes nothing.
+    let mut bad = bare;
+    bad.rules.tick_cents = 0;
+    assert!(changed.set_params(bad).is_err());
+    assert_eq!(changed.params(), &bare);
+}
+
+#[test]
+fn config_changes_mid_world_take_effect_from_the_next_step() {
+    let mut changed = exchange(5);
+    let mut untouched = exchange(5);
+    for _ in 0..50 {
+        changed.step();
+        untouched.step();
+    }
+    // Set to what it already is: nothing about the series moves.
+    let same = changed.simulator().config().clone();
+    changed.set_config(same.clone()).unwrap();
+    for _ in 0..50 {
+        assert_eq!(changed.step().tick, untouched.step().tick);
+    }
+    // Set to something else: the clock and the price carry on from where
+    // they were, and the series diverges from the one left alone.
+    let before = changed.simulator().snapshot();
+    let calmer = Config {
+        volatility: same.volatility * 0.1,
+        ..same.clone()
+    };
+    changed.set_config(calmer.clone()).unwrap();
+    let after = changed.simulator().snapshot();
+    assert_eq!(after.ts, before.ts, "no time passes in a change");
+    assert_eq!(after.price_cents, before.price_cents, "and no price moves");
+    assert_eq!(changed.simulator().config().volatility, calmer.volatility);
+    let mut diverged = false;
+    for _ in 0..200 {
+        if changed.step().tick.price_cents != untouched.step().tick.price_cents {
+            diverged = true;
+        }
+    }
+    assert!(diverged, "a tenth of the volatility is a different series");
+
+    // A bad config is refused and nothing is changed.
+    let bad = Config {
+        volatility: -1.0,
+        ..same
+    };
+    assert!(changed.set_config(bad).is_err());
+    assert_eq!(changed.simulator().config().volatility, calmer.volatility);
+}
+
+#[test]
 fn market_buy_pays_the_spread_and_moves_the_reference() {
     let mut ex = exchange(3);
     for _ in 0..10 {
