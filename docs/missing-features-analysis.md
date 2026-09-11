@@ -141,7 +141,15 @@ play. Score usefulness against that.
 
 Ranked by usefulness over cost. The first block is under a week of work in
 total and closes every gap the acceptance scenario would hit; each item is
-independent of the others.
+independent of the others. **The whole first block has landed**, one commit
+per item, and [`missing-features.md`](missing-features.md) no longer lists
+them; the table rows above are kept as the record of why each was ranked
+where it was. Two choices made on the way are worth knowing: the outbox rule
+became "everything that moves currency or units into or out of a player's
+hands", reversing a documented decision, with `command_seq` as the way a
+backend skips its own; and the user directory answers only to the
+configured operator key, so an unlocked server hands nobody every player's
+portfolio.
 
 1. **Commit a CI workflow.** S. Every doc claims it exists.
 2. **Document `FEHU_EVENT_LOG`, `FEHU_MAX_BARS`, `FEHU_NOW_MS`.** S.
