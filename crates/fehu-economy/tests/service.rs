@@ -382,6 +382,40 @@ async fn a_scope_reads_the_side_of_the_world_it_writes() {
 }
 
 #[tokio::test]
+async fn a_service_spends_an_allowance_of_its_own() {
+    // One write a second, two at once. The service's third write in a burst
+    // is refused out of *its* bucket, and the anonymous bucket — which is
+    // where a service key used to land — is untouched by it.
+    let app = App::new(Options {
+        rate_per_sec: 1.0,
+        rate_burst: 2.0,
+        ..options()
+    });
+    let key = issue(&app, "world", &["events"]).await;
+    let event =
+        |source: &str| json!({ "kind": "market_rally", "magnitude": 0.5, "source": source });
+    for i in 0..2 {
+        let (status, body) = post(
+            &app,
+            Some(&key),
+            "/api/game/events",
+            event(&format!("e{i}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "burst {i}: {body}");
+    }
+    let (status, body) = post(&app, Some(&key), "/api/game/events", event("e2")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["code"], "rate_limited");
+
+    // An anonymous write still goes through: the service spent none of that
+    // bucket. (Issuing the service did — the operator key is nobody's, and
+    // lands there — so one of its two is left, not two.)
+    let (status, body) = post(&app, None, "/api/traders", json!({ "name": "p1" })).await;
+    assert_eq!(status, StatusCode::CREATED, "anonymous: {body}");
+}
+
+#[tokio::test]
 async fn a_service_key_is_never_promoted_to_the_operators() {
     // The order of resolution is the whole safety property: a key the
     // registry knows is judged as that service, whatever else is configured.

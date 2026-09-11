@@ -258,11 +258,17 @@ async fn rate_limit_writes(
     if request.method().is_safe() {
         return Ok(next.run(request).await);
     }
-    // Whoever the key says, or nobody — an unknown key shares the anonymous
-    // bucket, and the handler is left to refuse it properly.
+    // Whoever the key says — a player or a service, each with a bucket of
+    // its own — or nobody: an unknown key shares the anonymous bucket, and
+    // the handler is left to refuse it properly. A revoked service key is
+    // still that service's, so its refusals come out of its own allowance.
     // The published directory: a request is counted before it waits on
     // anything.
-    let who = api_key_of_headers(request.headers()).and_then(|key| app.user_of(&key));
+    let who = api_key_of_headers(request.headers()).and_then(|key| {
+        app.service_of(&key)
+            .map(|s| crate::limit::Client::Service(s.id))
+            .or_else(|| app.user_of(&key).map(crate::limit::Client::User))
+    });
     match app.allow(who).await {
         Decision::Allowed => Ok(next.run(request).await),
         Decision::Limited { retry_after } => Err(ApiError::rate_limited(retry_after)),

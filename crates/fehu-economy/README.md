@@ -584,8 +584,10 @@ message carrying the order it became or the reason it could not be placed.
 
 One client cannot flood the market. Every request that *changes* something —
 an order, an amendment, a cancel, a stop, money, an event — spends a token
-from a bucket kept per API key, refilling at `FEHU_RATE_PER_SEC` with a burst
-of `FEHU_RATE_BURST`; requests with no key share one bucket. Over the limit is
+from a bucket kept per API key — a player's or a service's, so the game
+backend neither spends nor is starved by anyone else's — refilling at
+`FEHU_RATE_PER_SEC` with a burst of `FEHU_RATE_BURST`; requests with no key
+share one bucket. Over the limit is
 `429 rate_limited` with a `Retry-After`. Reading is never limited, and
 `FEHU_RATE_PER_SEC=0` turns the whole thing off.
 

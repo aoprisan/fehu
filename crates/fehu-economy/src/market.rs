@@ -80,7 +80,7 @@ use crate::jobs::{
     Job, JobBook, JobDelivery, JobError, JobStatus, Line, Recipe, RecipeBook, scaled_qty,
 };
 use crate::journal::JournalError;
-use crate::limit::{Decision, Limiter, Rate};
+use crate::limit::{Client, Decision, Limiter, Rate};
 use crate::metrics::Metrics;
 use crate::npc::{BPS, MAX_NPCS, Npc, NpcDto, Policy};
 use crate::rewards::{Budget, BudgetDto, RewardBook, RewardError, RewardReceipt, RewardRule};
@@ -5075,7 +5075,7 @@ impl App {
     /// Timed off the wall clock rather than the simulated one: a limit is
     /// about how fast requests actually arrive, and `FEHU_TIME_SCALE` must
     /// not be able to buy a client more of them.
-    pub async fn allow(&self, who: Option<UserId>) -> Decision {
+    pub async fn allow(&self, who: Option<Client>) -> Decision {
         let since_start = self.started_at.elapsed().unwrap_or_default();
         let at_ms = since_start.as_millis().min(u128::from(u64::MAX)) as u64;
         self.limits
