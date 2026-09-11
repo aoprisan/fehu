@@ -6,6 +6,10 @@ sources: the plan's own "what is still not here" notes, the routes the plan's
 API table and the server README name against the ones `api.rs` registers,
 and a read of each crate's public surface against its module docs.
 
+[`missing-features-analysis.md`](missing-features-analysis.md) weighs each
+item here by what it costs to close against what closing it buys, and orders
+the work.
+
 Every item names where the evidence is. Items are ranked within each section
 by how soon somebody running a game on this server would hit them. Nothing
 here is a bug report: each is a thing the code, the docs or the plan says it
