@@ -4286,20 +4286,14 @@ async fn stream(
         gap,
     };
     let viewer = q.api_key.as_deref().and_then(|k| app.user_of(k));
-    // Ticks and events are public; a fill belongs to the trader that made it,
-    // so it goes only to a stream that proved it speaks for that trader. The
-    // replay buffer holds everybody's, so the same rule applies to it. The
-    // published directory says who owns a trader without asking anyone,
-    // which is what lets every open stream check every message.
+    // Ticks and events are public; a fill, a reward or a transfer belongs to
+    // the party it happened to, so it goes only to a stream that proved it
+    // speaks for that user. The replay buffer holds everybody's, so the same
+    // rule applies to it. The published directory says who owns a trader or
+    // an account without asking anyone, which is what lets every open
+    // stream check every message; see `StreamMessage::audience`.
     let owner = Arc::clone(&app);
-    let visible = move |m: &StreamMessage| match m {
-        StreamMessage::Fill { trader_id, .. }
-        | StreamMessage::StopTriggered { trader_id, .. }
-        | StreamMessage::OrderExpired { trader_id, .. } => {
-            viewer.is_some_and(|user| owner.owner_of(TraderId(*trader_id)) == Some(user))
-        }
-        _ => true,
-    };
+    let visible = move |m: &StreamMessage| m.audience(&owner.directory()).admits(viewer);
     let mine = visible.clone();
     // A gap ends this connection: the client reconnects with `?since=` and
     // picks up where it left off. Never present later messages as an

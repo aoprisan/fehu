@@ -182,6 +182,7 @@ pub struct Directory {
     keys: Keyring,
     services: Services,
     owners: BTreeMap<TraderId, UserId>,
+    account_owners: BTreeMap<AccountId, UserId>,
 }
 
 impl Directory {
@@ -200,6 +201,11 @@ impl Directory {
     /// The user `trader` belongs to, if the trader exists.
     pub fn owner_of(&self, trader: TraderId) -> Option<UserId> {
         self.owners.get(&trader).copied()
+    }
+
+    /// The user `account` belongs to, if the account exists.
+    pub fn account_owner(&self, account: AccountId) -> Option<UserId> {
+        self.account_owners.get(&account).copied()
     }
 }
 
@@ -984,6 +990,8 @@ impl Market {
         );
         self.next_account_id += 1;
         self.accounts.insert(id, account);
+        self.directory.account_owners.insert(id, user_id);
+        self.publish_directory();
         if let Some(user) = self.users.get_mut(&user_id) {
             user.accounts.push(id);
         }
@@ -1613,7 +1621,8 @@ impl Market {
         rec
     }
 
-    /// Publish a fact: out over the SSE stream now, and into the outbox for
+    /// Publish a fact: out over the SSE stream now, to whoever
+    /// [`StreamMessage::audience`] admits, and into the outbox for
     /// the game backend to collect at its own pace.
     ///
     /// The outbox half is deliberately narrower than the stream. It takes a
@@ -4217,10 +4226,44 @@ pub enum StreamMessage {
     /// A symbol was delisted. Its book and stops are gone, every holder has
     /// been bought out, and orders in it will be refused from here on.
     Delisted(Delisting),
-    /// A production job came due and delivered what it made. There is no
-    /// message for a job *starting*: that is a command with a response, and
-    /// its owner already has it.
+    /// A production job came due and delivered what it made.
     JobDone(JobDelivery),
+    /// A production job started: its inputs and its cost are gone. Sent to
+    /// its owner, and into the outbox, because the game backend was not
+    /// necessarily the one who started it.
+    JobStarted(crate::jobs::Job),
+    /// A production job was cancelled before it came due, and whatever was
+    /// refundable came back.
+    JobCancelled(crate::jobs::Job),
+    /// A reward was paid out of a budget. Never sent for a duplicate: a
+    /// repeated source id moves nothing, and the outbox carries what moved.
+    RewardPaid(crate::rewards::RewardReceipt),
+    /// Units of a good were bought from the catalogue and paid for.
+    Purchased(crate::catalog::PurchaseReceipt),
+    /// Units of a good were destroyed.
+    Consumed(crate::catalog::ConsumeReceipt),
+    /// Currency moved between two accounts on request. Sent to both owners.
+    Transferred {
+        from_account_id: u64,
+        to_account_id: u64,
+        amount_cents: i64,
+        /// The balanced transaction that moved it.
+        tx_id: u64,
+        memo: Option<String>,
+    },
+    /// The operator minted currency into an account.
+    Minted {
+        account_id: u64,
+        entry: crate::account::LedgerEntry,
+    },
+    /// The operator burned currency out of an account.
+    Burned {
+        account_id: u64,
+        entry: crate::account::LedgerEntry,
+    },
+    /// A dividend was paid to every holder. Public, like the event that
+    /// records it: it names totals, not who was paid what.
+    Dividend(Dividend),
     /// A stop fired. It is held no longer: it either became the order in
     /// `order`, or was `refused` when the account was checked again.
     StopTriggered {
@@ -4249,6 +4292,83 @@ impl StreamMessage {
             Self::Delisted(_) => "delisted",
             Self::JobDone(_) => "job_done",
             Self::StopTriggered { .. } => "stop_triggered",
+            Self::JobStarted(_) => "job_started",
+            Self::JobCancelled(_) => "job_cancelled",
+            Self::RewardPaid(_) => "reward_paid",
+            Self::Purchased(_) => "purchased",
+            Self::Consumed(_) => "consumed",
+            Self::Transferred { .. } => "transferred",
+            Self::Minted { .. } => "minted",
+            Self::Burned { .. } => "burned",
+            Self::Dividend(_) => "dividend",
+        }
+    }
+
+    /// Whose message this is: the user it may be shown to, or `None` for
+    /// market data everyone may see. A fill is its trader's; a transfer is
+    /// both its accounts' owners'. Resolved through the published
+    /// [`Directory`], so every open stream can check every message without
+    /// asking the market.
+    ///
+    /// Two users at most: a transfer has two sides. Everything else has one
+    /// party or none.
+    #[must_use]
+    pub fn audience(&self, directory: &Directory) -> Audience {
+        let trader = |id: u64| Audience::One(directory.owner_of(TraderId(id)));
+        let account = |id: u64| Audience::One(directory.account_owner(AccountId(id)));
+        match self {
+            Self::Fill { trader_id, .. }
+            | Self::StopTriggered { trader_id, .. }
+            | Self::OrderExpired { trader_id, .. } => trader(*trader_id),
+            Self::JobStarted(job) | Self::JobCancelled(job) => trader(job.trader_id),
+            Self::RewardPaid(receipt) => trader(receipt.trader_id),
+            Self::Purchased(receipt) => trader(receipt.trader_id),
+            Self::Consumed(receipt) => trader(receipt.trader_id),
+            Self::Minted { account_id, .. } | Self::Burned { account_id, .. } => {
+                account(*account_id)
+            }
+            Self::Transferred {
+                from_account_id,
+                to_account_id,
+                ..
+            } => Audience::Two(
+                directory.account_owner(AccountId(*from_account_id)),
+                directory.account_owner(AccountId(*to_account_id)),
+            ),
+            Self::Hello { .. }
+            | Self::Tick { .. }
+            | Self::Event(_)
+            | Self::Status(_)
+            | Self::Listed { .. }
+            | Self::Delisted(_)
+            | Self::JobDone(_)
+            | Self::Dividend(_) => Audience::Everyone,
+        }
+    }
+}
+
+/// Who a [`StreamMessage`] may be shown to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Audience {
+    /// Market data: every connection.
+    Everyone,
+    /// One party, if the directory still knows them. `None` inside means
+    /// nobody: a message about a trader or account the directory does not
+    /// have is shown to no one rather than to everyone.
+    One(Option<UserId>),
+    /// Both sides of a transfer.
+    Two(Option<UserId>, Option<UserId>),
+}
+
+impl Audience {
+    /// Whether `viewer` — a stream that proved it speaks for that user, or
+    /// an anonymous one — may see the message.
+    #[must_use]
+    pub fn admits(self, viewer: Option<UserId>) -> bool {
+        match self {
+            Self::Everyone => true,
+            Self::One(owner) => viewer.is_some() && viewer == owner,
+            Self::Two(a, b) => viewer.is_some() && (viewer == a || viewer == b),
         }
     }
 }
@@ -4547,6 +4667,7 @@ impl App {
             keys: Keyring::from_pairs(m.api_keys),
             services: Services::from_saved(m.services),
             owners: m.traders.iter().map(|t| (t.id, t.user_id)).collect(),
+            account_owners: m.accounts.iter().map(|a| (a.id, a.user_id)).collect(),
         };
         let responses: BTreeMap<u64, OrderResponse> = m.order_responses.into_iter().collect();
         let orders = m
@@ -4847,6 +4968,17 @@ impl App {
     /// The user `trader` belongs to, if the trader exists.
     pub fn owner_of(&self, trader: TraderId) -> Option<UserId> {
         self.directory.borrow().owner_of(trader)
+    }
+
+    /// The user `account` belongs to, if the account exists.
+    pub fn account_owner(&self, account: AccountId) -> Option<UserId> {
+        self.directory.borrow().account_owner(account)
+    }
+
+    /// The directory as the market last published it, for a reader that
+    /// will ask it several things and wants them from one snapshot.
+    pub fn directory(&self) -> Arc<Directory> {
+        Arc::clone(&self.directory.borrow())
     }
 
     /// Every symbol's quote, in listing order, each from its own actor.

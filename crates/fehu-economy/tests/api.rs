@@ -3803,6 +3803,45 @@ async fn a_stream_says_so_when_the_replay_buffer_cannot_reach_back() {
 }
 
 #[tokio::test]
+async fn a_transfer_is_streamed_to_both_its_owners_and_nobody_else() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        ..Options::default()
+    });
+    let alice = sign_up(&app, "alice").await;
+    let bruno = sign_up(&app, "bruno").await;
+    let carla = sign_up(&app, "carla").await;
+    async fn account_of(p: &Player) -> u64 {
+        let (_, trader) = get(p, &format!("/api/traders/{}", p.trader)).await;
+        trader["account_id"].as_u64().unwrap()
+    }
+    let (from, to) = (account_of(&alice).await, account_of(&bruno).await);
+    let (code, body) = post(
+        &alice,
+        "/api/transfers",
+        json!({ "from_account_id": from, "to_account_id": to, "amount_cents": 1_500 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+
+    let saw = |frames: &[Value]| frames.iter().any(|m| m["type"] == "transferred");
+    for (who, party) in [(&alice, "the sender"), (&bruno, "the recipient")] {
+        let frames =
+            stream_frames(&app, &format!("/api/stream?since=0&api_key={}", who.key), 8).await;
+        assert!(saw(&frames), "{party} is told: {frames:?}");
+    }
+    let frames = stream_frames(
+        &app,
+        &format!("/api/stream?since=0&api_key={}", carla.key),
+        8,
+    )
+    .await;
+    assert!(!saw(&frames), "a third user is not: {frames:?}");
+    let frames = stream_frames(&app, "/api/stream?since=0", 8).await;
+    assert!(!saw(&frames), "nor is an anonymous stream: {frames:?}");
+}
+
+#[tokio::test]
 async fn a_replay_keeps_other_traders_fills_to_themselves() {
     let app = app_with(Options {
         now_ms: Some(NOW_MS),

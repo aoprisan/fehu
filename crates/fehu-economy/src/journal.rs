@@ -82,8 +82,8 @@ use crate::api::ApiError;
 use crate::events::{EventRecord, GameEventKind, MAX_MAGNITUDE, Prepared, Scope, SimEvent};
 use crate::jobs::{JobError, Line};
 use crate::market::{
-    Amendment, AssetKind, DelistError, Market, PlaceRequest, Placed, SymbolInfo, SymbolSpec,
-    wall_now_ms,
+    Amendment, AssetKind, DelistError, Market, PlaceRequest, Placed, StreamMessage, SymbolInfo,
+    SymbolSpec, wall_now_ms,
 };
 use crate::npc::Policy;
 use crate::rewards::RewardError;
@@ -1252,6 +1252,10 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
             let entry = m
                 .mint_into(id, *amount_cents, memo.clone(), wall_ms)
                 .map_err(ApiError::money)?;
+            m.announce(StreamMessage::Minted {
+                account_id: id.0,
+                entry: entry.clone(),
+            });
             Applied::new(
                 200,
                 &crate::account::LedgerResponse {
@@ -1273,6 +1277,10 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
             let entry = m
                 .burn_from(id, *amount_cents, memo.clone(), wall_ms)
                 .map_err(ApiError::money)?;
+            m.announce(StreamMessage::Burned {
+                account_id: id.0,
+                entry: entry.clone(),
+            });
             Applied::new(
                 200,
                 &crate::account::LedgerResponse {
@@ -1294,8 +1302,13 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 .get(&trader)
                 .ok_or_else(|| ApiError::unknown_trader(*trader_id))?
                 .account_id;
-            m.mint_into(account_id, *amount_cents, memo.clone(), wall_ms)
+            let entry = m
+                .mint_into(account_id, *amount_cents, memo.clone(), wall_ms)
                 .map_err(ApiError::money)?;
+            m.announce(StreamMessage::Minted {
+                account_id: account_id.0,
+                entry,
+            });
             Applied::new(200, &crate::api::portfolio(m, &views, trader)?)
         }
 
@@ -1545,6 +1558,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 )
                 .await
                 .map_err(ApiError::job)?;
+            m.announce(StreamMessage::JobStarted(job.clone()));
             Applied::new(201, &job)
         }
 
@@ -1556,6 +1570,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 return Err(ApiError::job(JobError::UnknownJob(*job_id)));
             }
             let job = m.cancel_job(*job_id, wall_ms).map_err(ApiError::job)?;
+            m.announce(StreamMessage::JobCancelled(job.clone()));
             Applied::new(200, &job)
         }
 
@@ -1632,6 +1647,9 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
             let receipt = m
                 .pay_reward(rule, TraderId(*trader_id), source, wall_ms)
                 .map_err(ApiError::reward)?;
+            if !receipt.duplicate {
+                m.announce(StreamMessage::RewardPaid(receipt.clone()));
+            }
             Applied::new(if receipt.duplicate { 200 } else { 201 }, &receipt)
         }
 
@@ -1650,6 +1668,13 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                     wall_ms,
                 )
                 .map_err(ApiError::money)?;
+            m.announce(StreamMessage::Transferred {
+                from_account_id: *from_account,
+                to_account_id: *to_account,
+                amount_cents: *amount_cents,
+                tx_id: sent.tx_id,
+                memo: memo.clone(),
+            });
             Applied::new(
                 201,
                 &serde_json::json!({
@@ -1674,6 +1699,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 .purchase(&handle, TraderId(*trader_id), *qty, wall_ms)
                 .await
                 .map_err(ApiError::goods)?;
+            m.announce(StreamMessage::Purchased(receipt.clone()));
             Applied::new(201, &receipt)
         }
 
@@ -1690,6 +1716,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 .consume(&handle, TraderId(*trader_id), *qty)
                 .await
                 .map_err(ApiError::goods)?;
+            m.announce(StreamMessage::Consumed(receipt.clone()));
             Applied::new(200, &receipt)
         }
 
@@ -1761,6 +1788,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                         price - 1
                     ))
                 })?;
+            m.announce(StreamMessage::Dividend(paid));
             let event = m.record(EventRecord {
                 id: 0,
                 received_at_ms: wall_ms,

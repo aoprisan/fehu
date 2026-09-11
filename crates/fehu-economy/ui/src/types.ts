@@ -785,12 +785,63 @@ export type DelistedMessage = { type: 'delisted' } & Delisting;
  */
 export type Sequenced<M> = M & { seq: number };
 
-/**
- * A production job came due and delivered what it made. There is no message
- * for a job starting: that is a command with a response, and its owner
- * already has it.
- */
+/** A production job came due and delivered what it made. */
 export type JobDoneMessage = { type: 'job_done' } & JobDelivery;
+
+/**
+ * A production job started: its inputs and its cost are gone. Sent to its
+ * owner only, like a fill.
+ */
+export type JobStartedMessage = { type: 'job_started' } & Job;
+
+/** A job was cancelled before it came due; what was refundable came back. */
+export type JobCancelledMessage = { type: 'job_cancelled' } & Job;
+
+/** A reward was paid out of a budget. Never sent for a duplicate. */
+export type RewardPaidMessage = { type: 'reward_paid' } & RewardReceipt;
+
+/** Units of a good were bought from the catalogue and paid for. */
+export type PurchasedMessage = { type: 'purchased' } & PurchaseReceipt;
+
+/** Units of a good were destroyed. */
+export type ConsumedMessage = { type: 'consumed' } & ConsumeReceipt;
+
+/** Currency moved between two accounts on request. Sent to both owners. */
+export interface TransferredMessage {
+  type: 'transferred';
+  from_account_id: number;
+  to_account_id: number;
+  amount_cents: number;
+  /** The balanced transaction that moved it. */
+  tx_id: number;
+  memo: string | null;
+}
+
+/** The operator minted currency into an account. */
+export interface MintedMessage {
+  type: 'minted';
+  account_id: number;
+  entry: LedgerEntry;
+}
+
+/** The operator burned currency out of an account. */
+export interface BurnedMessage {
+  type: 'burned';
+  account_id: number;
+  entry: LedgerEntry;
+}
+
+/** A dividend was paid to every holder. Public: totals, not who got what. */
+export interface DividendMessage {
+  type: 'dividend';
+  symbol: string;
+  cents_per_share: number;
+  /** The price it was declared against, before it went ex. */
+  price_cents: number;
+  shares_paid: number;
+  accounts_paid: number;
+  total_cents: number;
+}
 
 /** One published message, before the stream numbers it. */
 export type StreamPayload =
@@ -803,7 +854,16 @@ export type StreamPayload =
   | OrderExpiredMessage
   | ListedMessage
   | DelistedMessage
-  | JobDoneMessage;
+  | JobDoneMessage
+  | JobStartedMessage
+  | JobCancelledMessage
+  | RewardPaidMessage
+  | PurchasedMessage
+  | ConsumedMessage
+  | TransferredMessage
+  | MintedMessage
+  | BurnedMessage
+  | DividendMessage;
 
 export type StreamMessage = Sequenced<StreamPayload>;
 

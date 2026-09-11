@@ -438,11 +438,16 @@ any state file is.
 A stream is the wrong shape for the service that owns the rest of the game.
 `/api/stream` is best-effort, its `?since=` buffer is small and in memory,
 and a backend that was restarting when a job came due has no way to find out
-that it did. So the same facts go a second way: everything the server
-publishes that **nobody asked for** — a resting order that filled, a job that
-came due, an order the venue withdrew, a stop that fired, a halt, a listing, a
-delisting, an accepted game event — is also appended to a durable **outbox**,
-numbered from 1, and handed out against a cursor.
+that it did. So the same facts go a second way: everything that **moves
+currency or units into or out of a player's hands** — a fill, a purchase, a
+consumption, a transfer, a reward, a mint, a burn, a dividend, a job started,
+cancelled or delivered — and everything the market does on its own — an
+order the venue withdrew, a stop that fired, a halt, a listing, a delisting,
+an accepted game event — is also appended to a durable **outbox**, numbered
+from 1, and handed out against a cursor. Each entry names the journal
+sequence of the command that caused it, the same number every committed
+response carries in `Fehu-Journal-Seq`, so a backend that would rather not
+be told about its own rewards twice matches the two.
 
 Delivery is at-least-once. `GET /api/outbox` returns the facts after a
 cursor; reading does not consume them, so a backend that dies between reading
@@ -452,12 +457,12 @@ everything else — a cursor that moved only in memory would fall back to the
 snapshot's value on a restart. Both are the operator's or any service's, and
 no player's: the log is the whole world's.
 
-What is *not* in it is anything with a requester. A purchase, a transfer, a
-reward and a job *starting* are commands: whoever sent one has its response,
-and a lost response is recovered by its `Idempotency-Key` through
-`GET /api/commands/{key}`. Ticks are not in it either — they are market data,
-the highest-volume thing the server produces, and `/api/symbols/{sym}/bars`
-has them whenever they are wanted.
+What is *not* in it is the world's own bookkeeping — a budget opened or
+funded, takings swept, a rule or a recipe rewritten — which the operator did
+and knows, and ticks: they are market data, the highest-volume thing the
+server produces, and `/api/symbols/{sym}/bars` has them whenever they are
+wanted. A lost response to any command is still recovered by its
+`Idempotency-Key` through `GET /api/commands/{key}`.
 
 The log is bounded by `FEHU_OUTBOX`, and it is honest about the bound: a fact
 evicted before it was acknowledged is counted in `dropped`, and a read that
