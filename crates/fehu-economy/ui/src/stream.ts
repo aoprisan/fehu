@@ -11,6 +11,7 @@
 
 import { currentApiKey } from './api.js';
 import type { Actions } from './actions.js';
+import { fmtPrice } from './format.js';
 import { setOrderStatus } from './status.js';
 import type { Store } from './store.js';
 import type { StreamMessage, TickMessage } from './types.js';
@@ -180,6 +181,67 @@ export class MarketStream {
         const made = message.delivered.map((l) => `${l.qty} ${l.symbol}`).join(', ');
         setOrderStatus(`job #${message.job_id} delivered ${made === '' ? 'nothing' : made}`);
         // The units are the player's now, and so is what they cost.
+        void this.#actions.loadEconomy();
+        void this.#actions.refreshTrader();
+        break;
+      }
+      case 'stop_triggered': {
+        // The server sends this only to the stop's owner, but a stream opened
+        // before the player signed in is anonymous, so check anyway.
+        const trader = state.trader;
+        if (trader === null || message.trader_id !== trader.id) break;
+        const stop = message.stop;
+        const what = `stop #${stop.stop_id} ${stop.side} ${stop.qty} ${stop.symbol}`;
+        if (message.order !== null) {
+          setOrderStatus(
+            `${what} fired at ${fmtPrice(message.price_cents)} → order #${message.order.order_id}`,
+          );
+        } else {
+          setOrderStatus(`${what} fired and was refused: ${message.refused ?? 'unknown'}`, true);
+        }
+        void this.#actions.refreshTrader();
+        break;
+      }
+      case 'order_expired': {
+        const trader = state.trader;
+        if (trader === null || message.trader_id !== trader.id) break;
+        const order = message.order;
+        setOrderStatus(
+          `order #${order.order_id} ${order.side} ${order.qty} ${order.symbol} expired ` +
+            `(${order.filled}/${order.qty} filled)`,
+          true,
+        );
+        void this.#actions.refreshTrader();
+        break;
+      }
+      case 'reward_paid': {
+        const trader = state.trader;
+        if (trader === null || message.trader_id !== trader.id) break;
+        setOrderStatus(`reward: ${message.rule} paid ${fmtPrice(message.amount_cents)}`);
+        void this.#actions.refreshTrader();
+        break;
+      }
+      case 'transferred':
+      case 'minted':
+      case 'burned': {
+        // Money moved on this player's account. The server sends these only
+        // to the owner; what changed is on the account, so read it back.
+        if (state.trader === null) break;
+        const cents =
+          message.type === 'transferred' ? message.amount_cents : message.entry.amount_cents;
+        const said =
+          message.type === 'transferred'
+            ? `transfer of ${fmtPrice(cents)}`
+            : `${message.type} ${fmtPrice(Math.abs(cents))}`;
+        setOrderStatus(said);
+        void this.#actions.refreshTrader();
+        break;
+      }
+      case 'job_started':
+      case 'job_cancelled': {
+        // Usually this player's own click, already reflected; a second tab
+        // or the operator's dashboard is why the workshop is reloaded.
+        if (state.trader === null || message.trader_id !== state.trader.id) break;
         void this.#actions.loadEconomy();
         void this.#actions.refreshTrader();
         break;

@@ -41,22 +41,56 @@ import type {
   WorldResponse,
 } from './types.js';
 
-/** A non-2xx response, carrying the server's `error.code` when it sent one. */
+/**
+ * A non-2xx response, carrying the server's `error.code` when it sent one
+ * and, for a refusal that asks the client to wait, how long.
+ */
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
+  /** `Retry-After`, in seconds, on `rate_limited` and `overloaded`. */
+  readonly retryAfterSecs: number | null;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, retryAfterSecs: number | null = null) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
+    this.retryAfterSecs = retryAfterSecs;
   }
 }
 
-/** The message to show for anything thrown by this module (or by `fetch`). */
+/**
+ * The message to show for anything thrown by this module (or by `fetch`).
+ *
+ * Refusals a player can act on are said in their own words rather than as
+ * `code: message`: how long to wait, that a post-only order would have
+ * taken, that the order in the way is their own.
+ */
 export function errorMessage(e: unknown): string {
-  if (e instanceof ApiError) return `${e.code}: ${e.message}`;
+  if (e instanceof ApiError) {
+    const wait = e.retryAfterSecs === null ? '' : ` — try again in ${e.retryAfterSecs}s`;
+    switch (e.code) {
+      case 'rate_limited':
+        return `too fast${wait}`;
+      case 'overloaded':
+        return `server busy${wait}`;
+      case 'post_only_would_cross':
+        return 'post-only: that price would trade on arrival, not rest';
+      case 'self_trade':
+        return `self-trade: ${e.message}`;
+      case 'revoked_api_key':
+        return 'this key has been revoked';
+      case 'market_closed':
+        return 'the market is closed';
+      case 'symbol_halted':
+        return 'trading in this symbol is halted';
+      case 'network':
+        return `no answer from the server: ${e.message}`;
+      default:
+        return `${e.code}: ${e.message}`;
+    }
+  }
   if (e instanceof Error) return e.message;
   return String(e);
 }
@@ -114,27 +148,53 @@ async function request<T>(path: string, init?: RequestInit, key = apiKey): Promi
   const body: unknown = await response.json().catch(() => ({}));
   if (!response.ok) {
     const err = (body as ApiErrorBody).error;
+    const retryAfter = response.headers.get('retry-after');
+    const secs = retryAfter === null ? NaN : Number(retryAfter);
     throw new ApiError(
       response.status,
       err?.code ?? 'http_error',
       err?.message ?? `HTTP ${response.status}`,
+      Number.isFinite(secs) ? secs : null,
     );
   }
   return body as T;
 }
 
-function send<T>(
+/** A fresh `Idempotency-Key`: 128 bits from the platform, or a fallback. */
+function idempotencyKey(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+/**
+ * A write. Every one carries an `Idempotency-Key`, and one whose answer was
+ * lost on the wire — the request threw before a response came back — is
+ * sent once more under the same key, so a deposit or an order the server
+ * did apply is answered rather than applied twice. A response the server
+ * *gave*, refusal included, is never retried here: that is the caller's.
+ */
+async function send<T>(
   method: 'POST' | 'PATCH' | 'DELETE',
   path: string,
   body?: unknown,
   key = apiKey,
 ): Promise<T> {
-  const init: RequestInit = { method };
+  const headers: Record<string, string> = { 'idempotency-key': idempotencyKey() };
+  const init: RequestInit = { method, headers };
   if (body !== undefined) {
-    init.headers = { 'content-type': 'application/json' };
+    headers['content-type'] = 'application/json';
     init.body = JSON.stringify(body);
   }
-  return request<T>(path, init, key);
+  try {
+    return await request<T>(path, init, key);
+  } catch (e) {
+    if (e instanceof ApiError && e.code === 'network') {
+      return request<T>(path, init, key);
+    }
+    throw e;
+  }
 }
 
 const enc = encodeURIComponent;
