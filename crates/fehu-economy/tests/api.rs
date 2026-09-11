@@ -182,6 +182,126 @@ async fn health_and_symbols() {
 }
 
 #[tokio::test]
+async fn every_paged_read_walks_back_with_before() {
+    // `limit` alone made everything past it unreachable. Each read takes a
+    // `before` cursor — the oldest thing on the page you have — and the
+    // page before it is what comes back, with nothing repeated and nothing
+    // skipped across the boundary.
+    let app = test_app();
+    engine::advance_to(&app, Timestamp(NOW_MS + 5_000)).await;
+
+    // Bars, by open_ts. Oldest first, so the cursor is the first bar's.
+    let (_, page) = get(&app, "/api/symbols/ACME/bars?interval=M1&limit=3").await;
+    let bars = page["bars"].as_array().unwrap();
+    assert_eq!(bars.len(), 3);
+    let oldest = bars[0]["open_ts"].as_i64().unwrap();
+    let (status, page) = get(
+        &app,
+        &format!("/api/symbols/ACME/bars?interval=M1&limit=3&before={oldest}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let earlier = page["bars"].as_array().unwrap();
+    assert_eq!(earlier.len(), 3);
+    assert_eq!(
+        earlier[2]["open_ts"].as_i64().unwrap(),
+        oldest - 60_000,
+        "the page before ends one bar before the page after: {earlier:?}"
+    );
+
+    // The tape, by ts_ms. Newest first, so the cursor is the last print's.
+    let (_, page) = get(&app, "/api/symbols/ACME/trades?limit=2").await;
+    let trades = page["trades"].as_array().unwrap();
+    assert_eq!(trades.len(), 2);
+    let oldest = trades[1]["ts_ms"].as_i64().unwrap();
+    let (_, page) = get(
+        &app,
+        &format!("/api/symbols/ACME/trades?limit=2&before={oldest}"),
+    )
+    .await;
+    let earlier = page["trades"].as_array().unwrap();
+    assert!(!earlier.is_empty());
+    assert!(
+        earlier
+            .iter()
+            .all(|t| t["ts_ms"].as_i64().unwrap() < oldest),
+        "strictly before the cursor: {earlier:?}"
+    );
+
+    // Events, by id.
+    for i in 0..3 {
+        let (status, body) = post(
+            &app,
+            "/api/game/events",
+            json!({ "kind": "scandal", "symbol": "ACME", "magnitude": 0.3, "source": format!("e{i}") }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    }
+    let (_, page) = get(&app, "/api/events?limit=1").await;
+    let newest = page["events"][0]["id"].as_u64().unwrap();
+    let (_, page) = get(&app, &format!("/api/events?limit=5&before={newest}")).await;
+    let ids: Vec<u64> = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_u64().unwrap())
+        .collect();
+    assert!(ids.iter().all(|&id| id < newest), "{ids:?}");
+    assert_eq!(ids.len(), 2, "the two before the newest: {ids:?}");
+
+    // A trader's orders, by order id, and their account's ledger, by entry
+    // id: three market buys make three orders and three settlements.
+    let player = sign_up(&app, "pager").await;
+    let id = player.trader;
+    for _ in 0..3 {
+        let (status, body) = post(
+            &player,
+            "/api/symbols/ACME/orders",
+            json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (_, page) = get(&player, &format!("/api/traders/{id}/orders?limit=1")).await;
+    let newest = page[0]["order_id"].as_u64().unwrap();
+    let (_, page) = get(
+        &player,
+        &format!("/api/traders/{id}/orders?limit=5&before={newest}"),
+    )
+    .await;
+    let ids: Vec<u64> = page
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["order_id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(ids.iter().all(|&o| o < newest), "{ids:?}");
+
+    let (_, trader) = get(&player, &format!("/api/traders/{id}")).await;
+    let account = trader["account_id"].as_u64().unwrap();
+    let (_, page) = get(&player, &format!("/api/accounts/{account}/ledger?limit=1")).await;
+    let newest = page["entries"][0]["id"].as_u64().unwrap();
+    let (_, page) = get(
+        &player,
+        &format!("/api/accounts/{account}/ledger?limit=100&before={newest}"),
+    )
+    .await;
+    let entries = page["entries"].as_array().unwrap();
+    assert!(
+        entries.iter().all(|e| e["id"].as_u64().unwrap() < newest),
+        "{entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["kind"] == "deposit" || e["kind"] == "opening"),
+        "walking back reaches the opening balance: {entries:?}"
+    );
+}
+
+#[tokio::test]
 async fn bars_have_history_and_are_well_formed() {
     let app = test_app();
     for (iv, min_bars) in [("M1", 60), ("M5", 12), ("H1", 1), ("D1", 6)] {

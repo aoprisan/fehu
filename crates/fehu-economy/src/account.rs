@@ -344,7 +344,19 @@ impl Account {
 
     /// The most recent `limit` ledger entries, newest first.
     pub fn ledger(&self, limit: usize) -> Vec<LedgerEntry> {
-        self.ledger.iter().rev().take(limit).cloned().collect()
+        self.ledger_before(limit, None)
+    }
+
+    /// [`Self::ledger`], read further back: the `limit` entries with an id
+    /// strictly below `before`, newest first.
+    pub fn ledger_before(&self, limit: usize, before: Option<u64>) -> Vec<LedgerEntry> {
+        self.ledger
+            .iter()
+            .rev()
+            .filter(|e| before.is_none_or(|b| e.id < b))
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     /// The account may place orders.

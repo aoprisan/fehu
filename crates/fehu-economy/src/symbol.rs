@@ -813,12 +813,22 @@ impl SymbolState {
     /// The most recent `limit` bars of `iv`, oldest first, including the
     /// in-progress bar. Daily bars include the coarse pre-history.
     pub fn bars(&self, iv: Interval, limit: usize) -> Vec<Candle> {
+        self.bars_before(iv, limit, None)
+    }
+
+    /// [`Self::bars`], read further back: the last `limit` bars that opened
+    /// strictly before `before_ms`, so a client walks the history one page
+    /// at a time by passing the `open_ts` of the oldest bar it has.
+    pub fn bars_before(&self, iv: Interval, limit: usize, before_ms: Option<i64>) -> Vec<Candle> {
         let mut v: Vec<Candle> = Vec::new();
         if iv == Interval::D1 {
             v.extend(self.coarse_daily.iter().copied());
         }
         v.extend(self.candles.completed(iv).copied());
         v.extend(self.candles.current(iv).copied());
+        if let Some(before) = before_ms {
+            v.retain(|c| c.open_ts.0 < before);
+        }
         if v.len() > limit {
             v.drain(..v.len() - limit);
         }

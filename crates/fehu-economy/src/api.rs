@@ -2800,6 +2800,9 @@ async fn get_shares(
 struct BarsQuery {
     interval: Option<String>,
     limit: Option<usize>,
+    /// Only bars that opened strictly before this instant, in Unix
+    /// milliseconds — the `open_ts` of the oldest bar of the last page.
+    before: Option<i64>,
 }
 
 fn parse_interval(s: &str) -> Option<Interval> {
@@ -2833,11 +2836,12 @@ async fn get_bars(
         })?,
     };
     let limit = q.limit.unwrap_or(500).clamp(1, app.options.max_bars + 1);
+    let before = q.before;
     let handle = app
         .symbol(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
     let bars = handle
-        .ask_listed(move |s| s.bars(interval, limit))
+        .ask_listed(move |s| s.bars_before(interval, limit, before))
         .await?
         .ok_or_else(|| ApiError::not_found(&symbol))?;
     Ok(Json(BarsResponse {
@@ -2853,6 +2857,9 @@ async fn get_bars(
 struct EventsQuery {
     limit: Option<usize>,
     symbol: Option<String>,
+    /// Only events with an id strictly below this one — the id of the last
+    /// event of the previous page, to read further back.
+    before: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -2870,9 +2877,12 @@ async fn list_events(
     let events = app
         .market
         .call(move |m| {
-            m.events(limit, |e| match &q.symbol {
-                Some(sym) => e.symbols.iter().any(|s| s.eq_ignore_ascii_case(sym)),
-                None => true,
+            m.events(limit, |e| {
+                q.before.is_none_or(|before| e.id < before)
+                    && match &q.symbol {
+                        Some(sym) => e.symbols.iter().any(|s| s.eq_ignore_ascii_case(sym)),
+                        None => true,
+                    }
             })
         })
         .await?;
@@ -2895,6 +2905,7 @@ async fn list_symbol_events(
         Query(EventsQuery {
             limit: q.limit,
             symbol: Some(symbol),
+            before: q.before,
         }),
     )
     .await
@@ -3019,6 +3030,10 @@ async fn get_book(
 #[derive(Deserialize)]
 struct LimitQuery {
     limit: Option<usize>,
+    /// Read further back: only rows strictly before this cursor. What the
+    /// cursor is depends on the route — a trade's `ts_ms` on the tape, an
+    /// entry's `id` on a ledger — and each says so.
+    before: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -3035,6 +3050,10 @@ async fn get_trades(
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<TradesResponse>, ApiError> {
     let limit = q.limit.unwrap_or(50).clamp(1, app.options.tape_len.max(1));
+    // `before` is a `ts_ms`: the tape has no ids, and several prints can
+    // share an instant, so a page boundary inside one instant repeats that
+    // instant's prints on the next page rather than losing them.
+    let before = q.before;
     let handle = app
         .symbol(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
@@ -3043,6 +3062,7 @@ async fn get_trades(
             s.tape
                 .iter()
                 .rev()
+                .filter(|t| before.is_none_or(|b| t.ts.0 < b))
                 .take(limit)
                 .map(TradeDto::from)
                 .collect()
@@ -3446,6 +3466,9 @@ struct OrderHistoryQuery {
     /// `resting`, `filled` or `cancelled`; omit for every order.
     status: Option<String>,
     limit: Option<usize>,
+    /// Only orders with an id strictly below this one — the last order of
+    /// the previous page, to read further back.
+    before: Option<u64>,
 }
 
 /// One order by id, whatever became of it — filled and cancelled orders
@@ -3489,6 +3512,7 @@ async fn list_trader_orders(
         app.market
             .call(move |m| {
                 m.orders_of(trader)
+                    .filter(|o| q.before.is_none_or(|before| o.order_id < before))
                     .filter(|o| status.is_none_or(|s| o.status == s))
                     .take(limit)
                     .cloned()
@@ -3917,6 +3941,8 @@ async fn get_ledger(
         .limit
         .unwrap_or(100)
         .clamp(1, app.options.ledger_log.max(1));
+    // `before` is an entry id.
+    let before = q.before.map(|b| u64::try_from(b).unwrap_or(0));
     let id = AccountId(account_id);
     Ok(Json(
         app.market
@@ -3928,7 +3954,7 @@ async fn get_ledger(
                     .ok_or_else(|| ApiError::unknown_account(account_id))?;
                 Ok::<_, ApiError>(LedgerResponse {
                     account: account_view(m, account),
-                    entries: account.ledger(limit),
+                    entries: account.ledger_before(limit, before),
                 })
             })
             .await??,

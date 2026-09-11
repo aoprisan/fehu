@@ -113,11 +113,11 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `POST` | `/api/symbols/{sym}/halt`, `/resume` | Game master: stop and start trading in one symbol |
 | `POST` | `/api/symbols/{sym}/dividend` | Game master: `{"cents_per_share":50}` — pays every holder and takes the price ex |
 | `POST` | `/api/symbols/{sym}/delist` | Game master: take the symbol away — cancels its resting orders and stops, buys every holder out at `{"cents_per_share":60}` (the last price if omitted, `0` for a company worth nothing) |
-| `GET` | `/api/symbols/{sym}/bars?interval=M1\|M5\|H1\|D1&limit=500` | OHLCV bars, oldest first, in-progress bar last |
+| `GET` | `/api/symbols/{sym}/bars?interval=M1\|M5\|H1\|D1&limit=500` | OHLCV bars, oldest first, in-progress bar last; `&before=<open_ts>` reads the page before the oldest bar you have |
 | `POST` | `/api/symbols/{sym}/events` | Raw simulator event: `{"type":"jump","pct":-0.1}`, `drift_shift`, `drift_for_total_move`, `vol_shift`, `fundamental_shift`, `fundamental_target`; optional `at_ms` / `delay_secs`, `source`, `note` |
 | `POST` | `/api/game/events` | Semantic game event: `{"kind":"scandal","symbol":"ACME","magnitude":1.5}`; market-wide kinds (`market_crash`, `rate_hike`, …) need no symbol |
 | `GET` | `/api/game/catalog` | Every game-event kind and the simulator events it expands to |
-| `GET` | `/api/events` | Audit log of accepted events, newest first (`?symbol=`, `?limit=`) |
+| `GET` | `/api/events` | Audit log of accepted events, newest first (`?symbol=`, `?limit=`, `?before=<event id>` for the page before) |
 | `POST` | `/api/users` | Create a user: `{"name":"ada","email":"ada@example.com"}` (both optional). The response carries their `api_key`, once |
 | `GET` | `/api/users`, `/api/users/{id}` | The caller themselves: accounts, traders, cash and shares owned |
 | `GET` | `/api/users/{id}/holdings` | Shares the user owns per symbol, added up over their traders, with what is reserved and what is still sellable |
@@ -126,7 +126,7 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `POST` | `/api/accounts/{id}/deposit` | Game master: **mint** money into an account, `{"amount_cents":250000,"memo":"week 1"}` |
 | `POST` | `/api/accounts/{id}/withdraw` | Game master: **burn** money out of one; only the available balance can leave |
 | `POST` | `/api/accounts/{id}/status` | `{"status":"active\|frozen\|closed"}` — freezing and unfreezing are the game master's, closing is the owner's and needs an empty account |
-| `GET` | `/api/accounts/{id}/ledger?limit=100` | Every movement of money, newest first |
+| `GET` | `/api/accounts/{id}/ledger?limit=100` | Every movement of money, newest first; `&before=<entry id>` for the page before |
 | `GET` | `/api/accounts/{id}/validate` | Status, what the account may do, and any broken invariant |
 | `POST` | `/api/traders` | Create a trader, with a user and a funded account: `{"name":"alice","cash_cents":10000000}` (both optional), and hand over the new user's `api_key`; `user_id` and `account_id` join existing ones, which needs that user's key |
 | `GET` | `/api/traders`, `/api/traders/{id}` | Traders; a portfolio with cash, positions marked to the reference price, open orders and fills |
@@ -137,12 +137,12 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET`/`DELETE` | `/api/symbols/{sym}/orders/{id}` | Look up / cancel (`?trader_id=`) a resting order |
 | `PATCH` | `/api/symbols/{sym}/orders/{id}` | Amend a resting order: `{"trader_id":1,"price_cents":8500,"qty":50}` — a cancel and a fresh order, so it loses queue position |
 | `GET` | `/api/orders/{id}` | One order and what became of it — filled and cancelled ones included |
-| `GET` | `/api/traders/{id}/orders?status=resting\|filled\|cancelled&limit=100` | A trader's orders, newest first |
+| `GET` | `/api/traders/{id}/orders?status=resting\|filled\|cancelled&limit=100` | A trader's orders, newest first; `&before=<order id>` for the page before |
 | `POST` | `/api/symbols/{sym}/stops` | Arm a stop: `{"trader_id":1,"side":"sell","qty":100,"stop_price_cents":8000}`, plus `"limit_price_cents"` for a stop-limit. The trigger must be on the far side of the market |
 | `GET` | `/api/symbols/{sym}/stops?trader_id=`, `/api/traders/{id}/stops` | A trader's held stops, on one symbol or all of them |
 | `DELETE` | `/api/symbols/{sym}/stops/{id}?trader_id=` | Withdraw a stop before it fires |
 | `GET` | `/api/symbols/{sym}/book?depth=10` | Aggregated bids and asks, reference price, pending trader flow |
-| `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first |
+| `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first; `&before=<ts_ms>` for the prints before that instant |
 | `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and — for `?api_key=`, since `EventSource` cannot set headers — that player's `fill`s |
 | `GET` | `/api/npcs` | The traders the world runs itself: what each quotes, and what it has left |
 | `POST` | `/api/npcs` | Game master: put a funded merchant in a symbol — `{"symbol":"ORE","cash_cents":5000000,"inventory":800}`, optional `name`, `size`, `levels`, `half_spread_bps`, `level_step_bps`, `requote_bps` |
