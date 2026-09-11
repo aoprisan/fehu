@@ -119,7 +119,7 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/game/catalog` | Every game-event kind and the simulator events it expands to |
 | `GET` | `/api/events` | Audit log of accepted events, newest first (`?symbol=`, `?limit=`, `?before=<event id>` for the page before) |
 | `POST` | `/api/users` | Create a user: `{"name":"ada","email":"ada@example.com"}` (both optional). The response carries their `api_key`, once |
-| `GET` | `/api/users`, `/api/users/{id}` | The caller themselves: accounts, traders, cash and shares owned |
+| `GET` | `/api/users`, `/api/users/{id}` | The caller themselves: accounts, traders, cash and shares owned. With the operator's key, everyone — the directory of who exists. Literally the key: a server with no `FEHU_ADMIN_KEY` has nobody to show the directory to |
 | `GET` | `/api/users/{id}/holdings` | Shares the user owns per symbol, added up over their traders, with what is reserved and what is still sellable |
 | `POST` | `/api/users/{id}/accounts` | Open another account: `{"name":"main","cash_cents":10000000}` — the cash is paid out of treasury, not created |
 | `GET` | `/api/users/{id}/accounts`, `/api/accounts`, `/api/accounts/{id}` | Accounts: balance, reserved, available, status, and the `wallet_id` holding the money |

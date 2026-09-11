@@ -3667,29 +3667,73 @@ async fn create_user(
 }
 
 /// The caller, as a list of one: a user is not told about the others.
+/// Whether the request presented the operator's key — the configured one,
+/// not the absence of one.
+///
+/// [`Admin`] treats an unlocked server as open, which is right for the
+/// game master's levers and wrong for reading every player's portfolio: a
+/// server with no `FEHU_ADMIN_KEY` must not hand the whole user directory
+/// to anyone who asks. So the directory is the operator's in the literal
+/// sense, and on an unlocked server nobody is that.
+fn presented_operator_key(app: &App, admin: Option<Admin>) -> bool {
+    admin.is_some() && app.options.admin_key.is_some()
+}
+
+/// The users: the caller alone with a player's key, everyone with the
+/// operator's.
+///
+/// A user key is judged as that user, whatever else is configured, the
+/// same way a service key is judged as that service: a player is shown
+/// themselves and nobody else. Only a request that carries no user key
+/// and does carry the operator's is shown everyone; see
+/// [`presented_operator_key`] for why an unlocked server does not count.
 async fn list_users(
     State(app): State<AppState>,
-    caller: Caller,
+    caller: Option<Caller>,
+    admin: Option<Admin>,
 ) -> Result<Json<Vec<UserDto>>, ApiError> {
     let views = app.views().await;
-    let users = app
-        .market
-        .call(move |m| {
-            user_dto(m, &views, caller.0)
-                .into_iter()
-                .collect::<Vec<_>>()
-        })
-        .await?;
+    let admin = presented_operator_key(&app, admin).then_some(Admin);
+    let users = match (caller, admin) {
+        (Some(caller), _) => {
+            app.market
+                .call(move |m| {
+                    user_dto(m, &views, caller.0)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                })
+                .await?
+        }
+        (None, Some(_)) => {
+            app.market
+                .call(move |m| {
+                    let ids: Vec<UserId> = m.users.keys().copied().collect();
+                    ids.into_iter()
+                        .filter_map(|id| user_dto(m, &views, id).ok())
+                        .collect::<Vec<_>>()
+                })
+                .await?
+        }
+        (None, None) => return Err(ApiError::unauthenticated()),
+    };
     Ok(Json(users))
 }
 
+/// One user: their own, or any with the operator's key, on the terms
+/// [`list_users`] describes.
 async fn get_user(
     State(app): State<AppState>,
     Path(user_id): Path<u64>,
-    caller: Caller,
+    caller: Option<Caller>,
+    admin: Option<Admin>,
 ) -> Result<Json<UserDto>, ApiError> {
     let user = UserId(user_id);
-    owned_user(caller, user)?;
+    let admin = presented_operator_key(&app, admin).then_some(Admin);
+    match (caller, admin) {
+        (Some(caller), _) => owned_user(caller, user)?,
+        (None, Some(_)) => {}
+        (None, None) => return Err(ApiError::unauthenticated()),
+    }
     let views = app.views().await;
     Ok(Json(
         app.market

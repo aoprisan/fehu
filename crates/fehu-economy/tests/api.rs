@@ -182,6 +182,72 @@ async fn health_and_symbols() {
 }
 
 #[tokio::test]
+async fn the_operator_has_a_user_directory_and_a_player_has_themselves() {
+    let app = app_with(Options {
+        admin_key: Some("secret".into()),
+        now_ms: Some(NOW_MS),
+        ..no_rate_limit()
+    });
+    let ada = sign_up(&app, "ada").await;
+    let bo = sign_up(&app, "bo").await;
+
+    // A player: themselves, on a locked server as on an open one.
+    let (_, users) = get(&ada, "/api/users").await;
+    assert_eq!(users.as_array().unwrap().len(), 1);
+    assert_eq!(users[0]["id"], ada.user);
+    let (status, _) = get(&ada, &format!("/api/users/{}", bo.user)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a player key is never promoted"
+    );
+
+    // The operator: everyone, and any one of them.
+    let operator = Request::get("/api/users").header("x-api-key", "secret");
+    let (status, users) = call(&app, operator.body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{users}");
+    let mut ids: Vec<u64> = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["id"].as_u64().unwrap())
+        .collect();
+    ids.sort_unstable();
+    let mut want = vec![ada.user, bo.user];
+    want.sort_unstable();
+    assert_eq!(ids, want, "the directory names who exists: {users}");
+    assert!(
+        users[0]["api_key"].is_null(),
+        "and no key is ever shown twice"
+    );
+    let one = Request::get(format!("/api/users/{}", bo.user)).header("x-api-key", "secret");
+    let (status, user) = call(&app, one.body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{user}");
+    assert_eq!(user["id"], bo.user);
+
+    // Nobody: refused, as before — and on an unlocked server too, where there
+    // is no operator key to present and players' data stays their own.
+    let (status, _) = call(
+        &app,
+        Request::get("/api/users").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let open = test_app();
+    let _ = sign_up(&open, "solo").await;
+    let (status, _) = call(
+        &open,
+        Request::get("/api/users").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "unlocked is not a directory"
+    );
+}
+
+#[tokio::test]
 async fn every_paged_read_walks_back_with_before() {
     // `limit` alone made everything past it unreachable. Each read takes a
     // `before` cursor — the oldest thing on the page you have — and the
