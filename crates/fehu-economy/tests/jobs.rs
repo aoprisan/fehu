@@ -12,7 +12,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use fehu::Timestamp;
-use fehu_economy::market::{App, Options};
+use fehu_economy::market::{App, Options, Resume};
 use fehu_economy::{engine, router, save};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -395,6 +395,151 @@ async fn units_promised_to_a_resting_sell_cannot_be_smelted() {
         "{body}"
     );
     reconciles(&app).await;
+}
+
+#[tokio::test]
+async fn a_job_may_run_its_recipe_several_times_as_one_batch() {
+    let (app, player) = forge(1_000_000, 10).await;
+    smelt(&app, 500, 60, 0).await;
+    let (_, before) = get(
+        &app,
+        Some(&player.key),
+        &format!("/api/traders/{}", player.id),
+    )
+    .await;
+    let cash_before = before["cash_cents"].as_i64().unwrap();
+
+    // Three runs: six ore and 15.00, for three ingots, as one job.
+    let (status, job) = post(
+        &app,
+        Some(&player.key),
+        "/api/jobs",
+        json!({ "trader_id": player.id, "recipe": "smelt", "runs": 3 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{job}");
+    assert_eq!(job["runs"], 3);
+    assert_eq!(job["inputs"], json!([{ "symbol": "ORE", "qty": 6 }]));
+    assert_eq!(job["outputs"], json!([{ "symbol": "INGOT", "qty": 3 }]));
+    assert_eq!(job["cost_cents"], 1_500);
+    let (_, after) = get(
+        &app,
+        Some(&player.key),
+        &format!("/api/traders/{}", player.id),
+    )
+    .await;
+    assert_eq!(after["cash_cents"].as_i64().unwrap(), cash_before - 1_500);
+
+    // More runs than the ore allows is refused whole, and no runs at all is
+    // not a job.
+    let (status, body) = post(
+        &app,
+        Some(&player.key),
+        "/api/jobs",
+        json!({ "trader_id": player.id, "recipe": "smelt", "runs": 3 }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "four ore left: {body}"
+    );
+    let (_, unchanged) = get(
+        &app,
+        Some(&player.key),
+        &format!("/api/traders/{}", player.id),
+    )
+    .await;
+    assert_eq!(
+        unchanged["cash_cents"], after["cash_cents"],
+        "nothing moved"
+    );
+    let (status, body) = post(
+        &app,
+        Some(&player.key),
+        "/api/jobs",
+        json!({ "trader_id": player.id, "recipe": "smelt", "runs": 0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // One delivery, three ingots, and a unit cost spread over all of them.
+    engine::advance_to(&app, Timestamp(NOW_MS + 61_000)).await;
+    let (_, ingot) = get(&app, None, "/api/symbols/ingot").await;
+    assert_eq!(ingot["info"]["asset"]["issued"], 3);
+    let (_, inventory) = get(
+        &app,
+        Some(&player.key),
+        &format!("/api/traders/{}/inventory", player.id),
+    )
+    .await;
+    let ingots = inventory["inventory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["symbol"] == "INGOT")
+        .unwrap()
+        .clone();
+    assert_eq!(ingots["qty"], 3);
+    assert_eq!(
+        ingots["cost_cents"], 2_100,
+        "15.00 plus six ore at 1.00 is what the three of them cost, 7.00 each"
+    );
+    reconciles(&app).await;
+}
+
+#[tokio::test]
+async fn a_restart_pauses_the_world_unless_told_to_catch_up() {
+    // The same world twice: a job due in ten minutes, a snapshot, and a
+    // restart that finds the server was away for twelve. Paused, the job is
+    // still ten minutes out; catching up, it fell due while nobody was
+    // looking and the first step delivers it.
+    for (policy, delivered) in [(Resume::Pause, false), (Resume::CatchUp, true)] {
+        let dir = tempdir_lite::TempDir::new("fehu-resume");
+        let path = dir.path().join("state.json");
+        let before = App::new(Options {
+            state_file: Some(path.clone()),
+            ..options()
+        });
+        list_good(&before, "ore", "kg").await;
+        list_good(&before, "ingot", "bar").await;
+        let player = sign_up(&before, "smith", 1_000_000).await;
+        stock_up(&before, &player, "ORE", 10, 100).await;
+        smelt(&before, 500, 600, 0).await;
+        let (_, job) = start_job(&before, &player, "smelt").await;
+        let job_id = job["id"].as_u64().unwrap();
+        save::write(&before, &path).await.expect("state written");
+
+        // Twelve minutes of wall time have passed since the file was written.
+        let mut saved = save::read(&path).unwrap();
+        saved.saved_at_ms -= 720_000;
+        let after = App::resume(
+            Options {
+                state_file: Some(path.clone()),
+                resume: policy,
+                ..options()
+            },
+            saved,
+            Vec::new(),
+        )
+        .await;
+        engine::step(&after).await;
+
+        let (_, job) = get(&after, Some(&player.key), &format!("/api/jobs/{job_id}")).await;
+        let (_, ingot) = get(&after, None, "/api/symbols/ingot").await;
+        if delivered {
+            assert_eq!(job["status"], "done", "{policy:?}: {job}");
+            assert_eq!(ingot["info"]["asset"]["issued"], 1, "{policy:?}");
+            assert!(
+                job["finished_at_ms"].as_i64().unwrap() >= NOW_MS + 720_000,
+                "delivered at the instant the catch-up step reached: {job}"
+            );
+        } else {
+            assert_eq!(job["status"], "running", "{policy:?}: {job}");
+            assert_eq!(ingot["info"]["asset"]["issued"], 0, "{policy:?}");
+        }
+        reconciles(&after).await;
+    }
 }
 
 #[tokio::test]

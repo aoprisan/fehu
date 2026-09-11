@@ -278,6 +278,10 @@ pub enum Command {
     StartJob {
         trader_id: u64,
         recipe: String,
+        /// Times to run it. Absent in entries written before batches
+        /// existed, which ran once.
+        #[serde(default = "one_run")]
+        runs: u64,
     },
     /// Stop a job before it is due.
     CancelJob {
@@ -494,6 +498,11 @@ impl Command {
         }
         asked
     }
+}
+
+/// A job's default number of runs, for entries that predate batches.
+fn one_run() -> u64 {
+    1
 }
 
 /// One accepted command, in the order it was accepted.
@@ -1549,11 +1558,16 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
             Applied::new(200, &recipe)
         }
 
-        Command::StartJob { trader_id, recipe } => {
+        Command::StartJob {
+            trader_id,
+            recipe,
+            runs,
+        } => {
             let job = m
                 .start_job(
                     &crate::jobs::clean_id(recipe).map_err(ApiError::job)?,
                     TraderId(*trader_id),
+                    *runs,
                     wall_ms,
                 )
                 .await

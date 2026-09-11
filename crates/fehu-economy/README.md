@@ -156,7 +156,7 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/recipes` | What the world knows how to make, and what making it takes |
 | `POST` | `/api/recipes` | Game master: write or replace a recipe — `{"id":"smelt","inputs":[{"symbol":"ORE","qty":2}],"outputs":[{"symbol":"INGOT","qty":1}],"cost_cents":500,"duration_secs":300}`, optional `refund_bps`, `note`. Every line has to be a listed good |
 | `DELETE` | `/api/recipes/{id}` | Game master: stop making a thing. Jobs already running still deliver |
-| `POST` | `/api/jobs` | Run one: `{"trader_id":1,"recipe":"smelt"}` — the inputs and the cost go now, the outputs arrive at `due_at_ms` |
+| `POST` | `/api/jobs` | Run one: `{"trader_id":1,"recipe":"smelt"}` — the inputs and the cost go now, the outputs arrive at `due_at_ms`. `"runs":5` runs it five times as one job: inputs, cost and outputs all scale, and it is refused whole if any part cannot be afforded |
 | `GET` | `/api/jobs`, `/api/jobs/{id}` | The caller's jobs, or one of them: what it took, what it will deliver and when |
 | `POST` | `/api/jobs/{id}/cancel` | Stop a job before it is due. What comes back is `refund_bps` of the cost, nothing by default |
 | `GET` | `/api/budgets` | Game master: the pools rewards are paid from, and the rules that price them |
@@ -236,6 +236,13 @@ it does not pay.
 across restarts (`FEHU_SAVE_SECS`, 30 by default, sets how often the snapshot
 is written; the command journal beside it is written before every change is
 acknowledged, so the interval costs nothing that was promised).
+`FEHU_RESUME` (`pause`) says what a restart does with the time the server
+was away: `pause` carries on from the instant the world had reached, so a
+job due in ten minutes is still due in ten minutes of market time;
+`catch_up` lets the downtime elapse in the world instead — the clock resumes
+ahead by the wall time missed, scaled by `FEHU_TIME_SCALE`, and the first
+engine step advances every symbol through the gap and delivers every job
+that fell due in it.
 `FEHU_COMMAND_LOG` (10 000) is how many `Idempotency-Key`s are remembered,
 which is how late a retry may arrive and still be free. `FEHU_JOB_LOG`
 (2 000) is how many *finished* jobs are kept with what each delivered — a

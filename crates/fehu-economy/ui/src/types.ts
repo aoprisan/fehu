@@ -1131,6 +1131,8 @@ export interface Job {
   recipe: string;
   /** The version of the recipe this job was started under. */
   recipe_version: number;
+  /** How many times it runs the recipe; the lines below are the totals. */
+  runs: number;
   trader_id: number;
   account_id: number;
   /** What it took, and what it will deliver. Both fixed when it started. */

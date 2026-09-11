@@ -33,9 +33,6 @@ would like to have and does not.
 - **No key rotation.** A service that loses its key is issued a new service,
   because the registry keeps only a digest. A player's key cannot be rotated
   or revoked at all: `DELETE …/admin/services/{id}` is the only revoke route.
-- **Job catch-up after downtime.** Production pauses while the server is
-  down; the plan defers the catch-up policy and nothing in `engine.rs` or
-  `jobs.rs` implements one.
 - **An importer for older worlds.** `src/save.rs` refuses any snapshot whose
   version is not the current one and describes the importer that would bring
   an old world forward — one labelled `Migration` transaction out of
@@ -55,8 +52,6 @@ would like to have and does not.
   has no cooldown, per-player cap or expiry. The plan lists reward cadence
   and sizes as open choices to "implement with configuration"; only the size
   is configurable.
-- **Jobs run one at a time.** `Command::StartJob` carries a trader and a
-  recipe id, no quantity. Batching is N requests and N journal entries.
 - **No way to remove an NPC, close or drain a budget, or change a listed
   symbol's configuration.** `journal::Command` has no variant for any of
   them; an NPC can only be deactivated, a budget only funded.

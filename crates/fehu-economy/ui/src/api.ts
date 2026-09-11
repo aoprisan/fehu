@@ -274,8 +274,8 @@ export const api = {
   jobs: (): Promise<JobsResponse> => request('/api/jobs'),
 
   /** Start a job: the inputs and the cost now, the outputs when it is due. */
-  startJob: (traderId: number, recipe: string): Promise<Job> =>
-    send('POST', '/api/jobs', { trader_id: traderId, recipe }),
+  startJob: (traderId: number, recipe: string, runs = 1): Promise<Job> =>
+    send('POST', '/api/jobs', { trader_id: traderId, recipe, runs }),
 
   /** Stop one before it is due. What comes back is what the recipe says. */
   cancelJob: (jobId: number): Promise<Job> => send('POST', `/api/jobs/${jobId}/cancel`, {}),

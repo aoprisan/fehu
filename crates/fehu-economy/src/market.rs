@@ -2828,8 +2828,15 @@ impl Market {
         &mut self,
         recipe_id: &str,
         trader: TraderId,
+        runs: u64,
         now_ms: i64,
     ) -> Result<Job, JobError> {
+        if runs == 0 || runs > crate::jobs::MAX_JOB_RUNS {
+            return Err(JobError::Quantity(format!(
+                "a job runs its recipe 1 to {} times",
+                crate::jobs::MAX_JOB_RUNS
+            )));
+        }
         let recipe = self
             .recipes
             .get(recipe_id)
@@ -2838,6 +2845,33 @@ impl Market {
         if self.jobs.running() >= crate::jobs::MAX_RUNNING_JOBS {
             return Err(JobError::TooManyJobs(crate::jobs::MAX_RUNNING_JOBS));
         }
+        // The batch as a whole: what it costs and what it takes, each line
+        // multiplied once and refused if it cannot be counted.
+        let cost_cents = recipe
+            .cost_cents
+            .checked_mul(i64::try_from(runs).unwrap_or(i64::MAX))
+            .filter(|c| *c <= fehu::MAX_WALLET_CENTS)
+            .ok_or_else(|| {
+                JobError::Quantity("that many runs cost more than a wallet holds".into())
+            })?;
+        let scale = |line: &Line| -> Result<Line, JobError> {
+            Ok(Line {
+                symbol: line.symbol,
+                qty: line.qty.checked_mul(runs).ok_or_else(|| {
+                    JobError::Quantity(format!("{} × {runs} runs is too many units", line.symbol))
+                })?,
+            })
+        };
+        let recipe_inputs = recipe
+            .inputs
+            .iter()
+            .map(scale)
+            .collect::<Result<Vec<_>, _>>()?;
+        let recipe_outputs = recipe
+            .outputs
+            .iter()
+            .map(scale)
+            .collect::<Result<Vec<_>, _>>()?;
         let account_id = self
             .traders
             .get(&trader)
@@ -2849,11 +2883,11 @@ impl Market {
                 .ok_or(JobError::Money(MoneyError::NoWallet {
                     account: account_id,
                 }))?;
-        account.authorise(&self.ledger, recipe.cost_cents.max(1))?;
+        account.authorise(&self.ledger, cost_cents.max(1))?;
         let wallet = self.wallet_of(account_id)?;
         // Every listing the recipe names, resolved before anything moves.
-        let mut inputs = Vec::with_capacity(recipe.inputs.len());
-        for line in &recipe.inputs {
+        let mut inputs = Vec::with_capacity(recipe_inputs.len());
+        for line in &recipe_inputs {
             let handle = self.good_handle(line.symbol).await?;
             let free = self
                 .traders
@@ -2875,8 +2909,8 @@ impl Market {
             self.world
                 .multiplier_bps(Effect::Production, first.symbol, at)
         });
-        let mut outputs = Vec::with_capacity(recipe.outputs.len());
-        for line in &recipe.outputs {
+        let mut outputs = Vec::with_capacity(recipe_outputs.len());
+        for line in &recipe_outputs {
             let handle = self.good_handle(line.symbol).await?;
             let qty = scaled_qty(line.qty, yield_bps);
             let issued = handle.ask(|s| s.info.units_outstanding()).await?;
@@ -2892,19 +2926,24 @@ impl Market {
             });
         }
         // Past the point of refusal.
-        let tx_id = if recipe.cost_cents > 0 {
+        let memo = if runs == 1 {
+            format!("job: {}", recipe.id)
+        } else {
+            format!("job: {} × {runs}", recipe.id)
+        };
+        let tx_id = if cost_cents > 0 {
             let tx = self.ledger.post(
                 Draft::new(Reason::JobCost)
-                    .debit(wallet, recipe.cost_cents)
-                    .credit(self.wallets.venue, recipe.cost_cents)
-                    .memo(Some(format!("job: {}", recipe.id))),
+                    .debit(wallet, cost_cents)
+                    .credit(self.wallets.venue, cost_cents)
+                    .memo(Some(memo.clone())),
             )?;
             self.write_entry(
                 account_id,
                 LedgerKind::JobCost,
                 tx.id,
-                -recipe.cost_cents,
-                Some(format!("job: {}", recipe.id)),
+                -cost_cents,
+                Some(memo),
                 now_ms,
             );
             tx.id
@@ -2933,12 +2972,13 @@ impl Market {
             id,
             recipe: recipe.id.clone(),
             recipe_version: recipe.version,
+            runs,
             trader_id: trader.0,
             account_id: account_id.0,
-            inputs: recipe.inputs.clone(),
+            inputs: recipe_inputs,
             outputs,
             yield_bps,
-            cost_cents: recipe.cost_cents,
+            cost_cents,
             tx_id,
             inputs_cost_cents,
             started_at_ms: at,
@@ -4155,6 +4195,40 @@ fn prepare_listing(
     Ok(state)
 }
 
+/// What a restart does with the time the server was away. `FEHU_RESUME`.
+///
+/// Simulated time is the server's own: it stops when the process does and
+/// starts again where it stopped. [`Pause`](Self::Pause) keeps it that way,
+/// which is what a world whose players were away too wants — a job due in
+/// ten minutes is still due in ten minutes of market time. With
+/// [`CatchUp`](Self::CatchUp) the downtime elapses in the world instead: the
+/// clock resumes ahead by the wall time missed, scaled, and the first engine
+/// step advances every symbol through the gap and delivers every job that
+/// fell due in it. That step is a journaled command like any other, so a
+/// replay of it lands the same jobs at the same instant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Resume {
+    /// Carry on from the instant the world had reached.
+    #[default]
+    Pause,
+    /// Let the downtime pass in the world.
+    CatchUp,
+}
+
+impl std::str::FromStr for Resume {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pause" => Ok(Self::Pause),
+            "catch_up" | "catchup" | "catch-up" => Ok(Self::CatchUp),
+            other => Err(format!(
+                "FEHU_RESUME is `pause` or `catch_up`, not `{other}`"
+            )),
+        }
+    }
+}
+
 /// Maps wall time to simulated time: `sim_now = sim_epoch + elapsed × scale`.
 #[derive(Clone, Copy, Debug)]
 pub struct SimClock {
@@ -4737,6 +4811,13 @@ impl App {
     /// at the furthest instant they reach so that a market which ran on past
     /// its last snapshot does not come back frozen until wall time catches
     /// up with it.
+    ///
+    /// With [`Resume::CatchUp`] the clock starts further on still: ahead by
+    /// the wall time between the last thing written — the snapshot, or the
+    /// last journal entry after it — and now, scaled. The replay itself runs
+    /// at the entries' own instants regardless; only what comes after is
+    /// moved, and the first engine step then walks the world through the
+    /// gap.
     pub async fn resume(
         options: Options,
         mut save: Save,
@@ -4748,6 +4829,22 @@ impl App {
             .iter()
             .map(|e| e.at_ms)
             .fold(save.sim_now_ms, i64::max);
+        if options.resume == Resume::CatchUp {
+            let last_wall_ms = entries
+                .iter()
+                .map(|e| e.wall_ms)
+                .fold(save.saved_at_ms, i64::max);
+            let away_ms = wall_now_ms().saturating_sub(last_wall_ms).max(0);
+            let jump_ms = (away_ms as f64 * options.time_scale) as i64;
+            if jump_ms > 0 {
+                tracing::info!(
+                    away_ms,
+                    jump_ms,
+                    "catching up: the downtime elapses in the world on the first step"
+                );
+                save.sim_now_ms = save.sim_now_ms.saturating_add(jump_ms);
+            }
+        }
         let app = Self::restore(options, save);
         app.replay(entries).await;
         app
@@ -5113,6 +5210,9 @@ pub struct Options {
     pub time_scale: f64,
     /// Simulated "now" at start-up; defaults to the wall clock. `FEHU_NOW_MS`.
     pub now_ms: Option<i64>,
+    /// What a restart does with the time the server was away. `FEHU_RESUME`;
+    /// see [`Resume`].
+    pub resume: Resume,
     /// Completed bars retained per interval. `FEHU_MAX_BARS`.
     pub max_bars: usize,
     /// Events retained in the log. `FEHU_EVENT_LOG`.
@@ -5312,6 +5412,7 @@ impl Default for Options {
             outbox: crate::outbox::DEFAULT_OUTBOX,
             max_inflight: crate::limit::DEFAULT_MAX_INFLIGHT,
             max_streams: crate::limit::DEFAULT_MAX_STREAMS,
+            resume: Resume::Pause,
         }
     }
 }
@@ -5391,6 +5492,7 @@ impl Options {
             outbox: env_parse("FEHU_OUTBOX", d.outbox),
             max_inflight: env_parse("FEHU_MAX_INFLIGHT", d.max_inflight),
             max_streams: env_parse("FEHU_MAX_STREAMS", d.max_streams),
+            resume: env_parse("FEHU_RESUME", d.resume),
         }
     }
 }

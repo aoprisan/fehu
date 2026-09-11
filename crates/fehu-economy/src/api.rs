@@ -1878,6 +1878,8 @@ struct JobRequest {
     trader_id: u64,
     /// The recipe to run.
     recipe: String,
+    /// Times to run it, as one job. One if absent.
+    runs: Option<u64>,
 }
 
 /// Start a job: the inputs and the cost now, the outputs when it is due.
@@ -1896,6 +1898,7 @@ async fn start_job(
         Command::StartJob {
             trader_id: req.trader_id,
             recipe: req.recipe,
+            runs: req.runs.unwrap_or(1),
         },
     )
     .await
