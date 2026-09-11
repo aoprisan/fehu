@@ -40,7 +40,7 @@ use crate::market::{
     Sequenced, SnapshotDto, StreamMessage, Subscription, SupplyDto, Symbol, SymbolInfo,
     SymbolStatus, SymbolView, wall_now_ms,
 };
-use crate::npc::{NpcsResponse, Policy};
+use crate::npc::{NpcsResponse, Policy, Production};
 use crate::rewards::{BudgetsResponse, RewardError};
 use crate::service::{
     Scope, ScopeSet, ServiceAuth, ServiceDto, ServiceError, ServiceId, ServicesResponse,
@@ -124,6 +124,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/accounts/{account_id}/ledger", get(get_ledger))
         .route("/api/npcs", get(list_npcs).post(create_npc))
         .route("/api/npcs/{trader_id}/active", post(set_npc_active))
+        .route("/api/npcs/{trader_id}/production", post(set_npc_production))
         .route("/api/catalog", get(get_catalog).post(set_catalog_item))
         .route("/api/catalog/{symbol}", delete(remove_catalog_item))
         .route("/api/traders/{trader_id}/purchases", post(purchase))
@@ -1709,6 +1710,9 @@ struct NpcRequest {
     size: Option<u64>,
     #[serde(default)]
     requote_bps: Option<u32>,
+    /// Make it a producer: `{"recipe":"smelt","restock_below":10,"runs":5,"max_running":1}`.
+    #[serde(default)]
+    production: Option<Production>,
 }
 
 /// Put a funded trader in the market that the world runs.
@@ -1738,8 +1742,38 @@ async fn create_npc(
             symbol,
             name: clean_text(req.name, 64),
             policy,
+            production: req.production,
             cash_cents: req.cash_cents,
             inventory: req.inventory,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Body of `POST /api/npcs/{trader_id}/production`: the policy, or `null`
+/// to make the NPC a plain merchant again.
+#[derive(Deserialize)]
+struct ProductionRequest {
+    production: Option<Production>,
+}
+
+/// Give an NPC a production policy, or take it away.
+async fn set_npc_production(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<ProductionRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::SetNpcProduction {
+            trader_id,
+            production: req.production,
         },
     )
     .await

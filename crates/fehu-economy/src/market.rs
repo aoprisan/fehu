@@ -82,7 +82,7 @@ use crate::jobs::{
 use crate::journal::JournalError;
 use crate::limit::{Client, Decision, Limiter, Rate};
 use crate::metrics::Metrics;
-use crate::npc::{BPS, MAX_NPCS, Npc, NpcDto, Policy};
+use crate::npc::{BPS, MAX_NPCS, Npc, NpcDto, Policy, Production};
 use crate::rewards::{Budget, BudgetDto, RewardBook, RewardError, RewardReceipt, RewardRule};
 use crate::save::{MarketSave, STATE_VERSION, Save};
 use crate::service::{ScopeSet, Service, ServiceAuth, ServiceError, ServiceId, Services};
@@ -2316,11 +2316,15 @@ impl Market {
     /// # Errors
     /// [`GoodsError`] naming what was wrong. Nothing is created by a
     /// refusal.
+    // Every argument is one field of the command that made it; bundling
+    // them would be a struct with the same seven names.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_npc(
         &mut self,
         symbol: &Symbol,
         name: Option<String>,
         policy: Policy,
+        production: Option<Production>,
         cash_cents: i64,
         inventory: u64,
         now_ms: i64,
@@ -2334,6 +2338,7 @@ impl Market {
         policy
             .validate()
             .map_err(|e| GoodsError::Quantity(format!("policy: {e}")))?;
+        let production = production.map(clean_production).transpose()?;
         if cash_cents < 0 {
             return Err(GoodsError::Money(MoneyError::NotPositive {
                 amount_cents: cash_cents,
@@ -2401,9 +2406,11 @@ impl Market {
             name,
             policy,
             active: true,
+            production,
             quoted_ref_cents: 0,
             quoted_orders: 0,
             quoted_size: 0,
+            quoted_stock: 0,
         };
         self.npcs.insert(trader, npc.clone());
         Ok(npc)
@@ -2411,6 +2418,26 @@ impl Market {
 
     /// Switch an NPC's quoting on or off. Its money and its inventory stay
     /// where they are either way; what stops is putting them on the book.
+    /// Give an NPC a production policy, or take it away with `None`. A
+    /// merchant becomes a producer, or a producer a merchant; what it holds
+    /// and quotes is untouched, and a job already running still delivers.
+    ///
+    /// # Errors
+    /// The policy names a value out of range. `None` for an unknown trader.
+    pub fn set_npc_production(
+        &mut self,
+        trader: TraderId,
+        production: Option<Production>,
+    ) -> Option<Result<Npc, GoodsError>> {
+        let npc = self.npcs.get_mut(&trader)?;
+        let production = match production.map(clean_production).transpose() {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        npc.production = production;
+        Some(Ok(npc.clone()))
+    }
+
     pub async fn set_npc_active(&mut self, trader: TraderId, active: bool) -> Option<Npc> {
         let npc = self.npcs.get_mut(&trader)?;
         npc.active = active;
@@ -2437,6 +2464,7 @@ impl Market {
             name: npc.name.clone(),
             policy: npc.policy,
             active: npc.active,
+            production: npc.production.clone(),
             quoted_size: npc.quoted_size,
             cash_cents: self
                 .accounts
@@ -2458,6 +2486,77 @@ impl Market {
             .keys()
             .filter_map(|trader| self.npc_view(*trader))
             .collect()
+    }
+
+    /// Let every producer that has run low restock: buy the recipe's inputs
+    /// it lacks from the catalogue, then start the job.
+    ///
+    /// Run in the engine step after the jobs due have delivered and before
+    /// the quotes are redrawn, so what a producer just made is on the book
+    /// in the same step. Reads nothing but the market — no clock, no
+    /// randomness — and every purchase and job goes through the same paths
+    /// a player's would, so a replayed step restocks identically and the
+    /// audit sees ordinary purchases and ordinary jobs. A refusal anywhere
+    /// — no cash, no recipe, no catalogue line, the furnace full — leaves
+    /// this producer alone until the next step; the inputs it did manage
+    /// to buy stay in its inventory for that attempt.
+    async fn restock_npcs(&mut self) {
+        let producers: Vec<(TraderId, Production, &'static str)> = self
+            .npcs
+            .values()
+            .filter(|npc| npc.active)
+            .filter_map(|npc| Some((npc.trader, npc.production.clone()?, npc.symbol)))
+            .collect();
+        let now_ms = self.now().0;
+        for (trader, production, sells) in producers {
+            let free = self
+                .traders
+                .get(&trader)
+                .map_or(0, |t| t.free_shares(sells));
+            if free > production.restock_below {
+                continue;
+            }
+            let running = self
+                .jobs
+                .of_trader(trader)
+                .filter(|j| j.status == crate::jobs::JobStatus::Running)
+                .count();
+            if running >= production.max_running as usize {
+                continue;
+            }
+            let Some(recipe) = self.recipes.get(&production.recipe).cloned() else {
+                continue;
+            };
+            let mut stocked = true;
+            for line in &recipe.inputs {
+                let need = line.qty.saturating_mul(production.runs);
+                let have = self
+                    .traders
+                    .get(&trader)
+                    .map_or(0, |t| t.free_shares(line.symbol));
+                if have >= need {
+                    continue;
+                }
+                let Some(handle) = self.symbol(line.symbol).cloned() else {
+                    stocked = false;
+                    break;
+                };
+                if self
+                    .purchase(&handle, trader, need - have, now_ms)
+                    .await
+                    .is_err()
+                {
+                    stocked = false;
+                    break;
+                }
+            }
+            if !stocked {
+                continue;
+            }
+            let _ = self
+                .start_job(&recipe.id, trader, production.runs, now_ms)
+                .await;
+        }
     }
 
     /// Redraw every NPC's quotes that the market has moved away from.
@@ -2505,9 +2604,14 @@ impl Market {
                 .world
                 .multiplier_bps(Effect::Demand, npc.symbol, self.now().0);
             let size = scaled_qty(npc.policy.size, demand_bps);
+            let stock = self
+                .traders
+                .get(&trader)
+                .map_or(0, |t| t.free_shares(npc.symbol));
             if npc.policy.still_good(npc.quoted_ref_cents, reference)
                 && resting == npc.quoted_orders
                 && size == npc.quoted_size
+                && stock == npc.quoted_stock
             {
                 continue;
             }
@@ -2545,10 +2649,16 @@ impl Market {
                 .ask(move |s| resting_orders(s, trader))
                 .await
                 .unwrap_or(0);
+            // Read again after quoting: the asks just placed reserved stock.
+            let stock = self
+                .traders
+                .get(&trader)
+                .map_or(0, |t| t.free_shares(npc.symbol));
             if let Some(npc) = self.npcs.get_mut(&trader) {
                 npc.quoted_ref_cents = reference;
                 npc.quoted_orders = resting;
                 npc.quoted_size = size;
+                npc.quoted_stock = stock;
             }
         }
     }
@@ -3797,6 +3907,7 @@ impl Market {
         // so a merchant quotes the world as it is after the step rather than
         // as it was before it.
         self.complete_jobs(target).await;
+        self.restock_npcs().await;
         self.world.forget(target.0);
         self.requote_npcs().await;
         total
@@ -4193,6 +4304,17 @@ fn prepare_listing(
     let mut state = SymbolState::create(spec, options.max_bars, options.tape_len)?;
     state.warm_up(history_days, now);
     Ok(state)
+}
+
+/// A production policy as the market keeps it: validated, with the recipe
+/// id in the form the recipe book files it under, so a producer finds its
+/// recipe however the request spelled it.
+fn clean_production(p: Production) -> Result<Production, GoodsError> {
+    p.validate()
+        .map_err(|e| GoodsError::Quantity(format!("production: {e}")))?;
+    let recipe = crate::jobs::clean_id(&p.recipe)
+        .map_err(|e| GoodsError::Quantity(format!("production: {e}")))?;
+    Ok(Production { recipe, ..p })
 }
 
 /// What a restart does with the time the server was away. `FEHU_RESUME`.
@@ -4923,6 +5045,7 @@ impl App {
                 symbol: ticker.to_string(),
                 name: Some(format!("{ticker} Merchant")),
                 policy: Policy::default(),
+                production: None,
                 cash_cents: cents,
                 inventory,
             };

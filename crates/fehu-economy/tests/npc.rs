@@ -221,6 +221,135 @@ async fn an_npc_quotes_both_sides_and_a_player_trades_with_it() {
 }
 
 #[tokio::test]
+async fn a_producer_makes_what_it_sells_and_buys_what_that_takes() {
+    // Ore is sold from the catalogue; ingots are smelted from it. A producer
+    // in INGOT with cash and no stock buys ore, runs the recipe, and quotes
+    // what comes out — and keeps doing so while its stock is low.
+    let app = test_app();
+    list_ore(&app).await;
+    let (status, body) = post(
+        &app,
+        None,
+        "/api/symbols",
+        json!({ "symbol": "INGOT", "kind": "good", "unit": "bar", "name": "Iron Ingot", "start_price_cents": 50_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = post(
+        &app,
+        None,
+        "/api/catalog",
+        json!({ "symbol": "ORE", "price_cents": 100 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &app,
+        None,
+        "/api/recipes",
+        json!({
+            "id": "smelt",
+            "inputs": [{ "symbol": "ORE", "qty": 2 }],
+            "outputs": [{ "symbol": "INGOT", "qty": 1 }],
+            "cost_cents": 500,
+            "duration_secs": 60,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, smith) = post(
+        &app,
+        None,
+        "/api/npcs",
+        json!({
+            "symbol": "INGOT", "name": "Smithy", "cash_cents": 1_000_000, "inventory": 0,
+            "size": 1, "levels": 1,
+            "production": { "recipe": "smelt", "restock_below": 5, "runs": 3, "max_running": 1 },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{smith}");
+    assert_eq!(
+        smith["production"]["recipe"], "SMELT",
+        "filed as the book files it"
+    );
+    let smith_id = smith["trader_id"].as_u64().unwrap();
+    let before = supply(&app).await;
+
+    // First step: no stock, so it buys six ore and starts one job. Nothing
+    // is minted for any of it; the ore money went to ORE's issuer.
+    engine::advance_to(&app, Timestamp(NOW_MS + 1_000)).await;
+    let (_, ore) = get(&app, None, "/api/symbols/ORE").await;
+    assert_eq!(ore["info"]["asset"]["issued"], 6, "{ore}");
+    let after = supply(&app).await;
+    assert_eq!(after["outstanding_cents"], before["outstanding_cents"]);
+    assert_eq!(
+        after["issuer_cents"].as_i64().unwrap() - before["issuer_cents"].as_i64().unwrap(),
+        600,
+        "six ore at 1.00 went to ORE's issuer"
+    );
+    assert_eq!(
+        after["venue_cents"].as_i64().unwrap() - before["venue_cents"].as_i64().unwrap(),
+        1_500,
+        "and 15.00 of furnace to the venue"
+    );
+
+    // One job at a time: the next step starts nothing more.
+    engine::advance_to(&app, Timestamp(NOW_MS + 2_000)).await;
+    let (_, ore) = get(&app, None, "/api/symbols/ORE").await;
+    assert_eq!(
+        ore["info"]["asset"]["issued"], 6,
+        "the furnace is full: {ore}"
+    );
+
+    // Delivered: three ingots, on the book, and — still below the line —
+    // another batch of ore bought in the same step.
+    engine::advance_to(&app, Timestamp(NOW_MS + 61_000)).await;
+    let (_, ingot) = get(&app, None, "/api/symbols/INGOT").await;
+    assert_eq!(ingot["info"]["asset"]["issued"], 3, "{ingot}");
+    let (_, book) = get(&app, None, "/api/symbols/INGOT/book").await;
+    assert!(
+        !book["asks"].as_array().unwrap().is_empty(),
+        "what it made is for sale: {book}"
+    );
+    let (_, ore) = get(&app, None, "/api/symbols/ORE").await;
+    assert_eq!(
+        ore["info"]["asset"]["issued"], 12,
+        "restocking again: {ore}"
+    );
+    reconciles(&app).await;
+
+    // Taking the policy away makes it a merchant again: the running job
+    // still delivers, but nothing starts after it.
+    let (status, body) = post(
+        &app,
+        None,
+        &format!("/api/npcs/{smith_id}/production"),
+        json!({ "production": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["production"].is_null());
+    engine::advance_to(&app, Timestamp(NOW_MS + 200_000)).await;
+    let (_, ingot) = get(&app, None, "/api/symbols/INGOT").await;
+    assert_eq!(ingot["info"]["asset"]["issued"], 6);
+    let (_, ore) = get(&app, None, "/api/symbols/ORE").await;
+    assert_eq!(ore["info"]["asset"]["issued"], 12, "no third batch: {ore}");
+
+    // And a policy that names nonsense is refused.
+    let (status, body) = post(
+        &app,
+        None,
+        &format!("/api/npcs/{smith_id}/production"),
+        json!({ "production": { "recipe": "smelt", "restock_below": 5, "runs": 0, "max_running": 1 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    reconciles(&app).await;
+}
+
+#[tokio::test]
 async fn a_merchant_that_runs_out_has_nothing_to_say() {
     let app = test_app();
     list_ore(&app).await;

@@ -30,6 +30,24 @@
 //! player's. Scarcity is then visible in the book instead of being a rule
 //! written down somewhere.
 //!
+//! # Producers
+//!
+//! A merchant sells what it was given. A *producer* makes what it sells: an
+//! NPC with a [`Production`] policy watches its free stock of the symbol it
+//! quotes and, when that falls to the restock line, buys the recipe's
+//! inputs from the catalogue with its own cash and starts a job through
+//! the same command path a player's job takes. The outputs land in its
+//! inventory on the step that delivers them and are quoted like anything
+//! else it holds. Its takings go to the catalogue's issuers and the venue
+//! along the way, where a sweep brings them home — so the loop the
+//! economy plan draws, seam to furnace to market to treasury, closes with
+//! nothing minted.
+//!
+//! A producer that cannot afford its inputs, or whose recipe is gone, or
+//! that already has as many jobs running as its policy allows, does
+//! nothing that step and looks again on the next. Running out is still the
+//! feature.
+//!
 //! # Determinism
 //!
 //! Quoting happens inside the engine step, which is a journaled command
@@ -140,6 +158,46 @@ impl Policy {
     }
 }
 
+/// How a producer restocks: which recipe it runs, when, and how much at a
+/// time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Production {
+    /// The recipe it runs; it should make the symbol it sells.
+    pub recipe: String,
+    /// A job is started when its free stock of the symbol it sells is at or
+    /// below this.
+    pub restock_below: u64,
+    /// Runs per job. See [`crate::jobs`]: a batch is one job.
+    pub runs: u64,
+    /// Jobs it will have in the furnace at once.
+    pub max_running: u32,
+}
+
+impl Production {
+    /// Check every field against its documented range. The recipe's
+    /// existence is not checked here: a recipe may be written after the
+    /// producer, and taken away while it runs, and either way the producer
+    /// simply waits.
+    ///
+    /// # Errors
+    /// A message naming the field and what it should have been.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.recipe.trim().is_empty() {
+            return Err("recipe must name a recipe".into());
+        }
+        if self.runs == 0 || self.runs > crate::jobs::MAX_JOB_RUNS {
+            return Err(format!(
+                "runs must be in [1, {}]",
+                crate::jobs::MAX_JOB_RUNS
+            ));
+        }
+        if !(1..=64).contains(&self.max_running) {
+            return Err("max_running must be in [1, 64]".into());
+        }
+        Ok(())
+    }
+}
+
 /// One NPC: who it is in the world, what it trades, and how it quotes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 // The ticker is registered on the way in rather than borrowed from the
@@ -161,8 +219,12 @@ pub struct Npc {
     pub name: String,
     pub policy: Policy,
     /// Quoting is on. An NPC that is switched off keeps its money and its
-    /// inventory and simply stops putting them on the book.
+    /// inventory and simply stops putting them on the book — and, if it is a
+    /// producer, stops restocking.
     pub active: bool,
+    /// How it makes what it sells, if it does. `None` is a merchant.
+    #[serde(default)]
+    pub production: Option<Production>,
     /// The reference price its resting quotes were drawn around, or `0` if
     /// it has none out.
     pub quoted_ref_cents: i64,
@@ -189,6 +251,15 @@ pub struct Npc {
     /// nothing has been eaten.
     #[serde(default)]
     pub quoted_size: u64,
+    /// Its free stock of the symbol when it last quoted.
+    ///
+    /// The fourth half of the re-quote decision, for stock that arrives
+    /// without an order going: a job delivering, a purchase, an endowment.
+    /// A fill changes the resting count and is caught above; a delivery
+    /// changes nothing on the book, and a producer whose ingots came out of
+    /// the furnace and were never offered would be a furnace for nothing.
+    #[serde(default)]
+    pub quoted_stock: u64,
 }
 
 /// `GET /api/npcs`: who the world is trading as.
@@ -208,6 +279,8 @@ pub struct NpcDto {
     pub name: String,
     pub policy: Policy,
     pub active: bool,
+    /// How it restocks, if it is a producer.
+    pub production: Option<Production>,
     /// What it is quoting at each level now: its policy size, scaled by what
     /// the world wants of this good.
     pub quoted_size: u64,

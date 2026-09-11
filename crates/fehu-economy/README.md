@@ -148,6 +148,7 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/npcs` | The traders the world runs itself: what each quotes, and what it has left |
 | `POST` | `/api/npcs` | Game master: put a funded merchant in a symbol — `{"symbol":"ORE","cash_cents":5000000,"inventory":800}`, optional `name`, `size`, `levels`, `half_spread_bps`, `level_step_bps`, `requote_bps` |
 | `POST` | `/api/npcs/{trader_id}/active` | Game master: `{"active":false}` — stop it quoting. It keeps its money and its stock |
+| `POST` | `/api/npcs/{trader_id}/production` | Game master: make it a producer — `{"production":{"recipe":"smelt","restock_below":10,"runs":5,"max_running":1}}` — or a plain merchant again with `{"production":null}`. The same object may be given at creation |
 | `GET` | `/api/catalog` | What the world will make and what it charges: one line per good |
 | `POST` | `/api/catalog` | Game master: write or replace a line — `{"symbol":"ORE","price_cents":250,"available":500}`, `available` omitted for a seam that never runs out |
 | `DELETE` | `/api/catalog/{sym}` | Game master: stop making a good. What was made stays made |
@@ -559,6 +560,17 @@ inventory — shares of a stock nobody held, or units of a good issued to it —
 and gives it a quoting policy: a half-spread and a few levels either side of
 the reference price, redrawn when the market moves past a band or when
 something it was offering has been taken.
+
+A merchant sells what it was given; a **producer** makes what it sells.
+Give an NPC a `production` policy and, whenever its free stock of the symbol
+it quotes falls to `restock_below`, it buys the recipe's inputs it lacks
+from the catalogue with its own cash and starts a job of `runs` runs,
+keeping at most `max_running` in the furnace. The outputs land in its
+inventory on the step that delivers them and are quoted like anything else
+it holds. Its takings go to the catalogue's issuers and the venue on the
+way, where a sweep brings them home, so the loop closes with nothing
+minted. A producer that cannot afford its inputs, whose recipe is gone, or
+whose furnace is full does nothing that step and looks again on the next.
 
 Nothing about an NPC is special, and that is the point. It has a wallet, a
 position and reservations; its orders go through the same command path as a

@@ -1373,6 +1373,7 @@ async fn npc_contract() {
         "name",
         "policy",
         "active",
+        "production",
         "quoted_size",
         "cash_cents",
         "inventory",

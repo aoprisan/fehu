@@ -85,7 +85,7 @@ use crate::market::{
     Amendment, AssetKind, DelistError, Market, PlaceRequest, Placed, StreamMessage, SymbolInfo,
     SymbolSpec, wall_now_ms,
 };
-use crate::npc::Policy;
+use crate::npc::{Policy, Production};
 use crate::rewards::RewardError;
 use crate::service::{ScopeSet, ServiceId};
 use crate::trading::{AmendRequest, AmendResponse, OpenOrderDto, OrderRequest, StopRequest};
@@ -266,8 +266,17 @@ pub enum Command {
         symbol: String,
         name: Option<String>,
         policy: Policy,
+        /// How it restocks, if it is a producer. Absent in entries written
+        /// before producers existed: a merchant.
+        #[serde(default)]
+        production: Option<Production>,
         cash_cents: i64,
         inventory: u64,
+    },
+    /// Operator: give an NPC a production policy, or take it away.
+    SetNpcProduction {
+        trader_id: u64,
+        production: Option<Production>,
     },
     /// Operator: start or stop an NPC quoting.
     SetNpcActive {
@@ -452,6 +461,7 @@ impl Command {
             Self::SetCatalogItem { .. } => "set_catalog_item",
             Self::RemoveCatalogItem { .. } => "remove_catalog_item",
             Self::CreateNpc { .. } => "create_npc",
+            Self::SetNpcProduction { .. } => "set_npc_production",
             Self::SetNpcActive { .. } => "set_npc_active",
             Self::SetRecipe { .. } => "set_recipe",
             Self::RemoveRecipe { .. } => "remove_recipe",
@@ -1557,6 +1567,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
             symbol,
             name,
             policy,
+            production,
             cash_cents,
             inventory,
         } => {
@@ -1569,6 +1580,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                     &handle,
                     name.clone(),
                     *policy,
+                    production.clone(),
                     *cash_cents,
                     *inventory,
                     wall_ms,
@@ -1579,6 +1591,20 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 .npc_view(npc.trader)
                 .ok_or_else(|| ApiError::internal("the NPC vanished as it was made"))?;
             Applied::new(201, &view)
+        }
+
+        Command::SetNpcProduction {
+            trader_id,
+            production,
+        } => {
+            let trader = TraderId(*trader_id);
+            m.set_npc_production(trader, production.clone())
+                .ok_or_else(|| ApiError::unknown_trader(*trader_id))?
+                .map_err(ApiError::goods)?;
+            let view = m
+                .npc_view(trader)
+                .ok_or_else(|| ApiError::internal("the NPC vanished as it was changed"))?;
+            Applied::new(200, &view)
         }
 
         Command::SetNpcActive { trader_id, active } => {

@@ -20,10 +20,6 @@ would like to have and does not.
 
 ### Named by the plan or the docs, not built
 
-- **NPC producers.** The plan's "NPC merchants and producers" section says a
-  producer "runs recipes and sells the output". `src/npc.rs` implements
-  merchants only: a wallet, an inventory and a quoting policy. Nothing on the
-  world's side ever starts a job.
 - **Push delivery for the outbox.** The backend polls `GET /api/outbox`. The
   milestone-5 note calls pull "the wrong default across a WAN"; there are no
   webhooks.

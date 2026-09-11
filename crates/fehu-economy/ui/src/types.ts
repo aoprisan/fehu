@@ -1075,6 +1075,8 @@ export interface NpcDto {
   policy: NpcPolicy;
   /** Quoting is on. Off, it keeps its money and stock and stops offering them. */
   active: boolean;
+  /** How it restocks, if it is a producer; `null` for a merchant. */
+  production: NpcProduction | null;
   /** What it quotes at each level now: its policy size, scaled by demand. */
   quoted_size: number;
   /** Currency it can still bid with. */
@@ -1083,6 +1085,18 @@ export interface NpcDto {
   inventory: number;
   /** Units already promised to resting sells. */
   reserved: number;
+}
+
+/** `npc::Production` — how a producer restocks. */
+export interface NpcProduction {
+  /** The recipe it runs; it should make the symbol it sells. */
+  recipe: string;
+  /** A job starts when its free stock of what it sells is at or below this. */
+  restock_below: number;
+  /** Runs per job. */
+  runs: number;
+  /** Jobs it will have in the furnace at once. */
+  max_running: number;
 }
 
 /** `GET /api/npcs` (`npc::NpcsResponse`). */
