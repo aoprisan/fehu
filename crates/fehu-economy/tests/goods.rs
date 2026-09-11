@@ -284,6 +284,122 @@ async fn the_audit_holds_over_a_world_with_goods_in_it() {
 }
 
 #[tokio::test]
+async fn takings_are_swept_home_to_treasury_and_nowhere_else() {
+    let app = test_app();
+    list_good(&app, "ore", "kg").await;
+    stock_catalog(&app, "ORE", 250, Some(1_000)).await;
+    let player = sign_up(&app, "wanda", 1_000_000).await;
+    let (status, receipt) = post(
+        &app,
+        Some(&player.key),
+        &format!("/api/traders/{}/purchases", player.id),
+        json!({ "symbol": "ore", "qty": 100 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{receipt}");
+
+    // Find ORE's issuer by what the purchase did to it.
+    let (_, overview) = get(&app, None, "/api/overview").await;
+    let issuer = overview["wallets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["kind"] == "issuer" && w["owner"] == "ORE")
+        .cloned()
+        .unwrap_or_else(|| panic!("ORE has an issuer wallet: {overview}"));
+    let issuer_id = issuer["wallet"].as_u64().unwrap();
+    let float = issuer["balance_cents"].as_i64().unwrap();
+    assert!(
+        float >= 25_000,
+        "the purchase landed in the issuer: {issuer}"
+    );
+    let before = supply(&app).await;
+
+    // Part of it, by amount.
+    let (status, swept) = post(
+        &app,
+        None,
+        &format!("/api/wallets/{issuer_id}/sweep"),
+        json!({ "amount_cents": 10_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{swept}");
+    assert_eq!(swept["swept_cents"], 10_000);
+    assert_eq!(swept["wallet"]["balance_cents"], float - 10_000);
+    assert_eq!(
+        swept["treasury_cents"].as_i64().unwrap(),
+        before["treasury_cents"].as_i64().unwrap() + 10_000
+    );
+
+    // The rest, with no body at all.
+    let (status, swept) = call(
+        &app,
+        None,
+        Request::post(format!("/api/wallets/{issuer_id}/sweep"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{swept}");
+    assert_eq!(swept["swept_cents"], float - 10_000);
+    assert_eq!(swept["wallet"]["balance_cents"], 0);
+
+    // Nothing was made or destroyed: the issuer's takings are treasury's now.
+    let after = supply(&app).await;
+    assert_eq!(after["outstanding_cents"], before["outstanding_cents"]);
+    assert_eq!(after["balanced"], true);
+    assert_eq!(
+        after["treasury_cents"].as_i64().unwrap(),
+        before["treasury_cents"].as_i64().unwrap() + float
+    );
+    assert_eq!(
+        after["issuer_cents"].as_i64().unwrap(),
+        before["issuer_cents"].as_i64().unwrap() - float
+    );
+    reconciles(&app).await;
+
+    // An empty wallet has nothing to sweep, and says so rather than posting
+    // a zero.
+    let (status, body) = post(
+        &app,
+        None,
+        &format!("/api/wallets/{issuer_id}/sweep"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_amount");
+
+    // A player's wallet is somebody's money, not takings.
+    let (_, trader) = get(
+        &app,
+        Some(&player.key),
+        &format!("/api/traders/{}", player.id),
+    )
+    .await;
+    let (_, account) = get(
+        &app,
+        Some(&player.key),
+        &format!("/api/accounts/{}", trader["account_id"]),
+    )
+    .await;
+    let (status, body) = post(
+        &app,
+        None,
+        &format!("/api/wallets/{}/sweep", account["wallet_id"]),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "not_takings");
+
+    // And a wallet that does not exist is not found.
+    let (status, body) = post(&app, None, "/api/wallets/999999/sweep", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "unknown_wallet");
+}
+
+#[tokio::test]
 async fn buying_a_good_makes_units_and_moves_currency_without_making_any() {
     let app = test_app();
     list_good(&app, "ore", "kg").await;

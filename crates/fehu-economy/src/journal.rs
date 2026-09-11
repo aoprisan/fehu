@@ -295,6 +295,12 @@ pub enum Command {
         wallet: u64,
         cash_cents: i64,
     },
+    /// Operator: bring an issuer's or the venue's takings home to treasury —
+    /// all of them, or `amount_cents` of them.
+    Sweep {
+        wallet: u64,
+        amount_cents: Option<i64>,
+    },
     /// Operator: write or replace what a named reward is worth.
     SetRewardRule {
         id: String,
@@ -432,6 +438,7 @@ impl Command {
             Self::CancelJob { .. } => "cancel_job",
             Self::CreateBudget { .. } => "create_budget",
             Self::FundBudget { .. } => "fund_budget",
+            Self::Sweep { .. } => "sweep",
             Self::SetRewardRule { .. } => "set_reward_rule",
             Self::RemoveRewardRule { .. } => "remove_reward_rule",
             Self::PayReward { .. } => "pay_reward",
@@ -1575,6 +1582,22 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 .find(|b| b.wallet == budget.wallet)
                 .ok_or_else(|| ApiError::internal("the budget vanished as it was funded"))?;
             Applied::new(200, &view)
+        }
+
+        Command::Sweep {
+            wallet,
+            amount_cents,
+        } => {
+            let wallet = WalletId(*wallet);
+            let swept_cents = m.sweep(wallet, *amount_cents).map_err(ApiError::sweep)?;
+            Applied::new(
+                200,
+                &crate::api::SweepResponse {
+                    wallet: crate::api::wallet_dto(m, wallet)?,
+                    swept_cents,
+                    treasury_cents: m.ledger.balance(m.wallets.treasury),
+                },
+            )
         }
 
         Command::SetRewardRule {

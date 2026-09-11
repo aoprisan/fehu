@@ -162,6 +162,7 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/budgets` | Game master: the pools rewards are paid from, and the rules that price them |
 | `POST` | `/api/budgets` | Game master: open one, funded out of treasury — `{"name":"quests","cash_cents":5000000}` |
 | `POST` | `/api/budgets/{wallet_id}/fund` | Game master: top one up, `{"amount_cents":100000}` |
+| `POST` | `/api/wallets/{wallet_id}/sweep` | Game master: bring an issuer's or the venue's takings home to treasury — everything available, or `{"amount_cents":100000}` of it |
 | `POST` | `/api/rewards/rules` | Game master: what a named reward is worth — `{"id":"daily","budget":12,"amount_cents":5000}` |
 | `DELETE` | `/api/rewards/rules/{id}` | Game master: take a rule away. What it has paid stays paid |
 | `POST` | `/api/rewards` | Game master: pay for something that happened — `{"rule":"daily","trader_id":1,"source":"quest:42"}`. A `source` already paid gets its first receipt back and moves nothing |
@@ -291,6 +292,16 @@ pays it out of treasury; a fee goes to a venue wallet instead of leaving the
 world; a dividend or a delisting buyout is funded from that symbol's issuer
 wallet, and one it cannot fund is refused with the shortfall rather than
 paid to some holders and not others, or clipped at a balance cap.
+
+Takings come home the same way. A purchase from the catalogue credits the
+good's issuer and a fee credits the venue, and `POST
+/api/wallets/{id}/sweep` moves what either has collected back to treasury,
+where a budget can be funded from it — so the loop closes without minting:
+what players spend on ore pays the next quest reward. It is a transfer like
+any other, with a memo naming the wallet it came from, and it refuses any
+wallet that is not an issuer's or the venue's: a player's or an NPC's is
+somebody's money, and a budget's is set aside on purpose. An issuer swept
+bare will refuse its next dividend rather than clip it.
 
 Freezing an account is the game master's and withdraws its resting orders in
 the same job, since an order that outlived a freeze would fill against a

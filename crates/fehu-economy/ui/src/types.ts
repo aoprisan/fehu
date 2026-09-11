@@ -1223,6 +1223,16 @@ export interface WalletDto {
 export type WalletKind = WalletDto['kind'];
 
 /**
+ * `api::SweepResponse` — `POST /api/wallets/{id}/sweep`: an issuer's or the
+ * venue's takings brought home to treasury.
+ */
+export interface SweepResponse {
+  wallet: WalletDto;
+  swept_cents: number;
+  treasury_cents: number;
+}
+
+/**
  * `market::WalletRow` — one wallet in the operator's directory: what it
  * holds, and whose it is.
  *

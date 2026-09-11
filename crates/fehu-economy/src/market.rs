@@ -223,6 +223,36 @@ impl std::fmt::Display for ListingError {
 
 impl std::error::Error for ListingError {}
 
+/// Why takings could not be swept to treasury.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SweepError {
+    /// No wallet by that id.
+    UnknownWallet(WalletId),
+    /// The wallet is not one that collects takings. Only an issuer's and the
+    /// venue's are: a player's or an NPC's is somebody's money, a budget's
+    /// is set aside on purpose, and treasury is where a sweep goes.
+    NotTakings { wallet: WalletId, kind: WalletKind },
+    /// Nothing to sweep, or more asked for than is there.
+    Money(MoneyError),
+}
+
+impl std::fmt::Display for SweepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownWallet(w) => write!(f, "no wallet {}", w.0),
+            Self::NotTakings { wallet, kind } => write!(
+                f,
+                "wallet {} is a {} wallet, and only an issuer's or the venue's takings are swept",
+                wallet.0,
+                kind.label()
+            ),
+            Self::Money(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for SweepError {}
+
 /// Why a symbol could not be delisted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DelistError {
@@ -3115,6 +3145,55 @@ impl Market {
                 .memo(Some(format!("budget: {}", budget.name))),
         )?;
         Ok(budget)
+    }
+
+    /// Bring takings home: move what an issuer or the venue has collected
+    /// back to treasury, all of it or `amount_cents` of it.
+    ///
+    /// A purchase credits the good's issuer and a fee credits the venue,
+    /// and without this nothing ever moved either back, so every budget was
+    /// funded by minting while the takings piled up where nothing could
+    /// spend them. Posted as a transfer with a memo naming the wallet, so
+    /// the flow meter counts it with the transfers and the treasury's own
+    /// history says where each sweep came from. An issuer swept bare will
+    /// refuse its next dividend rather than clip it, which is the
+    /// operator's call to make.
+    ///
+    /// # Errors
+    /// [`SweepError`]: the wallet is unknown or not one that collects
+    /// takings, or there is less in it than was asked for. Nothing moves on
+    /// a refusal.
+    pub fn sweep(
+        &mut self,
+        wallet: WalletId,
+        amount_cents: Option<i64>,
+    ) -> Result<i64, SweepError> {
+        let held = self
+            .ledger
+            .wallet(wallet)
+            .ok_or(SweepError::UnknownWallet(wallet))?;
+        if !matches!(held.kind, WalletKind::Issuer | WalletKind::Venue) {
+            return Err(SweepError::NotTakings {
+                wallet,
+                kind: held.kind,
+            });
+        }
+        let amount = amount_cents.unwrap_or_else(|| held.available_cents());
+        check_transfer(amount).map_err(SweepError::Money)?;
+        let name = self
+            .issuers
+            .iter()
+            .find(|(_, id)| **id == wallet)
+            .map_or_else(|| "venue".to_string(), |(sym, _)| format!("{sym} issuer"));
+        self.ledger
+            .post(
+                Draft::new(Reason::Transfer)
+                    .debit(wallet, amount)
+                    .credit(self.wallets.treasury, amount)
+                    .memo(Some(format!("sweep: {name}"))),
+            )
+            .map_err(|e| SweepError::Money(MoneyError::Ledger(e)))?;
+        Ok(amount)
     }
 
     /// Write or replace a reward rule.

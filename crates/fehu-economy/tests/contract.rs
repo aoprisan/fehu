@@ -1321,6 +1321,39 @@ async fn goods_contract() {
             "units_outstanding",
         ],
     );
+
+    // The purchase credited ORE's issuer; sweeping brings it home.
+    let overview = get(&app, "/api/overview").await;
+    let issuer = overview["wallets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["kind"] == "issuer" && w["owner"] == "ORE")
+        .unwrap_or_else(|| panic!("ORE has an issuer wallet: {overview}"));
+    let swept = post(
+        &app,
+        &format!("/api/wallets/{}/sweep", issuer["wallet"]),
+        json!({}),
+    )
+    .await;
+    assert_keys(
+        "SweepResponse",
+        &swept,
+        &["wallet", "swept_cents", "treasury_cents"],
+    );
+    assert_keys(
+        "WalletDto",
+        &swept["wallet"],
+        &[
+            "wallet",
+            "kind",
+            "status",
+            "balance_cents",
+            "reserved_cents",
+            "available_cents",
+            "account_id",
+        ],
+    );
 }
 
 #[tokio::test]

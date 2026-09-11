@@ -137,6 +137,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/rewards/rules/{id}", delete(remove_reward_rule))
         .route("/api/transfers", post(transfer))
         .route("/api/wallets/{wallet_id}", get(get_wallet))
+        .route("/api/wallets/{wallet_id}/sweep", post(sweep_wallet))
         .route(
             "/api/wallets/{wallet_id}/transactions",
             get(get_wallet_transactions),
@@ -193,6 +194,10 @@ pub fn router(app: AppState) -> Router {
             delete(remove_catalog_item),
         )
         .route("/api/v1/economy/admin/budgets", post(create_budget))
+        .route(
+            "/api/v1/economy/admin/wallets/{wallet_id}/sweep",
+            post(sweep_wallet),
+        )
         .route(
             "/api/v1/economy/admin/budgets/{wallet_id}/fund",
             post(fund_budget),
@@ -589,6 +594,23 @@ impl ApiError {
             },
         };
         Self::new(status, code, e.to_string())
+    }
+
+    /// Takings that could not be swept home.
+    pub(crate) fn sweep(e: crate::market::SweepError) -> Self {
+        match e {
+            crate::market::SweepError::UnknownWallet(w) => Self::new(
+                StatusCode::NOT_FOUND,
+                "unknown_wallet",
+                format!("no wallet {}", w.0),
+            ),
+            crate::market::SweepError::NotTakings { .. } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not_takings",
+                e.to_string(),
+            ),
+            crate::market::SweepError::Money(e) => Self::money(e),
+        }
     }
 
     /// The server could not do its own job. Never the client's fault, and
@@ -2343,6 +2365,34 @@ fn may_read_wallet(
     }
 }
 
+/// One wallet as the API shows it, or `unknown_wallet`.
+pub(crate) fn wallet_dto(
+    m: &Market,
+    wallet: fehu::ledger::WalletId,
+) -> Result<WalletDto, ApiError> {
+    let held = m.ledger.wallet(wallet).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_wallet",
+            format!("no wallet {}", wallet.0),
+        )
+    })?;
+    let account_id = m
+        .accounts
+        .values()
+        .find(|a| a.wallet == wallet)
+        .map(|a| a.id.0);
+    Ok(WalletDto {
+        wallet,
+        kind: held.kind.label(),
+        status: held.status.label(),
+        balance_cents: held.balance_cents(),
+        reserved_cents: held.reserved_cents(),
+        available_cents: held.available_cents(),
+        account_id,
+    })
+}
+
 /// One wallet's balance, by wallet id. Its owner's, the operator's, or the
 /// game backend's under any scope that moves money.
 async fn get_wallet(
@@ -2355,25 +2405,52 @@ async fn get_wallet(
     let trusted = trusted.is_some();
     app.market
         .call(move |m| {
-            let account_id = may_read_wallet(m, wallet, caller, trusted)?;
-            let held = m.ledger.wallet(wallet).ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::NOT_FOUND,
-                    "unknown_wallet",
-                    format!("no wallet {wallet_id}"),
-                )
-            })?;
-            Ok(Json(WalletDto {
-                wallet,
-                kind: held.kind.label(),
-                status: held.status.label(),
-                balance_cents: held.balance_cents(),
-                reserved_cents: held.reserved_cents(),
-                available_cents: held.available_cents(),
-                account_id: account_id.map(|a| a.0),
-            }))
+            may_read_wallet(m, wallet, caller, trusted)?;
+            wallet_dto(m, wallet).map(Json)
         })
         .await?
+}
+
+/// Body of `POST /api/wallets/{wallet_id}/sweep`. Empty, or `{}`, sweeps
+/// everything the wallet has available.
+#[derive(Default, Deserialize)]
+struct SweepRequest {
+    amount_cents: Option<i64>,
+}
+
+/// What a sweep did: the wallet as it is now, what left it, and what the
+/// treasury holds after.
+#[derive(Serialize)]
+pub struct SweepResponse {
+    pub wallet: WalletDto,
+    pub swept_cents: i64,
+    pub treasury_cents: i64,
+}
+
+/// Bring an issuer's or the venue's takings home to treasury. The
+/// operator's: it is the world's money moving between the world's wallets,
+/// and it closes the loop a purchase and a fee open — without it every
+/// budget is funded by minting while the takings sit where nothing spends
+/// them.
+async fn sweep_wallet(
+    State(app): State<AppState>,
+    Path(wallet): Path<u64>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Option<Json<SweepRequest>>,
+) -> Result<Committed, ApiError> {
+    let req = payload.map(|Json(r)| r).unwrap_or_default();
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::Sweep {
+            wallet,
+            amount_cents: req.amount_cents,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 /// A wallet's movements: the account's ledger, under the wallet's name.
