@@ -38,6 +38,7 @@ pub struct Tick {
 
 /// Read-only view of the latent state, for tests, tuning and UI.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Snapshot {
     /// Timestamp of the last emitted tick (or the start if none yet).
     pub ts: Timestamp,
@@ -197,6 +198,45 @@ impl Simulator {
         }));
         self.next_seq += 1;
         Ok(())
+    }
+
+    /// Every event queued and not yet applied, in the order they will
+    /// apply, each with the sequence number that names it to
+    /// [`retract`](Self::retract). Sequence numbers count pushes from the
+    /// start of the world and are never reused.
+    pub fn events(&self) -> Vec<(u64, Event)> {
+        let mut queued: Vec<&Queued> = self.pending.iter().map(|Reverse(q)| q).collect();
+        queued.sort();
+        queued
+            .into_iter()
+            .map(|q| {
+                (
+                    q.seq,
+                    Event {
+                        at: q.at,
+                        kind: q.kind,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Withdraw a queued event by the sequence number [`events`](Self::events)
+    /// reports, and hand it back if it was still pending. An event already
+    /// applied is gone and returns `None`. Withdrawing draws no randomness:
+    /// the series is what it would have been had the event never been
+    /// pushed.
+    pub fn retract(&mut self, seq: u64) -> Option<Event> {
+        let found = self
+            .pending
+            .iter()
+            .find(|Reverse(q)| q.seq == seq)
+            .map(|Reverse(q)| Event {
+                at: q.at,
+                kind: q.kind,
+            })?;
+        self.pending.retain(|Reverse(q)| q.seq != seq);
+        Some(found)
     }
 
     /// Apply every queued event with `at < before`.
@@ -691,8 +731,7 @@ impl core::fmt::Display for LoadError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for LoadError {}
+impl core::error::Error for LoadError {}
 
 /// Round a log-dollar price to cents, clamped to `[1, 10^15]`.
 fn cents(log_price: f64) -> i64 {

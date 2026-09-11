@@ -114,8 +114,7 @@ impl fmt::Display for EventError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for EventError {}
+impl core::error::Error for EventError {}
 
 /// A queued event, ordered by `(at, seq)` so equal timestamps apply in push
 /// order.

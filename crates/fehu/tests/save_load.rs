@@ -78,6 +78,36 @@ fn postcard_round_trip() {
 }
 
 #[test]
+fn a_standalone_book_keeps_its_rules_and_a_snapshot_serialises() {
+    let mut book = fehu::OrderBook::new();
+    book.set_rules(fehu::MarketRules {
+        tick_cents: 5,
+        lot: 10,
+    });
+    let json = serde_json::to_string(&book).unwrap();
+    let back: fehu::OrderBook = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        back.rules(),
+        book.rules(),
+        "the tick and lot survive: {json}"
+    );
+    // A file written before the rules were saved reads back with the
+    // default rather than being refused.
+    let without: serde_json::Value = {
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("rules");
+        v
+    };
+    let old: fehu::OrderBook = serde_json::from_value(without).unwrap();
+    assert_eq!(old.rules(), fehu::MarketRules::default());
+
+    let snapshot = busy().snapshot();
+    let back: fehu::Snapshot =
+        serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+    assert_eq!(back, snapshot);
+}
+
+#[test]
 fn candles_round_trip() {
     let mut sim = Simulator::new(Config::default(), 1).unwrap();
     let mut c = Candles::new(50);

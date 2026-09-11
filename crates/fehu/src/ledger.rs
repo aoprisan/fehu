@@ -399,6 +399,7 @@ impl Reason {
 /// applies every posting or none. The ledger assigns the id — a draft has
 /// none, because a transaction that was refused never happened.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Draft {
     /// Why the currency moved.
     pub reason: Reason,
@@ -761,14 +762,13 @@ impl core::fmt::Display for LedgerError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for LedgerError {}
+impl core::error::Error for LedgerError {}
 
 /// Every wallet, the supply, and the arithmetic that keeps them in step.
 ///
 /// Cloneable and serialisable whole, private fields included: a save file has
 /// to carry the balances, not a view of them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Ledger {
     wallets: BTreeMap<WalletId, Wallet>,

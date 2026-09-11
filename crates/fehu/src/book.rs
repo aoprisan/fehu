@@ -221,8 +221,7 @@ impl fmt::Display for OrderError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for OrderError {}
+impl core::error::Error for OrderError {}
 
 /// What a symbol will quote and trade in.
 ///
@@ -314,8 +313,7 @@ impl fmt::Display for CancelError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for CancelError {}
+impl core::error::Error for CancelError {}
 
 /// An order resting in the book.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -524,14 +522,14 @@ pub struct OrderBook {
     index: BTreeMap<OrderId, (Side, i64)>,
     next_id: u64,
     /// Queue priority, handed out on every post and every iceberg refresh.
-    /// Zero in a file written before icebergs existed, which is the signal
-    /// to seed it from the ids.
-    #[cfg_attr(feature = "serde", serde(default))]
     next_seq: u64,
-    /// The tick and lot this book enforces. Not serialised: the exchange
-    /// owns the truth in its [`TradingParams`](crate::TradingParams) and
-    /// sets it here whenever a book is assembled, so the two cannot drift.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    /// The tick and lot this book enforces. Serialised, so a standalone
+    /// book round-trips whole; inside an exchange the
+    /// [`TradingParams`](crate::TradingParams) are still the truth and are
+    /// set here whenever one is assembled, so the two cannot drift. A file
+    /// written before the rules were saved reads back with the default,
+    /// which the exchange then overwrites.
+    #[cfg_attr(feature = "serde", serde(default))]
     rules: MarketRules,
 }
 
@@ -1012,31 +1010,10 @@ impl OrderBook {
     }
 
     /// The next queue priority, and never zero: zero is the mark of a book
-    /// written before priority was its own number.
     fn take_seq(&mut self) -> u64 {
         let seq = self.next_seq.max(1);
         self.next_seq = seq.saturating_add(1);
         seq
-    }
-
-    /// Give every resting order a queue priority, if a file did not carry
-    /// one. Before icebergs, priority *was* the id, so the ids it was
-    /// written with are exactly the right seeds. A book that already has
-    /// priorities is left alone.
-    pub fn seed_priority(&mut self) {
-        if self.next_seq != 0 {
-            return;
-        }
-        let mut highest = 0;
-        for levels in [&mut self.bids, &mut self.asks] {
-            for level in levels.values_mut() {
-                for order in level.iter_mut() {
-                    order.seq = order.id.0;
-                    highest = highest.max(order.id.0);
-                }
-            }
-        }
-        self.next_seq = highest.saturating_add(1).max(self.next_id).max(1);
     }
 
     fn rest(&mut self, order: Resting) {

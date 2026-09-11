@@ -362,10 +362,6 @@ impl Exchange {
         // order without asking. Setting it here covers both a fresh exchange
         // and one read back from a save.
         book.set_rules(params.rules);
-        // A book from a file written before icebergs has no queue priority
-        // of its own; back then priority was the id, so the ids are the
-        // seeds. A book that has one is left alone.
-        book.seed_priority();
         let cfg = sim.config();
         let days = cfg
             .market_hours
