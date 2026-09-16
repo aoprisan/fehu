@@ -50,14 +50,20 @@ would like to have and does not.
   is configurable.
 - **No way to remove an NPC, or close or drain a budget.** `journal::Command`
   has no variant for either; an NPC can only be deactivated, a budget only
-  funded.
+  funded. `Sweep` drains a wallet to treasury but `Market::sweep` refuses any
+  wallet that is not `Issuer` or `Venue`, so it does not reach a budget.
 - **No market-wide halt.** `Halt` and `Resume` are per symbol.
 - **Day orders are refused without a calendar** (`trading.rs`,
-  `OrderRequest::day`). Documented, but a client has no way to ask whether
-  the server has a calendar before the refusal.
+  `OrderRequest::day`). Documented, but no field says so: a client can only
+  infer it from `SymbolStatus`, where `market_open` is true and
+  `next_open_ms` is `null`.
 
 ### Tooling and documentation drift
 
+- **`main.rs`'s module doc names 17 `FEHU_*` variables; the code reads 35.**
+  `FEHU_NOW_MS`, `FEHU_RESUME`, `FEHU_MARKET_HOURS`, the fee, tick, lot and
+  band knobs and both admission bounds are absent from the list a reader of
+  the binary's own docs sees. The README's table is complete.
 - **Metrics are a field of `/api/health`.** `metrics.rs` keeps counters and
   there is no exposition endpoint in a scraper's format.
 - **No offline tooling.** `main.rs` takes no arguments; there is no
