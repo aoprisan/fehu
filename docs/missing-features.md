@@ -33,9 +33,11 @@ would like to have and does not.
   version is not the current one and describes the importer that would bring
   an old world forward — one labelled `Migration` transaction out of
   issuance — as "a day's work when there is such a world".
-- **Quotas beyond the limiter.** No cap on one trader's resting orders, held
-  stops or running jobs. The milestone-5 note: "nothing measured has asked
-  for them yet".
+- **Quotas beyond the limiter are uneven.** Held stops are capped per trader
+  (`MAX_STOPS_PER_TRADER`, 100) and running jobs world-wide
+  (`MAX_RUNNING_JOBS`, 1 024), but nothing caps one trader's resting orders,
+  and nothing caps how much of the world's job capacity one trader may take.
+  The milestone-5 note: "nothing measured has asked for them yet".
 - **v1 admin routes the plan's API table names.** `/api/v1/economy/admin/mint`,
   `/burn`, `/freeze`, `/unfreeze`, `/api/v1/economy/game-events` and
   `/api/v1/economy/markets/{symbol}/orders` have no v1 spelling in
@@ -104,16 +106,14 @@ would like to have and does not.
 
 ## Browser UI (`crates/fehu-economy/ui`)
 
-- **Stop orders are absent** despite `StopOrder` and `StopRequest` being
-  fully typed in `types.ts`: there is no ticket to place one, though a stop
-  that fires is now reported.
 - **Players cannot buy or consume goods.** No catalogue view, no purchase, no
   consume. The workshop panel shows inventory and recipes, but a fresh player
   has no way to source the inputs for a job.
 - **No order amend, cancel-all, order history, fills blotter, ledger view,
-  wallet transactions or transfer form.** `api.ts` already has
-  `amendOrder`, `traderOrders`, `order`, `ledger`, `validateAccount` and
-  `holdings` with no callers.
+  wallet transactions or transfer form.** Cancel is per order and there is no
+  in-place amend, so a resting order is changed by cancelling and retyping
+  it. `api.ts` already has `amendOrder`, `traderOrders`, `order`, `ledger`,
+  `validateAccount` and `holdings` with no callers.
 - **The operator's dashboard has readings and few levers.** It cannot list
   a symbol, pay a dividend, delist, create a merchant, pay a reward, edit a
   recipe, download a backup, issue or revoke a service key, list provisioned
@@ -123,9 +123,6 @@ would like to have and does not.
   `player` and keeps the key in `localStorage`. There is no field to paste an
   existing key, no way to see it, and no sign-out; a second account cannot be
   opened.
-- **The ticket exposes three of eight order options.** `post_only`,
-  `display_qty`, `expires_at_ms`, `day` and `client_order_id` are typed and
-  unreachable from the form.
 - **Typed data nobody renders.** Symbol status (next open and close, band,
   halt reason), day OHLC and market cap on a quote, the book's reference
   price and pending flow, NPC policy, most health counters, and a delisting's

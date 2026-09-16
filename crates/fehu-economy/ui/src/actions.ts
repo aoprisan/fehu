@@ -17,6 +17,8 @@ import type {
   OpenOrderDto,
   OrderRequest,
   PushEventRequest,
+  StopOrder,
+  StopRequest,
   TickMessage,
 } from './types.js';
 
@@ -289,6 +291,41 @@ export class Actions {
       this.loadBookAndTape().catch(() => {
         // The next tick refreshes both anyway.
       });
+    } catch (e) {
+      setOrderStatus(errorMessage(e), true);
+    }
+  }
+
+  /**
+   * Arm a stop. Nothing is reserved until it fires, so the portfolio only
+   * gains a trigger; the refusal, if it comes, is about the price.
+   */
+  async placeStop(body: StopRequest): Promise<void> {
+    const symbol = this.#state.symbol;
+    if (symbol === null) return;
+    try {
+      const stop = await api.placeStop(symbol, body);
+      const becomes =
+        stop.limit_price_cents === null
+          ? 'at market'
+          : `limit ${fmtPrice(stop.limit_price_cents)}`;
+      setOrderStatus(
+        `stop #${stop.stop_id} armed: ${stop.side} ${stop.qty} ${symbol} at ` +
+          `${fmtPrice(stop.stop_price_cents)}, ${becomes}`,
+      );
+      await this.refreshTrader();
+    } catch (e) {
+      setOrderStatus(errorMessage(e), true);
+    }
+  }
+
+  async cancelStop(stop: StopOrder): Promise<void> {
+    const trader = this.#state.trader;
+    if (trader === null) return;
+    try {
+      await api.cancelStop(stop.symbol, stop.stop_id, trader.id);
+      setOrderStatus(`withdrew stop #${stop.stop_id}`);
+      await this.refreshTrader();
     } catch (e) {
       setOrderStatus(errorMessage(e), true);
     }

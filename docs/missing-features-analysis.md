@@ -4,9 +4,10 @@ A complexity-against-usefulness reading of every item in
 [`missing-features.md`](missing-features.md). This is the **second** reading:
 the first was taken at the head that finished milestone 7, and the work it
 ranked first has since landed. Every claim the survey still makes was
-re-checked against the code at this head before it was scored again; all of
-them hold, and the re-check added one row the survey had missed (`main.rs`'s
-own environment list).
+re-checked against the code at this head before it was scored again. All of
+them hold but one — the quota row, which overstated what is uncapped and is
+corrected in both documents — and the re-check added one row the survey had
+missed (`main.rs`'s own environment list).
 
 That document says what is absent and where the evidence is; this one says
 what each absence costs to close, what closing it buys, and in what order the
@@ -41,7 +42,8 @@ where it matters:
    survey lists in the same breath as removing an NPC — is now the widening
    of one match arm rather than a new command.
 3. **Producers are self-bounding.** `max_running` caps a producer's jobs, so
-   the quota item still has nothing measured behind it.
+   the quota item still has nothing measured behind it — and the existing
+   caps on stops and on running jobs make it smaller than the survey said.
 
 ## How the scores are made
 
@@ -103,7 +105,7 @@ item that unblocks another.
 |---|---|---|---|---|
 | v1 spellings for admin routes | 3 | S | **very high** | The last unrouted piece of the documented surface, and the cheapest thing left. `Mint` and `Burn` already carry the memo the plan's table asks for, freeze and unfreeze are `SetAccountStatus`, and `markets/{symbol}/orders` and `game-events` are pure aliases of handlers that exist. Only `/admin/mint` and `/admin/burn` need a body-shaped wrapper, for which `purchase_body` and `consume_body` are the precedent. A backend restricted to `/api/v1/economy` cannot mint, freeze, push an event or trade today. |
 | Key rotation and revocation for players | 3 | M | medium | Worth more than at the first reading: `ProvisionPlayer` means a backend mints player identities in bulk, and a leaked player key can be neither rotated nor revoked — only the account frozen. `auth.rs` stores digests, so it is "issue a new digest, retire the old one in the same command": one variant and one persisted field. Bundle its save bump with the reward-rule fields below. |
-| Quotas beyond the limiter | 2 | S–M | medium | A cap on resting orders, stops and running jobs per trader is a counter and a refusal in three `apply` arms. Producers cap themselves with `max_running`, so the only unbounded actor left is a player, and nothing has measured one. Do it with the first load test against real players. |
+| Quotas beyond the limiter | 2 | S | medium | Less missing than the survey first said: stops are capped per trader at 100 and running jobs world-wide at 1 024, so what is open is a cap on resting orders per trader, and a per-trader share of the job capacity — a counter and a refusal in two `apply` arms. Producers cap themselves with `max_running`, so the only unbounded actor left is a player, and nothing has measured one. Do it with the first load test against real players. |
 | The SSE credential in the query string | 3 | M | low–medium | A short-lived stream ticket: one route that mints a ticket from a key, `stream` accepts either. The cost is `stream.ts`, the bundle rebuild and the ticket's own expiry. A real weakness across a proxy; a non-issue on localhost. Its own milestone, as the plan says, when tier two starts. |
 | Push delivery for the outbox | 3 | L | low | Webhooks need retry, backoff, a signed body, a dead-letter path and a kind of outbound task the server does not have. The pull outbox with a cursor is correct for tier one, and a WAN backend can poll every second at no real cost. Defer to tier two. |
 | An importer for older worlds | 1 | M | low | Still exactly the "day's work when there is such a world", and there is still no such world. The argument for writing it early is that the next save bump makes one — but a demo world regenerated from seeds is not a world worth importing. |
@@ -151,14 +153,16 @@ not a browser. The UI's job is to let an operator watch and an evaluator
 play — and since the producers landed, the thing an evaluator most wants to
 watch is a loop the browser cannot join.
 
+Two rows this reading listed here have since been built — the stop ticket
+(place, list and withdraw) and the five order options the form could not
+reach — so what is below is what is left.
+
 | Item | Use | Cost | Leverage | Reading |
 |---|---|---|---|---|
 | Players cannot buy or consume goods | 5 | M | **very high** | Promoted from 4. NPC producers now run recipes and quote the output, so the world manufactures goods continuously and a browser player can neither buy one nor consume one; the workshop panel shows recipes whose inputs are unobtainable. A catalogue section with a buy button and consume on the inventory row, against `POST /api/traders/{id}/purchases` and `/consume` — two calls `api.ts` does not yet have, one panel that does. This is the whole demo. |
 | Identity controls: paste a key, see it, sign out, second account | 4 | M | high | `actions.ts` silently creates a trader named `player` and keeps the key in `localStorage` with no way to read it back, replace it or drop it. Without this an evaluator cannot play two players from one browser, which is what the acceptance scenario needs and what buying from another player requires. |
-| Stop orders absent from the ticket | 3 | S–M | high | Half of this row landed — a stop that fires and an order that expires now say so. What is left is one form against `StopRequest`, which `types.ts` already carries, and a list of held stops to cancel from. |
 | Amend, cancel-all, order history, fills, ledger, transactions, transfer | 3 | M–L | medium | `api.ts` still holds `amendOrder`, `traderOrders`, `order`, `ledger`, `validateAccount` and `holdings` with no callers — the client half is written. Order history and the ledger view are the two an operator asks for first; do those and leave the rest until something wants them. |
 | Operator dashboard has readings, few levers | 3 | L | medium | Wider than at the first reading, because the server grew levers while the dashboard did not: sweep a wallet, reconfigure a listed symbol and manage a producer's `Production` are all operator-only and all reachable only by `curl`. Each lever is a form against an existing route, an hour apiece. Order: list a symbol, sweep, reconfigure, merchant and production, issue and revoke a service key, pay a reward, download a backup. Replace the `window.prompt` for funding while there. |
-| Ticket exposes three of eight order options | 2 | S | medium | Five fields in one form. `post_only` and `expires_at_ms` are the useful two; `client_order_id` now matters, because the idempotency item landed and the ticket is the one write that could carry a client's own id. |
 | Typed data nobody renders; no deep links; no theme | 1–2 | S–M | low | Symbol status — next open and close, band, halt reason — is the one worth rendering, and it is the same DTO the calendar flag above would land in. Deep links, the theme control and the hard-coded book depth and tape length are polish. |
 
 ## Where the leverage is now
@@ -175,7 +179,8 @@ each other.
 3. **Let `Sweep` drain a budget**, and add the explicit `calendar` flag and
    the market-wide halt while in the same neighbourhood. S each.
 4. **Buy and consume in the UI.** M. The producers have nobody to sell to.
-5. **Identity controls in the UI**, then the stop ticket. M, then S–M.
+5. **Identity controls in the UI.** M. (The stop ticket, which stood here,
+   is built.)
 
 The second block is one save bump's worth. Land them together as version 13,
 so a world is refused once rather than three times:
