@@ -32,6 +32,8 @@ import type {
   RecipesResponse,
   Reconciliation,
   SharesResponse,
+  StopOrder,
+  StopRequest,
   SymbolStatus,
   SymbolsResponse,
   TradesResponse,
@@ -261,6 +263,18 @@ export const api = {
     send('DELETE', `/api/symbols/${enc(symbol)}/orders/${orderId}?trader_id=${traderId}`),
 
   /** One wallet by id: the owner's or the operator's to read. */
+  /**
+   * Arm a stop: a trigger held aside until the price touches it. It rests
+   * nowhere and reserves nothing until it fires, which is why it is its own
+   * route rather than a kind of order.
+   */
+  placeStop: (symbol: string, body: StopRequest): Promise<StopOrder> =>
+    send('POST', `/api/symbols/${enc(symbol)}/stops`, body),
+
+  /** Withdraw a stop before it fires. */
+  cancelStop: (symbol: string, stopId: number, traderId: number): Promise<StopOrder> =>
+    send('DELETE', `/api/symbols/${enc(symbol)}/stops/${stopId}?trader_id=${traderId}`),
+
   wallet: (walletId: number): Promise<WalletDto> => request(`/api/wallets/${walletId}`),
 
   /** A trader's units of the world's goods, reservations included. */

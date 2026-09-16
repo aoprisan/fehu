@@ -1,10 +1,17 @@
-/** Cash, positions and resting orders, plus the equity readout in the header. */
+/**
+ * Cash, positions, resting orders and held stops, plus the equity readout in
+ * the header.
+ *
+ * Orders and stops are listed apart because they are different things: an
+ * order is in the book and holds cash or shares against it, a stop is a
+ * trigger that holds nothing until the price reaches it.
+ */
 
 import type { Actions } from '../actions.js';
 import { byId, el, query, replace, td } from '../dom.js';
 import { fmtPrice, fmtSignedPrice, trendClass } from '../format.js';
 import type { Store } from '../store.js';
-import type { OpenOrderDto, PositionDto } from '../types.js';
+import type { OpenOrderDto, PositionDto, StopOrder } from '../types.js';
 
 export class AccountPanel {
   readonly #store: Store;
@@ -13,6 +20,7 @@ export class AccountPanel {
   readonly #summary = byId('acct');
   readonly #positions = byId('positions');
   readonly #orders = byId('orders');
+  readonly #stops = byId('stops');
   readonly #deposit = byId('deposit', HTMLFormElement);
   readonly #amount = query(byId('deposit'), '[name=amount]', HTMLInputElement);
 
@@ -65,6 +73,10 @@ export class AccountPanel {
       this.#orders,
       trader.open_orders.map((o) => this.#orderRow(o)),
     );
+    replace(
+      this.#stops,
+      trader.stops.map((s) => this.#stopRow(s)),
+    );
   }
 
   /** One position. Reserved shares show as `free/held`: only free can be sold. */
@@ -81,6 +93,33 @@ export class AccountPanel {
     return row;
   }
 
+  /**
+   * One held stop: what it will do, and the price that will make it do it.
+   * An iceberg's hidden remainder is the order list's business; here the
+   * quantity is the whole of what fires.
+   */
+  #stopRow(s: StopOrder): HTMLLIElement {
+    const cancel = el('button', { type: 'button', title: 'withdraw' }, '✕');
+    cancel.addEventListener('click', () => void this.#actions.cancelStop(s));
+    const becomes =
+      s.limit_price_cents === null ? 'at market' : `limit ${fmtPrice(s.limit_price_cents)}`;
+    return el(
+      'li',
+      {},
+      el('span', { class: s.side === 'buy' ? 'up' : 'down' }, s.side),
+      el('span', {}, s.symbol),
+      el('span', {}, String(s.qty)),
+      el('span', {}, `⇢ ${fmtPrice(s.stop_price_cents)}`),
+      el('span', { class: 'becomes' }, becomes),
+      cancel,
+    );
+  }
+
+  /**
+   * One resting order. An iceberg says what it is showing: the book only
+   * ever sees that slice, so `10/100` resting with `10` on show is not the
+   * same order as `100` on show, and the ticket can now place either.
+   */
   #orderRow(o: OpenOrderDto): HTMLLIElement {
     const cancel = el('button', { type: 'button', title: 'cancel' }, '✕');
     cancel.addEventListener('click', () => void this.#actions.cancelOrder(o));
@@ -91,6 +130,9 @@ export class AccountPanel {
       el('span', {}, o.symbol),
       el('span', {}, `${o.remaining}/${o.qty}`),
       el('span', {}, `@ ${fmtPrice(o.price_cents)}`),
+      ...(o.display_qty === null
+        ? []
+        : [el('span', { class: 'becomes' }, `${o.shown_qty} shown`)]),
       cancel,
     );
   }

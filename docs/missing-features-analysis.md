@@ -1,50 +1,90 @@
 # Missing features, weighed
 
 A complexity-against-usefulness reading of every item in
-[`missing-features.md`](missing-features.md), taken at the same head of
-`main`. That document says what is absent and where the evidence is; this
-one says what each absence costs to close, what closing it buys, and in what
-order the work should go. Each claim in the survey was re-checked against
-the code before it was scored here; every one holds.
+[`missing-features.md`](missing-features.md). This is the **second** reading:
+the first was taken at the head that finished milestone 7, and the work it
+ranked first has since landed. Every claim the survey still makes was
+re-checked against the code at this head before it was scored again. All of
+them hold but one — the quota row, which overstated what is uncapped and is
+corrected in both documents — and the re-check added one row the survey had
+missed (`main.rs`'s own environment list).
+
+That document says what is absent and where the evidence is; this one says
+what each absence costs to close, what closing it buys, and in what order the
+work should go.
+
+## What has landed since the first reading
+
+Every item in the first block, and four of the second:
+
+- a committed CI workflow; the three undocumented `FEHU_*` variables;
+  read access for service scopes; a `Sweep` command; every money movement in
+  the outbox; the rate limiter keyed by service; `before` cursors on the five
+  `limit`-only reads; `stop_triggered` and `order_expired` in `stream.ts`,
+  `Idempotency-Key` on UI writes and structured errors; the operator's user
+  directory; `Simulator::events()` and `retract`, the dead `seed_priority`
+  deleted and the four serialisation gaps closed;
+- then **job catch-up on resume** and a **batch quantity on `StartJob`**
+  (`FEHU_RESUME`, `runs`), **setters on `Exchange::params` and
+  `Simulator::config`** with the server's `Reconfigure` command on top, and
+  **NPC producers** (`npc::Production`: a recipe, a restock line and a
+  `max_running` bound).
+
+Three of those change what should be ranked next, and the tables below say so
+where it matters:
+
+1. **Producers make goods the browser cannot buy.** The world now
+   manufactures inventory on its own, and the UI still has no purchase or
+   consume path. That was the largest UI gap before; it is now the one that
+   makes the running world illegible.
+2. **`Sweep` exists but only for takings.** `Market::sweep` refuses any
+   wallet that is not `Issuer` or `Venue`, so draining a budget — which the
+   survey lists in the same breath as removing an NPC — is now the widening
+   of one match arm rather than a new command.
+3. **Producers are self-bounding.** `max_running` caps a producer's jobs, so
+   the quota item still has nothing measured behind it — and the existing
+   caps on stops and on running jobs make it smaller than the survey said.
 
 ## How the scores are made
 
 **Usefulness** is measured against the project's own stated goal — the
 acceptance scenario in [`economy-engine-plan.md`](economy-engine-plan.md):
 a game backend onboarding players, paying rewards from budgets, players
-buying from NPC merchants, running jobs, listing and trading the output,
-and an audit that sums to the genesis supply after every step, every retry
-and every restart. Tier one is one host and a trusted backend on the same
-network; tier two is a live service. An item scores high when the
-acceptance scenario, or the first real game to be run on this server, hits
-it early, and low when nothing measured has asked for it.
+buying from NPC merchants, running jobs, listing and trading the output, and
+an audit that sums to the genesis supply after every step, every retry and
+every restart. Tier one is one host and a trusted backend on the same
+network; tier two is a live service. An item scores high when the acceptance
+scenario, or the first real game to be run on this server, hits it early, and
+low when nothing measured has asked for it.
 
 **Complexity** is the cost to land the item to this repository's standard,
-which is stricter than the line count suggests. The things that make an
-item expensive here, in roughly descending order:
+which is stricter than the line count suggests. The things that make an item
+expensive here, in roughly descending order:
 
 1. **A new `journal::Command` variant.** Every mutation is a variant, an
    `apply` arm that validates fully before touching anything, a handler that
    resolves everything replay cannot (clock, RNG, digests) and journals it,
    and a contract-test row. Cheap in lines, but each one is a promise about
    replay.
-2. **A save-format bump.** `fehu_economy::save::STATE_VERSION` is refused on
-   mismatch, so any new persisted field means a bump and, for anyone with a
-   world, the importer the survey says does not exist.
+2. **A save-format bump.** `fehu_economy::save::STATE_VERSION` is 12 and is
+   refused on mismatch, so any new persisted field means a bump and, for
+   anyone with a world, the importer the survey says does not exist. Several
+   remaining items each want one; they should share a single bump.
 3. **A library API change.** `crates/fehu` is `no_std`, published, and gated
    by golden hashes. Anything that touches RNG draw order bumps
    `fehu::STATE_VERSION` and the constants in `tests/determinism.rs`.
    Anything serialised bumps `EXCHANGE_VERSION` or the book format.
-4. **A UI change.** `types.ts` is pinned to the Rust DTOs by `tests/contract.rs`,
-   and the built bundle in `static/` is committed, so the smallest UI edit
-   drags a rebuild and a bundle diff into the commit.
-5. **Ordinary code.** A new read route, a new query parameter, a doc.
+4. **A UI change.** `types.ts` is pinned to the Rust DTOs by
+   `tests/contract.rs`, and the built bundle in `static/` is committed, so the
+   smallest UI edit drags a rebuild and a bundle diff into the commit.
+5. **Ordinary code.** A new read route, a route alias, a query parameter, a
+   doc.
 
 Scores are S / M / L / XL:
 
 | | Roughly | Typically involves |
 |---|---|---|
-| **S** | an hour or two | one function, a doc line, a query param, a read route |
+| **S** | an hour or two | one function, a doc line, a query param, a route alias |
 | **M** | half a day to a day | a command variant or a UI panel, tests, docs |
 | **L** | a few days | several commands, a save bump, a library format bump, or a design choice with more than one defensible answer |
 | **XL** | a milestone | a new subsystem, or anything that changes what a replay means |
@@ -54,9 +94,8 @@ game; 4 is hit within the first week of running one; 3 is hit eventually by
 anyone running one; 2 is a rounding-off that the code already half-promises;
 1 is speculative until something measures a need.
 
-The leverage column is usefulness divided by cost, which is where the
-ordering at the end comes from. Ties break towards the item that unblocks
-another.
+The leverage column is usefulness divided by cost. Ties break towards the
+item that unblocks another.
 
 ## Economy server
 
@@ -64,161 +103,136 @@ another.
 
 | Item | Use | Cost | Leverage | Reading |
 |---|---|---|---|---|
-| Takings never come home | 5 | S | **very high** | One `Sweep` command: move a named issuer or venue wallet's balance to treasury (or a budget). No new state, no save bump. Without it the loop `world.html` animates does not close and every budget is funded by minting, so supply-in-circulation drifts up with no operator action. |
-| Services share the anonymous bucket | 3 | S | **high** | `limit.rs` keys by user id; keying by service id is the "small change" the milestone-6 note names. Do it when the outbox poller starts spending the anonymous allowance, which is the first day a backend runs. |
-| Job catch-up after downtime | 4 | M | high | One policy, configurable: on `App::resume`, jobs whose due instant passed while the server was down complete on the first `Step`, or are pushed forward by the gap. The step already carries the instant, so the arm is small; the design choice is the cost. Pick "complete on first step" as the default and journal nothing new. |
-| Key rotation and revocation for players | 3 | M | medium | `auth.rs` stores digests, so rotation is "issue a new digest, retire the old one in the same command". One variant, one save-format field (the retired digest, or none if revocation is immediate). The plan defers it; a game with any churn wants it. |
-| NPC producers | 4 | L | medium | The plan's producer "runs recipes and sells the output". `npc.rs` has the wallet, inventory and quoting; what is missing is a policy that starts a job when stock is low and the job path already exists. It runs inside the step, so it is journaled for free. The cost is the policy's shape (target inventory, restock threshold) and a save bump for the new policy fields. Worth doing after the sweep, since a producer that never sends takings home just accumulates. |
-| Quotas beyond the limiter | 2 | S–M | medium | A cap on resting orders, stops and running jobs per trader is a counter and a refusal in three `apply` arms. Cheap, but the plan is right that nothing has measured a need. Do it when the first load test with real players runs. |
-| An importer for older worlds | 1 | M | low | Exactly the "day's work when there is such a world". There is no such world. Not before the first save bump that somebody cares about. |
-| v1 spellings for admin routes | 2 | S | medium | Aliases in the router; the handlers exist. Cheap and closes a documented gap, but a backend already talks to the un-versioned routes. Bundle into the next API commit. |
-| Push delivery for the outbox | 3 | L | low | Webhooks need retry, backoff, a signed body, a dead-letter path and a new kind of outbound task in a server that has none. The pull outbox with a cursor is correct for tier one, and a WAN backend can poll every second at no real cost. Defer to tier two. |
-| The SSE credential in the query string | 3 | M | low–medium | A short-lived stream ticket: one route that mints a ticket from a key, `stream` accepts either. The cost is the UI (`stream.ts`), the bundle rebuild and the ticket's own expiry. A real weakness across a proxy; a non-issue on localhost. Its own milestone, as the plan says, when tier two starts. |
+| v1 spellings for admin routes | 3 | S | **very high** | The last unrouted piece of the documented surface, and the cheapest thing left. `Mint` and `Burn` already carry the memo the plan's table asks for, freeze and unfreeze are `SetAccountStatus`, and `markets/{symbol}/orders` and `game-events` are pure aliases of handlers that exist. Only `/admin/mint` and `/admin/burn` need a body-shaped wrapper, for which `purchase_body` and `consume_body` are the precedent. A backend restricted to `/api/v1/economy` cannot mint, freeze, push an event or trade today. |
+| Key rotation and revocation for players | 3 | M | medium | Worth more than at the first reading: `ProvisionPlayer` means a backend mints player identities in bulk, and a leaked player key can be neither rotated nor revoked — only the account frozen. `auth.rs` stores digests, so it is "issue a new digest, retire the old one in the same command": one variant and one persisted field. Bundle its save bump with the reward-rule fields below. |
+| Quotas beyond the limiter | 2 | S | medium | Less missing than the survey first said: stops are capped per trader at 100 and running jobs world-wide at 1 024, so what is open is a cap on resting orders per trader, and a per-trader share of the job capacity — a counter and a refusal in two `apply` arms. Producers cap themselves with `max_running`, so the only unbounded actor left is a player, and nothing has measured one. Do it with the first load test against real players. |
+| The SSE credential in the query string | 3 | M | low–medium | A short-lived stream ticket: one route that mints a ticket from a key, `stream` accepts either. The cost is `stream.ts`, the bundle rebuild and the ticket's own expiry. A real weakness across a proxy; a non-issue on localhost. Its own milestone, as the plan says, when tier two starts. |
+| Push delivery for the outbox | 3 | L | low | Webhooks need retry, backoff, a signed body, a dead-letter path and a kind of outbound task the server does not have. The pull outbox with a cursor is correct for tier one, and a WAN backend can poll every second at no real cost. Defer to tier two. |
+| An importer for older worlds | 1 | M | low | Still exactly the "day's work when there is such a world", and there is still no such world. The argument for writing it early is that the next save bump makes one — but a demo world regenerated from seeds is not a world worth importing. |
 
 ### Gaps a game backend or an operator hits
 
 | Item | Use | Cost | Leverage | Reading |
 |---|---|---|---|---|
-| Service scopes cannot read | 5 | S–M | **very high** | Accept `ServiceCaller` on the wallet, inventory, outbox and command reads under the matching scope. No new command, no save change, four handlers. A backend that holds the `inventory` scope and cannot read the inventory it just changed is the first wall the acceptance scenario hits. |
-| The outbox carries only what the stream announces | 5 | M | **very high** | Route `PayReward`, `Purchase`, `Transfer`, `Dividend`, `Mint`, `Burn`, `StartJob` and `CancelJob` through `Market::announce`, or through a sibling that writes to the outbox without the stream. Each is one call at the end of an existing `apply` arm plus a fact DTO. Without it a backend must poll wallets to learn a player was paid, which defeats the outbox's purpose. Pair it with the read-scope item; together they make the service surface usable. |
-| Pagination is `limit` only | 4 | M | high | Add `before` (a sequence or id) to ledger, tape, order history, event log and bars. Each store is already ordered, so it is a filter plus a query field, five times. Anything past the limit is unreachable today, which an audit tool hits on day one. |
-| Reward rules: cooldown, per-player cap, expiry | 3 | M | medium | Three optional fields on `RewardRule`, a per-player last-paid map (save bump), and refusals in the `PayReward` arm. The plan says to implement cadence with configuration; the backend can enforce it itself today, so the value is in refusing what the backend gets wrong. |
-| Jobs run one at a time | 3 | S–M | medium | A `quantity` on `StartJob`, defaulting to one, that multiplies inputs, cost and outputs. One arm, one field. Cheap and stops N journal entries for one batch. |
-| Remove an NPC, close or drain a budget, change a listed symbol | 3 | M | medium | Three commands. Draining a budget is a transfer back to treasury and is close to the sweep above; removing an NPC needs its orders cancelled and its wallet drained first, so it composes existing arms. Symbol reconfiguration is the hard one: `Exchange::params` has no setters (see the library section), so it is blocked on that. |
-| No market-wide halt | 2 | S | medium | A loop over symbols inside one command, or a `symbol: None` on the existing `Halt`. Cheap; rarely wanted until an incident. |
-| The operator has no user directory | 3 | S | high | `list_users` returns the caller; let the operator key list everyone. A read route change. |
-| Day orders refused without a calendar | 2 | S | medium | A `calendar` boolean on `/api/health` or the symbol status. Trivial. |
+| Close or drain a budget | 3 | S | **very high** | `Market::sweep` already moves a wallet's balance to treasury; it refuses anything that is not `Issuer` or `Venue`. Draining a budget is that match arm plus a decision already taken elsewhere (takings go to treasury). Closing one — refusing further funding and payment — is a flag on the budget and a refusal in `PayReward`, which does want the save bump. Do the drain now, the close with the batch. |
+| Remove an NPC | 3 | M | medium | One command that composes arms that exist: cancel its orders, sweep its wallet, stop its production, drop it from the table. Worth more now that a producer can sit on inventory and a wallet indefinitely; deactivating one leaves both stranded. The only design choice is what happens to its unsold stock — burn it, or leave it in the holdings table as an orphan. Burn it, and journal the burn. |
+| Reward rules: cooldown, per-player cap, expiry | 3 | M | medium | Three optional fields on `RewardRule`, a per-player last-paid map (save bump), and refusals in the `PayReward` arm. With producers and the sweep landed, rewards are the last money tap bounded only by the size of the budget behind them. The backend holding the `reward` scope can enforce cadence itself, so the value is in refusing what the backend gets wrong — real, but second-order. |
+| No market-wide halt | 2 | S | medium | A loop over symbols inside one command, or `symbol: None` on the existing `Halt`. Cheap; rarely wanted until an incident, and an incident is exactly when nobody wants to send N requests. |
+| Day orders refused without a calendar | 2 | S | medium | Smaller than the survey makes it sound: `SymbolStatus` already implies the answer — `market_open` true with `next_open_ms` null means there is no calendar — but implying is not saying. One boolean on the status DTO, one `types.ts` row, one contract-test row. |
 
 ### Tooling and documentation drift
 
 | Item | Use | Cost | Leverage | Reading |
 |---|---|---|---|---|
-| No CI configuration committed | 4 | S | **very high** | One workflow that runs `just ci`, plus a Node step for `just ui-check`. The `justfile` is already the recipe. The gap between "CI runs `just ci`" and "there is no CI" is the largest doc drift in the repository and the cheapest to close. |
-| Three env vars undocumented | 3 | S | **very high** | Three rows in the README's table. `FEHU_NOW_MS` in particular is how a test pins the world's start instant, and nobody can find it. |
+| `main.rs`'s environment list is half the truth | 3 | S | **very high** | Its module doc names 17 `FEHU_*` variables and the code reads 35; `FEHU_NOW_MS`, `FEHU_RESUME`, `FEHU_MARKET_HOURS`, the fee and band knobs and both admission bounds are missing. The README's table is complete and was fixed at the first reading, so this is the same drift one file over, and the fix is to point at the README rather than to duplicate it a second time. |
+| No offline tooling | 3 | M | medium | A `fehu-economy verify <state> <journal>` subcommand that loads and replays without serving is mostly `App::resume` behind a flag; `main.rs` takes no arguments at all today, so a three-arm `match` on `args()` is part of the cost. Restoring from a backup by pointing `FEHU_STATE_FILE` at it is acceptable; verifying one before trusting it is not possible, and a world that now survives downtime by replaying jobs is a world worth verifying. |
 | Metrics inside `/api/health` | 2 | S | medium | A `/metrics` route in Prometheus text format over `metrics.rs`'s counters. Half an hour; tier two wants it, tier one does not. |
-| No offline tooling | 3 | M | medium | A `fehu-economy verify <state> <journal>` subcommand that loads and replays without serving is mostly `App::resume` behind a flag. Restoring from a backup by pointing `FEHU_STATE_FILE` at it is acceptable; verifying a backup before trusting it is not possible today. |
 
 ## Utilities library
 
-Everything here is gated by determinism and by a published, `no_std` API,
-so the same feature costs more than its server twin. The survey's central
-observation is right: the server reimplements four order features on top
-of the book, and every other consumer would too. The question is whether
-there is another consumer.
+Everything here is gated by determinism and by a published, `no_std` API, so
+the same feature costs more than its server twin. The setters item from the
+first reading has landed, which removed the one library row the server was
+blocked on. What is left divides cleanly: one item that would simplify the
+server, and five that wait for a second consumer of the crate.
 
 | Item | Use | Cost | Leverage | Reading |
 |---|---|---|---|---|
-| Stop orders, post-only, self-trade prevention, expiry, amend in the book | 2 | L–XL | low | Pulling the server's `check_post_only`, `self_crossing`, `sweep_expired` and cancel-then-resubmit into `book.rs` is a format change and a draw-order change for the exchange's synthetic flow, so a golden-hash bump and `EXCHANGE_VERSION` bump. The server already has them and works. Worth it only when a second consumer of the crate exists. Until then it is duplication with one copy. |
-| The event queue is write-only | 3 | S | high | `Simulator::events()` returning a slice, and `retract(id)`. No draw-order change, no format change (the queue is already serialised). A cheap and obviously right addition. |
-| Candles fixed to four intervals; no VWAP; no coarse ingest | 3 | M–L | medium | Making `Interval` carry a duration and `Candles` a `Vec` keyed by it is a storage change, so a format bump. Ingesting coarse candles into `Candles` would let `symbol.rs` drop its parallel `coarse_daily` vector and the read-time join, which is the concrete win. Notional per bar is one field. Do the ingest first; it simplifies the server. Fifteen-minute bars can wait. |
+| Candles fixed to four intervals; no VWAP; no coarse ingest | 3 | M–L | medium | The coarse ingest is the only part with a concrete win: `symbol.rs` keeps a parallel `coarse_daily` vector and joins it to the aggregator at read time, and `Candles` accepting a finished candle would delete both. That is a storage change and a format bump. Notional per bar is one field. Arbitrary intervals are a different, larger change and nothing has asked for 15-minute bars. |
+| Version mismatch is a dead end | 2 | S–M | low–medium | With `seed_priority` gone, what remains is the real question: `Simulator` and `Exchange` refuse every version but the current one, and there is no one-version-back path. Cheap to add for the book, pointless until a saved world from an older version exists — which is the server's importer question wearing a library hat. |
+| Stop orders, post-only, self-trade prevention, expiry, amend in the book | 2 | L–XL | low | Pulling the server's `check_post_only`, `self_crossing`, `sweep_expired` and cancel-then-resubmit into `book.rs` is a format change and a draw-order change for the exchange's synthetic flow, so a golden-hash bump and an `EXCHANGE_VERSION` bump. The server has them and works. Duplication with one copy is not a bug; wait for the second consumer. |
 | Calendar: UTC only, no holidays, half days, breaks; weekend gap unweighted | 2 | M | low | A holiday list is a `Vec<u32>` of day numbers and a lookup; half days and breaks change what "session" means and touch the coarse path. A game's exchange does not observe Thanksgiving. Only the weekend-gap weighting is a modelling question, and it changes every golden hash. |
-| Multi-currency half-built | 1 | XL | very low | The plan chose one currency deliberately; issuance, supply, flows and every audit sum are single-currency. Finishing it is a rewrite of `ledger.rs`'s invariants. Not until a game needs two currencies, which is a product decision the plan has explicitly not taken. |
-| Fee reasons with no fee mechanism | 1 | M | low | The server's maker/taker fees are the fees. A `TradingParams` fee schedule that the exchange books would be a second implementation with no consumer. Leave `Reason::Fee` as the vocabulary it is. |
-| Version mismatch is a dead end; dead `seed_priority` | 2 | S | medium | Delete `seed_priority` and the branch that can never run, or wire a one-version-back upgrade for the book. Deleting is the honest choice: the survey's own reading is that it cannot execute. |
-| Serialisation gaps | 2 | S | medium | `rules` on `OrderBook` should round-trip (drop the `serde(skip)`, bump the book format); `Snapshot` and `Draft` get derives; `Ledger` gets `PartialEq`; `core::error::Error` replaces the `std`-gated impl. Four small independent edits; the `rules` one is the only format change. |
-| Configuration immutable after construction | 3 | M | medium | Setters on `Exchange::params` and `Simulator::config` that re-run validation and re-derive the cached per-tick quantities. No draw-order change if the setter takes effect at the next step. This unblocks the server's "change a listed symbol's configuration" item. Re-export `MAX_PRICE_CENTS` in the same commit. |
+| Fee and rebate reasons with no fee mechanism | 1 | M | low | The server's maker/taker fees are the fees. A `TradingParams` fee schedule the exchange books would be a second implementation with no consumer. Leave `Reason::Fee` as the vocabulary it is. |
+| Multi-currency half-built | 1 | XL | very low | Issuance, supply, flows and every audit sum are single-currency by design. Finishing it is a rewrite of `ledger.rs`'s invariants, and which currencies a game has is a product decision the plan has deliberately not taken. |
 
 ## Browser UI
 
 Every item here costs a bundle rebuild and a committed `static/` diff, and
 nothing here blocks the acceptance scenario, which is played by a backend,
 not a browser. The UI's job is to let an operator watch and an evaluator
-play. Score usefulness against that.
+play — and since the producers landed, the thing an evaluator most wants to
+watch is a loop the browser cannot join.
+
+Two rows this reading listed here have since been built — the stop ticket
+(place, list and withdraw) and the five order options the form could not
+reach — so what is below is what is left.
 
 | Item | Use | Cost | Leverage | Reading |
 |---|---|---|---|---|
-| Stop orders absent; `stop_triggered` and `order_expired` dropped | 4 | S–M | **high** | Two `case` arms in `stream.ts` that refresh the portfolio and post a notification are trivial and fix a real silence: a stop fires and the screen does not change. A stop ticket is a second form against a typed request that already exists. |
-| Players cannot buy or consume goods | 4 | M | **high** | A catalogue view with a buy button, and consume on the inventory row. `api.ts` needs two calls. This is the gap that makes the workshop panel unusable: a fresh player has inputs for nothing. |
-| Identity controls: paste a key, see it, sign out, second account | 4 | M | high | A key field and a sign-out button in the account panel; `actions.ts` already keeps the key in `localStorage`. Without it an evaluator cannot play two players from one browser, which the acceptance scenario requires. |
-| Errors are one string; `Retry-After` discarded | 3 | S–M | high | Keep `code` and the header on `ApiError`; render `rate_limited` and `overloaded` with a countdown, `post_only_would_cross` and `self_trade` with their names. Small and it makes every other UI failure legible. |
-| No `Idempotency-Key` on writes | 3 | S | high | A UUID per submit in `send`, retried with the same key. One function. A double-applied deposit from a retried click is a real bug in waiting. |
-| Amend, cancel-all, order history, fills, ledger, transactions, transfer | 3 | M–L | medium | `api.ts` has the calls; each is a panel. Order history and the ledger view are the two an operator wants first; do those and leave the rest. |
-| Operator dashboard has readings, few levers | 3 | L | medium | Each lever is a form against an existing route. Prioritise in this order: list a symbol, pay a reward, create a merchant, download a backup, issue and revoke a service key. Each is an hour; all of them are a few days. Replace the `window.prompt` for funding while there. |
-| Ticket exposes three of eight options | 2 | S | medium | Five fields in one form. `post_only` and `expires_at_ms` are the useful two; `client_order_id` matters only once the idempotency item lands. |
-| Typed data nobody renders; no deep links; no theme | 1–2 | S–M | low | Symbol status (next open, halt reason) is the one worth rendering. Deep links and theme are polish. |
+| Players cannot buy or consume goods | 5 | M | **very high** | Promoted from 4. NPC producers now run recipes and quote the output, so the world manufactures goods continuously and a browser player can neither buy one nor consume one; the workshop panel shows recipes whose inputs are unobtainable. A catalogue section with a buy button and consume on the inventory row, against `POST /api/traders/{id}/purchases` and `/consume` — two calls `api.ts` does not yet have, one panel that does. This is the whole demo. |
+| Identity controls: paste a key, see it, sign out, second account | 4 | M | high | `actions.ts` silently creates a trader named `player` and keeps the key in `localStorage` with no way to read it back, replace it or drop it. Without this an evaluator cannot play two players from one browser, which is what the acceptance scenario needs and what buying from another player requires. |
+| Amend, cancel-all, order history, fills, ledger, transactions, transfer | 3 | M–L | medium | `api.ts` still holds `amendOrder`, `traderOrders`, `order`, `ledger`, `validateAccount` and `holdings` with no callers — the client half is written. Order history and the ledger view are the two an operator asks for first; do those and leave the rest until something wants them. |
+| Operator dashboard has readings, few levers | 3 | L | medium | Wider than at the first reading, because the server grew levers while the dashboard did not: sweep a wallet, reconfigure a listed symbol and manage a producer's `Production` are all operator-only and all reachable only by `curl`. Each lever is a form against an existing route, an hour apiece. Order: list a symbol, sweep, reconfigure, merchant and production, issue and revoke a service key, pay a reward, download a backup. Replace the `window.prompt` for funding while there. |
+| Typed data nobody renders; no deep links; no theme | 1–2 | S–M | low | Symbol status — next open and close, band, halt reason — is the one worth rendering, and it is the same DTO the calendar flag above would land in. Deep links, the theme control and the hard-coded book depth and tape length are polish. |
 
-## Where the leverage is
+## Where the leverage is now
 
-Ranked by usefulness over cost. The first block is under a week of work in
-total and closes every gap the acceptance scenario would hit; each item is
-independent of the others. **The whole first block has landed**, one commit
-per item, and [`missing-features.md`](missing-features.md) no longer lists
-them; the table rows above are kept as the record of why each was ranked
-where it was. Two choices made on the way are worth knowing: the outbox rule
-became "everything that moves currency or units into or out of a player's
-hands", reversing a documented decision, with `command_seq` as the way a
-backend skips its own; and the user directory answers only to the
-configured operator key, so an unlocked server hands nobody every player's
-portfolio.
+Ranked by usefulness over cost. The first block is about two days of work and
+is what a person picking this up should do next; the items are independent of
+each other.
 
-1. **Commit a CI workflow.** S. Every doc claims it exists.
-2. **Document `FEHU_EVENT_LOG`, `FEHU_MAX_BARS`, `FEHU_NOW_MS`.** S.
-3. **Let service scopes read** what they can write. S–M, no new command.
-4. **A `Sweep` command** from issuer and venue wallets to treasury. S–M,
-   one variant. Closes the economic loop.
-5. **Put every money movement in the outbox**: rewards, purchases,
-   transfers, dividends, mints, burns, job start and cancel. M.
-6. **Key the rate limiter by service id.** S.
-7. **`before` cursors** on the five `limit`-only reads. M.
-8. **`stream.ts` handles `stop_triggered` and `order_expired`**; an
-   `Idempotency-Key` on every UI write; structured errors with
-   `Retry-After`. S–M together.
-9. **The operator can list every user.** S.
-10. **Delete `seed_priority`**, add `Simulator::events()` and `retract`,
-    fix the four serialisation gaps. S each.
+1. **Point `main.rs`'s module doc at the README's table.** S. The same drift
+   the first reading closed, one file over.
+2. **v1 spellings for `/admin/mint`, `/burn`, `/freeze`, `/unfreeze`,
+   `/game-events` and `/markets/{symbol}/orders`.** S. Aliases and two body
+   wrappers; closes the documented surface.
+3. **Let `Sweep` drain a budget**, and add the explicit `calendar` flag and
+   the market-wide halt while in the same neighbourhood. S each.
+4. **Buy and consume in the UI.** M. The producers have nobody to sell to.
+5. **Identity controls in the UI.** M. (The stop ticket, which stood here,
+   is built.)
 
-The second block is the next milestone's worth, each one a design choice
-with a defensible default:
+The second block is one save bump's worth. Land them together as version 13,
+so a world is refused once rather than three times:
 
-11. **Job catch-up policy** on resume, defaulting to "complete on the first
-    step". M.
-12. **A quantity on `StartJob`.** S–M.
-13. **Setters on `Exchange::params` and `Simulator::config`**, then a
-    server command to reconfigure a listed symbol. M + M.
-14. **NPC producers** as a restock policy on the existing NPC. L; after the
-    sweep so takings return.
-15. **Player key rotation.** M, one save bump.
-16. **Buy, consume and identity in the UI**, then order history and a
-    ledger view. M each.
-17. **Coarse ingest into `Candles`** so `symbol.rs` can drop its parallel
-    vector. M–L, library format bump.
-18. **An offline `verify` subcommand.** M.
+6. **Player key rotation and revocation.** M.
+7. **Reward rule cooldown, per-player cap and expiry**, and a budget that can
+   be closed as well as drained. M.
+8. **Per-trader quotas** on resting orders, held stops and running jobs — if
+   the load test that motivates them has been run by then. S–M.
+
+Then, each on its own merit:
+
+9. **Remove an NPC**, burning its stock and journaling the burn. M.
+10. **An offline `verify` subcommand.** M.
+11. **Order history and a ledger view in the UI**, then the operator's
+    levers in the order listed above. M, then L.
+12. **Coarse ingest into `Candles`**, so `symbol.rs` can drop its parallel
+    vector and its read-time join. M–L, library format bump.
 
 Not now, and the reason:
 
+- **Webhooks, stream tickets, a `/metrics` route.** Tier two. Pull with a
+  cursor, a query-string key on localhost and counters in `/api/health` are
+  all correct for tier one.
 - **Book-level stops, post-only, STP, expiry, amend.** Duplication with one
   copy is not a bug. Wait for a second consumer of the crate.
-- **Webhooks, stream tickets, a `/metrics` route, quotas.** Tier two.
-  Pull, a query-string key on localhost, counters in `/api/health` and the
-  limiter are all correct for tier one, and the plan says tier two "is not
-  on the path to a playable economy".
 - **Multi-currency, a fee schedule in the library, holidays and intraday
   breaks, arbitrary candle intervals.** Each is speculative, and two of them
-  change every golden hash. Nothing measured has asked.
-- **An importer for older worlds.** The day it is needed is the day to write
-  it; that day has not come.
-- **Reward cooldowns and caps.** The backend that holds the `reward` scope
-  can enforce cadence itself; build it in the server only once a backend
-  gets it wrong.
+  change every golden hash.
+- **An importer for older worlds, and a one-version-back path in the
+  library.** The day one is needed is the day to write it. The demo world is
+  regenerated from seeds.
 
-## What the survey undercounts
+## What this reading changes, and what it confirms
 
-Two things the survey lists as small are larger than they look, and one it
-lists at all is not a feature.
+Three rows moved, and each moved because something landed rather than because
+the first reading was wrong:
 
-- **"Change a listed symbol's configuration"** is scored as a missing command
-  but is blocked on the library: with no setters on `Exchange::params` it is
-  a serde round trip of a live exchange inside a command, which is exactly
-  the kind of thing `apply` should not do. Item 13 above lands the library
-  half first.
-- **"NPC producers"** reads as a policy but is also a supply question: a
-  producer that sells output and never sweeps takings is a wallet that grows
-  forever. Item 4 is its prerequisite.
-- **"The outbox carries only what the stream announces"** is not a gap in
-  the outbox; it is a gap in which `apply` arms announce. That is why it is
-  M rather than L: the plumbing exists, the calls do not.
+- **Buy and consume in the UI, 4 → 5.** A world that manufactures goods
+  nobody in the browser can buy is worse than a world that manufactures
+  nothing.
+- **Drain a budget, M → S.** `Sweep` did the hard half and stopped one match
+  arm short.
+- **Remove an NPC, held at M but wanted sooner.** A producer accumulates; a
+  deactivated one accumulates quietly.
 
-Determinism is untouched by everything in the first block. The sweep, the
-outbox facts, the read scopes, the cursors and the UI edits draw no
-randomness and the price process never sees them; the golden hashes in
-`tests/determinism.rs` need no change until item 17.
+And two things the survey is still right to list and right to rank low: the
+quotas, because `max_running` means the only unbounded actor is a player and
+no player has been measured, and the importer, because the world it would
+import does not exist.
+
+Determinism is untouched by everything in the first two blocks. The aliases,
+the sweep widening, the calendar flag, the save-version-13 fields and every
+UI edit draw no randomness and the price process never sees them; the golden
+hashes in `tests/determinism.rs` need no change until item 12.

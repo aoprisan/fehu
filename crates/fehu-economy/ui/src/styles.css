@@ -95,6 +95,14 @@ table.tape tr.mine td { background: var(--selected); }
 .ticket button.submit { font-weight: 600; }
 .ticket button.submit:disabled { cursor: not-allowed; opacity: 0.7; }
 .ticket button.submit.stopped { background: var(--panel); color: var(--muted); }
+/* The options a ticket rarely needs, folded away until it does. */
+.ticket .opts { font-size: 12px; color: var(--muted); }
+.ticket .opts summary { cursor: pointer; padding: 2px 0; }
+.ticket .opts[open] summary { margin-bottom: 6px; }
+.ticket .opts > :not(summary) { margin-bottom: 6px; }
+.ticket .opts label { display: flex; gap: 6px; align-items: center; }
+.ticket .opts input[type='number'], .ticket .opts input[type='text'] { width: 100%; box-sizing: border-box; }
+.ticket .opts input:disabled, .ticket .opts label:has(input:disabled) { opacity: 0.45; }
 /* A symbol nobody can trade, in the rail and on the ticket. */
 b.stopped { color: var(--down); text-transform: uppercase; font-size: 10px; letter-spacing: 0.04em; }
 .acct { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 6px 0; }
@@ -102,9 +110,9 @@ b.stopped { color: var(--down); text-transform: uppercase; font-size: 10px; lett
 .deposit { display: flex; gap: 6px; margin: 6px 0; }
 .deposit input { flex: 1; min-width: 0; }
 .deposit.closed { display: none; }
-#orders li, #jobs li { display: flex; gap: 6px; align-items: center; font-size: 12px; padding: 2px 0; }
-#orders li span, #jobs li span { flex: 1; font-variant-numeric: tabular-nums; }
-#orders button, #jobs button { padding: 1px 6px; font-size: 11px; }
+#orders li, #stops li, #jobs li { display: flex; gap: 6px; align-items: center; font-size: 12px; padding: 2px 0; }
+#orders li span, #stops li span, #jobs li span { flex: 1; font-variant-numeric: tabular-nums; }
+#orders button, #stops button, #jobs button { padding: 1px 6px; font-size: 11px; }
 #jobs { list-style: none; margin: 0; padding: 0; }
 #jobs li span:nth-child(3) { flex: 2; color: var(--muted); }
 #start-job select { flex: 1; min-width: 0; }
@@ -156,7 +164,9 @@ code { background: var(--backdrop); padding: 1px 4px; border-radius: 3px; }
   #trading > div:nth-child(3) { display: none; }
 }
 
-#orders { list-style: none; margin: 0; padding: 0; }
+#orders, #stops { list-style: none; margin: 0; padding: 0; }
+/* What the trigger will become: quieter than the trigger itself. */
+#orders li span.becomes, #stops li span.becomes { color: var(--muted); flex: 1.4; }
 
 /*
  * The operator's dashboard: a full-page overlay over the trading UI, opened

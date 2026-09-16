@@ -40,9 +40,18 @@
                 <button type="button" class="sell" data-side="sell">Sell</button>
               </div>
               <input type="number" name="qty" min="1" step="1" value="100" placeholder="qty" required>
-              <select name="type"><option value="market">market</option><option value="limit">limit</option></select>
+              <select name="type"><option value="market">market</option><option value="limit">limit</option><option value="stop">stop</option><option value="stop_limit">stop limit</option></select>
               <input type="number" name="price" step="0.01" placeholder="limit price" class="full" disabled>
+              <input type="number" name="stop_price" step="0.01" placeholder="stop price" class="full" disabled>
               <select name="tif" class="full"><option value="gtc">good till cancelled</option><option value="ioc">immediate or cancel</option><option value="fok">fill or kill</option></select>
+              <details class="full opts">
+                <summary>more</summary>
+                <label title="refuse the order if it would trade on arrival instead of resting"><input type="checkbox" name="post_only"> post only</label>
+                <label title="withdraw what is still resting at the close of this session"><input type="checkbox" name="day"> day order</label>
+                <input type="number" name="display_qty" min="1" step="1" placeholder="show qty" title="iceberg: show only this much at a time">
+                <input type="number" name="expires_mins" min="1" step="1" placeholder="expires in (min)" title="withdraw what is still resting this many simulated minutes from now">
+                <input type="text" name="client_order_id" class="full" placeholder="client order id" title="your own id for this order: sending it twice places it once">
+              </details>
               <button type="submit" class="submit full">Buy 100 at market</button>
             </form>
             <div class="acct" id="ticket-holding"></div>
@@ -58,6 +67,8 @@
             <table class="pos"><tbody id="positions"></tbody></table>
             <h2>Open orders</h2>
             <ul id="orders"></ul>
+            <h2>Stops</h2>
+            <ul id="stops"></ul>
           </div>
         </div>
       </div>
