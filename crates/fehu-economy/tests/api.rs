@@ -182,6 +182,192 @@ async fn health_and_symbols() {
 }
 
 #[tokio::test]
+async fn the_operator_has_a_user_directory_and_a_player_has_themselves() {
+    let app = app_with(Options {
+        admin_key: Some("secret".into()),
+        now_ms: Some(NOW_MS),
+        ..no_rate_limit()
+    });
+    let ada = sign_up(&app, "ada").await;
+    let bo = sign_up(&app, "bo").await;
+
+    // A player: themselves, on a locked server as on an open one.
+    let (_, users) = get(&ada, "/api/users").await;
+    assert_eq!(users.as_array().unwrap().len(), 1);
+    assert_eq!(users[0]["id"], ada.user);
+    let (status, _) = get(&ada, &format!("/api/users/{}", bo.user)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a player key is never promoted"
+    );
+
+    // The operator: everyone, and any one of them.
+    let operator = Request::get("/api/users").header("x-api-key", "secret");
+    let (status, users) = call(&app, operator.body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{users}");
+    let mut ids: Vec<u64> = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["id"].as_u64().unwrap())
+        .collect();
+    ids.sort_unstable();
+    let mut want = vec![ada.user, bo.user];
+    want.sort_unstable();
+    assert_eq!(ids, want, "the directory names who exists: {users}");
+    assert!(
+        users[0]["api_key"].is_null(),
+        "and no key is ever shown twice"
+    );
+    let one = Request::get(format!("/api/users/{}", bo.user)).header("x-api-key", "secret");
+    let (status, user) = call(&app, one.body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{user}");
+    assert_eq!(user["id"], bo.user);
+
+    // Nobody: refused, as before — and on an unlocked server too, where there
+    // is no operator key to present and players' data stays their own.
+    let (status, _) = call(
+        &app,
+        Request::get("/api/users").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let open = test_app();
+    let _ = sign_up(&open, "solo").await;
+    let (status, _) = call(
+        &open,
+        Request::get("/api/users").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "unlocked is not a directory"
+    );
+}
+
+#[tokio::test]
+async fn every_paged_read_walks_back_with_before() {
+    // `limit` alone made everything past it unreachable. Each read takes a
+    // `before` cursor — the oldest thing on the page you have — and the
+    // page before it is what comes back, with nothing repeated and nothing
+    // skipped across the boundary.
+    let app = test_app();
+    engine::advance_to(&app, Timestamp(NOW_MS + 5_000)).await;
+
+    // Bars, by open_ts. Oldest first, so the cursor is the first bar's.
+    let (_, page) = get(&app, "/api/symbols/ACME/bars?interval=M1&limit=3").await;
+    let bars = page["bars"].as_array().unwrap();
+    assert_eq!(bars.len(), 3);
+    let oldest = bars[0]["open_ts"].as_i64().unwrap();
+    let (status, page) = get(
+        &app,
+        &format!("/api/symbols/ACME/bars?interval=M1&limit=3&before={oldest}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let earlier = page["bars"].as_array().unwrap();
+    assert_eq!(earlier.len(), 3);
+    assert_eq!(
+        earlier[2]["open_ts"].as_i64().unwrap(),
+        oldest - 60_000,
+        "the page before ends one bar before the page after: {earlier:?}"
+    );
+
+    // The tape, by ts_ms. Newest first, so the cursor is the last print's.
+    let (_, page) = get(&app, "/api/symbols/ACME/trades?limit=2").await;
+    let trades = page["trades"].as_array().unwrap();
+    assert_eq!(trades.len(), 2);
+    let oldest = trades[1]["ts_ms"].as_i64().unwrap();
+    let (_, page) = get(
+        &app,
+        &format!("/api/symbols/ACME/trades?limit=2&before={oldest}"),
+    )
+    .await;
+    let earlier = page["trades"].as_array().unwrap();
+    assert!(!earlier.is_empty());
+    assert!(
+        earlier
+            .iter()
+            .all(|t| t["ts_ms"].as_i64().unwrap() < oldest),
+        "strictly before the cursor: {earlier:?}"
+    );
+
+    // Events, by id.
+    for i in 0..3 {
+        let (status, body) = post(
+            &app,
+            "/api/game/events",
+            json!({ "kind": "scandal", "symbol": "ACME", "magnitude": 0.3, "source": format!("e{i}") }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    }
+    let (_, page) = get(&app, "/api/events?limit=1").await;
+    let newest = page["events"][0]["id"].as_u64().unwrap();
+    let (_, page) = get(&app, &format!("/api/events?limit=5&before={newest}")).await;
+    let ids: Vec<u64> = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_u64().unwrap())
+        .collect();
+    assert!(ids.iter().all(|&id| id < newest), "{ids:?}");
+    assert_eq!(ids.len(), 2, "the two before the newest: {ids:?}");
+
+    // A trader's orders, by order id, and their account's ledger, by entry
+    // id: three market buys make three orders and three settlements.
+    let player = sign_up(&app, "pager").await;
+    let id = player.trader;
+    for _ in 0..3 {
+        let (status, body) = post(
+            &player,
+            "/api/symbols/ACME/orders",
+            json!({ "trader_id": id, "side": "buy", "qty": 1, "type": "market" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (_, page) = get(&player, &format!("/api/traders/{id}/orders?limit=1")).await;
+    let newest = page[0]["order_id"].as_u64().unwrap();
+    let (_, page) = get(
+        &player,
+        &format!("/api/traders/{id}/orders?limit=5&before={newest}"),
+    )
+    .await;
+    let ids: Vec<u64> = page
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["order_id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(ids.iter().all(|&o| o < newest), "{ids:?}");
+
+    let (_, trader) = get(&player, &format!("/api/traders/{id}")).await;
+    let account = trader["account_id"].as_u64().unwrap();
+    let (_, page) = get(&player, &format!("/api/accounts/{account}/ledger?limit=1")).await;
+    let newest = page["entries"][0]["id"].as_u64().unwrap();
+    let (_, page) = get(
+        &player,
+        &format!("/api/accounts/{account}/ledger?limit=100&before={newest}"),
+    )
+    .await;
+    let entries = page["entries"].as_array().unwrap();
+    assert!(
+        entries.iter().all(|e| e["id"].as_u64().unwrap() < newest),
+        "{entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["kind"] == "deposit" || e["kind"] == "opening"),
+        "walking back reaches the opening balance: {entries:?}"
+    );
+}
+
+#[tokio::test]
 async fn bars_have_history_and_are_well_formed() {
     let app = test_app();
     for (iv, min_bars) in [("M1", 60), ("M5", 12), ("H1", 1), ("D1", 6)] {
@@ -3800,6 +3986,45 @@ async fn a_stream_says_so_when_the_replay_buffer_cannot_reach_back() {
     let frames = stream_frames(&app, "/api/stream?since=4", 2).await;
     assert_eq!(frames[0]["gap"], false, "{}", frames[0]);
     assert_eq!(frames[1]["seq"], 5);
+}
+
+#[tokio::test]
+async fn a_transfer_is_streamed_to_both_its_owners_and_nobody_else() {
+    let app = app_with(Options {
+        now_ms: Some(NOW_MS),
+        ..Options::default()
+    });
+    let alice = sign_up(&app, "alice").await;
+    let bruno = sign_up(&app, "bruno").await;
+    let carla = sign_up(&app, "carla").await;
+    async fn account_of(p: &Player) -> u64 {
+        let (_, trader) = get(p, &format!("/api/traders/{}", p.trader)).await;
+        trader["account_id"].as_u64().unwrap()
+    }
+    let (from, to) = (account_of(&alice).await, account_of(&bruno).await);
+    let (code, body) = post(
+        &alice,
+        "/api/transfers",
+        json!({ "from_account_id": from, "to_account_id": to, "amount_cents": 1_500 }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+
+    let saw = |frames: &[Value]| frames.iter().any(|m| m["type"] == "transferred");
+    for (who, party) in [(&alice, "the sender"), (&bruno, "the recipient")] {
+        let frames =
+            stream_frames(&app, &format!("/api/stream?since=0&api_key={}", who.key), 8).await;
+        assert!(saw(&frames), "{party} is told: {frames:?}");
+    }
+    let frames = stream_frames(
+        &app,
+        &format!("/api/stream?since=0&api_key={}", carla.key),
+        8,
+    )
+    .await;
+    assert!(!saw(&frames), "a third user is not: {frames:?}");
+    let frames = stream_frames(&app, "/api/stream?since=0", 8).await;
+    assert!(!saw(&frames), "nor is an anonymous stream: {frames:?}");
 }
 
 #[tokio::test]

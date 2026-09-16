@@ -20,20 +20,36 @@
 //!
 //! # What is in it, and what is not
 //!
-//! **Only what nobody asked for.** A purchase, a transfer, a reward and a
-//! job *starting* are commands: whoever sent one has its response, and a
-//! response that was lost is recovered by its `Idempotency-Key` through
-//! `GET /api/commands/{key}`. What has no requester is everything the market
-//! does on its own — a resting order that filled, a job that came due, an
-//! order the venue withdrew, a stop that fired, a symbol that halted or was
-//! delisted, a dividend, an accepted game event. Those are what this log
-//! carries, and they are exactly the [`StreamMessage`] kinds other than the
-//! per-connection `hello` and the price `tick`.
+//! **Everything that moves currency or units into or out of a player's
+//! hands, and everything the market does on its own.** The second half is
+//! what has no requester: a resting order that filled, a job that came due,
+//! an order the venue withdrew, a stop that fired, a symbol that halted or
+//! was delisted, an accepted game event. The first half is the commands —
+//! a purchase, a consumption, a transfer, a reward, a mint, a burn, a
+//! dividend, a job starting or being cancelled — and it is here because the
+//! requester is not always the backend. A player buys from the catalogue in
+//! a browser, transfers to a friend, starts a job; the backend that owns the
+//! rest of the game learns of none of it from a response it never saw, and
+//! before these were facts it could only poll every wallet.
 //!
-//! Ticks are left out deliberately. They are market data — the highest
-//! volume thing the server produces, reconstructible at any time from
-//! `/api/symbols/{symbol}/bars` — and a durable log of them would be a
-//! time-series database that the outbox is not trying to be.
+//! The backend's *own* commands come back to it here too, and that is not a
+//! problem to solve: every entry names the journal sequence of the command
+//! that caused it, and every committed response carries that same number in
+//! `Fehu-Journal-Seq`, so a consumer that wants to skip what it already
+//! knows matches the two. The rule for what is a fact is then about the
+//! world and not about who asked, which is the only rule a consumer can
+//! reason about.
+//!
+//! What is left out is the world's own bookkeeping — a budget opened or
+//! funded, takings swept to treasury, a rule rewritten, a symbol listed —
+//! which the operator did and the operator knows, and ticks. Ticks are
+//! market data — the highest volume thing the server produces,
+//! reconstructible at any time from `/api/symbols/{symbol}/bars` — and a
+//! durable log of them would be a time-series database that the outbox is
+//! not trying to be. The facts are exactly the [`StreamMessage`] kinds
+//! other than the per-connection `hello` and the price `tick`; on the
+//! stream each goes only to the party it happened to, and here the backend
+//! sees all of them.
 //!
 //! # A fact is stored as it will be sent
 //!

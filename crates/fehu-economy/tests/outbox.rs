@@ -76,6 +76,8 @@ async fn restart(app: Arc<App>, path: &Path, options: Options) -> Arc<App> {
 struct Response {
     status: StatusCode,
     body: Value,
+    /// `Fehu-Journal-Seq`, on a committed command.
+    seq: Option<u64>,
 }
 
 async fn call(app: &Arc<App>, key: Option<&str>, mut req: Request<Body>) -> Response {
@@ -87,13 +89,18 @@ async fn call(app: &Arc<App>, key: Option<&str>, mut req: Request<Body>) -> Resp
     }
     let resp = router(Arc::clone(app)).oneshot(req).await.unwrap();
     let status = resp.status();
+    let seq = resp
+        .headers()
+        .get("fehu-journal-seq")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok());
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body = if bytes.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("bad JSON ({e}): {bytes:?}"))
     };
-    Response { status, body }
+    Response { status, body, seq }
 }
 
 async fn get(app: &Arc<App>, key: Option<&str>, uri: &str) -> Response {
@@ -218,30 +225,101 @@ async fn a_game_event_lands_in_the_outbox_under_the_command_that_made_it() {
 }
 
 #[tokio::test]
-async fn only_what_nobody_asked_for_is_in_it() {
+async fn what_moves_money_is_in_it_and_the_worlds_bookkeeping_is_not() {
     let app = test_app();
     let player = sign_up(&app, "wilma").await;
-    // Every one of these is a command with a response the caller already
-    // has, so none of them is a fact the outbox has to deliver.
-    post(
+    let page = read_outbox(&app, None).await;
+    assert!(
+        page["events"].as_array().unwrap().is_empty(),
+        "a sign-up moves nothing into anyone's hands: {page}"
+    );
+
+    // A mint is a fact — the backend was not necessarily the one who asked —
+    // and the fact names the command that caused it by the same number the
+    // command's own response carried.
+    let minted = post(
         &app,
         None,
         &format!("/api/accounts/{}/deposit", player.account_id),
         json!({ "amount_cents": 100_000 }),
     )
     .await;
-    post(
+    assert_eq!(minted.status, StatusCode::OK, "{:?}", minted.body);
+    let page = read_outbox(&app, None).await;
+    assert_eq!(kinds(&page), ["minted"]);
+    let fact = &page["events"][0];
+    assert_eq!(fact["event"]["account_id"], player.account_id);
+    assert_eq!(fact["event"]["entry"]["amount_cents"], 100_000);
+    assert_eq!(
+        Some(fact["command_seq"].as_u64().unwrap()),
+        minted.seq,
+        "a consumer can match a fact to a response it already has: {fact}"
+    );
+
+    // The world's own bookkeeping is not: a budget is the operator's, and the
+    // operator opened it.
+    let r = post(
         &app,
         None,
         "/api/budgets",
-        json!({ "name": "quests", "cents": 1_000_000 }),
+        json!({ "name": "quests", "cash_cents": 1_000_000 }),
     )
     .await;
-    let page = read_outbox(&app, None).await;
-    assert!(
-        page["events"].as_array().unwrap().is_empty(),
-        "a sign-up, a deposit and a budget are answers, not facts: {page}"
-    );
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    assert_eq!(kinds(&read_outbox(&app, None).await), ["minted"]);
+
+    // A transfer is: both sides, one fact.
+    let friend = sign_up(&app, "betty").await;
+    let r = post(
+        &app,
+        Some(&player.key),
+        "/api/transfers",
+        json!({
+            "from_account_id": player.account_id,
+            "to_account_id": friend.account_id,
+            "amount_cents": 2_500,
+            "memo": "rent",
+        }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let page = read_outbox(&app, Some(1)).await;
+    assert_eq!(kinds(&page), ["transferred"]);
+    let fact = &page["events"][0]["event"];
+    assert_eq!(fact["from_account_id"], player.account_id);
+    assert_eq!(fact["to_account_id"], friend.account_id);
+    assert_eq!(fact["amount_cents"], 2_500);
+    assert_eq!(fact["memo"], "rent");
+    let after_transfer = page["latest"].as_u64().unwrap();
+
+    // A reward is, once: the duplicate that moved nothing leaves nothing.
+    let (_, budget) = {
+        let r = get(&app, None, "/api/budgets").await;
+        (r.status, r.body["budgets"][0]["wallet"].as_u64().unwrap())
+    };
+    let r = post(
+        &app,
+        None,
+        "/api/rewards/rules",
+        json!({ "id": "quest", "budget": budget, "amount_cents": 700 }),
+    )
+    .await;
+    assert!(r.status.is_success(), "{:?}", r.body);
+    for _ in 0..2 {
+        let r = post(
+            &app,
+            None,
+            "/api/rewards",
+            json!({ "rule": "quest", "trader_id": player.trader_id, "source": "q-1" }),
+        )
+        .await;
+        assert!(r.status.is_success(), "{:?}", r.body);
+    }
+    let page = read_outbox(&app, Some(after_transfer)).await;
+    assert_eq!(kinds(&page), ["reward_paid"], "paid once, told once");
+    assert_eq!(page["events"][0]["event"]["source"], "q-1");
+    assert_eq!(page["events"][0]["event"]["amount_cents"], 700);
+    let after_reward = page["latest"].as_u64().unwrap();
 
     // A fill is: the resting side never asked for it. Buy first, because
     // nothing here shorts, and then rest the shares back at a price the
@@ -289,6 +367,7 @@ async fn only_what_nobody_asked_for_is_in_it() {
         "both sides of the trade were told, the resting one included: {}",
         page["events"]
     );
+    assert!(after_buy > after_reward, "the first buy filled too");
 }
 
 #[tokio::test]

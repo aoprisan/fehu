@@ -40,7 +40,7 @@ use crate::market::{
     Sequenced, SnapshotDto, StreamMessage, Subscription, SupplyDto, Symbol, SymbolInfo,
     SymbolStatus, SymbolView, wall_now_ms,
 };
-use crate::npc::{NpcsResponse, Policy};
+use crate::npc::{NpcsResponse, Policy, Production};
 use crate::rewards::{BudgetsResponse, RewardError};
 use crate::service::{
     Scope, ScopeSet, ServiceAuth, ServiceDto, ServiceError, ServiceId, ServicesResponse,
@@ -71,7 +71,10 @@ pub fn router(app: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/reconcile", get(reconcile))
         .route("/api/symbols", get(list_symbols).post(list_symbol))
-        .route("/api/symbols/{symbol}", get(get_symbol))
+        .route(
+            "/api/symbols/{symbol}",
+            get(get_symbol).patch(reconfigure_symbol),
+        )
         .route("/api/symbols/{symbol}/bars", get(get_bars))
         .route(
             "/api/symbols/{symbol}/events",
@@ -121,6 +124,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/accounts/{account_id}/ledger", get(get_ledger))
         .route("/api/npcs", get(list_npcs).post(create_npc))
         .route("/api/npcs/{trader_id}/active", post(set_npc_active))
+        .route("/api/npcs/{trader_id}/production", post(set_npc_production))
         .route("/api/catalog", get(get_catalog).post(set_catalog_item))
         .route("/api/catalog/{symbol}", delete(remove_catalog_item))
         .route("/api/traders/{trader_id}/purchases", post(purchase))
@@ -137,6 +141,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/rewards/rules/{id}", delete(remove_reward_rule))
         .route("/api/transfers", post(transfer))
         .route("/api/wallets/{wallet_id}", get(get_wallet))
+        .route("/api/wallets/{wallet_id}/sweep", post(sweep_wallet))
         .route(
             "/api/wallets/{wallet_id}/transactions",
             get(get_wallet_transactions),
@@ -193,6 +198,10 @@ pub fn router(app: AppState) -> Router {
             delete(remove_catalog_item),
         )
         .route("/api/v1/economy/admin/budgets", post(create_budget))
+        .route(
+            "/api/v1/economy/admin/wallets/{wallet_id}/sweep",
+            post(sweep_wallet),
+        )
         .route(
             "/api/v1/economy/admin/budgets/{wallet_id}/fund",
             post(fund_budget),
@@ -253,11 +262,17 @@ async fn rate_limit_writes(
     if request.method().is_safe() {
         return Ok(next.run(request).await);
     }
-    // Whoever the key says, or nobody — an unknown key shares the anonymous
-    // bucket, and the handler is left to refuse it properly.
+    // Whoever the key says — a player or a service, each with a bucket of
+    // its own — or nobody: an unknown key shares the anonymous bucket, and
+    // the handler is left to refuse it properly. A revoked service key is
+    // still that service's, so its refusals come out of its own allowance.
     // The published directory: a request is counted before it waits on
     // anything.
-    let who = api_key_of_headers(request.headers()).and_then(|key| app.user_of(&key));
+    let who = api_key_of_headers(request.headers()).and_then(|key| {
+        app.service_of(&key)
+            .map(|s| crate::limit::Client::Service(s.id))
+            .or_else(|| app.user_of(&key).map(crate::limit::Client::User))
+    });
     match app.allow(who).await {
         Decision::Allowed => Ok(next.run(request).await),
         Decision::Limited { retry_after } => Err(ApiError::rate_limited(retry_after)),
@@ -500,13 +515,18 @@ impl ApiError {
     /// Deliberately not `invalid_api_key`: the key is real and the server
     /// knows it. What is missing is authority, which is something an
     /// operator can grant and the caller cannot fix by retrying.
-    pub(crate) fn missing_scope(scope: Scope) -> Self {
+    pub(crate) fn missing_scope(scopes: &[Scope]) -> Self {
+        let needed = match scopes {
+            [one] => format!("the `{one}` scope"),
+            many => {
+                let names: Vec<String> = many.iter().map(|s| format!("`{s}`")).collect();
+                format!("one of the {} scopes", names.join(", "))
+            }
+        };
         Self::new(
             StatusCode::FORBIDDEN,
             "missing_scope",
-            format!(
-                "this endpoint needs the `{scope}` scope, which that service key does not carry"
-            ),
+            format!("this endpoint needs {needed}, which that service key does not carry"),
         )
     }
 
@@ -584,6 +604,23 @@ impl ApiError {
             },
         };
         Self::new(status, code, e.to_string())
+    }
+
+    /// Takings that could not be swept home.
+    pub(crate) fn sweep(e: crate::market::SweepError) -> Self {
+        match e {
+            crate::market::SweepError::UnknownWallet(w) => Self::new(
+                StatusCode::NOT_FOUND,
+                "unknown_wallet",
+                format!("no wallet {}", w.0),
+            ),
+            crate::market::SweepError::NotTakings { .. } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not_takings",
+                e.to_string(),
+            ),
+            crate::market::SweepError::Money(e) => Self::money(e),
+        }
     }
 
     /// The server could not do its own job. Never the client's fault, and
@@ -897,11 +934,14 @@ impl<S: ScopeOf> Trusted<S> {
 /// A scope, as a type, so a handler names the authority it needs in its own
 /// signature and cannot be wired up to check the wrong one.
 pub trait ScopeOf {
-    /// The scope a `Trusted<Self>` demands.
-    const SCOPE: Scope;
+    /// The scopes a `Trusted<Self>` accepts: a service key carrying any one
+    /// of them is let through. A write names exactly one; a read names the
+    /// scopes whose writes it is the read side of.
+    const SCOPES: &'static [Scope];
 }
 
-/// Marker types for [`Trusted`], one per [`Scope`].
+/// Marker types for [`Trusted`]: one per [`Scope`] for the writes, and the
+/// sets the reads accept.
 pub mod scope {
     use super::{Scope, ScopeOf};
 
@@ -913,18 +953,33 @@ pub mod scope {
     pub struct Inventory;
     /// Push a game event from the catalogue.
     pub struct Events;
+    /// Read a wallet: every scope that moves money in or out of one.
+    /// Provisioning opens a player's, a reward pays into one and a purchase
+    /// spends from one; the backend that did any of those may look at what
+    /// it did. Pushing an event moves no money and does not.
+    pub struct Wallets;
+    /// Read the outbox: any scope at all. The outbox is what the game
+    /// backend reads instead of the stream, and a service is the game
+    /// backend whatever it has been narrowed to.
+    pub struct Any;
 
     impl ScopeOf for Provision {
-        const SCOPE: Scope = Scope::Provision;
+        const SCOPES: &'static [Scope] = &[Scope::Provision];
     }
     impl ScopeOf for Reward {
-        const SCOPE: Scope = Scope::Reward;
+        const SCOPES: &'static [Scope] = &[Scope::Reward];
     }
     impl ScopeOf for Inventory {
-        const SCOPE: Scope = Scope::Inventory;
+        const SCOPES: &'static [Scope] = &[Scope::Inventory];
     }
     impl ScopeOf for Events {
-        const SCOPE: Scope = Scope::Events;
+        const SCOPES: &'static [Scope] = &[Scope::Events];
+    }
+    impl ScopeOf for Wallets {
+        const SCOPES: &'static [Scope] = &[Scope::Provision, Scope::Reward, Scope::Inventory];
+    }
+    impl ScopeOf for Any {
+        const SCOPES: &'static [Scope] = &Scope::ALL;
     }
 }
 
@@ -941,8 +996,8 @@ impl<S: ScopeOf> FromRequestParts<AppState> for Trusted<S> {
             if auth.revoked {
                 return Err(ApiError::revoked_key());
             }
-            if !auth.scopes.contains(S::SCOPE) {
-                return Err(ApiError::missing_scope(S::SCOPE));
+            if !S::SCOPES.iter().any(|&scope| auth.scopes.contains(scope)) {
+                return Err(ApiError::missing_scope(S::SCOPES));
             }
             return Ok(Self {
                 principal: Principal::Service { id: auth.id.0 },
@@ -954,6 +1009,40 @@ impl<S: ScopeOf> FromRequestParts<AppState> for Trusted<S> {
             principal: Principal::Operator,
             _scope: PhantomData,
         })
+    }
+}
+
+impl<S: ScopeOf> OptionalFromRequestParts<AppState> for Trusted<S> {
+    type Rejection = ApiError;
+
+    /// Whether the request carries the backend's authority at this scope,
+    /// for a read that is also somebody's own — a wallet is its owner's to
+    /// read as well as the backend's.
+    ///
+    /// A service key is still judged: one that is revoked, or that carries
+    /// none of the scopes, is refused here rather than falling through to
+    /// the owner's check, because a service key is not a user key and the
+    /// owner branch could never match it anyway. Only the *absence* of
+    /// backend authority is answered with `None`.
+    async fn from_request_parts(
+        parts: &mut Parts,
+        app: &AppState,
+    ) -> Result<Option<Self>, ApiError> {
+        if let Some(key) = api_key_of(parts)
+            && app.service_of(&key).is_some()
+        {
+            return <Self as FromRequestParts<AppState>>::from_request_parts(parts, app)
+                .await
+                .map(Some);
+        }
+        Ok(
+            <Admin as OptionalFromRequestParts<AppState>>::from_request_parts(parts, app)
+                .await?
+                .map(|_| Self {
+                    principal: Principal::Operator,
+                    _scope: PhantomData,
+                }),
+        )
     }
 }
 
@@ -1528,6 +1617,66 @@ async fn list_symbol(
     .map(Committed)
 }
 
+/// Body of `PATCH /api/symbols/{symbol}`. Every field optional; an absent
+/// one is left as it is.
+#[derive(Deserialize)]
+struct ReconfigureRequest {
+    name: Option<String>,
+    sector: Option<String>,
+    description: Option<String>,
+    /// Annual log drift and annualised volatility.
+    drift: Option<f64>,
+    volatility: Option<f64>,
+    /// Expected shares traded per day, which is what impact and the ladder's
+    /// depth scale by.
+    base_volume_per_day: Option<f64>,
+    /// The synthetic ladder's half spread, as a fraction of the price.
+    half_spread: Option<f64>,
+    /// Whether the symbol is quoted synthetically at all. Ignored for a good.
+    synthetic: Option<bool>,
+    source: Option<String>,
+    note: Option<String>,
+}
+
+/// Change a listed symbol without delisting it: what it is called, how its
+/// price behaves, how it is quoted. Game master's, and recorded in the event
+/// log like a listing, because a price series that changes character is a
+/// fact anyone reading the chart is owed.
+async fn reconfigure_symbol(
+    State(app): State<AppState>,
+    Path(symbol): Path<String>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<ReconfigureRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    let handle = app
+        .symbol(&symbol)
+        .ok_or_else(|| ApiError::not_found(&symbol))?;
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::Reconfigure {
+            symbol: handle.ticker.to_string(),
+            name: clean_text(req.name, 64),
+            sector: clean_text(req.sector, 64),
+            description: req
+                .description
+                .map(|d| clean_text(Some(d), 280).unwrap_or_default()),
+            drift: req.drift,
+            volatility: req.volatility,
+            base_volume_per_day: req.base_volume_per_day,
+            half_spread: req.half_spread,
+            synthetic: req.synthetic,
+            source: req.source.unwrap_or_else(|| "api".into()),
+            note: req.note,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
 // ---------------------------------------------------------------------------
 // NPCs: the traders the world runs itself.
 
@@ -1561,6 +1710,9 @@ struct NpcRequest {
     size: Option<u64>,
     #[serde(default)]
     requote_bps: Option<u32>,
+    /// Make it a producer: `{"recipe":"smelt","restock_below":10,"runs":5,"max_running":1}`.
+    #[serde(default)]
+    production: Option<Production>,
 }
 
 /// Put a funded trader in the market that the world runs.
@@ -1590,8 +1742,38 @@ async fn create_npc(
             symbol,
             name: clean_text(req.name, 64),
             policy,
+            production: req.production,
             cash_cents: req.cash_cents,
             inventory: req.inventory,
+        },
+    )
+    .await
+    .map(Committed)
+}
+
+/// Body of `POST /api/npcs/{trader_id}/production`: the policy, or `null`
+/// to make the NPC a plain merchant again.
+#[derive(Deserialize)]
+struct ProductionRequest {
+    production: Option<Production>,
+}
+
+/// Give an NPC a production policy, or take it away.
+async fn set_npc_production(
+    State(app): State<AppState>,
+    Path(trader_id): Path<u64>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Result<Json<ProductionRequest>, JsonRejection>,
+) -> Result<Committed, ApiError> {
+    let Json(req) = payload.map_err(ApiError::bad_json)?;
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::SetNpcProduction {
+            trader_id,
+            production: req.production,
         },
     )
     .await
@@ -1793,6 +1975,8 @@ struct JobRequest {
     trader_id: u64,
     /// The recipe to run.
     recipe: String,
+    /// Times to run it, as one job. One if absent.
+    runs: Option<u64>,
 }
 
 /// Start a job: the inputs and the cost now, the outputs when it is due.
@@ -1811,6 +1995,7 @@ async fn start_job(
         Command::StartJob {
             trader_id: req.trader_id,
             recipe: req.recipe,
+            runs: req.runs.unwrap_or(1),
         },
     )
     .await
@@ -1905,9 +2090,11 @@ struct FundRequest {
 
 /// What the world has set aside, and what it will pay for. Operator
 /// authority: this is the game's own budgeting, not a player's business.
+/// The operator's, or the backend's with [`Scope::Reward`]: a service that
+/// pays from a budget may see what is left in it and what the rules say.
 async fn get_budgets(
     State(app): State<AppState>,
-    _admin: Admin,
+    _trusted: Trusted<scope::Reward>,
 ) -> Result<Json<BudgetsResponse>, ApiError> {
     let (budgets, rules) = app
         .market
@@ -2259,19 +2446,19 @@ pub struct WalletDto {
 }
 
 /// Whether the caller may look into `wallet`: it is their account's, or they
-/// are the operator.
+/// are the operator or the game backend (see [`scope::Wallets`]).
 fn may_read_wallet(
     m: &Market,
     wallet: fehu::ledger::WalletId,
     caller: Option<Caller>,
-    admin: Option<Admin>,
+    trusted: bool,
 ) -> Result<Option<AccountId>, ApiError> {
     let account = m
         .accounts
         .values()
         .find(|a| a.wallet == wallet)
         .map(|a| (a.id, a.user_id));
-    if admin.is_some() {
+    if trusted {
         return Ok(account.map(|(id, _)| id));
     }
     match (account, caller) {
@@ -2284,35 +2471,92 @@ fn may_read_wallet(
     }
 }
 
-/// One wallet's balance, by wallet id.
+/// One wallet as the API shows it, or `unknown_wallet`.
+pub(crate) fn wallet_dto(
+    m: &Market,
+    wallet: fehu::ledger::WalletId,
+) -> Result<WalletDto, ApiError> {
+    let held = m.ledger.wallet(wallet).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_wallet",
+            format!("no wallet {}", wallet.0),
+        )
+    })?;
+    let account_id = m
+        .accounts
+        .values()
+        .find(|a| a.wallet == wallet)
+        .map(|a| a.id.0);
+    Ok(WalletDto {
+        wallet,
+        kind: held.kind.label(),
+        status: held.status.label(),
+        balance_cents: held.balance_cents(),
+        reserved_cents: held.reserved_cents(),
+        available_cents: held.available_cents(),
+        account_id,
+    })
+}
+
+/// One wallet's balance, by wallet id. Its owner's, the operator's, or the
+/// game backend's under any scope that moves money.
 async fn get_wallet(
     State(app): State<AppState>,
     Path(wallet_id): Path<u64>,
     caller: Option<Caller>,
-    admin: Option<Admin>,
+    trusted: Option<Trusted<scope::Wallets>>,
 ) -> Result<Json<WalletDto>, ApiError> {
     let wallet = fehu::ledger::WalletId(wallet_id);
+    let trusted = trusted.is_some();
     app.market
         .call(move |m| {
-            let account_id = may_read_wallet(m, wallet, caller, admin)?;
-            let held = m.ledger.wallet(wallet).ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::NOT_FOUND,
-                    "unknown_wallet",
-                    format!("no wallet {wallet_id}"),
-                )
-            })?;
-            Ok(Json(WalletDto {
-                wallet,
-                kind: held.kind.label(),
-                status: held.status.label(),
-                balance_cents: held.balance_cents(),
-                reserved_cents: held.reserved_cents(),
-                available_cents: held.available_cents(),
-                account_id: account_id.map(|a| a.0),
-            }))
+            may_read_wallet(m, wallet, caller, trusted)?;
+            wallet_dto(m, wallet).map(Json)
         })
         .await?
+}
+
+/// Body of `POST /api/wallets/{wallet_id}/sweep`. Empty, or `{}`, sweeps
+/// everything the wallet has available.
+#[derive(Default, Deserialize)]
+struct SweepRequest {
+    amount_cents: Option<i64>,
+}
+
+/// What a sweep did: the wallet as it is now, what left it, and what the
+/// treasury holds after.
+#[derive(Serialize)]
+pub struct SweepResponse {
+    pub wallet: WalletDto,
+    pub swept_cents: i64,
+    pub treasury_cents: i64,
+}
+
+/// Bring an issuer's or the venue's takings home to treasury. The
+/// operator's: it is the world's money moving between the world's wallets,
+/// and it closes the loop a purchase and a fee open — without it every
+/// budget is funded by minting while the takings sit where nothing spends
+/// them.
+async fn sweep_wallet(
+    State(app): State<AppState>,
+    Path(wallet): Path<u64>,
+    _admin: Admin,
+    Idempotency(key): Idempotency,
+    payload: Option<Json<SweepRequest>>,
+) -> Result<Committed, ApiError> {
+    let req = payload.map(|Json(r)| r).unwrap_or_default();
+    run(
+        &app,
+        Principal::Operator,
+        key,
+        Command::Sweep {
+            wallet,
+            amount_cents: req.amount_cents,
+        },
+    )
+    .await
+    .map(Committed)
 }
 
 /// A wallet's movements: the account's ledger, under the wallet's name.
@@ -2324,12 +2568,13 @@ async fn get_wallet_transactions(
     State(app): State<AppState>,
     Path(wallet_id): Path<u64>,
     caller: Option<Caller>,
-    admin: Option<Admin>,
+    trusted: Option<Trusted<scope::Wallets>>,
 ) -> Result<Json<LedgerResponse>, ApiError> {
     let wallet = fehu::ledger::WalletId(wallet_id);
+    let trusted = trusted.is_some();
     app.market
         .call(move |m| {
-            let account_id = may_read_wallet(m, wallet, caller, admin)?.ok_or_else(|| {
+            let account_id = may_read_wallet(m, wallet, caller, trusted)?.ok_or_else(|| {
                 ApiError::new(
                     StatusCode::NOT_FOUND,
                     "no_account",
@@ -2360,13 +2605,17 @@ pub struct InventoryResponse {
     pub inventory: Vec<HoldingDto>,
 }
 
+/// Its owner's, or the game backend's with [`Scope::Inventory`]: exactly
+/// who may issue and destroy units on it, because a backend that just
+/// changed an inventory must be able to read what it did.
 async fn get_inventory(
     State(app): State<AppState>,
     Path(trader_id): Path<u64>,
-    caller: Caller,
+    caller: Option<Caller>,
+    service: Option<ServiceCaller>,
 ) -> Result<Json<InventoryResponse>, ApiError> {
     let trader = TraderId(trader_id);
-    owned_trader(&app, caller, trader)?;
+    goods_principal(&app, trader_id, caller, service)?;
     let views = app.views().await;
     let inventory = app
         .market
@@ -2431,7 +2680,7 @@ fn goods_principal(
             return Err(ApiError::revoked_key());
         }
         if !auth.scopes.contains(Scope::Inventory) {
-            return Err(ApiError::missing_scope(Scope::Inventory));
+            return Err(ApiError::missing_scope(&[Scope::Inventory]));
         }
         return Ok(Principal::Service { id: auth.id.0 });
     }
@@ -2651,6 +2900,9 @@ async fn get_shares(
 struct BarsQuery {
     interval: Option<String>,
     limit: Option<usize>,
+    /// Only bars that opened strictly before this instant, in Unix
+    /// milliseconds — the `open_ts` of the oldest bar of the last page.
+    before: Option<i64>,
 }
 
 fn parse_interval(s: &str) -> Option<Interval> {
@@ -2684,11 +2936,12 @@ async fn get_bars(
         })?,
     };
     let limit = q.limit.unwrap_or(500).clamp(1, app.options.max_bars + 1);
+    let before = q.before;
     let handle = app
         .symbol(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
     let bars = handle
-        .ask_listed(move |s| s.bars(interval, limit))
+        .ask_listed(move |s| s.bars_before(interval, limit, before))
         .await?
         .ok_or_else(|| ApiError::not_found(&symbol))?;
     Ok(Json(BarsResponse {
@@ -2704,6 +2957,9 @@ async fn get_bars(
 struct EventsQuery {
     limit: Option<usize>,
     symbol: Option<String>,
+    /// Only events with an id strictly below this one — the id of the last
+    /// event of the previous page, to read further back.
+    before: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -2721,9 +2977,12 @@ async fn list_events(
     let events = app
         .market
         .call(move |m| {
-            m.events(limit, |e| match &q.symbol {
-                Some(sym) => e.symbols.iter().any(|s| s.eq_ignore_ascii_case(sym)),
-                None => true,
+            m.events(limit, |e| {
+                q.before.is_none_or(|before| e.id < before)
+                    && match &q.symbol {
+                        Some(sym) => e.symbols.iter().any(|s| s.eq_ignore_ascii_case(sym)),
+                        None => true,
+                    }
             })
         })
         .await?;
@@ -2746,6 +3005,7 @@ async fn list_symbol_events(
         Query(EventsQuery {
             limit: q.limit,
             symbol: Some(symbol),
+            before: q.before,
         }),
     )
     .await
@@ -2870,6 +3130,10 @@ async fn get_book(
 #[derive(Deserialize)]
 struct LimitQuery {
     limit: Option<usize>,
+    /// Read further back: only rows strictly before this cursor. What the
+    /// cursor is depends on the route — a trade's `ts_ms` on the tape, an
+    /// entry's `id` on a ledger — and each says so.
+    before: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -2886,6 +3150,10 @@ async fn get_trades(
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<TradesResponse>, ApiError> {
     let limit = q.limit.unwrap_or(50).clamp(1, app.options.tape_len.max(1));
+    // `before` is a `ts_ms`: the tape has no ids, and several prints can
+    // share an instant, so a page boundary inside one instant repeats that
+    // instant's prints on the next page rather than losing them.
+    let before = q.before;
     let handle = app
         .symbol(&symbol)
         .ok_or_else(|| ApiError::not_found(&symbol))?;
@@ -2894,6 +3162,7 @@ async fn get_trades(
             s.tape
                 .iter()
                 .rev()
+                .filter(|t| before.is_none_or(|b| t.ts.0 < b))
                 .take(limit)
                 .map(TradeDto::from)
                 .collect()
@@ -3297,6 +3566,9 @@ struct OrderHistoryQuery {
     /// `resting`, `filled` or `cancelled`; omit for every order.
     status: Option<String>,
     limit: Option<usize>,
+    /// Only orders with an id strictly below this one — the last order of
+    /// the previous page, to read further back.
+    before: Option<u64>,
 }
 
 /// One order by id, whatever became of it — filled and cancelled orders
@@ -3340,6 +3612,7 @@ async fn list_trader_orders(
         app.market
             .call(move |m| {
                 m.orders_of(trader)
+                    .filter(|o| q.before.is_none_or(|before| o.order_id < before))
                     .filter(|o| status.is_none_or(|s| o.status == s))
                     .take(limit)
                     .cloned()
@@ -3494,29 +3767,73 @@ async fn create_user(
 }
 
 /// The caller, as a list of one: a user is not told about the others.
+/// Whether the request presented the operator's key — the configured one,
+/// not the absence of one.
+///
+/// [`Admin`] treats an unlocked server as open, which is right for the
+/// game master's levers and wrong for reading every player's portfolio: a
+/// server with no `FEHU_ADMIN_KEY` must not hand the whole user directory
+/// to anyone who asks. So the directory is the operator's in the literal
+/// sense, and on an unlocked server nobody is that.
+fn presented_operator_key(app: &App, admin: Option<Admin>) -> bool {
+    admin.is_some() && app.options.admin_key.is_some()
+}
+
+/// The users: the caller alone with a player's key, everyone with the
+/// operator's.
+///
+/// A user key is judged as that user, whatever else is configured, the
+/// same way a service key is judged as that service: a player is shown
+/// themselves and nobody else. Only a request that carries no user key
+/// and does carry the operator's is shown everyone; see
+/// [`presented_operator_key`] for why an unlocked server does not count.
 async fn list_users(
     State(app): State<AppState>,
-    caller: Caller,
+    caller: Option<Caller>,
+    admin: Option<Admin>,
 ) -> Result<Json<Vec<UserDto>>, ApiError> {
     let views = app.views().await;
-    let users = app
-        .market
-        .call(move |m| {
-            user_dto(m, &views, caller.0)
-                .into_iter()
-                .collect::<Vec<_>>()
-        })
-        .await?;
+    let admin = presented_operator_key(&app, admin).then_some(Admin);
+    let users = match (caller, admin) {
+        (Some(caller), _) => {
+            app.market
+                .call(move |m| {
+                    user_dto(m, &views, caller.0)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                })
+                .await?
+        }
+        (None, Some(_)) => {
+            app.market
+                .call(move |m| {
+                    let ids: Vec<UserId> = m.users.keys().copied().collect();
+                    ids.into_iter()
+                        .filter_map(|id| user_dto(m, &views, id).ok())
+                        .collect::<Vec<_>>()
+                })
+                .await?
+        }
+        (None, None) => return Err(ApiError::unauthenticated()),
+    };
     Ok(Json(users))
 }
 
+/// One user: their own, or any with the operator's key, on the terms
+/// [`list_users`] describes.
 async fn get_user(
     State(app): State<AppState>,
     Path(user_id): Path<u64>,
-    caller: Caller,
+    caller: Option<Caller>,
+    admin: Option<Admin>,
 ) -> Result<Json<UserDto>, ApiError> {
     let user = UserId(user_id);
-    owned_user(caller, user)?;
+    let admin = presented_operator_key(&app, admin).then_some(Admin);
+    match (caller, admin) {
+        (Some(caller), _) => owned_user(caller, user)?,
+        (None, Some(_)) => {}
+        (None, None) => return Err(ApiError::unauthenticated()),
+    }
     let views = app.views().await;
     Ok(Json(
         app.market
@@ -3768,6 +4085,8 @@ async fn get_ledger(
         .limit
         .unwrap_or(100)
         .clamp(1, app.options.ledger_log.max(1));
+    // `before` is an entry id.
+    let before = q.before.map(|b| u64::try_from(b).unwrap_or(0));
     let id = AccountId(account_id);
     Ok(Json(
         app.market
@@ -3779,7 +4098,7 @@ async fn get_ledger(
                     .ok_or_else(|| ApiError::unknown_account(account_id))?;
                 Ok::<_, ApiError>(LedgerResponse {
                     account: account_view(m, account),
-                    entries: account.ledger(limit),
+                    entries: account.ledger_before(limit, before),
                 })
             })
             .await??,
@@ -3948,10 +4267,11 @@ struct OutboxQuery {
 
 /// The facts the game backend has not collected yet.
 ///
-/// The operator's, because the log is the whole world's: one player's fills
-/// are in it beside another's. In tier one the operator key *is* the trusted
-/// game backend — one host, one process, the backend on the same network —
-/// which is the same reasoning that put rewards and budgets behind it.
+/// The operator's or any service's, and no player's, because the log is the
+/// whole world's: one player's fills are in it beside another's. A service
+/// key is the game backend whatever it has been narrowed to, and the outbox
+/// is what that backend reads instead of the stream, so every scope opens
+/// it; what a scope narrows is what the backend may *do*.
 ///
 /// Reading does not consume. A consumer that has acted on what it read says
 /// so with `POST /api/outbox/ack`, and until it does, the same facts come
@@ -3959,7 +4279,7 @@ struct OutboxQuery {
 /// sees them again rather than never.
 async fn read_outbox(
     State(app): State<AppState>,
-    _admin: Admin,
+    _trusted: Trusted<scope::Any>,
     Query(query): Query<OutboxQuery>,
 ) -> Result<Json<crate::outbox::Page>, ApiError> {
     let limit = query.limit.unwrap_or(crate::outbox::DEFAULT_PAGE);
@@ -3987,14 +4307,14 @@ struct AckRequest {
 /// restart and hand the backend facts it had already acted on.
 async fn ack_outbox(
     State(app): State<AppState>,
-    _admin: Admin,
+    trusted: Trusted<scope::Any>,
     Idempotency(key): Idempotency,
     body: Result<Json<AckRequest>, JsonRejection>,
 ) -> Result<Committed, ApiError> {
     let Json(req) = body.map_err(ApiError::bad_json)?;
     run(
         &app,
-        Principal::Operator,
+        trusted.principal(),
         key,
         Command::AckOutbox {
             through: req.through,
@@ -4142,20 +4462,14 @@ async fn stream(
         gap,
     };
     let viewer = q.api_key.as_deref().and_then(|k| app.user_of(k));
-    // Ticks and events are public; a fill belongs to the trader that made it,
-    // so it goes only to a stream that proved it speaks for that trader. The
-    // replay buffer holds everybody's, so the same rule applies to it. The
-    // published directory says who owns a trader without asking anyone,
-    // which is what lets every open stream check every message.
+    // Ticks and events are public; a fill, a reward or a transfer belongs to
+    // the party it happened to, so it goes only to a stream that proved it
+    // speaks for that user. The replay buffer holds everybody's, so the same
+    // rule applies to it. The published directory says who owns a trader or
+    // an account without asking anyone, which is what lets every open
+    // stream check every message; see `StreamMessage::audience`.
     let owner = Arc::clone(&app);
-    let visible = move |m: &StreamMessage| match m {
-        StreamMessage::Fill { trader_id, .. }
-        | StreamMessage::StopTriggered { trader_id, .. }
-        | StreamMessage::OrderExpired { trader_id, .. } => {
-            viewer.is_some_and(|user| owner.owner_of(TraderId(*trader_id)) == Some(user))
-        }
-        _ => true,
-    };
+    let visible = move |m: &StreamMessage| m.audience(&owner.directory()).admits(viewer);
     let mine = visible.clone();
     // A gap ends this connection: the client reconnects with `?since=` and
     // picks up where it left off. Never present later messages as an

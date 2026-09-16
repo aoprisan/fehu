@@ -38,6 +38,28 @@
 //! is advancing to, which is a field of the journal entry, so a replayed
 //! step delivers the same jobs at the same moment.
 //!
+//! # A batch is one job
+//!
+//! A job may run its recipe several times at once (`runs`): the inputs, the
+//! cost and the outputs all scale, the yield is applied to the total so it
+//! rounds once rather than once per run, and the whole batch is one journal
+//! entry that lands on one step. It is refused whole if any part of it
+//! cannot be afforded, exactly as a single run is.
+//!
+//! # Downtime
+//!
+//! Simulated time is what a job is due in, and simulated time stops with
+//! the server: on a restart the clock resumes from the instant the last
+//! snapshot or journal entry reached, so a job due in ten minutes is still
+//! due in ten minutes of *market* time, however long the server was away.
+//! That is the default, and the right one for a world whose players were
+//! away too. `FEHU_RESUME=catch_up` is the other policy: the clock jumps
+//! forward by the downtime, scaled, and the first engine step advances the
+//! world through it — every job that fell due while the server was down is
+//! delivered on that step, at the instant the step reaches, and every
+//! symbol prints the ticks it missed. Either way replay is unaffected: the
+//! step is a journaled command carrying the instant it advanced to.
+//!
 //! # Determinism
 //!
 //! Nothing here reads a clock or draws a random number. Starting a job takes
@@ -71,6 +93,15 @@ pub const MAX_DURATION_SECS: u64 = 30 * 24 * 3_600;
 
 /// Units one line of a recipe may name.
 pub const MAX_LINE_QTY: u64 = 1_000_000;
+
+/// Times one job may run its recipe. A batch is one job, one journal entry
+/// and one delivery; this bounds how much one command can move.
+pub const MAX_JOB_RUNS: u64 = 1_000;
+
+/// The default for a job that does not say: one run.
+fn one_run() -> u64 {
+    1
+}
 
 /// Jobs the world will have in the furnace at once.
 ///
@@ -112,12 +143,13 @@ pub struct Recipe {
     /// Bumped every time an operator rewrites the recipe, so a job started
     /// under an earlier text can still say which one it was.
     pub version: u32,
-    /// Units consumed when the job starts.
+    /// Units consumed when the job starts, per run.
     pub inputs: Vec<Line>,
-    /// Units issued when it completes, before any event effect on the yield.
+    /// Units issued when it completes, per run, before any event effect on
+    /// the yield.
     pub outputs: Vec<Line>,
-    /// What the furnace charges, in cents. Paid to the venue when the job
-    /// starts; nothing is created or destroyed by it.
+    /// What the furnace charges per run, in cents. Paid to the venue when
+    /// the job starts; nothing is created or destroyed by it.
     pub cost_cents: i64,
     /// How long it takes, in simulated seconds.
     pub duration_secs: u64,
@@ -401,6 +433,10 @@ pub struct Job {
     /// started.
     pub recipe: String,
     pub recipe_version: u32,
+    /// How many times it runs the recipe. The inputs, the cost and the
+    /// outputs below are the totals for all of them: a batch is one job.
+    #[serde(default = "one_run")]
+    pub runs: u64,
     /// Who started it.
     pub trader_id: u64,
     /// The account the cost came out of and any refund goes back to.
@@ -764,6 +800,7 @@ mod tests {
             id: 0,
             recipe: "SMELT".into(),
             recipe_version: 1,
+            runs: 1,
             trader_id: 1,
             account_id: 1,
             inputs: vec![],

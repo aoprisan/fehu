@@ -72,11 +72,18 @@ carries a fixed set of *scopes* and nothing else —
 | Scope | Opens |
 |---|---|
 | `provision` | `POST /api/v1/economy/players`, and the roster that reads it back |
-| `reward` | `POST /api/v1/economy/rewards` |
-| `inventory` | `POST /api/v1/economy/purchases` and `.../consume`, for any player |
+| `reward` | `POST /api/v1/economy/rewards`, and `GET /api/budgets` to see what is left |
+| `inventory` | `POST /api/v1/economy/purchases` and `.../consume`, and `GET .../players/{id}/inventory`, for any player |
 | `events` | `POST /api/game/events` |
+| any of `provision`, `reward`, `inventory` | `GET /api/wallets/{id}` and its `/transactions`: whatever moves money may read the wallet it moved it in |
+| any scope at all | `GET /api/outbox` and `POST /api/outbox/ack`: a service is the game backend whatever it has been narrowed to, and the outbox is what that backend reads instead of the stream |
 
-so a backend that pays quest rewards need not hold the key that can also mint
+A scope opens the read side of its own writes — a backend that just changed
+an inventory can see what it did without holding a second key — and nothing
+else: `/api/overview` names every wallet in the world and stays the
+operator's.
+
+So a backend that pays quest rewards need not hold the key that can also mint
 currency, freeze accounts and rewrite the catalogue. A scope **narrows a
 credential; it does not narrow the operator** — every route above stays open
 to the operator on exactly the terms it always was, so issuing a service
@@ -101,25 +108,26 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/symbols` | Quotes for every listed symbol |
 | `POST` | `/api/symbols` | Game master: list a new symbol — `{"symbol":"WDGT","name":"Widget Corp","shares_outstanding":1000000,"start_price_cents":5000}`, optional `sector`, `description`, `drift`, `volatility`, `seed`, `history_days`. `{"kind":"good","unit":"kg"}` lists a good instead: no float, no ladder, no dividend |
 | `GET` | `/api/symbols/{sym}` | Quote, latent snapshot, config and share count |
+| `PATCH` | `/api/symbols/{sym}` | Game master: change a listed symbol in place — any of `name`, `sector`, `description`, `drift`, `volatility`, `base_volume_per_day`, `half_spread`, `synthetic`; what is not given stays. Takes effect from the next tick, draws nothing, and is recorded in the event log as `corporate:reconfigure` |
 | `GET` | `/api/symbols/{sym}/shares` | The symbol's shares: outstanding, held by traders, bid for, still available, and who holds them |
 | `GET` | `/api/symbols/{sym}/status` | Whether the symbol can be traded: session open, halted, the limit band and the next open/close |
 | `POST` | `/api/symbols/{sym}/halt`, `/resume` | Game master: stop and start trading in one symbol |
 | `POST` | `/api/symbols/{sym}/dividend` | Game master: `{"cents_per_share":50}` — pays every holder and takes the price ex |
 | `POST` | `/api/symbols/{sym}/delist` | Game master: take the symbol away — cancels its resting orders and stops, buys every holder out at `{"cents_per_share":60}` (the last price if omitted, `0` for a company worth nothing) |
-| `GET` | `/api/symbols/{sym}/bars?interval=M1\|M5\|H1\|D1&limit=500` | OHLCV bars, oldest first, in-progress bar last |
+| `GET` | `/api/symbols/{sym}/bars?interval=M1\|M5\|H1\|D1&limit=500` | OHLCV bars, oldest first, in-progress bar last; `&before=<open_ts>` reads the page before the oldest bar you have |
 | `POST` | `/api/symbols/{sym}/events` | Raw simulator event: `{"type":"jump","pct":-0.1}`, `drift_shift`, `drift_for_total_move`, `vol_shift`, `fundamental_shift`, `fundamental_target`; optional `at_ms` / `delay_secs`, `source`, `note` |
 | `POST` | `/api/game/events` | Semantic game event: `{"kind":"scandal","symbol":"ACME","magnitude":1.5}`; market-wide kinds (`market_crash`, `rate_hike`, …) need no symbol |
 | `GET` | `/api/game/catalog` | Every game-event kind and the simulator events it expands to |
-| `GET` | `/api/events` | Audit log of accepted events, newest first (`?symbol=`, `?limit=`) |
+| `GET` | `/api/events` | Audit log of accepted events, newest first (`?symbol=`, `?limit=`, `?before=<event id>` for the page before) |
 | `POST` | `/api/users` | Create a user: `{"name":"ada","email":"ada@example.com"}` (both optional). The response carries their `api_key`, once |
-| `GET` | `/api/users`, `/api/users/{id}` | The caller themselves: accounts, traders, cash and shares owned |
+| `GET` | `/api/users`, `/api/users/{id}` | The caller themselves: accounts, traders, cash and shares owned. With the operator's key, everyone — the directory of who exists. Literally the key: a server with no `FEHU_ADMIN_KEY` has nobody to show the directory to |
 | `GET` | `/api/users/{id}/holdings` | Shares the user owns per symbol, added up over their traders, with what is reserved and what is still sellable |
 | `POST` | `/api/users/{id}/accounts` | Open another account: `{"name":"main","cash_cents":10000000}` — the cash is paid out of treasury, not created |
 | `GET` | `/api/users/{id}/accounts`, `/api/accounts`, `/api/accounts/{id}` | Accounts: balance, reserved, available, status, and the `wallet_id` holding the money |
 | `POST` | `/api/accounts/{id}/deposit` | Game master: **mint** money into an account, `{"amount_cents":250000,"memo":"week 1"}` |
 | `POST` | `/api/accounts/{id}/withdraw` | Game master: **burn** money out of one; only the available balance can leave |
 | `POST` | `/api/accounts/{id}/status` | `{"status":"active\|frozen\|closed"}` — freezing and unfreezing are the game master's, closing is the owner's and needs an empty account |
-| `GET` | `/api/accounts/{id}/ledger?limit=100` | Every movement of money, newest first |
+| `GET` | `/api/accounts/{id}/ledger?limit=100` | Every movement of money, newest first; `&before=<entry id>` for the page before |
 | `GET` | `/api/accounts/{id}/validate` | Status, what the account may do, and any broken invariant |
 | `POST` | `/api/traders` | Create a trader, with a user and a funded account: `{"name":"alice","cash_cents":10000000}` (both optional), and hand over the new user's `api_key`; `user_id` and `account_id` join existing ones, which needs that user's key |
 | `GET` | `/api/traders`, `/api/traders/{id}` | Traders; a portfolio with cash, positions marked to the reference price, open orders and fills |
@@ -130,16 +138,17 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET`/`DELETE` | `/api/symbols/{sym}/orders/{id}` | Look up / cancel (`?trader_id=`) a resting order |
 | `PATCH` | `/api/symbols/{sym}/orders/{id}` | Amend a resting order: `{"trader_id":1,"price_cents":8500,"qty":50}` — a cancel and a fresh order, so it loses queue position |
 | `GET` | `/api/orders/{id}` | One order and what became of it — filled and cancelled ones included |
-| `GET` | `/api/traders/{id}/orders?status=resting\|filled\|cancelled&limit=100` | A trader's orders, newest first |
+| `GET` | `/api/traders/{id}/orders?status=resting\|filled\|cancelled&limit=100` | A trader's orders, newest first; `&before=<order id>` for the page before |
 | `POST` | `/api/symbols/{sym}/stops` | Arm a stop: `{"trader_id":1,"side":"sell","qty":100,"stop_price_cents":8000}`, plus `"limit_price_cents"` for a stop-limit. The trigger must be on the far side of the market |
 | `GET` | `/api/symbols/{sym}/stops?trader_id=`, `/api/traders/{id}/stops` | A trader's held stops, on one symbol or all of them |
 | `DELETE` | `/api/symbols/{sym}/stops/{id}?trader_id=` | Withdraw a stop before it fires |
 | `GET` | `/api/symbols/{sym}/book?depth=10` | Aggregated bids and asks, reference price, pending trader flow |
-| `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first |
+| `GET` | `/api/symbols/{sym}/trades?limit=50` | The tape, newest first; `&before=<ts_ms>` for the prints before that instant |
 | `GET` | `/api/stream` | Server-sent events: `hello`, then every `tick` (with best bid/ask, top of book and the step's prints), accepted `event`, and — for `?api_key=`, since `EventSource` cannot set headers — that player's `fill`s |
 | `GET` | `/api/npcs` | The traders the world runs itself: what each quotes, and what it has left |
 | `POST` | `/api/npcs` | Game master: put a funded merchant in a symbol — `{"symbol":"ORE","cash_cents":5000000,"inventory":800}`, optional `name`, `size`, `levels`, `half_spread_bps`, `level_step_bps`, `requote_bps` |
 | `POST` | `/api/npcs/{trader_id}/active` | Game master: `{"active":false}` — stop it quoting. It keeps its money and its stock |
+| `POST` | `/api/npcs/{trader_id}/production` | Game master: make it a producer — `{"production":{"recipe":"smelt","restock_below":10,"runs":5,"max_running":1}}` — or a plain merchant again with `{"production":null}`. The same object may be given at creation |
 | `GET` | `/api/catalog` | What the world will make and what it charges: one line per good |
 | `POST` | `/api/catalog` | Game master: write or replace a line — `{"symbol":"ORE","price_cents":250,"available":500}`, `available` omitted for a seam that never runs out |
 | `DELETE` | `/api/catalog/{sym}` | Game master: stop making a good. What was made stays made |
@@ -149,12 +158,13 @@ replayed one also carries `Fehu-Idempotent-Replay`. See
 | `GET` | `/api/recipes` | What the world knows how to make, and what making it takes |
 | `POST` | `/api/recipes` | Game master: write or replace a recipe — `{"id":"smelt","inputs":[{"symbol":"ORE","qty":2}],"outputs":[{"symbol":"INGOT","qty":1}],"cost_cents":500,"duration_secs":300}`, optional `refund_bps`, `note`. Every line has to be a listed good |
 | `DELETE` | `/api/recipes/{id}` | Game master: stop making a thing. Jobs already running still deliver |
-| `POST` | `/api/jobs` | Run one: `{"trader_id":1,"recipe":"smelt"}` — the inputs and the cost go now, the outputs arrive at `due_at_ms` |
+| `POST` | `/api/jobs` | Run one: `{"trader_id":1,"recipe":"smelt"}` — the inputs and the cost go now, the outputs arrive at `due_at_ms`. `"runs":5` runs it five times as one job: inputs, cost and outputs all scale, and it is refused whole if any part cannot be afforded |
 | `GET` | `/api/jobs`, `/api/jobs/{id}` | The caller's jobs, or one of them: what it took, what it will deliver and when |
 | `POST` | `/api/jobs/{id}/cancel` | Stop a job before it is due. What comes back is `refund_bps` of the cost, nothing by default |
 | `GET` | `/api/budgets` | Game master: the pools rewards are paid from, and the rules that price them |
 | `POST` | `/api/budgets` | Game master: open one, funded out of treasury — `{"name":"quests","cash_cents":5000000}` |
 | `POST` | `/api/budgets/{wallet_id}/fund` | Game master: top one up, `{"amount_cents":100000}` |
+| `POST` | `/api/wallets/{wallet_id}/sweep` | Game master: bring an issuer's or the venue's takings home to treasury — everything available, or `{"amount_cents":100000}` of it |
 | `POST` | `/api/rewards/rules` | Game master: what a named reward is worth — `{"id":"daily","budget":12,"amount_cents":5000}` |
 | `DELETE` | `/api/rewards/rules/{id}` | Game master: take a rule away. What it has paid stays paid |
 | `POST` | `/api/rewards` | Game master: pay for something that happened — `{"rule":"daily","trader_id":1,"source":"quest:42"}`. A `source` already paid gets its first receipt back and moves nothing |
@@ -181,7 +191,13 @@ three days of 1 s ticks, so every interval has history before the first
 request. `FEHU_TIME_SCALE=60` runs the market at 60 simulated seconds per
 wall second; `FEHU_BIND`, `FEHU_HISTORY_DAYS`, `FEHU_WARMUP_HOURS`,
 `FEHU_STARTING_CASH_CENTS`, `FEHU_TAPE`, `FEHU_FILL_LOG`, `FEHU_ORDER_LOG`
-and `FEHU_LEDGER_LOG` are the other knobs. `FEHU_GENESIS_CENTS` (10^14, i.e.
+and `FEHU_LEDGER_LOG` are the other knobs. `FEHU_NOW_MS` pins the simulated
+instant the world starts at, in Unix milliseconds, instead of reading the
+wall clock — which is how a test, or a demo that should look the same every
+time, gets the same history from the same seeds. `FEHU_MAX_BARS` (5 000) is
+how many completed bars each interval keeps per symbol and `FEHU_EVENT_LOG`
+(500) how many accepted events the audit log at `/api/events` retains.
+`FEHU_GENESIS_CENTS` (10^14, i.e.
 $1 trillion) is the world's whole opening supply, minted into treasury at
 start-up; `FEHU_STARTING_CASH_CENTS` is paid to each new account *out of*
 that, so a treasury that runs dry refuses to open more rather than printing
@@ -222,6 +238,13 @@ it does not pay.
 across restarts (`FEHU_SAVE_SECS`, 30 by default, sets how often the snapshot
 is written; the command journal beside it is written before every change is
 acknowledged, so the interval costs nothing that was promised).
+`FEHU_RESUME` (`pause`) says what a restart does with the time the server
+was away: `pause` carries on from the instant the world had reached, so a
+job due in ten minutes is still due in ten minutes of market time;
+`catch_up` lets the downtime elapse in the world instead — the clock resumes
+ahead by the wall time missed, scaled by `FEHU_TIME_SCALE`, and the first
+engine step advances every symbol through the gap and delivers every job
+that fell due in it.
 `FEHU_COMMAND_LOG` (10 000) is how many `Idempotency-Key`s are remembered,
 which is how late a retry may arrive and still be free. `FEHU_JOB_LOG`
 (2 000) is how many *finished* jobs are kept with what each delivered — a
@@ -278,6 +301,16 @@ pays it out of treasury; a fee goes to a venue wallet instead of leaving the
 world; a dividend or a delisting buyout is funded from that symbol's issuer
 wallet, and one it cannot fund is refused with the shortfall rather than
 paid to some holders and not others, or clipped at a balance cap.
+
+Takings come home the same way. A purchase from the catalogue credits the
+good's issuer and a fee credits the venue, and `POST
+/api/wallets/{id}/sweep` moves what either has collected back to treasury,
+where a budget can be funded from it — so the loop closes without minting:
+what players spend on ore pays the next quest reward. It is a transfer like
+any other, with a memo naming the wallet it came from, and it refuses any
+wallet that is not an issuer's or the venue's: a player's or an NPC's is
+somebody's money, and a budget's is set aside on purpose. An issuer swept
+bare will refuse its next dividend rather than clip it.
 
 Freezing an account is the game master's and withdraws its resting orders in
 the same job, since an order that outlived a freeze would fill against a
@@ -414,25 +447,31 @@ any state file is.
 A stream is the wrong shape for the service that owns the rest of the game.
 `/api/stream` is best-effort, its `?since=` buffer is small and in memory,
 and a backend that was restarting when a job came due has no way to find out
-that it did. So the same facts go a second way: everything the server
-publishes that **nobody asked for** — a resting order that filled, a job that
-came due, an order the venue withdrew, a stop that fired, a halt, a listing, a
-delisting, an accepted game event — is also appended to a durable **outbox**,
-numbered from 1, and handed out against a cursor.
+that it did. So the same facts go a second way: everything that **moves
+currency or units into or out of a player's hands** — a fill, a purchase, a
+consumption, a transfer, a reward, a mint, a burn, a dividend, a job started,
+cancelled or delivered — and everything the market does on its own — an
+order the venue withdrew, a stop that fired, a halt, a listing, a delisting,
+an accepted game event — is also appended to a durable **outbox**, numbered
+from 1, and handed out against a cursor. Each entry names the journal
+sequence of the command that caused it, the same number every committed
+response carries in `Fehu-Journal-Seq`, so a backend that would rather not
+be told about its own rewards twice matches the two.
 
 Delivery is at-least-once. `GET /api/outbox` returns the facts after a
 cursor; reading does not consume them, so a backend that dies between reading
 and acting reads them again rather than never. `POST /api/outbox/ack`
 `{"through":128}` says how far it got, and is a journaled command like
 everything else — a cursor that moved only in memory would fall back to the
-snapshot's value on a restart.
+snapshot's value on a restart. Both are the operator's or any service's, and
+no player's: the log is the whole world's.
 
-What is *not* in it is anything with a requester. A purchase, a transfer, a
-reward and a job *starting* are commands: whoever sent one has its response,
-and a lost response is recovered by its `Idempotency-Key` through
-`GET /api/commands/{key}`. Ticks are not in it either — they are market data,
-the highest-volume thing the server produces, and `/api/symbols/{sym}/bars`
-has them whenever they are wanted.
+What is *not* in it is the world's own bookkeeping — a budget opened or
+funded, takings swept, a rule or a recipe rewritten — which the operator did
+and knows, and ticks: they are market data, the highest-volume thing the
+server produces, and `/api/symbols/{sym}/bars` has them whenever they are
+wanted. A lost response to any command is still recovered by its
+`Idempotency-Key` through `GET /api/commands/{key}`.
 
 The log is bounded by `FEHU_OUTBOX`, and it is honest about the bound: a fact
 evicted before it was acknowledged is counted in `dropped`, and a read that
@@ -522,6 +561,17 @@ and gives it a quoting policy: a half-spread and a few levels either side of
 the reference price, redrawn when the market moves past a band or when
 something it was offering has been taken.
 
+A merchant sells what it was given; a **producer** makes what it sells.
+Give an NPC a `production` policy and, whenever its free stock of the symbol
+it quotes falls to `restock_below`, it buys the recipe's inputs it lacks
+from the catalogue with its own cash and starts a job of `runs` runs,
+keeping at most `max_running` in the furnace. The outputs land in its
+inventory on the step that delivers them and are quoted like anything else
+it holds. Its takings go to the catalogue's issuers and the venue on the
+way, where a sweep brings them home, so the loop closes with nothing
+minted. A producer that cannot afford its inputs, whose recipe is gone, or
+whose furnace is full does nothing that step and looks again on the next.
+
 Nothing about an NPC is special, and that is the point. It has a wallet, a
 position and reservations; its orders go through the same command path as a
 player's, and a fill against it settles, charges fees and reconciles like any
@@ -554,8 +604,10 @@ message carrying the order it became or the reason it could not be placed.
 
 One client cannot flood the market. Every request that *changes* something —
 an order, an amendment, a cancel, a stop, money, an event — spends a token
-from a bucket kept per API key, refilling at `FEHU_RATE_PER_SEC` with a burst
-of `FEHU_RATE_BURST`; requests with no key share one bucket. Over the limit is
+from a bucket kept per API key — a player's or a service's, so the game
+backend neither spends nor is starved by anyone else's — refilling at
+`FEHU_RATE_PER_SEC` with a burst of `FEHU_RATE_BURST`; requests with no key
+share one bucket. Over the limit is
 `429 rate_limited` with a `Retry-After`. Reading is never limited, and
 `FEHU_RATE_PER_SEC=0` turns the whole thing off.
 

@@ -82,10 +82,10 @@ use crate::api::ApiError;
 use crate::events::{EventRecord, GameEventKind, MAX_MAGNITUDE, Prepared, Scope, SimEvent};
 use crate::jobs::{JobError, Line};
 use crate::market::{
-    Amendment, AssetKind, DelistError, Market, PlaceRequest, Placed, SymbolInfo, SymbolSpec,
-    wall_now_ms,
+    Amendment, AssetKind, DelistError, Market, PlaceRequest, Placed, StreamMessage, SymbolInfo,
+    SymbolSpec, wall_now_ms,
 };
-use crate::npc::Policy;
+use crate::npc::{Policy, Production};
 use crate::rewards::RewardError;
 use crate::service::{ScopeSet, ServiceId};
 use crate::trading::{AmendRequest, AmendResponse, OpenOrderDto, OrderRequest, StopRequest};
@@ -234,6 +234,22 @@ pub enum Command {
     ListSymbol {
         listing: Listing,
     },
+    /// Operator: change what a listed symbol is called and how its price
+    /// behaves, without delisting it. Every field is optional and an absent
+    /// one is left as it is; see [`crate::symbol::SymbolState::reconfigure`].
+    Reconfigure {
+        symbol: String,
+        name: Option<String>,
+        sector: Option<String>,
+        description: Option<String>,
+        drift: Option<f64>,
+        volatility: Option<f64>,
+        base_volume_per_day: Option<f64>,
+        half_spread: Option<f64>,
+        synthetic: Option<bool>,
+        source: String,
+        note: Option<String>,
+    },
     /// Operator: write or replace what a good costs from the catalogue.
     SetCatalogItem {
         symbol: String,
@@ -250,8 +266,17 @@ pub enum Command {
         symbol: String,
         name: Option<String>,
         policy: Policy,
+        /// How it restocks, if it is a producer. Absent in entries written
+        /// before producers existed: a merchant.
+        #[serde(default)]
+        production: Option<Production>,
         cash_cents: i64,
         inventory: u64,
+    },
+    /// Operator: give an NPC a production policy, or take it away.
+    SetNpcProduction {
+        trader_id: u64,
+        production: Option<Production>,
     },
     /// Operator: start or stop an NPC quoting.
     SetNpcActive {
@@ -278,6 +303,10 @@ pub enum Command {
     StartJob {
         trader_id: u64,
         recipe: String,
+        /// Times to run it. Absent in entries written before batches
+        /// existed, which ran once.
+        #[serde(default = "one_run")]
+        runs: u64,
     },
     /// Stop a job before it is due.
     CancelJob {
@@ -294,6 +323,12 @@ pub enum Command {
     FundBudget {
         wallet: u64,
         cash_cents: i64,
+    },
+    /// Operator: bring an issuer's or the venue's takings home to treasury —
+    /// all of them, or `amount_cents` of them.
+    Sweep {
+        wallet: u64,
+        amount_cents: Option<i64>,
     },
     /// Operator: write or replace what a named reward is worth.
     SetRewardRule {
@@ -422,9 +457,11 @@ impl Command {
             Self::PlaceStop { .. } => "place_stop",
             Self::CancelStop { .. } => "cancel_stop",
             Self::ListSymbol { .. } => "list_symbol",
+            Self::Reconfigure { .. } => "reconfigure",
             Self::SetCatalogItem { .. } => "set_catalog_item",
             Self::RemoveCatalogItem { .. } => "remove_catalog_item",
             Self::CreateNpc { .. } => "create_npc",
+            Self::SetNpcProduction { .. } => "set_npc_production",
             Self::SetNpcActive { .. } => "set_npc_active",
             Self::SetRecipe { .. } => "set_recipe",
             Self::RemoveRecipe { .. } => "remove_recipe",
@@ -432,6 +469,7 @@ impl Command {
             Self::CancelJob { .. } => "cancel_job",
             Self::CreateBudget { .. } => "create_budget",
             Self::FundBudget { .. } => "fund_budget",
+            Self::Sweep { .. } => "sweep",
             Self::SetRewardRule { .. } => "set_reward_rule",
             Self::RemoveRewardRule { .. } => "remove_reward_rule",
             Self::PayReward { .. } => "pay_reward",
@@ -487,6 +525,11 @@ impl Command {
         }
         asked
     }
+}
+
+/// A job's default number of runs, for entries that predate batches.
+fn one_run() -> u64 {
+    1
 }
 
 /// One accepted command, in the order it was accepted.
@@ -1245,6 +1288,10 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
             let entry = m
                 .mint_into(id, *amount_cents, memo.clone(), wall_ms)
                 .map_err(ApiError::money)?;
+            m.announce(StreamMessage::Minted {
+                account_id: id.0,
+                entry: entry.clone(),
+            });
             Applied::new(
                 200,
                 &crate::account::LedgerResponse {
@@ -1266,6 +1313,10 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
             let entry = m
                 .burn_from(id, *amount_cents, memo.clone(), wall_ms)
                 .map_err(ApiError::money)?;
+            m.announce(StreamMessage::Burned {
+                account_id: id.0,
+                entry: entry.clone(),
+            });
             Applied::new(
                 200,
                 &crate::account::LedgerResponse {
@@ -1287,8 +1338,13 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 .get(&trader)
                 .ok_or_else(|| ApiError::unknown_trader(*trader_id))?
                 .account_id;
-            m.mint_into(account_id, *amount_cents, memo.clone(), wall_ms)
+            let entry = m
+                .mint_into(account_id, *amount_cents, memo.clone(), wall_ms)
                 .map_err(ApiError::money)?;
+            m.announce(StreamMessage::Minted {
+                account_id: account_id.0,
+                entry,
+            });
             Applied::new(200, &crate::api::portfolio(m, &views, trader)?)
         }
 
@@ -1434,6 +1490,54 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
 
         Command::ListSymbol { listing } => apply_listing(m, wall_ms, listing).await,
 
+        Command::Reconfigure {
+            symbol,
+            name,
+            sector,
+            description,
+            drift,
+            volatility,
+            base_volume_per_day,
+            half_spread,
+            synthetic,
+            source,
+            note,
+        } => {
+            let handle = m
+                .symbol(symbol)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(symbol))?;
+            let patch = crate::symbol::Patch {
+                name: name.clone(),
+                sector: sector.clone(),
+                description: description.clone(),
+                drift: *drift,
+                volatility: *volatility,
+                base_volume_per_day: *base_volume_per_day,
+                half_spread: *half_spread,
+                synthetic: *synthetic,
+            };
+            let changed = patch.describe();
+            let quote = handle
+                .change(move |s| s.reconfigure(&patch).map(|()| s.quote()))
+                .await?
+                .map_err(|e| ApiError::invalid_event(e.to_string()))?;
+            let at = m.now();
+            let event = m.record(EventRecord {
+                id: 0,
+                received_at_ms: wall_ms,
+                at_ms: at.0,
+                symbols: vec![handle.ticker],
+                kind: "corporate:reconfigure".into(),
+                source: source.clone(),
+                note: note.clone(),
+                magnitude: None,
+                effects: Vec::new(),
+                summary: vec![format!("{} reconfigured: {changed}", handle.ticker)],
+            });
+            Applied::new(200, &ListingResponse { quote, event })
+        }
+
         Command::SetCatalogItem {
             symbol,
             price_cents,
@@ -1463,6 +1567,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
             symbol,
             name,
             policy,
+            production,
             cash_cents,
             inventory,
         } => {
@@ -1475,6 +1580,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                     &handle,
                     name.clone(),
                     *policy,
+                    production.clone(),
                     *cash_cents,
                     *inventory,
                     wall_ms,
@@ -1485,6 +1591,20 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 .npc_view(npc.trader)
                 .ok_or_else(|| ApiError::internal("the NPC vanished as it was made"))?;
             Applied::new(201, &view)
+        }
+
+        Command::SetNpcProduction {
+            trader_id,
+            production,
+        } => {
+            let trader = TraderId(*trader_id);
+            m.set_npc_production(trader, production.clone())
+                .ok_or_else(|| ApiError::unknown_trader(*trader_id))?
+                .map_err(ApiError::goods)?;
+            let view = m
+                .npc_view(trader)
+                .ok_or_else(|| ApiError::internal("the NPC vanished as it was changed"))?;
+            Applied::new(200, &view)
         }
 
         Command::SetNpcActive { trader_id, active } => {
@@ -1529,15 +1649,21 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
             Applied::new(200, &recipe)
         }
 
-        Command::StartJob { trader_id, recipe } => {
+        Command::StartJob {
+            trader_id,
+            recipe,
+            runs,
+        } => {
             let job = m
                 .start_job(
                     &crate::jobs::clean_id(recipe).map_err(ApiError::job)?,
                     TraderId(*trader_id),
+                    *runs,
                     wall_ms,
                 )
                 .await
                 .map_err(ApiError::job)?;
+            m.announce(StreamMessage::JobStarted(job.clone()));
             Applied::new(201, &job)
         }
 
@@ -1549,6 +1675,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 return Err(ApiError::job(JobError::UnknownJob(*job_id)));
             }
             let job = m.cancel_job(*job_id, wall_ms).map_err(ApiError::job)?;
+            m.announce(StreamMessage::JobCancelled(job.clone()));
             Applied::new(200, &job)
         }
 
@@ -1575,6 +1702,22 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 .find(|b| b.wallet == budget.wallet)
                 .ok_or_else(|| ApiError::internal("the budget vanished as it was funded"))?;
             Applied::new(200, &view)
+        }
+
+        Command::Sweep {
+            wallet,
+            amount_cents,
+        } => {
+            let wallet = WalletId(*wallet);
+            let swept_cents = m.sweep(wallet, *amount_cents).map_err(ApiError::sweep)?;
+            Applied::new(
+                200,
+                &crate::api::SweepResponse {
+                    wallet: crate::api::wallet_dto(m, wallet)?,
+                    swept_cents,
+                    treasury_cents: m.ledger.balance(m.wallets.treasury),
+                },
+            )
         }
 
         Command::SetRewardRule {
@@ -1609,6 +1752,9 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
             let receipt = m
                 .pay_reward(rule, TraderId(*trader_id), source, wall_ms)
                 .map_err(ApiError::reward)?;
+            if !receipt.duplicate {
+                m.announce(StreamMessage::RewardPaid(receipt.clone()));
+            }
             Applied::new(if receipt.duplicate { 200 } else { 201 }, &receipt)
         }
 
@@ -1627,6 +1773,13 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                     wall_ms,
                 )
                 .map_err(ApiError::money)?;
+            m.announce(StreamMessage::Transferred {
+                from_account_id: *from_account,
+                to_account_id: *to_account,
+                amount_cents: *amount_cents,
+                tx_id: sent.tx_id,
+                memo: memo.clone(),
+            });
             Applied::new(
                 201,
                 &serde_json::json!({
@@ -1651,6 +1804,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 .purchase(&handle, TraderId(*trader_id), *qty, wall_ms)
                 .await
                 .map_err(ApiError::goods)?;
+            m.announce(StreamMessage::Purchased(receipt.clone()));
             Applied::new(201, &receipt)
         }
 
@@ -1667,6 +1821,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                 .consume(&handle, TraderId(*trader_id), *qty)
                 .await
                 .map_err(ApiError::goods)?;
+            m.announce(StreamMessage::Consumed(receipt.clone()));
             Applied::new(200, &receipt)
         }
 
@@ -1738,6 +1893,7 @@ async fn apply(m: &mut Market, wall_ms: i64, command: &Command) -> Result<Applie
                         price - 1
                     ))
                 })?;
+            m.announce(StreamMessage::Dividend(paid));
             let event = m.record(EventRecord {
                 id: 0,
                 received_at_ms: wall_ms,

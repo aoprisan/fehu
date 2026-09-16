@@ -24,11 +24,15 @@
 //! otherwise submit orders as fast as it can open them, and every submission
 //! takes the one market lock.
 //!
-//! The bucket is per user, because a key is the only thing the server can
-//! honestly identify a client by: it does not see addresses, and would not
-//! trust a forwarded one it could not verify. Requests that carry no key
-//! share a single bucket, which is a blunt instrument and deliberately so —
-//! the only unauthenticated writes are signing up and, on a server with no
+//! The bucket is per credential — a user's key or a service's — because a
+//! key is the only thing the server can honestly identify a client by: it
+//! does not see addresses, and would not trust a forwarded one it could not
+//! verify. A service has a bucket of its own for the same reason a user
+//! does: the game backend polling the outbox and paying rewards is one busy
+//! client, and it must not spend the same allowance as, or be starved by, a
+//! client that carries no key at all. Requests that carry no key share a
+//! single bucket, which is a blunt instrument and deliberately so — the
+//! only unauthenticated writes are signing up and, on a server with no
 //! `FEHU_ADMIN_KEY`, the game master's own endpoints.
 
 use std::collections::BTreeMap;
@@ -38,6 +42,18 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::account::UserId;
+use crate::service::ServiceId;
+
+/// Whose allowance a request spends: the credential it carried. A user's
+/// key and a service's key are different namespaces, so a user and a
+/// service that happen to share a number share nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Client {
+    /// A player, by their key.
+    User(UserId),
+    /// The game backend, by one of its credentials.
+    Service(ServiceId),
+}
 
 /// Buckets kept before the full ones are swept away. A bucket that has
 /// refilled completely says nothing a fresh one would not, so dropping it
@@ -71,11 +87,12 @@ struct Bucket {
     at_ms: u64,
 }
 
-/// The token buckets, one per user plus one shared by requests with no key.
+/// The token buckets, one per credential plus one shared by requests with
+/// no key.
 #[derive(Debug)]
 pub struct Limiter {
     rate: Rate,
-    users: BTreeMap<UserId, Bucket>,
+    clients: BTreeMap<Client, Bucket>,
     anonymous: Bucket,
 }
 
@@ -96,7 +113,7 @@ impl Limiter {
     pub fn new(rate: Rate) -> Self {
         Self {
             rate,
-            users: BTreeMap::new(),
+            clients: BTreeMap::new(),
             anonymous: Bucket {
                 tokens: rate.burst,
                 at_ms: 0,
@@ -112,22 +129,22 @@ impl Limiter {
 
     /// Spend one request's worth of `who`'s allowance, `now_ms` milliseconds
     /// after the limiter started. `None` is the shared anonymous bucket.
-    pub fn take(&mut self, who: Option<UserId>, now_ms: u64) -> Decision {
+    pub fn take(&mut self, who: Option<Client>, now_ms: u64) -> Decision {
         if self.rate.is_off() {
             return Decision::Allowed;
         }
         let rate = self.rate;
-        let bucket = if let Some(user) = who {
-            if !self.users.contains_key(&user) {
-                if self.users.len() >= MAX_BUCKETS {
+        let bucket = if let Some(client) = who {
+            if !self.clients.contains_key(&client) {
+                if self.clients.len() >= MAX_BUCKETS {
                     // Only full buckets go: a client mid-burst keeps its
                     // place, so sweeping can never hand out free requests.
-                    self.users
+                    self.clients
                         .retain(|_, b| refill(b, rate, now_ms) < rate.burst);
                 }
-                if self.users.len() < MAX_BUCKETS {
-                    self.users.insert(
-                        user,
+                if self.clients.len() < MAX_BUCKETS {
+                    self.clients.insert(
+                        client,
                         Bucket {
                             tokens: rate.burst,
                             at_ms: now_ms,
@@ -139,7 +156,7 @@ impl Limiter {
             // cannot track shares the anonymous one. That is stricter than
             // its own allowance, never looser: running out of memory must
             // not become a way to buy requests.
-            self.users.get_mut(&user).unwrap_or(&mut self.anonymous)
+            self.clients.get_mut(&client).unwrap_or(&mut self.anonymous)
         } else {
             &mut self.anonymous
         };
@@ -161,7 +178,7 @@ impl Limiter {
     /// Buckets currently held, for `/api/health`.
     #[must_use]
     pub fn tracked(&self) -> usize {
-        self.users.len()
+        self.clients.len()
     }
 }
 
@@ -296,7 +313,7 @@ mod tests {
     #[test]
     fn a_burst_is_spent_then_refills_at_the_rate() {
         let mut limiter = Limiter::new(RATE);
-        let user = Some(UserId(1));
+        let user = Some(Client::User(UserId(1)));
         for i in 0..3 {
             assert!(allowed(limiter.take(user, 0)), "burst request {i}");
         }
@@ -321,16 +338,33 @@ mod tests {
     fn one_client_cannot_spend_anothers_allowance() {
         let mut limiter = Limiter::new(RATE);
         for _ in 0..3 {
-            assert!(allowed(limiter.take(Some(UserId(1)), 0)));
+            assert!(allowed(limiter.take(Some(Client::User(UserId(1))), 0)));
         }
-        assert!(!allowed(limiter.take(Some(UserId(1)), 0)));
-        assert!(allowed(limiter.take(Some(UserId(2)), 0)));
+        assert!(!allowed(limiter.take(Some(Client::User(UserId(1))), 0)));
+        assert!(allowed(limiter.take(Some(Client::User(UserId(2))), 0)));
         // And the anonymous bucket is separate from both.
         assert!(allowed(limiter.take(None, 0)));
         assert!(allowed(limiter.take(None, 0)));
         assert!(allowed(limiter.take(None, 0)));
         assert!(!allowed(limiter.take(None, 0)));
-        assert!(allowed(limiter.take(Some(UserId(2)), 0)));
+        assert!(allowed(limiter.take(Some(Client::User(UserId(2))), 0)));
+    }
+
+    #[test]
+    fn a_service_has_a_bucket_of_its_own() {
+        let mut limiter = Limiter::new(RATE);
+        let backend = Some(Client::Service(ServiceId(1)));
+        let player = Some(Client::User(UserId(1)));
+        for _ in 0..3 {
+            assert!(allowed(limiter.take(backend, 0)));
+        }
+        assert!(
+            !allowed(limiter.take(backend, 0)),
+            "the backend spent its burst"
+        );
+        // Neither the anonymous bucket nor a user that shares its number.
+        assert!(allowed(limiter.take(None, 0)));
+        assert!(allowed(limiter.take(player, 0)));
     }
 
     #[test]
@@ -340,7 +374,7 @@ mod tests {
             burst: 0.0,
         });
         for _ in 0..1_000 {
-            assert!(allowed(limiter.take(Some(UserId(1)), 0)));
+            assert!(allowed(limiter.take(Some(Client::User(UserId(1))), 0)));
         }
     }
 
@@ -349,12 +383,12 @@ mod tests {
         let mut limiter = Limiter::new(RATE);
         // One client mid-burst, then enough others to fill the table. None
         // of them is full, so there is nothing to sweep.
-        let held = Some(UserId(0));
+        let held = Some(Client::User(UserId(0)));
         for _ in 0..3 {
             assert!(allowed(limiter.take(held, 0)));
         }
         for i in 1..MAX_BUCKETS as u64 {
-            assert!(allowed(limiter.take(Some(UserId(i)), 0)));
+            assert!(allowed(limiter.take(Some(Client::User(UserId(i))), 0)));
         }
         assert_eq!(limiter.tracked(), MAX_BUCKETS, "the table is full");
 
@@ -362,9 +396,13 @@ mod tests {
         // instead of being given one of its own.
         let crowd = MAX_BUCKETS as u64 + 1;
         for i in 0..3 {
-            assert!(allowed(limiter.take(Some(UserId(crowd + i)), 0)));
+            assert!(allowed(
+                limiter.take(Some(Client::User(UserId(crowd + i))), 0)
+            ));
         }
-        assert!(!allowed(limiter.take(Some(UserId(crowd + 99)), 0)));
+        assert!(!allowed(
+            limiter.take(Some(Client::User(UserId(crowd + 99))), 0)
+        ));
         assert_eq!(limiter.tracked(), MAX_BUCKETS, "and nothing was evicted");
         assert!(
             !allowed(limiter.take(held, 0)),
@@ -373,7 +411,9 @@ mod tests {
 
         // Once the table's buckets refill they are swept, and a new client
         // gets its own again.
-        assert!(allowed(limiter.take(Some(UserId(crowd)), 600_000)));
+        assert!(allowed(
+            limiter.take(Some(Client::User(UserId(crowd))), 600_000)
+        ));
         assert!(limiter.tracked() < MAX_BUCKETS, "the full ones went");
     }
 

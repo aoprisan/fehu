@@ -25,6 +25,48 @@ fn quiet(theta: f64) -> Config {
 }
 
 #[test]
+fn the_queue_can_be_read_and_an_event_withdrawn() {
+    let mut sim = Simulator::new(quiet(50.0), 1).unwrap();
+    assert!(sim.events().is_empty());
+    let later = Event {
+        at: Timestamp(120_000),
+        kind: EventKind::Jump(0.50),
+    };
+    let sooner = Event {
+        at: Timestamp(60_000),
+        kind: EventKind::Jump(0.10),
+    };
+    sim.push_event(later).unwrap();
+    sim.push_event(sooner).unwrap();
+
+    // Listed in the order they will apply, each named by its push number.
+    let queued = sim.events();
+    assert_eq!(queued.len(), 2);
+    assert_eq!(queued[0], (1, sooner), "pushed second, applies first");
+    assert_eq!(queued[1], (0, later));
+    assert_eq!(sim.snapshot().pending_events, 2);
+
+    // Withdrawn, the later jump never happens; the sooner one still does.
+    assert_eq!(sim.retract(0), Some(later));
+    assert_eq!(sim.retract(0), None, "gone is gone");
+    assert_eq!(sim.retract(99), None, "never pushed");
+    assert_eq!(sim.events(), vec![(1, sooner)]);
+    let p0 = sim.step().price_cents;
+    let p1 = sim.step().price_cents;
+    let expected = (p0 as f64 * 1.10).round() as i64;
+    assert!(
+        (p1 - expected).abs() <= 1,
+        "the sooner jump applied: {p0} -> {p1}"
+    );
+    assert!(sim.events().is_empty(), "and left the queue");
+    let p2 = sim.step().price_cents;
+    assert!(
+        p2 < (p1 as f64 * 1.4) as i64,
+        "the withdrawn jump never applied: {p1} -> {p2}"
+    );
+}
+
+#[test]
 fn jump_moves_price_by_pct_then_reverts() {
     let mut sim = Simulator::new(quiet(50.0), 1).unwrap();
     let p0 = sim.step().price_cents;

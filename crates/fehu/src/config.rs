@@ -261,8 +261,7 @@ impl fmt::Display for ConfigError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for ConfigError {}
+impl core::error::Error for ConfigError {}
 
 pub(crate) fn check_finite(field: &'static str, v: f64) -> Result<(), ConfigError> {
     if v.is_finite() {
